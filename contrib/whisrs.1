@@ -1,0 +1,110 @@
+.TH WHISRS 1 "2026-03-14" "whisrs 0.1.0" "User Commands"
+.SH NAME
+whisrs \- Linux-first voice-to-text dictation CLI
+.SH SYNOPSIS
+.B whisrs
+.I subcommand
+.SH DESCRIPTION
+.B whisrs
+is a thin CLI client that communicates with
+.BR whisrsd (1)
+over a Unix domain socket.
+It sends commands (toggle, cancel, status) and prints the daemon's response.
+.PP
+The
+.B setup
+subcommand runs an interactive onboarding flow and does not require the daemon.
+.SH SUBCOMMANDS
+.TP
+.B setup
+Interactive onboarding \(em select a transcription backend, enter an API key,
+test the microphone, and write
+.IR config.toml .
+Does not require the daemon to be running.
+.TP
+.B toggle
+Start or stop recording. If idle, begins audio capture. If recording,
+stops capture and sends audio for transcription. Text is typed at the
+cursor in the previously focused window.
+.TP
+.B cancel
+Cancel the current recording and discard captured audio. Returns the
+daemon to the idle state. Has no effect if the daemon is not recording.
+.TP
+.B status
+Query the daemon state. Prints one of:
+.BR idle ,
+.BR recording ,
+or
+.BR transcribing .
+.SH ENVIRONMENT
+.TP
+.B WHISRS_GROQ_API_KEY
+Groq API key. Overrides the value in
+.IR config.toml .
+.TP
+.B WHISRS_OPENAI_API_KEY
+OpenAI API key. Overrides the value in
+.IR config.toml .
+.TP
+.B XDG_RUNTIME_DIR
+Directory for the Unix socket. The socket is created at
+.IR $XDG_RUNTIME_DIR/whisrs.sock .
+Falls back to
+.IR /tmp/whisrs\-<uid>.sock .
+.TP
+.B XDG_CONFIG_HOME
+Directory for configuration. Config file is read from
+.IR $XDG_CONFIG_HOME/whisrs/config.toml .
+Defaults to
+.IR ~/.config/whisrs/config.toml .
+.SH FILES
+.TP
+.I ~/.config/whisrs/config.toml
+Main configuration file. Created by
+.BR "whisrs setup" .
+Contains backend selection, API keys, language, and audio settings.
+Permissions should be 0600 since it may contain API keys.
+.TP
+.I $XDG_RUNTIME_DIR/whisrs.sock
+Unix domain socket for CLI\-daemon IPC.
+.TP
+.I ~/.cache/whisrs/recovery/
+Recovery directory for audio that failed transcription.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error (daemon not running, invalid state transition, or setup failure).
+.SH EXAMPLES
+Run interactive setup:
+.PP
+.RS
+.B whisrs setup
+.RE
+.PP
+Start dictation (bind this to a hotkey):
+.PP
+.RS
+.B whisrs toggle
+.RE
+.PP
+Cancel recording:
+.PP
+.RS
+.B whisrs cancel
+.RE
+.PP
+Check daemon state:
+.PP
+.RS
+.B whisrs status
+.RE
+.SH SEE ALSO
+.BR whisrsd (1)
+.SH AUTHORS
+whisrs contributors
+.SH LICENSE
+MIT

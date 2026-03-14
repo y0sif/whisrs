@@ -1,0 +1,155 @@
+.TH WHISRSD 1 "2026-03-14" "whisrs 0.1.0" "User Commands"
+.SH NAME
+whisrsd \- whisrs dictation daemon
+.SH SYNOPSIS
+.B whisrsd
+.SH DESCRIPTION
+.B whisrsd
+is the background daemon for the whisrs dictation system. It manages audio
+capture, transcription, window tracking, and text injection via a virtual
+keyboard.
+.PP
+The daemon listens on a Unix domain socket for commands from the
+.BR whisrs (1)
+CLI client. It runs as a long-lived process, either standalone or as a
+systemd user service.
+.PP
+On startup, the daemon:
+.IP \(bu 2
+Loads configuration from
+.IR ~/.config/whisrs/config.toml
+.IP \(bu 2
+Checks /dev/uinput access for virtual keyboard
+.IP \(bu 2
+Checks for available audio input devices
+.IP \(bu 2
+Auto-detects the active window manager/compositor
+.IP \(bu 2
+Initializes the selected transcription backend
+.IP \(bu 2
+Binds the Unix domain socket and begins accepting commands
+.SH STATE MACHINE
+The daemon maintains one of three states:
+.TP
+.B idle
+Waiting for a toggle command. No audio is being captured.
+.TP
+.B recording
+Audio is being captured from the microphone. A second toggle or a cancel
+command transitions out of this state.
+.TP
+.B transcribing
+Audio has been sent to the transcription backend. The daemon is waiting
+for results. Text is typed at the cursor as it becomes available.
+.SH TRANSCRIPTION BACKENDS
+.TP
+.B groq
+Groq Whisper API. Free tier available. Audio is chunked at silence
+boundaries and sent as HTTP POST requests. Timestamp-based deduplication
+prevents repeated text.
+.TP
+.B openai-realtime
+OpenAI Realtime API via WebSocket. Provides true streaming transcription
+with the lowest latency. Recommended for the best experience.
+.TP
+.B openai
+OpenAI REST API. Simple HTTP POST, non-streaming fallback.
+.TP
+.B local
+Local transcription via whisper.cpp (requires the
+.B local
+feature flag at compile time). Fully offline.
+.SH SOCKET
+The daemon creates a Unix domain socket at:
+.PP
+.RS
+.I $XDG_RUNTIME_DIR/whisrs.sock
+.RE
+.PP
+If
+.B XDG_RUNTIME_DIR
+is not set, falls back to:
+.PP
+.RS
+.IR /tmp/whisrs\-<uid>.sock
+.RE
+.PP
+The protocol uses length-prefixed JSON messages (4-byte big-endian length
+header followed by a JSON body).
+.PP
+On startup, the daemon checks for and removes stale sockets from previous
+instances. If another daemon is already running, it exits with an error.
+.SH SIGNALS
+.TP
+.B SIGINT
+Graceful shutdown. The socket file is removed before exit.
+.TP
+.B SIGTERM
+Graceful shutdown (when run as a systemd service).
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Controls log verbosity. Examples:
+.BR info ,
+.BR debug ,
+.BR "whisrs=debug" .
+Default is
+.BR info .
+.TP
+.B WHISRS_GROQ_API_KEY
+Groq API key. Overrides the config file value.
+.TP
+.B WHISRS_OPENAI_API_KEY
+OpenAI API key. Overrides the config file value.
+.TP
+.B XDG_RUNTIME_DIR
+Socket directory.
+.TP
+.B XDG_CONFIG_HOME
+Configuration directory.
+.TP
+.B WAYLAND_DISPLAY
+Used to detect Wayland session for clipboard operations.
+.TP
+.B HYPRLAND_INSTANCE_SIGNATURE
+Used to detect Hyprland compositor for window tracking.
+.TP
+.B SWAYSOCK
+Used to detect Sway compositor for window tracking.
+.TP
+.B XDG_SESSION_TYPE
+Used to detect X11 session for window tracking.
+.SH FILES
+.TP
+.I ~/.config/whisrs/config.toml
+Configuration file.
+.TP
+.I $XDG_RUNTIME_DIR/whisrs.sock
+IPC socket.
+.TP
+.I ~/.cache/whisrs/recovery/
+Audio recovery files saved on transcription failure.
+.SH EXAMPLES
+Run the daemon in the foreground with debug logging:
+.PP
+.RS
+RUST_LOG=debug whisrsd
+.RE
+.PP
+Run the daemon in the background:
+.PP
+.RS
+whisrsd &
+.RE
+.PP
+Enable as a systemd user service:
+.PP
+.RS
+systemctl \-\-user enable \-\-now whisrs.service
+.RE
+.SH SEE ALSO
+.BR whisrs (1)
+.SH AUTHORS
+whisrs contributors
+.SH LICENSE
+MIT

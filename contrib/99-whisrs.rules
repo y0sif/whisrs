@@ -1,0 +1,4 @@
+# Allow members of the "input" group to access /dev/uinput
+# Install: sudo cp 99-whisrs.rules /etc/udev/rules.d/
+# Reload: sudo udevadm control --reload-rules && sudo udevadm trigger
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", TAG+="uaccess"

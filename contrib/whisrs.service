@@ -1,0 +1,17 @@
+[Unit]
+Description=whisrs dictation daemon
+Documentation=https://github.com/whisrs/whisrs
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/whisrsd
+Restart=on-failure
+RestartSec=3
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
