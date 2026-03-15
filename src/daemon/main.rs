@@ -623,26 +623,16 @@ async fn run_streaming_pipeline(
                 first_text = false;
             }
 
-            if !full_text.is_empty() && !full_text.ends_with(' ') && !text.starts_with(' ') {
-                full_text.push(' ');
-            }
-            full_text.push_str(&text);
-
-            // Type this text chunk immediately.
-            let text_to_type = if full_text.len() == text.len() {
-                // First chunk — type as-is.
+            // Determine what to type BEFORE updating full_text.
+            let text_to_type = if full_text.is_empty() {
                 text.clone()
+            } else if !text.starts_with(' ') && !full_text.ends_with(' ') {
+                format!(" {text}")
             } else {
-                // Subsequent chunk — add space if needed.
-                let needs_space = !text.starts_with(' ')
-                    && full_text.len() > text.len()
-                    && !full_text[..full_text.len() - text.len()].ends_with(' ');
-                if needs_space {
-                    format!(" {text}")
-                } else {
-                    text.clone()
-                }
+                text.clone()
             };
+
+            full_text.push_str(&text_to_type);
 
             info!("typing: {:?}", text_to_type);
             if let Err(e) =

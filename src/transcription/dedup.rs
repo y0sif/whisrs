@@ -118,7 +118,9 @@ fn remove_overlap(previous: &str, new: &str) -> String {
     }
 
     // Try matching n-gram overlaps (from longest to shortest).
-    let max_overlap = prev_words.len().min(new_words.len()).min(10);
+    // The sliding window approach can produce 15-20+ word overlaps,
+    // so we use a generous limit here.
+    let max_overlap = prev_words.len().min(new_words.len()).min(50);
 
     for overlap_len in (1..=max_overlap).rev() {
         let prev_suffix = &prev_words[prev_words.len() - overlap_len..];
