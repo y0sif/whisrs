@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::audio::AudioChunk;
 
@@ -258,7 +258,7 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                     .await
                     .is_err()
                 {
-                    warn!("WebSocket send failed — connection may be closed");
+                    error!("WebSocket send failed — connection may be closed");
                     break;
                 }
             }
@@ -313,7 +313,7 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                     break;
                 }
                 Err(e) => {
-                    warn!("WebSocket receive error: {e}");
+                    error!("WebSocket receive error: {e}");
                     break;
                 }
                 _ => {}

@@ -66,21 +66,55 @@ async fn cleanup_stale_socket(path: &std::path::Path) -> Result<()> {
 }
 
 /// Load configuration from config.toml, falling back to defaults.
-fn load_config() -> Config {
+/// Returns (Config, Option<warning_message>) — the warning is set when config
+/// parsing fails and defaults are used, so the caller can notify the user.
+fn load_config() -> (Config, Option<String>) {
     let config_path = whisrs::config_path();
     if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
             Ok(contents) => match toml::from_str::<Config>(&contents) {
                 Ok(config) => {
                     info!("loaded config from {}", config_path.display());
-                    return config;
+                    return (config, None);
                 }
                 Err(e) => {
-                    warn!("failed to parse config at {}: {e}", config_path.display());
+                    let msg = format!(
+                        "Failed to parse config at {}: {e} — using defaults",
+                        config_path.display()
+                    );
+                    error!("{msg}");
+                    return (
+                        Config {
+                            general: Default::default(),
+                            audio: Default::default(),
+                            groq: None,
+                            openai: None,
+                            local_whisper: None,
+                            local_vosk: None,
+                            local_parakeet: None,
+                        },
+                        Some(msg),
+                    );
                 }
             },
             Err(e) => {
-                warn!("failed to read config at {}: {e}", config_path.display());
+                let msg = format!(
+                    "Failed to read config at {}: {e} — using defaults",
+                    config_path.display()
+                );
+                error!("{msg}");
+                return (
+                    Config {
+                        general: Default::default(),
+                        audio: Default::default(),
+                        groq: None,
+                        openai: None,
+                        local_whisper: None,
+                        local_vosk: None,
+                        local_parakeet: None,
+                    },
+                    Some(msg),
+                );
             }
         }
     } else {
@@ -89,15 +123,18 @@ fn load_config() -> Config {
             config_path.display()
         );
     }
-    Config {
-        general: Default::default(),
-        audio: Default::default(),
-        groq: None,
-        openai: None,
-        local_whisper: None,
-        local_vosk: None,
-        local_parakeet: None,
-    }
+    (
+        Config {
+            general: Default::default(),
+            audio: Default::default(),
+            groq: None,
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+        },
+        None,
+    )
 }
 
 fn check_uinput_access() {
@@ -300,9 +337,16 @@ async fn main() -> Result<()> {
     check_uinput_access();
     check_audio_devices();
 
-    let config = load_config();
+    let (config, config_warning) = load_config();
     validate_config(&config);
     let notify = config.general.notify;
+
+    // Notify user if config parsing failed and defaults are being used.
+    if let Some(msg) = config_warning {
+        if notify {
+            send_notification("whisrs", &msg);
+        }
+    }
 
     let backend = create_backend(&config);
 
@@ -691,19 +735,38 @@ async fn run_streaming_pipeline(
     drop(audio_tx);
 
     // Wait for backend to finish.
+    let mut stream_error: Option<String> = None;
     match backend_task.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             let friendly = format_api_error(&e);
-            warn!("streaming transcription error: {friendly}");
+            error!("streaming transcription error: {friendly}");
+            stream_error = Some(friendly);
         }
         Err(e) => {
-            warn!("streaming backend task panicked: {e}");
+            error!("streaming backend task panicked: {e}");
+            stream_error = Some(format!("transcription task panicked: {e}"));
         }
     }
 
     // Wait for typing to finish.
     let full_text = typing_task.await.unwrap_or_default();
+
+    // Notify user about streaming errors.
+    if let Some(err_msg) = &stream_error {
+        if notify {
+            if full_text.is_empty() {
+                send_notification("whisrs", &format!("Transcription error: {err_msg}"));
+            } else {
+                send_notification(
+                    "whisrs",
+                    &format!(
+                        "Transcription failed — partial text may have been typed.\n{err_msg}"
+                    ),
+                );
+            }
+        }
+    }
 
     // If auto-stop happened, we need to transition to Idle.
     let mut ds = daemon_state.lock().await;
@@ -764,12 +827,15 @@ async fn process_recording_batch(
             use whisrs::audio::recovery;
             match recovery::save_recovery_audio(&samples) {
                 Ok(path) => {
-                    info!("audio saved for recovery: {}", path.display());
+                    info!(
+                        "audio saved for recovery: {} — retry with: whisrs transcribe-recovery",
+                        path.display()
+                    );
                     if context.notify {
                         send_notification(
                             "whisrs",
                             &format!(
-                                "Transcription failed: {friendly}\nAudio saved to {}",
+                                "Transcription failed: {friendly}\nAudio saved to {}\nRetry with: whisrs transcribe-recovery",
                                 path.display()
                             ),
                         );

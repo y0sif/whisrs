@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use reqwest::multipart;
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::audio::capture::encode_wav;
 use crate::audio::silence::is_silent;
@@ -270,7 +270,7 @@ impl TranscriptionBackend for GroqBackend {
                             }
                         }
                         Err(e) => {
-                            warn!("groq stream: chunk transcription failed: {e}");
+                            error!("groq stream: chunk transcription failed: {e}");
                         }
                     }
 
@@ -316,7 +316,7 @@ impl TranscriptionBackend for GroqBackend {
                         }
                     }
                     Err(e) => {
-                        warn!("groq stream: final chunk transcription failed: {e}");
+                        error!("groq stream: final chunk transcription failed: {e}");
                     }
                 }
             }
