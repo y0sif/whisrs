@@ -3300,6 +3300,7 @@ dependencies = [
  "indicatif",
  "libc",
  "notify-rust",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

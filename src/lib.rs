@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod config;
 pub mod input;
+pub mod post_processing;
 pub mod state;
 pub mod transcription;
 pub mod window;
@@ -83,6 +84,18 @@ pub struct GeneralConfig {
     pub silence_timeout_ms: u64,
     #[serde(default = "default_true")]
     pub notify: bool,
+    /// Enable automatic filler word removal from transcriptions.
+    #[serde(default)]
+    pub remove_filler_words: bool,
+    /// Custom filler words to remove. When empty, uses the built-in list.
+    #[serde(default)]
+    pub filler_words: Vec<String>,
+    /// Enable audio feedback (tones on start/stop/done).
+    #[serde(default)]
+    pub audio_feedback: bool,
+    /// Volume for audio feedback (0.0 to 1.0).
+    #[serde(default = "default_audio_feedback_volume")]
+    pub audio_feedback_volume: f32,
 }
 
 impl Default for GeneralConfig {
@@ -92,6 +105,10 @@ impl Default for GeneralConfig {
             language: default_language(),
             silence_timeout_ms: default_silence_timeout(),
             notify: true,
+            remove_filler_words: false,
+            filler_words: Vec::new(),
+            audio_feedback: false,
+            audio_feedback_volume: default_audio_feedback_volume(),
         }
     }
 }
@@ -153,6 +170,9 @@ fn default_true() -> bool {
 }
 fn default_device() -> String {
     "default".to_string()
+}
+fn default_audio_feedback_volume() -> f32 {
+    0.5
 }
 fn default_groq_model() -> String {
     "whisper-large-v3-turbo".to_string()

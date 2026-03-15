@@ -1,6 +1,7 @@
 //! Audio capture, silence detection, and recovery.
 
 pub mod capture;
+pub mod feedback;
 pub mod recovery;
 pub mod silence;
 

@@ -42,6 +42,7 @@ hound = "3"
 libc = "0.2"
 notify-rust = "4"
 indicatif = "0.17"
+regex = "1"
 reqwest = { version = "0.12", features = ["multipart", "json", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

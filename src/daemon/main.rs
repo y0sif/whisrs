@@ -7,7 +7,9 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use whisrs::audio::capture::AudioCaptureHandle;
+use whisrs::audio::feedback;
 use whisrs::audio::silence::AutoStopDetector;
+use whisrs::post_processing::filler::remove_filler_words;
 use whisrs::state::{Action, StateMachine};
 use whisrs::transcription::groq::GroqBackend;
 use whisrs::transcription::local_parakeet::ParakeetBackend;
@@ -500,6 +502,10 @@ async fn handle_toggle(
                 // 3. Type text as it arrives
                 let silence_timeout = context.config.general.silence_timeout_ms;
                 let ds_ref = Arc::clone(&daemon_state);
+                let filler_enabled = context.config.general.remove_filler_words;
+                let filler_words = context.config.general.filler_words.clone();
+                let pipeline_audio_feedback = context.config.general.audio_feedback;
+                let pipeline_audio_volume = context.config.general.audio_feedback_volume;
 
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
@@ -511,6 +517,10 @@ async fn handle_toggle(
                         silence_timeout,
                         ds_ref,
                         window_tracker_for_pipeline,
+                        filler_enabled,
+                        filler_words,
+                        pipeline_audio_feedback,
+                        pipeline_audio_volume,
                     )
                     .await
                 });
@@ -531,6 +541,9 @@ async fn handle_toggle(
             match ds.state_machine.transition(Action::Toggle) {
                 Ok(new_state) => {
                     info!("started recording");
+                    if context.config.general.audio_feedback {
+                        feedback::play_start(context.config.general.audio_feedback_volume);
+                    }
                     if context.notify {
                         send_notification("whisrs", "Recording...");
                     }
@@ -551,6 +564,9 @@ async fn handle_toggle(
             match ds.state_machine.transition(Action::Toggle) {
                 Ok(_) => {
                     info!("stopped recording, transitioning to transcribing");
+                    if context.config.general.audio_feedback {
+                        feedback::play_stop(context.config.general.audio_feedback_volume);
+                    }
                     if context.notify {
                         send_notification("whisrs", "Transcribing...");
                     }
@@ -585,6 +601,11 @@ async fn handle_toggle(
                         Ok(new_state) => match result {
                             Ok(text) => {
                                 info!("transcription complete: {} chars", text.len());
+                                if context.config.general.audio_feedback {
+                                    feedback::play_done(
+                                        context.config.general.audio_feedback_volume,
+                                    );
+                                }
                                 if context.notify {
                                     let preview = if text.len() > 80 {
                                         format!("{}...", &text[..77])
@@ -634,6 +655,10 @@ async fn run_streaming_pipeline(
     silence_timeout_ms: u64,
     daemon_state: Arc<Mutex<DaemonState>>,
     window_tracker: Arc<dyn WindowTracker>,
+    filler_enabled: bool,
+    filler_words: Vec<String>,
+    audio_feedback: bool,
+    audio_feedback_volume: f32,
 ) -> Result<String> {
     let (audio_tx, backend_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(256);
     let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -651,9 +676,17 @@ async fn run_streaming_pipeline(
     let typing_task = tokio::spawn(async move {
         let mut full_text = String::new();
 
-        while let Some(text) = text_rx.recv().await {
+        while let Some(mut text) = text_rx.recv().await {
             if text.is_empty() {
                 continue;
+            }
+
+            // Apply filler word removal if enabled.
+            if filler_enabled {
+                text = remove_filler_words(&text, &filler_words);
+                if text.is_empty() {
+                    continue;
+                }
             }
 
             // Re-focus the original window before typing each chunk.
@@ -772,6 +805,9 @@ async fn run_streaming_pipeline(
     let mut ds = daemon_state.lock().await;
     if ds.state_machine.state() == State::Transcribing {
         ds.state_machine.transition(Action::TranscriptionDone).ok();
+        if audio_feedback {
+            feedback::play_done(audio_feedback_volume);
+        }
         if notify {
             let preview = if full_text.len() > 80 {
                 format!("{}...", &full_text[..77])
@@ -847,6 +883,21 @@ async fn process_recording_batch(
             }
             return Err(e);
         }
+    };
+
+    // Apply filler word removal if enabled.
+    let text = if context.config.general.remove_filler_words {
+        let cleaned = remove_filler_words(&text, &context.config.general.filler_words);
+        if cleaned != text {
+            info!(
+                "filler removal: {} chars -> {} chars",
+                text.len(),
+                cleaned.len()
+            );
+        }
+        cleaned
+    } else {
+        text
     };
 
     if text.is_empty() {
