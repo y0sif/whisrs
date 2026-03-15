@@ -686,6 +686,7 @@ fn setup_systemd_service() {
                      ExecStart={whisrsd_path}\n\
                      Restart=on-failure\n\
                      RestartSec=3\n\
+                     PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR\n\
                      StandardOutput=journal\n\
                      StandardError=journal\n\
                      \n\

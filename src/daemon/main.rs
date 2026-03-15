@@ -43,7 +43,7 @@ impl DaemonState {
 /// Resources shared across all connections (not behind the per-request mutex).
 struct DaemonContext {
     config: Config,
-    window_tracker: Box<dyn WindowTracker>,
+    window_tracker: Arc<dyn WindowTracker>,
     transcription_backend: Arc<dyn TranscriptionBackend>,
     notify: bool,
 }
@@ -350,7 +350,7 @@ async fn main() -> Result<()> {
 
     let backend = create_backend(&config);
 
-    let window_tracker = window::detect_tracker();
+    let window_tracker: Arc<dyn WindowTracker> = Arc::from(window::detect_tracker());
     info!(
         "window tracker: {}",
         std::any::type_name_of_val(&*window_tracker)
@@ -490,7 +490,7 @@ async fn handle_toggle(
                 let backend = Arc::clone(&context.transcription_backend);
                 let wid = window_id.clone();
                 let ctx_notify = context.notify;
-                let window_tracker_ref = &context.window_tracker;
+                let window_tracker_for_pipeline = Arc::clone(&context.window_tracker);
                 // Restore focus before starting the pipeline.
                 let wid_for_focus = wid.clone();
 
@@ -510,6 +510,7 @@ async fn handle_toggle(
                         ctx_notify,
                         silence_timeout,
                         ds_ref,
+                        window_tracker_for_pipeline,
                     )
                     .await
                 });
@@ -518,7 +519,7 @@ async fn handle_toggle(
 
                 // Focus the window now (so text goes to the right place from the start).
                 if let Some(wid) = &wid_for_focus {
-                    if let Err(e) = window_tracker_ref.focus_window(wid) {
+                    if let Err(e) = context.window_tracker.focus_window(wid) {
                         warn!("failed to pre-focus window: {e}");
                     }
                 }
@@ -623,6 +624,7 @@ async fn handle_toggle(
 
 /// The streaming pipeline: reads audio in real-time, sends to API, types text.
 /// Also monitors for silence auto-stop.
+#[allow(clippy::too_many_arguments)]
 async fn run_streaming_pipeline(
     mut audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
     backend: Arc<dyn TranscriptionBackend>,
@@ -631,6 +633,7 @@ async fn run_streaming_pipeline(
     notify: bool,
     silence_timeout_ms: u64,
     daemon_state: Arc<Mutex<DaemonState>>,
+    window_tracker: Arc<dyn WindowTracker>,
 ) -> Result<String> {
     let (audio_tx, backend_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(256);
     let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -647,24 +650,23 @@ async fn run_streaming_pipeline(
     let wid = window_id.clone();
     let typing_task = tokio::spawn(async move {
         let mut full_text = String::new();
-        let mut first_text = true;
 
         while let Some(text) = text_rx.recv().await {
             if text.is_empty() {
                 continue;
             }
 
-            // On first text chunk, restore window focus.
-            if first_text {
-                if let Some(wid) = &wid {
-                    let wid_clone = wid.clone();
-                    // We can't access the window tracker here easily, but the
-                    // focus was pre-set when recording started. If the user
-                    // switched windows, we can't fix that without the tracker.
-                    // The focus was set at recording start which is the expected behavior.
-                    let _ = wid_clone; // focus already set
+            // Re-focus the original window before typing each chunk.
+            // This handles the case where the user switched windows during recording.
+            if let Some(wid) = &wid {
+                let wid_clone = wid.clone();
+                let tracker = Arc::clone(&window_tracker);
+                if let Err(e) = tracker.focus_window(&wid_clone) {
+                    warn!("failed to refocus window {wid_clone} before typing: {e}");
+                } else {
+                    // Small delay to let the compositor process the focus change.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                first_text = false;
             }
 
             // Determine what to type BEFORE updating full_text.

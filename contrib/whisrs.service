@@ -9,6 +9,10 @@ ExecStart=%h/.cargo/bin/whisrsd
 Restart=on-failure
 RestartSec=3
 
+# Import compositor environment variables so window tracking works.
+# These are set by the compositor/session and must be passed through.
+PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR
+
 # Logging
 StandardOutput=journal
 StandardError=journal
