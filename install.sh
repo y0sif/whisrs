@@ -2,7 +2,7 @@
 # whisrs installer — builds from source, installs, and runs setup.
 #
 # Usage:
-#   curl -sSf https://raw.githubusercontent.com/YOUR_USERNAME/whisrs/main/install.sh | bash
+#   curl -sSf https://raw.githubusercontent.com/y0sif/whisrs/main/install.sh | bash
 #   # or from a local clone:
 #   ./install.sh
 
@@ -117,7 +117,7 @@ else
         git -C "$SRCDIR" pull --ff-only
     else
         info "Cloning:" "whisrs → $SRCDIR"
-        git clone https://github.com/YOUR_USERNAME/whisrs "$SRCDIR"
+        git clone https://github.com/y0sif/whisrs "$SRCDIR"
     fi
 fi
 
