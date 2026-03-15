@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2021"
 description = "Linux-first voice-to-text dictation tool"
 license = "MIT"
+repository = "https://github.com/y0sif/whisrs"
+homepage = "https://github.com/y0sif/whisrs"
+keywords = ["voice", "dictation", "speech-to-text", "whisper", "linux"]
+categories = ["multimedia::audio", "accessibility"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = false
+features = []
 
 [[bin]]
 name = "whisrs"
