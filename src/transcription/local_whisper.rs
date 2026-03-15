@@ -3,6 +3,12 @@
 //! When compiled without the `local-whisper` feature, this module provides a stub
 //! that returns an error. When compiled with `local-whisper`, it uses whisper-rs
 //! with a sliding window approach for pseudo-streaming.
+//!
+//! Deduplication strategy: each window is transcribed with `set_initial_prompt()`
+//! set to the previous output for consistency. Text-based n-gram overlap removal
+//! (from `dedup.rs`) strips the repeated prefix. Timestamp filtering is not used
+//! because whisper often produces a single segment with `start_timestamp=0`,
+//! making timestamp-based approaches unreliable.
 
 #[cfg(feature = "local-whisper")]
 use std::sync::Arc;
@@ -11,6 +17,8 @@ use async_trait::async_trait;
 #[cfg(feature = "local-whisper")]
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "local-whisper")]
+use super::dedup::DeduplicationTracker;
 use super::{TranscriptionBackend, TranscriptionConfig};
 #[cfg(feature = "local-whisper")]
 use crate::audio::AudioChunk;
@@ -34,6 +42,11 @@ const STEP_SAMPLES: usize = STEP_SECS * SAMPLE_RATE;
 const INITIAL_WINDOW_SECS: usize = 4;
 #[cfg(feature = "local-whisper")]
 const INITIAL_WINDOW_SAMPLES: usize = INITIAL_WINDOW_SECS * SAMPLE_RATE;
+
+/// Silence threshold — must match or be below the daemon's auto-stop threshold
+/// (0.003) so we never skip windows that auto-stop considers speech.
+#[cfg(feature = "local-whisper")]
+const SILENCE_THRESHOLD: f64 = 0.003;
 
 /// Local whisper.cpp transcription backend.
 pub struct LocalWhisperBackend {
@@ -88,30 +101,17 @@ fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
         .collect()
 }
 
-/// Result of a windowed whisper inference, including text and segments.
-#[cfg(feature = "local-whisper")]
-struct InferenceResult {
-    /// Full text of all segments (used for batch mode).
-    full_text: String,
-    /// Only text from segments that start at or after `keep_after_cs`.
-    new_text: String,
-}
-
 /// Run whisper inference on an audio window.
 ///
-/// - `keep_after_cs`: only include segments starting at or after this timestamp
-///   (in centiseconds). Use 0 to keep everything. This is the key to avoiding
-///   duplicates in the sliding window: the overlap region is transcribed for
-///   context but only segments in the "new" portion are returned.
 /// - `prompt`: previous transcription to condition this window for consistency.
+///   Whisper uses it to maintain context across overlapping windows.
 #[cfg(feature = "local-whisper")]
 fn run_whisper_inference(
     ctx: &whisper_rs::WhisperContext,
     audio: &[f32],
     language: &str,
-    keep_after_cs: i64,
     prompt: Option<&str>,
-) -> anyhow::Result<InferenceResult> {
+) -> anyhow::Result<String> {
     use whisper_rs::{FullParams, SamplingStrategy};
 
     let mut state = ctx
@@ -149,23 +149,12 @@ fn run_whisper_inference(
         .full(params, audio)
         .map_err(|e| anyhow::anyhow!("whisper inference failed: {e}"))?;
 
-    let mut full_text = String::new();
-    let mut new_text = String::new();
-
+    let mut text = String::new();
     for segment in state.as_iter() {
-        let seg_text = format!("{}", segment);
-        full_text.push_str(&seg_text);
-
-        // Only keep segments whose start falls in the "new" portion of the window.
-        if segment.start_timestamp() >= keep_after_cs {
-            new_text.push_str(&seg_text);
-        }
+        text.push_str(&format!("{}", segment));
     }
 
-    Ok(InferenceResult {
-        full_text: full_text.trim().to_string(),
-        new_text: new_text.trim().to_string(),
-    })
+    Ok(text.trim().to_string())
 }
 
 // --- Stub implementation when feature is disabled ---
@@ -213,11 +202,10 @@ impl TranscriptionBackend for LocalWhisperBackend {
         let ctx = Arc::clone(ctx);
         let language = config.language.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            run_whisper_inference(&ctx, &samples_f32, &language, 0, None)
+        tokio::task::spawn_blocking(move || {
+            run_whisper_inference(&ctx, &samples_f32, &language, None)
         })
-        .await??;
-        Ok(result.full_text)
+        .await?
     }
 
     async fn transcribe_stream(
@@ -232,9 +220,10 @@ impl TranscriptionBackend for LocalWhisperBackend {
             .ok_or_else(|| anyhow::anyhow!("whisper model not loaded from {}", self.model_path))?;
 
         let mut buffer: Vec<i16> = Vec::new();
+        let mut dedup = DeduplicationTracker::new();
         let mut next_process_at = INITIAL_WINDOW_SAMPLES;
         let mut last_processed_end: usize = 0;
-        // Previous transcription fed as prompt to the next window for consistency.
+        // Previous full transcription fed as prompt to the next window.
         let mut prompt = String::new();
 
         while let Some(chunk) = audio_rx.recv().await {
@@ -251,14 +240,8 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 let window_start = window_end.saturating_sub(window_size);
                 let window = buffer[window_start..window_end].to_vec();
 
-                // How many seconds of this window overlap with already-transcribed audio.
-                // Whisper still processes the overlap for acoustic context, but we only
-                // keep segments whose timestamps fall in the new portion.
-                let overlap_samples = last_processed_end.saturating_sub(window_start);
-                let keep_after_cs = (overlap_samples as f64 / SAMPLE_RATE as f64 * 100.0) as i64;
-
                 // Skip silent windows.
-                if !crate::audio::silence::is_silent(&window, 0.005) {
+                if !crate::audio::silence::is_silent(&window, SILENCE_THRESHOLD) {
                     let samples_f32 = i16_to_f32(&window);
                     let ctx_clone = Arc::clone(ctx);
                     let lang = config.language.clone();
@@ -273,20 +256,21 @@ impl TranscriptionBackend for LocalWhisperBackend {
                             &ctx_clone,
                             &samples_f32,
                             &lang,
-                            keep_after_cs,
                             prev_prompt.as_deref(),
                         )
                     })
                     .await
                     {
-                        Ok(Ok(result)) => {
-                            // Update prompt with full transcription for next window.
-                            if !result.full_text.is_empty() {
-                                prompt = result.full_text;
+                        Ok(Ok(full_text)) => {
+                            // Update prompt with this window's full transcription.
+                            if !full_text.is_empty() {
+                                prompt.clone_from(&full_text);
                             }
-                            if !result.new_text.is_empty() {
-                                debug!("streaming window produced: {:?}", result.new_text);
-                                text_tx.send(result.new_text).await.ok();
+                            // Use text-based dedup to extract only the new portion.
+                            let new_text = dedup.filter_text(&full_text);
+                            if !new_text.trim().is_empty() {
+                                debug!("streaming window produced: {:?}", new_text);
+                                text_tx.send(new_text).await.ok();
                             }
                         }
                         Ok(Err(e)) => warn!("whisper window inference failed: {e}"),
@@ -313,10 +297,9 @@ impl TranscriptionBackend for LocalWhisperBackend {
             };
             let remaining = &buffer[remaining_start..];
 
-            let overlap_samples = last_processed_end.saturating_sub(remaining_start);
-            let keep_after_cs = (overlap_samples as f64 / SAMPLE_RATE as f64 * 100.0) as i64;
-
-            if !remaining.is_empty() && !crate::audio::silence::is_silent(remaining, 0.005) {
+            if !remaining.is_empty()
+                && !crate::audio::silence::is_silent(remaining, SILENCE_THRESHOLD)
+            {
                 let samples_f32 = i16_to_f32(remaining);
                 let ctx_clone = Arc::clone(ctx);
                 let lang = config.language.clone();
@@ -327,19 +310,14 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 };
 
                 match tokio::task::spawn_blocking(move || {
-                    run_whisper_inference(
-                        &ctx_clone,
-                        &samples_f32,
-                        &lang,
-                        keep_after_cs,
-                        prev_prompt.as_deref(),
-                    )
+                    run_whisper_inference(&ctx_clone, &samples_f32, &lang, prev_prompt.as_deref())
                 })
                 .await
                 {
-                    Ok(Ok(result)) => {
-                        if !result.new_text.is_empty() {
-                            text_tx.send(result.new_text).await.ok();
+                    Ok(Ok(full_text)) => {
+                        let new_text = dedup.filter_text(&full_text);
+                        if !new_text.trim().is_empty() {
+                            text_tx.send(new_text).await.ok();
                         }
                     }
                     Ok(Err(e)) => warn!("whisper final inference failed: {e}"),
