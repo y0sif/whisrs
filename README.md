@@ -235,6 +235,10 @@ backend = "groq"            # groq | openai-realtime | openai | local-whisper
 language = "en"             # ISO 639-1 or "auto"
 silence_timeout_ms = 2000   # auto-stop after silence (streaming only)
 notify = true               # desktop notifications
+remove_filler_words = true  # strip "um", "uh", "you know", etc.
+filler_words = []           # custom list (empty = use built-in defaults)
+audio_feedback = true       # play tones on record start/stop/done
+audio_feedback_volume = 0.5 # 0.0 to 1.0
 
 [audio]
 device = "default"
