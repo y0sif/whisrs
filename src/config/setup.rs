@@ -97,13 +97,20 @@ pub fn run_setup() -> Result<()> {
     // 4. Test microphone.
     test_microphone();
 
-    // 5. Build and write config.
+    // 5. Extra options.
+    let (remove_filler_words, audio_feedback) = configure_extras()?;
+
+    // 6. Build and write config.
     let config = Config {
         general: GeneralConfig {
             backend,
             language,
             silence_timeout_ms: 2000,
             notify: true,
+            remove_filler_words,
+            filler_words: Vec::new(),
+            audio_feedback,
+            audio_feedback_volume: 0.5,
         },
         audio: AudioConfig {
             device: "default".to_string(),
@@ -121,16 +128,16 @@ pub fn run_setup() -> Result<()> {
         config_path.display()
     );
 
-    // 6. Check and optionally fix uinput permissions.
+    // 7. Check and optionally fix uinput permissions.
     setup_uinput_permissions();
 
-    // 7. Offer to install and enable the systemd service.
+    // 8. Offer to install and enable the systemd service.
     setup_systemd_service();
 
-    // 8. Offer to add keybinding.
+    // 9. Offer to add keybinding.
     setup_keybinding();
 
-    // 9. Print summary.
+    // 10. Print summary.
     print_done();
 
     Ok(())
@@ -950,12 +957,43 @@ fn which_whisrs() -> String {
     home.join(".cargo/bin/whisrs").to_string_lossy().to_string()
 }
 
+/// Ask the user about extra features (filler removal, audio feedback).
+fn configure_extras() -> Result<(bool, bool)> {
+    println!("\n{BOLD}Extra features...{RESET}");
+
+    let remove_fillers = Confirm::new()
+        .with_prompt("Enable filler word removal? (strips \"um\", \"uh\", \"you know\", etc.)")
+        .default(true)
+        .interact()
+        .unwrap_or(true);
+
+    let audio_feedback = Confirm::new()
+        .with_prompt("Enable audio feedback? (subtle tones on record start/stop)")
+        .default(true)
+        .interact()
+        .unwrap_or(true);
+
+    if remove_fillers {
+        println!("  {GREEN}Filler removal enabled{RESET}");
+    }
+    if audio_feedback {
+        println!("  {GREEN}Audio feedback enabled{RESET}");
+    }
+
+    Ok((remove_fillers, audio_feedback))
+}
+
 /// Print the final success message.
 fn print_done() {
     println!("\n{GREEN}{BOLD}You're all set!{RESET}");
     println!();
-    println!("  {DIM}Config: ~/.config/whisrs/config.toml{RESET}");
-    println!("  {DIM}Logs:   journalctl --user -u whisrs -f{RESET}");
-    println!("  {DIM}Re-run: whisrs setup (to change backend or settings){RESET}");
+    println!("  {DIM}Config:    ~/.config/whisrs/config.toml{RESET}");
+    println!("  {DIM}Logs:      journalctl --user -u whisrs -f{RESET}");
+    println!("  {DIM}Re-run:    whisrs setup (to change backend or settings){RESET}");
+    println!();
+    println!("  You can adjust all settings (filler words, audio feedback, silence");
+    println!(
+        "  timeout, etc.) by editing the config file or re-running {BOLD}whisrs setup{RESET}."
+    );
     println!();
 }

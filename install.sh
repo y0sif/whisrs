@@ -21,7 +21,7 @@ warn()  { echo -e "  ${YELLOW}$1${RESET}"; }
 error() { echo -e "  ${RED}$1${RESET}"; }
 step()  { echo -e "\n${BOLD}[$1/$TOTAL] $2${RESET}"; }
 
-TOTAL=4
+TOTAL=5
 
 echo -e "\n${BOLD}whisrs installer${RESET} — voice-to-text dictation for Linux\n"
 
@@ -145,12 +145,33 @@ else
     fi
 fi
 
-# ── Step 4: Run interactive setup ────────────────────────────────────────
+# ── Step 4: Restart daemon if running ───────────────────────────────────
 
-step 4 "Running whisrs setup..."
+step 4 "Checking for running daemon..."
+
+if systemctl --user is-active whisrs.service &>/dev/null; then
+    info "Restarting:" "whisrs daemon (systemd service)"
+    systemctl --user restart whisrs.service
+    echo "  Daemon restarted with the new binary."
+elif pgrep -x whisrsd &>/dev/null; then
+    warn "whisrsd is running but not via systemd."
+    echo "  Please restart it manually: kill \$(pgrep whisrsd) && whisrsd &"
+else
+    echo "  No running daemon found — it will start after setup."
+fi
+
+# ── Step 5: Run interactive setup ────────────────────────────────────────
+
+step 5 "Running whisrs setup..."
 
 echo ""
 whisrs setup
+
+# Restart daemon again if setup changed the config.
+if systemctl --user is-active whisrs.service &>/dev/null; then
+    systemctl --user restart whisrs.service
+    info "Daemon restarted" "with new config."
+fi
 
 echo -e "\n${GREEN}${BOLD}Installation complete!${RESET}"
 echo ""
