@@ -145,22 +145,15 @@ If any check fails, fix the issue before pushing. Do not push with the intent to
 
 When a feature or set of changes warrants a version bump:
 
-1. **Bump version** in `Cargo.toml` (semver: `MAJOR.MINOR.PATCH`)
+1. **Bump version** in `Cargo.toml` and `flake.nix` (semver: `MAJOR.MINOR.PATCH`)
 2. **Run all CI checks** locally (see above)
-3. **Commit** the version bump (e.g., `Bump version to 0.1.1`)
-4. **Tag** the commit: `git tag v0.1.1`
-5. **Push** commit and tag: `git push; git push --tags`
-6. The release workflow (`.github/workflows/release.yml`) will automatically:
-   - Build a static Linux binary (musl)
-   - Create a GitHub Release with the binary attached
-   - Publish to crates.io (requires `CARGO_REGISTRY_TOKEN` secret)
-7. **Update AUR** package locally and push to AUR
-
-**IMPORTANT:** The release workflow only triggers on tag pushes matching `v*`. Pushing commits alone will NOT create a release. Always tag after bumping the version.
+3. **Commit** and **push**
+4. **Publish to crates.io**: `cargo publish`
+5. **Update AUR** package locally and push to AUR
 
 ## Packaging
 
 Packaging files (AUR PKGBUILD, etc.) do NOT belong in this repo. They are maintained externally:
 - **AUR**: `whisrs-git` package on AUR (maintained locally, pushed via `makepkg --printsrcinfo > .SRCINFO; git push`)
 - **Nix**: `flake.nix` lives in-repo (standard practice for Nix projects)
-- **crates.io**: Handled automatically by the release workflow
+- **crates.io**: `cargo publish` manually after version bump
