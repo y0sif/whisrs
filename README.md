@@ -74,7 +74,7 @@ whisrs is noticeably faster at typing transcribed text:
 sudo pacman -S base-devel alsa-lib libxkbcommon
 
 # Build (cloud backends only)
-git clone https://github.com/YOUR_USERNAME/whisrs
+git clone https://github.com/y0sif/whisrs
 cd whisrs
 cargo build --release
 
