@@ -93,10 +93,17 @@ impl TranscriptionBackend for OpenAIRestBackend {
             .file_name("audio.wav")
             .mime_str("audio/wav")?;
 
+        // whisper-1 supports verbose_json; gpt-4o-transcribe models only support json/text.
+        let response_format = if config.model.starts_with("whisper") {
+            "verbose_json"
+        } else {
+            "json"
+        };
+
         let mut form = multipart::Form::new()
             .part("file", file_part)
             .text("model", config.model.clone())
-            .text("response_format", "verbose_json");
+            .text("response_format", response_format.to_string());
 
         if config.language != "auto" {
             form = form.text("language", config.language.clone());
