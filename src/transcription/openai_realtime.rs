@@ -50,6 +50,7 @@ struct SessionUpdate {
 
 #[derive(Debug, Serialize)]
 struct SessionConfig {
+    input_audio_format: String,
     input_audio_transcription: AudioTranscriptionConfig,
     turn_detection: TurnDetectionConfig,
 }
@@ -57,6 +58,8 @@ struct SessionConfig {
 #[derive(Debug, Serialize)]
 struct AudioTranscriptionConfig {
     model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    language: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,12 +100,20 @@ struct ServerError {
 }
 
 impl SessionUpdate {
-    fn new(model: &str) -> Self {
+    fn new(model: &str, language: &str) -> Self {
+        // Map "auto" to empty string (let the API auto-detect).
+        let lang = if language == "auto" {
+            String::new()
+        } else {
+            language.to_string()
+        };
         Self {
-            msg_type: "session.update".to_string(),
+            msg_type: "transcription_session.update".to_string(),
             session: SessionConfig {
+                input_audio_format: "pcm16".to_string(),
                 input_audio_transcription: AudioTranscriptionConfig {
                     model: model.to_string(),
+                    language: lang,
                 },
                 turn_detection: TurnDetectionConfig {
                     detection_type: "server_vad".to_string(),
@@ -208,7 +219,7 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
     ) -> anyhow::Result<()> {
         let api_key = self.resolve_api_key()?;
         let model = &config.model;
-        let url = format!("wss://api.openai.com/v1/realtime?model={model}");
+        let url = "wss://api.openai.com/v1/realtime?intent=transcription".to_string();
 
         info!("connecting to OpenAI Realtime API: {url}");
 
@@ -231,13 +242,15 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
 
         info!("connected to OpenAI Realtime API");
 
-        // Send session configuration.
-        let session_update = SessionUpdate::new(model);
+        // Send transcription session configuration.
+        let session_update = SessionUpdate::new(model, &config.language);
         let session_json = serde_json::to_string(&session_update)?;
         ws_sink
             .send(tungstenite::Message::Text(session_json.into()))
             .await?;
-        debug!("sent session.update");
+        debug!(
+            "sent transcription_session.update for model={model}"
+        );
 
         // Spawn a task to send audio.
         let send_task = tokio::spawn(async move {
@@ -263,12 +276,37 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                 }
             }
 
-            // Close the WebSocket gracefully.
-            ws_sink.send(tungstenite::Message::Close(None)).await.ok();
+            // All real audio sent. Send ~1.5 seconds of silence so the
+            // server VAD detects end-of-speech and triggers transcription.
+            debug!("sending silence frames for VAD end-of-speech detection");
+            let silence_samples = vec![0i16; 24_000]; // 1s at 24kHz
+            let silence_b64 = encode_pcm_base64(&silence_samples);
+            // Send in two chunks to give the server time to process.
+            for _ in 0..3 {
+                let msg = AudioBufferAppend::new(silence_b64.clone());
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(_) => break,
+                };
+                if ws_sink
+                    .send(tungstenite::Message::Text(json.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+
+            // Return the sink so the caller can close after transcription.
+            ws_sink
         });
 
-        // Receive transcription events.
-        while let Some(msg_result) = ws_source.next().await {
+        // Receive transcription events (with a timeout to avoid hanging forever).
+        let timeout_duration = std::time::Duration::from_secs(15);
+        while let Ok(Some(msg_result)) =
+            tokio::time::timeout(timeout_duration, ws_source.next()).await
+        {
             match msg_result {
                 Ok(tungstenite::Message::Text(text)) => {
                     match serde_json::from_str::<ServerMessage>(&text) {
@@ -289,15 +327,26 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                                     // don't re-send here.
                                 }
                             }
-                            "error" => {
+                            "error"
+                            | "conversation.item.input_audio_transcription.failed" => {
                                 let err_msg = server_msg
                                     .error
                                     .map(|e| e.message)
                                     .unwrap_or_else(|| "unknown error".to_string());
                                 error!("OpenAI Realtime error: {err_msg}");
+                                // Log the raw message for debugging.
+                                debug!("raw error message: {text}");
                             }
-                            "session.created" | "session.updated" => {
+                            "session.created"
+                            | "session.updated"
+                            | "transcription_session.created"
+                            | "transcription_session.updated" => {
                                 debug!("session event: {}", server_msg.msg_type);
+                            }
+                            "input_audio_buffer.committed"
+                            | "input_audio_buffer.speech_started"
+                            | "input_audio_buffer.speech_stopped" => {
+                                debug!("audio buffer event: {}", server_msg.msg_type);
                             }
                             other => {
                                 debug!("unhandled server message type: {other}");
@@ -320,7 +369,10 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
             }
         }
 
-        send_task.await.ok();
+        // Wait for the send task and close the WebSocket.
+        if let Ok(mut ws_sink) = send_task.await {
+            ws_sink.send(tungstenite::Message::Close(None)).await.ok();
+        }
         info!("OpenAI Realtime stream finished");
 
         Ok(())
@@ -337,15 +389,28 @@ mod tests {
 
     #[test]
     fn session_update_serialization() {
-        let msg = SessionUpdate::new("gpt-4o-mini-transcribe");
+        let msg = SessionUpdate::new("gpt-4o-mini-transcribe", "en");
         let json = serde_json::to_value(&msg).unwrap();
 
-        assert_eq!(json["type"], "session.update");
+        assert_eq!(json["type"], "transcription_session.update");
+        assert_eq!(json["session"]["input_audio_format"], "pcm16");
         assert_eq!(
             json["session"]["input_audio_transcription"]["model"],
             "gpt-4o-mini-transcribe"
         );
+        assert_eq!(json["session"]["input_audio_transcription"]["language"], "en");
         assert_eq!(json["session"]["turn_detection"]["type"], "server_vad");
+    }
+
+    #[test]
+    fn session_update_auto_language_omitted() {
+        let msg = SessionUpdate::new("gpt-4o-transcribe", "auto");
+        let json = serde_json::to_value(&msg).unwrap();
+
+        // "auto" should be converted to empty string and skipped
+        assert!(json["session"]["input_audio_transcription"]
+            .get("language")
+            .is_none());
     }
 
     #[test]
