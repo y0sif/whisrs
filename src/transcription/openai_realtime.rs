@@ -276,26 +276,18 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                 }
             }
 
-            // All real audio sent. Send ~1.5 seconds of silence so the
-            // server VAD detects end-of-speech and triggers transcription.
-            debug!("sending silence frames for VAD end-of-speech detection");
-            let silence_samples = vec![0i16; 24_000]; // 1s at 24kHz
+            // All real audio sent. Send a short silence burst so the
+            // server VAD detects end-of-speech and triggers transcription
+            // for any remaining buffered audio.
+            debug!("sending silence for VAD end-of-speech detection");
+            let silence_samples = vec![0i16; 12_000]; // 0.5s at 24kHz
             let silence_b64 = encode_pcm_base64(&silence_samples);
-            // Send in two chunks to give the server time to process.
-            for _ in 0..3 {
-                let msg = AudioBufferAppend::new(silence_b64.clone());
-                let json = match serde_json::to_string(&msg) {
-                    Ok(j) => j,
-                    Err(_) => break,
-                };
-                if ws_sink
+            let msg = AudioBufferAppend::new(silence_b64);
+            if let Ok(json) = serde_json::to_string(&msg) {
+                ws_sink
                     .send(tungstenite::Message::Text(json.into()))
                     .await
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    .ok();
             }
 
             // Return the sink so the caller can close after transcription.
@@ -303,9 +295,16 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
         });
 
         // Receive transcription events (with a timeout to avoid hanging forever).
-        let timeout_duration = std::time::Duration::from_secs(15);
-        while let Ok(Some(msg_result)) =
-            tokio::time::timeout(timeout_duration, ws_source.next()).await
+        // Use a long timeout initially, then a short one after transcription completes.
+        let long_timeout = std::time::Duration::from_secs(15);
+        let short_timeout = std::time::Duration::from_secs(2);
+        let mut got_completed = false;
+
+        while let Ok(Some(msg_result)) = tokio::time::timeout(
+            if got_completed { short_timeout } else { long_timeout },
+            ws_source.next(),
+        )
+        .await
         {
             match msg_result {
                 Ok(tungstenite::Message::Text(text)) => {
@@ -322,10 +321,8 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                             "conversation.item.input_audio_transcription.completed" => {
                                 if let Some(transcript) = server_msg.transcript {
                                     debug!("realtime completed: {transcript}");
-                                    // The completed event contains the full text;
-                                    // deltas already sent it incrementally, so we
-                                    // don't re-send here.
                                 }
+                                got_completed = true;
                             }
                             "error"
                             | "conversation.item.input_audio_transcription.failed" => {

@@ -671,44 +671,61 @@ async fn run_streaming_pipeline(
             .await
     });
 
-    // Spawn a task that types text as it arrives.
+    // Spawn a task that batches and types text as it arrives.
+    // We collect deltas for a short window to avoid creating a new virtual
+    // keyboard for every single word delta from the streaming API.
     let wid = window_id.clone();
     let typing_task = tokio::spawn(async move {
         let mut full_text = String::new();
+        let mut focused = false;
+        let batch_delay = std::time::Duration::from_millis(150);
 
-        while let Some(mut text) = text_rx.recv().await {
-            if text.is_empty() {
+        loop {
+            // Wait for the first delta (blocking).
+            let first = text_rx.recv().await;
+            let Some(first) = first else { break };
+
+            // Collect this delta and any others that arrive within the batch window.
+            let mut batch = first;
+            while let Ok(Some(more)) =
+                tokio::time::timeout(batch_delay, text_rx.recv()).await
+            {
+                batch.push_str(&more);
+            }
+
+            if batch.is_empty() {
                 continue;
             }
 
             // Apply filler word removal if enabled.
             if filler_enabled {
-                text = remove_filler_words(&text, &filler_words);
-                if text.is_empty() {
+                batch = remove_filler_words(&batch, &filler_words);
+                if batch.is_empty() {
                     continue;
                 }
             }
 
-            // Re-focus the original window before typing each chunk.
-            // This handles the case where the user switched windows during recording.
-            if let Some(wid) = &wid {
-                let wid_clone = wid.clone();
-                let tracker = Arc::clone(&window_tracker);
-                if let Err(e) = tracker.focus_window(&wid_clone) {
-                    warn!("failed to refocus window {wid_clone} before typing: {e}");
-                } else {
-                    // Small delay to let the compositor process the focus change.
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Focus the original window (only once, or re-focus if needed).
+            if !focused {
+                if let Some(wid) = &wid {
+                    let wid_clone = wid.clone();
+                    let tracker = Arc::clone(&window_tracker);
+                    if let Err(e) = tracker.focus_window(&wid_clone) {
+                        warn!("failed to refocus window {wid_clone} before typing: {e}");
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
                 }
+                focused = true;
             }
 
-            // Determine what to type BEFORE updating full_text.
+            // Add space separator between turns if needed.
             let text_to_type = if full_text.is_empty() {
-                text.clone()
-            } else if !text.starts_with(' ') && !full_text.ends_with(' ') {
-                format!(" {text}")
+                batch.clone()
+            } else if !batch.starts_with(' ') && !full_text.ends_with(' ') {
+                format!(" {batch}")
             } else {
-                text.clone()
+                batch.clone()
             };
 
             full_text.push_str(&text_to_type);
