@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod config;
+pub mod history;
 pub mod input;
 pub mod post_processing;
 pub mod state;
@@ -22,6 +23,18 @@ pub enum Command {
     Toggle,
     Cancel,
     Status,
+    /// Retrieve recent transcription history.
+    Log {
+        #[serde(default = "default_log_limit")]
+        limit: usize,
+    },
+    /// Clear all transcription history.
+    #[serde(rename = "clear-history")]
+    ClearHistory,
+}
+
+fn default_log_limit() -> usize {
+    20
 }
 
 /// Responses sent from the daemon back to the CLI.
@@ -30,6 +43,7 @@ pub enum Command {
 pub enum Response {
     Ok { state: State },
     Error { message: String },
+    History { entries: Vec<history::HistoryEntry> },
 }
 
 /// Daemon state.

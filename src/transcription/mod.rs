@@ -4,7 +4,28 @@ pub mod dedup;
 pub mod groq;
 pub mod local_parakeet;
 pub mod local_vosk;
+#[cfg(feature = "local-whisper")]
 pub mod local_whisper;
+#[cfg(not(feature = "local-whisper"))]
+pub mod local_whisper {
+    //! Stub when local-whisper feature is disabled.
+    pub struct LocalWhisperBackend;
+    impl LocalWhisperBackend {
+        pub fn new(_model_path: String) -> Self {
+            Self
+        }
+    }
+    #[async_trait::async_trait]
+    impl super::TranscriptionBackend for LocalWhisperBackend {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _config: &super::TranscriptionConfig,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("local-whisper feature not enabled — rebuild with: cargo build --features local-whisper")
+        }
+    }
+}
 pub mod openai_realtime;
 pub mod openai_rest;
 

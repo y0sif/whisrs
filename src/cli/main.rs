@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
+use whisrs::history::HistoryEntry;
 use whisrs::{encode_message, read_message, socket_path, Command, Response, State};
 
 const ASCII_BANNER: &str = concat!(
@@ -47,6 +48,15 @@ enum SubCmd {
     Cancel,
     /// Query the daemon state (idle, recording, transcribing)
     Status,
+    /// Show recent transcription history
+    Log {
+        /// Number of entries to show (default: 20)
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+        /// Clear all history
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 /// Check if stdout is a TTY for color support.
@@ -91,6 +101,13 @@ async fn main() -> anyhow::Result<()> {
         }
         SubCmd::Status => {
             send_command(Command::Status).await?;
+        }
+        SubCmd::Log { limit, clear } => {
+            if clear {
+                send_command(Command::ClearHistory).await?;
+            } else {
+                send_command(Command::Log { limit }).await?;
+            }
         }
     }
 
@@ -144,6 +161,13 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
         Response::Ok { state } => {
             println!("{}", format_state(state, use_color));
         }
+        Response::History { entries } => {
+            if entries.is_empty() {
+                println!("No transcription history.");
+            } else {
+                print_history(&entries, use_color);
+            }
+        }
         Response::Error { message } => {
             if use_color {
                 eprintln!("{RED}error:{RESET} {message}");
@@ -155,4 +179,32 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Display transcription history entries.
+fn print_history(entries: &[HistoryEntry], use_color: bool) {
+    let dim = if use_color { "\x1b[2m" } else { "" };
+
+    for entry in entries {
+        let ts = entry.timestamp.format("%Y-%m-%d %H:%M:%S");
+        let duration = format!("{:.1}s", entry.duration_secs);
+
+        if use_color {
+            println!(
+                "{dim}{ts}{RESET}  {dim}[{backend} | {lang} | {dur}]{RESET}",
+                backend = entry.backend,
+                lang = entry.language,
+                dur = duration,
+            );
+        } else {
+            println!(
+                "{ts}  [{backend} | {lang} | {dur}]",
+                backend = entry.backend,
+                lang = entry.language,
+                dur = duration,
+            );
+        }
+        println!("  {}", entry.text);
+        println!();
+    }
 }

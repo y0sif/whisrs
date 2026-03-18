@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use whisrs::audio::capture::AudioCaptureHandle;
 use whisrs::audio::feedback;
 use whisrs::audio::silence::AutoStopDetector;
+use whisrs::history::{self, HistoryEntry};
 use whisrs::post_processing::filler::remove_filler_words;
 use whisrs::state::{Action, StateMachine};
 use whisrs::transcription::groq::GroqBackend;
@@ -29,6 +30,8 @@ struct DaemonState {
     recording_window_id: Option<String>,
     /// Handle to the background streaming pipeline (if active).
     streaming_task: Option<tokio::task::JoinHandle<Result<String>>>,
+    /// When recording started (for duration tracking).
+    recording_started_at: Option<std::time::Instant>,
 }
 
 impl DaemonState {
@@ -38,6 +41,7 @@ impl DaemonState {
             audio_capture: None,
             recording_window_id: None,
             streaming_task: None,
+            recording_started_at: None,
         }
     }
 }
@@ -433,6 +437,23 @@ async fn handle_command(
                 state: ds.state_machine.state(),
             }
         }
+        Command::Log { limit } => match history::read_entries(limit) {
+            Ok(entries) => Response::History { entries },
+            Err(e) => Response::Error {
+                message: format!("failed to read history: {e}"),
+            },
+        },
+        Command::ClearHistory => match history::clear_history() {
+            Ok(()) => {
+                info!("transcription history cleared");
+                Response::Ok {
+                    state: daemon_state.lock().await.state_machine.state(),
+                }
+            }
+            Err(e) => Response::Error {
+                message: format!("failed to clear history: {e}"),
+            },
+        },
     }
 }
 
@@ -507,6 +528,9 @@ async fn handle_toggle(
                 let pipeline_audio_feedback = context.config.general.audio_feedback;
                 let pipeline_audio_volume = context.config.general.audio_feedback_volume;
 
+                let pipeline_backend_name = context.config.general.backend.clone();
+                let pipeline_language = context.config.general.language.clone();
+
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
                         audio_rx,
@@ -521,6 +545,8 @@ async fn handle_toggle(
                         filler_words,
                         pipeline_audio_feedback,
                         pipeline_audio_volume,
+                        pipeline_backend_name,
+                        pipeline_language,
                     )
                     .await
                 });
@@ -537,6 +563,7 @@ async fn handle_toggle(
 
             ds.audio_capture = Some(capture);
             ds.recording_window_id = window_id;
+            ds.recording_started_at = Some(std::time::Instant::now());
 
             match ds.state_machine.transition(Action::Toggle) {
                 Ok(new_state) => {
@@ -574,6 +601,7 @@ async fn handle_toggle(
                     let capture = ds.audio_capture.take();
                     let window_id = ds.recording_window_id.take();
                     let streaming_task = ds.streaming_task.take();
+                    let recording_started_at = ds.recording_started_at.take();
 
                     // Release lock before slow operations.
                     drop(ds);
@@ -596,11 +624,22 @@ async fn handle_toggle(
                     };
 
                     // Transition back to Idle.
+                    let duration_secs = recording_started_at
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
                     let mut ds = daemon_state.lock().await;
                     match ds.state_machine.transition(Action::TranscriptionDone) {
                         Ok(new_state) => match result {
                             Ok(text) => {
                                 info!("transcription complete: {} chars", text.len());
+                                if !text.is_empty() {
+                                    save_history_entry(
+                                        &text,
+                                        &context.config.general.backend,
+                                        &context.config.general.language,
+                                        duration_secs,
+                                    );
+                                }
                                 if context.config.general.audio_feedback {
                                     feedback::play_done(
                                         context.config.general.audio_feedback_volume,
@@ -659,7 +698,10 @@ async fn run_streaming_pipeline(
     filler_words: Vec<String>,
     audio_feedback: bool,
     audio_feedback_volume: f32,
+    backend_name: String,
+    language: String,
 ) -> Result<String> {
+    let pipeline_start = std::time::Instant::now();
     let (audio_tx, backend_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(256);
     let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
 
@@ -814,6 +856,12 @@ async fn run_streaming_pipeline(
                 );
             }
         }
+    }
+
+    // Save to history if we got any text.
+    if !full_text.is_empty() {
+        let duration_secs = pipeline_start.elapsed().as_secs_f64();
+        save_history_entry(&full_text, &backend_name, &language, duration_secs);
     }
 
     // If auto-stop happened, we need to transition to Idle.
@@ -1003,6 +1051,20 @@ fn type_text_at_cursor(text: &str) -> Result<()> {
 
     keyboard.type_text(text).context("failed to type text")?;
     Ok(())
+}
+
+/// Save a transcription to the history file.
+fn save_history_entry(text: &str, backend: &str, language: &str, duration_secs: f64) {
+    let entry = HistoryEntry {
+        timestamp: chrono::Local::now(),
+        text: text.to_string(),
+        backend: backend.to_string(),
+        language: language.to_string(),
+        duration_secs,
+    };
+    if let Err(e) = history::append_entry(&entry) {
+        warn!("failed to save history entry: {e}");
+    }
 }
 
 async fn handle_cancel(
