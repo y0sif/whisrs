@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, Password, Select};
 
+use crate::llm::LlmConfig;
 use crate::{AudioConfig, Config, GeneralConfig, GroqConfig, LocalWhisperConfig, OpenAiConfig};
 
 // ANSI color codes.
@@ -100,7 +101,10 @@ pub fn run_setup() -> Result<()> {
     // 5. Extra options.
     let (remove_filler_words, audio_feedback) = configure_extras()?;
 
-    // 6. Build and write config.
+    // 6. Command mode LLM (optional).
+    let llm_config = configure_llm()?;
+
+    // 7. Build and write config.
     let config = Config {
         general: GeneralConfig {
             backend,
@@ -121,7 +125,7 @@ pub fn run_setup() -> Result<()> {
         local_whisper: local_whisper_config,
         local_vosk: None,
         local_parakeet: None,
-        llm: None,
+        llm: llm_config,
     };
 
     let config_path = write_config(&config)?;
@@ -1033,6 +1037,97 @@ fn configure_extras() -> Result<(bool, bool)> {
     }
 
     Ok((remove_fillers, audio_feedback))
+}
+
+/// LLM provider choices for command mode.
+const LLM_PROVIDER_CHOICES: &[&str] = &[
+    "OpenAI         (gpt-4o-mini, recommended)",
+    "Groq           (llama-3.3-70b, free)",
+    "Anthropic      (claude-sonnet-4-20250514)",
+    "OpenRouter     (any model, requires account)",
+    "Google Gemini  (gemini-2.0-flash)",
+    "Skip           (configure later in config.toml)",
+];
+
+/// LLM provider: (api_url, default_model).
+const LLM_PROVIDERS: &[(&str, &str)] = &[
+    ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini"),
+    (
+        "https://api.groq.com/openai/v1/chat/completions",
+        "llama-3.3-70b-versatile",
+    ),
+    (
+        "https://api.anthropic.com/v1/messages",
+        "claude-sonnet-4-20250514",
+    ),
+    (
+        "https://openrouter.ai/api/v1/chat/completions",
+        "openai/gpt-4o-mini",
+    ),
+    (
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "gemini-2.0-flash",
+    ),
+];
+
+/// Configure the LLM for command mode (optional).
+fn configure_llm() -> Result<Option<LlmConfig>> {
+    println!("\n{BOLD}Command mode (optional)...{RESET}");
+    println!("  {DIM}Select text + hotkey + speak instruction → LLM rewrites it in place{RESET}");
+    println!();
+
+    let selection = Select::new()
+        .with_prompt("Select an LLM provider for command mode")
+        .items(LLM_PROVIDER_CHOICES)
+        .default(LLM_PROVIDER_CHOICES.len() - 1) // default to "Skip"
+        .interact()
+        .context("failed to read LLM provider selection")?;
+
+    // "Skip" is the last option.
+    if selection >= LLM_PROVIDERS.len() {
+        println!("  {DIM}Skipped — you can add [llm] to config.toml later{RESET}");
+        return Ok(None);
+    }
+
+    let (api_url, default_model) = LLM_PROVIDERS[selection];
+    let provider_name = LLM_PROVIDER_CHOICES[selection]
+        .split_whitespace()
+        .next()
+        .unwrap_or("LLM");
+
+    // API key.
+    let hint = match selection {
+        0 => "Get one at https://platform.openai.com/api-keys",
+        1 => "Get one free at https://console.groq.com/keys",
+        2 => "Get one at https://console.anthropic.com/settings/keys",
+        3 => "Get one at https://openrouter.ai/settings/keys",
+        4 => "Get one at https://aistudio.google.com/apikey",
+        _ => "",
+    };
+    println!("  {DIM}{hint}{RESET}");
+    let api_key = Password::new()
+        .with_prompt(format!("{provider_name} API key"))
+        .interact()
+        .context("failed to read LLM API key")?;
+
+    if api_key.is_empty() {
+        println!("  {YELLOW}Warning: empty API key — command mode won't work until you set it in config.toml{RESET}");
+    }
+
+    // Model (with default pre-filled).
+    let model: String = Input::new()
+        .with_prompt("Model")
+        .default(default_model.to_string())
+        .interact_text()
+        .context("failed to read model")?;
+
+    println!("  {GREEN}Command mode configured: {provider_name} / {model}{RESET}");
+
+    Ok(Some(LlmConfig {
+        api_key,
+        model,
+        api_url: api_url.to_string(),
+    }))
 }
 
 /// Print the final success message.
