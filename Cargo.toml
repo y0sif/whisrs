@@ -23,8 +23,9 @@ name = "whisrsd"
 path = "src/daemon/main.rs"
 
 [features]
-default = ["local-whisper"]
+default = ["local-whisper", "tray"]
 local-whisper = ["dep:whisper-rs"]
+tray = ["dep:ksni"]
 
 [dependencies]
 anyhow = "1"
@@ -57,6 +58,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x11rb = "0.13"
 xkbcommon = "0.8"
 zbus = "5"
+
+[dependencies.ksni]
+version = "0.3"
+optional = true
 
 [dependencies.whisper-rs]
 version = "0.16"

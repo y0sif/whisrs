@@ -8,6 +8,7 @@ pub mod llm;
 pub mod post_processing;
 pub mod state;
 pub mod transcription;
+pub mod tray;
 pub mod window;
 
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,20 @@ pub struct Config {
     /// LLM configuration for command mode (text rewriting).
     #[serde(default)]
     pub llm: Option<llm::LlmConfig>,
+    /// Global hotkey configuration.
+    #[serde(default)]
+    pub hotkeys: Option<HotkeyConfig>,
+}
+
+/// Global hotkey configuration — key combos that trigger actions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HotkeyConfig {
+    /// Hotkey to toggle recording (e.g. "Super+Shift+D").
+    pub toggle: Option<String>,
+    /// Hotkey to cancel recording (e.g. "Super+Shift+Escape").
+    pub cancel: Option<String>,
+    /// Hotkey to start command mode (e.g. "Super+Shift+C").
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +136,9 @@ pub struct GeneralConfig {
     /// Passed as a prompt hint to transcription backends to improve accuracy.
     #[serde(default)]
     pub vocabulary: Vec<String>,
+    /// Enable system tray icon.
+    #[serde(default = "default_true")]
+    pub tray: bool,
 }
 
 impl Default for GeneralConfig {
@@ -135,6 +153,7 @@ impl Default for GeneralConfig {
             audio_feedback: false,
             audio_feedback_volume: default_audio_feedback_volume(),
             vocabulary: Vec::new(),
+            tray: true,
         }
     }
 }
@@ -581,6 +600,7 @@ mod tests {
             local_vosk: None,
             local_parakeet: None,
             llm: None,
+            hotkeys: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("Unknown backend"));
@@ -602,6 +622,7 @@ mod tests {
             local_vosk: None,
             local_parakeet: None,
             llm: None,
+            hotkeys: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("no API key"));
@@ -624,6 +645,7 @@ mod tests {
             local_vosk: None,
             local_parakeet: None,
             llm: None,
+            hotkeys: None,
         };
         let result = config.validate();
         assert!(result.is_ok());
@@ -647,6 +669,7 @@ mod tests {
             local_vosk: None,
             local_parakeet: None,
             llm: None,
+            hotkeys: None,
         };
         let warnings = config.validate().unwrap();
         assert!(warnings

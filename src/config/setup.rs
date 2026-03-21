@@ -116,6 +116,7 @@ pub fn run_setup() -> Result<()> {
             audio_feedback,
             audio_feedback_volume: 0.5,
             vocabulary: Vec::new(),
+            tray: true,
         },
         audio: AudioConfig {
             device: "default".to_string(),
@@ -126,6 +127,7 @@ pub fn run_setup() -> Result<()> {
         local_vosk: None,
         local_parakeet: None,
         llm: llm_config,
+        hotkeys: None,
     };
 
     let config_path = write_config(&config)?;

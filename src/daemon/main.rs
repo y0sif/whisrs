@@ -65,6 +65,8 @@ struct DaemonContext {
     window_tracker: Arc<dyn WindowTracker>,
     transcription_backend: Arc<dyn TranscriptionBackend>,
     notify: bool,
+    /// Broadcast channel for state changes (consumed by system tray).
+    state_tx: tokio::sync::watch::Sender<State>,
 }
 
 /// Try to connect to an existing socket.
@@ -112,6 +114,7 @@ fn load_config() -> (Config, Option<String>) {
                             local_vosk: None,
                             local_parakeet: None,
                             llm: None,
+                            hotkeys: None,
                         },
                         Some(msg),
                     );
@@ -133,6 +136,7 @@ fn load_config() -> (Config, Option<String>) {
                         local_vosk: None,
                         local_parakeet: None,
                         llm: None,
+                        hotkeys: None,
                     },
                     Some(msg),
                 );
@@ -154,6 +158,7 @@ fn load_config() -> (Config, Option<String>) {
             local_vosk: None,
             local_parakeet: None,
             llm: None,
+            hotkeys: None,
         },
         None,
     )
@@ -378,12 +383,22 @@ async fn main() -> Result<()> {
         std::any::type_name_of_val(&*window_tracker)
     );
 
+    // State broadcast channel — consumed by system tray.
+    let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
+
+    let tray_enabled = config.general.tray;
     let context = Arc::new(DaemonContext {
         config,
         window_tracker,
         transcription_backend: backend,
         notify,
+        state_tx,
     });
+
+    // Start system tray if enabled.
+    if tray_enabled {
+        whisrs::tray::spawn_tray(state_rx).await;
+    }
 
     let sock_path = socket_path();
     info!("socket path: {}", sock_path.display());
@@ -431,7 +446,11 @@ async fn handle_connection(
     let cmd: Command = read_message(&mut reader).await?;
     info!("received command: {cmd:?}");
 
-    let response = handle_command(cmd, daemon_state, context).await;
+    let response = handle_command(cmd, Arc::clone(&daemon_state), Arc::clone(&context)).await;
+
+    // Broadcast state for tray updates.
+    let current = daemon_state.lock().await.state_machine.state();
+    let _ = context.state_tx.send(current);
 
     let encoded = encode_message(&response)?;
     writer.write_all(&encoded).await?;
@@ -548,6 +567,7 @@ async fn handle_toggle(
 
                 let pipeline_backend_name = context.config.general.backend.clone();
                 let pipeline_language = context.config.general.language.clone();
+                let pipeline_state_tx = context.state_tx.clone();
 
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
@@ -565,6 +585,7 @@ async fn handle_toggle(
                         pipeline_audio_volume,
                         pipeline_backend_name,
                         pipeline_language,
+                        pipeline_state_tx,
                     )
                     .await
                 });
@@ -718,6 +739,7 @@ async fn run_streaming_pipeline(
     audio_feedback_volume: f32,
     backend_name: String,
     language: String,
+    state_tx: tokio::sync::watch::Sender<State>,
 ) -> Result<String> {
     let pipeline_start = std::time::Instant::now();
     let (audio_tx, backend_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(256);
@@ -886,6 +908,7 @@ async fn run_streaming_pipeline(
     let mut ds = daemon_state.lock().await;
     if ds.state_machine.state() == State::Transcribing {
         ds.state_machine.transition(Action::TranscriptionDone).ok();
+        let _ = state_tx.send(ds.state_machine.state());
         if audio_feedback {
             feedback::play_done(audio_feedback_volume);
         }
@@ -1415,6 +1438,7 @@ async fn command_mode_background(
     // Transition back to idle.
     let mut ds = daemon_state.lock().await;
     let _ = ds.state_machine.transition(Action::TranscriptionDone);
+    let _ = context.state_tx.send(ds.state_machine.state());
 }
 
 /// Simulate a key combo (e.g. Ctrl+C, Ctrl+V) via a temporary uinput device.
