@@ -1,16 +1,15 @@
-//! System tray indicator via StatusNotifierItem (KDE/freedesktop SNI protocol).
+//! System tray indicator.
 //!
-//! Shows the daemon state (idle/recording/transcribing) as a tray icon.
-//! Works with any SNI-compatible tray host: waybar, swaybar, KDE Plasma,
-//! GNOME (with AppIndicator extension), etc.
+//! On Linux: uses StatusNotifierItem (KDE/freedesktop SNI protocol) via ksni.
+//! On other platforms: not yet implemented (no-op).
 
-#[cfg(feature = "tray")]
+#[cfg(all(feature = "tray", target_os = "linux"))]
 mod service;
 
-#[cfg(feature = "tray")]
+#[cfg(all(feature = "tray", target_os = "linux"))]
 pub use service::spawn_tray;
 
-#[cfg(not(feature = "tray"))]
+#[cfg(not(all(feature = "tray", target_os = "linux")))]
 pub async fn spawn_tray(_state_rx: tokio::sync::watch::Receiver<crate::State>) {
-    // Tray feature not enabled — no-op.
+    // Tray not available — either feature disabled or unsupported platform.
 }

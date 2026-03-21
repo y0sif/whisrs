@@ -1,7 +1,9 @@
 //! Input injection: virtual keyboard and clipboard operations.
 
 pub mod clipboard;
+#[cfg(target_os = "linux")]
 pub mod keymap;
+#[cfg(target_os = "linux")]
 pub mod uinput;
 
 /// A modifier key that may need to be held during key injection.
@@ -13,7 +15,7 @@ pub enum Modifier {
 /// Information needed to produce a character via a physical keypress.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyMapping {
-    /// The evdev keycode (physical key position).
+    /// The platform-specific keycode (evdev keycode on Linux).
     pub keycode: u16,
     /// Whether Shift must be held.
     pub shift: bool,
@@ -27,7 +29,7 @@ pub trait KeyInjector: Send + Sync {
     /// Send N backspace key events.
     fn backspace(&mut self, count: u32) -> anyhow::Result<()>;
 
-    /// Paste text via clipboard (Ctrl+V). Used for characters
+    /// Paste text via clipboard (Ctrl+V / Cmd+V). Used for characters
     /// that cannot be typed via the keyboard layout.
     fn paste_text(&mut self, text: &str) -> anyhow::Result<()>;
 }

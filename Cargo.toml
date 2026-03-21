@@ -27,6 +27,7 @@ default = ["local-whisper", "tray"]
 local-whisper = ["dep:whisper-rs"]
 tray = ["dep:ksni"]
 
+# ── Cross-platform dependencies ──────────────────────────────────────────────
 [dependencies]
 anyhow = "1"
 arboard = "3"
@@ -37,10 +38,8 @@ clap = { version = "4", features = ["derive"] }
 cpal = "0.15"
 dialoguer = "0.11"
 dirs = "6"
-evdev = { version = "0.12", features = ["tokio"] }
 futures-util = "0.3"
 hound = "3"
-libc = "0.2"
 notify-rust = "4"
 indicatif = "0.17"
 regex = "1"
@@ -48,21 +47,26 @@ reqwest = { version = "0.12", default-features = false, features = ["multipart",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strsim = "0.11"
-swayipc = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-x11rb = "0.13"
-xkbcommon = "0.8"
-zbus = "5"
-
-[dependencies.ksni]
-version = "0.3"
-optional = true
 
 [dependencies.whisper-rs]
 version = "0.16"
 optional = true
+
+# ── Unix-only dependencies (Linux + macOS) ───────────────────────────────────
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# ── Linux-only dependencies ──────────────────────────────────────────────────
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = { version = "0.12", features = ["tokio"] }
+ksni = { version = "0.3", optional = true }
+swayipc = "3"
+x11rb = "0.13"
+xkbcommon = "0.8"
+zbus = "5"

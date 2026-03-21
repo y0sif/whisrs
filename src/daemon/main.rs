@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -70,11 +71,13 @@ struct DaemonContext {
 }
 
 /// Try to connect to an existing socket.
+#[cfg(unix)]
 async fn socket_is_alive(path: &std::path::Path) -> bool {
     tokio::net::UnixStream::connect(path).await.is_ok()
 }
 
 /// Remove a stale socket file if no daemon is listening on it.
+#[cfg(unix)]
 async fn cleanup_stale_socket(path: &std::path::Path) -> Result<()> {
     if path.exists() {
         if socket_is_alive(path).await {
@@ -164,6 +167,7 @@ fn load_config() -> (Config, Option<String>) {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn check_uinput_access() {
     use std::fs::OpenOptions;
     match OpenOptions::new().write(true).open("/dev/uinput") {
@@ -366,6 +370,7 @@ async fn main() -> Result<()> {
 
     info!("whisrsd v{} starting", env!("CARGO_PKG_VERSION"));
 
+    #[cfg(target_os = "linux")]
     check_uinput_access();
     check_audio_devices();
 
@@ -405,30 +410,7 @@ async fn main() -> Result<()> {
         whisrs::tray::spawn_tray(state_rx).await;
     }
 
-    let sock_path = socket_path();
-    info!("socket path: {}", sock_path.display());
-
-    if let Some(parent) = sock_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
-        }
-    }
-
-    cleanup_stale_socket(&sock_path).await?;
-
-    let listener = UnixListener::bind(&sock_path).context("failed to bind Unix socket")?;
-    info!("listening on {}", sock_path.display());
-
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
-
-    let sock_path_clone = sock_path.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("received SIGINT, shutting down");
-        let _ = std::fs::remove_file(&sock_path_clone);
-        std::process::exit(0);
-    });
 
     // Start global hotkey listener if configured.
     if let Some(ref hk_config) = context.config.hotkeys {
@@ -450,6 +432,39 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Start the IPC listener.
+    run_ipc_listener(daemon_state, context).await
+}
+
+/// Run the IPC listener loop (Unix domain socket on Linux/macOS).
+#[cfg(unix)]
+async fn run_ipc_listener(
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+) -> Result<()> {
+    let sock_path = socket_path();
+    info!("socket path: {}", sock_path.display());
+
+    if let Some(parent) = sock_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+    }
+
+    cleanup_stale_socket(&sock_path).await?;
+
+    let listener = UnixListener::bind(&sock_path).context("failed to bind Unix socket")?;
+    info!("listening on {}", sock_path.display());
+
+    let sock_path_clone = sock_path.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("received SIGINT, shutting down");
+        let _ = std::fs::remove_file(&sock_path_clone);
+        std::process::exit(0);
+    });
+
     loop {
         let (stream, _addr) = listener.accept().await?;
         let state = Arc::clone(&daemon_state);
@@ -462,6 +477,16 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Run the IPC listener loop (named pipe on Windows — not yet implemented).
+#[cfg(windows)]
+async fn run_ipc_listener(
+    _daemon_state: Arc<Mutex<DaemonState>>,
+    _context: Arc<DaemonContext>,
+) -> Result<()> {
+    anyhow::bail!("Windows IPC (named pipes) is not yet implemented. Coming soon!")
+}
+
+#[cfg(unix)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -1101,7 +1126,11 @@ fn format_api_error(err: &anyhow::Error) -> String {
     msg
 }
 
-/// Type text at the cursor using uinput (keyboard injection) or clipboard paste.
+/// Type text at the cursor using platform-specific keyboard injection.
+///
+/// **Linux**: uinput virtual keyboard with XKB keymap.
+/// **macOS/Windows**: Not yet implemented (logs a warning).
+#[cfg(target_os = "linux")]
 fn type_text_at_cursor(text: &str) -> Result<()> {
     use whisrs::input::clipboard::ClipboardOps;
     use whisrs::input::keymap::XkbKeymap;
@@ -1125,6 +1154,12 @@ fn type_text_at_cursor(text: &str) -> Result<()> {
     };
 
     keyboard.type_text(text).context("failed to type text")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn type_text_at_cursor(text: &str) -> Result<()> {
+    warn!("keyboard injection not yet implemented on this platform — text: {text:?}");
     Ok(())
 }
 
@@ -1475,6 +1510,7 @@ async fn command_mode_background(
 }
 
 /// Simulate a key combo (e.g. Ctrl+C, Ctrl+V) via a temporary uinput device.
+#[cfg(target_os = "linux")]
 fn simulate_key_combo(modifier: evdev::Key, key: evdev::Key) -> anyhow::Result<()> {
     use evdev::{AttributeSet, EventType, InputEvent, Key};
     use std::thread;
@@ -1511,13 +1547,27 @@ fn simulate_key_combo(modifier: evdev::Key, key: evdev::Key) -> anyhow::Result<(
 }
 
 /// Simulate Ctrl+C (copy) via uinput.
+#[cfg(target_os = "linux")]
 fn simulate_copy() -> anyhow::Result<()> {
     simulate_key_combo(evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_C)
 }
 
 /// Simulate Ctrl+V (paste) via uinput.
+#[cfg(target_os = "linux")]
 fn simulate_paste() -> anyhow::Result<()> {
     simulate_key_combo(evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_V)
+}
+
+/// Simulate copy (Ctrl+C / Cmd+C) — not yet implemented on this platform.
+#[cfg(not(target_os = "linux"))]
+fn simulate_copy() -> anyhow::Result<()> {
+    anyhow::bail!("simulate_copy not yet implemented on this platform")
+}
+
+/// Simulate paste (Ctrl+V / Cmd+V) — not yet implemented on this platform.
+#[cfg(not(target_os = "linux"))]
+fn simulate_paste() -> anyhow::Result<()> {
+    anyhow::bail!("simulate_paste not yet implemented on this platform")
 }
 
 async fn handle_cancel(

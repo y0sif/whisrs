@@ -231,10 +231,14 @@ fn default_openai_model() -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Return the path to the Unix domain socket used for CLI-daemon IPC.
+/// Return the path to the IPC socket used for CLI-daemon communication.
 ///
+/// **Unix** (Linux/macOS): Unix domain socket.
 /// Prefers `$XDG_RUNTIME_DIR/whisrs.sock`.
 /// Falls back to `/tmp/whisrs-<uid>.sock`.
+///
+/// **Windows**: Named pipe path (\\.\pipe\whisrs).
+#[cfg(unix)]
 pub fn socket_path() -> PathBuf {
     if let Some(runtime_dir) = dirs::runtime_dir() {
         runtime_dir.join("whisrs.sock")
@@ -242,6 +246,12 @@ pub fn socket_path() -> PathBuf {
         let uid = unsafe { libc::getuid() };
         PathBuf::from(format!("/tmp/whisrs-{uid}.sock"))
     }
+}
+
+#[cfg(windows)]
+pub fn socket_path() -> PathBuf {
+    // On Windows we use a named pipe; this path is used as an identifier only.
+    PathBuf::from(r"\\.\pipe\whisrs")
 }
 
 /// Return the path to the configuration file.
@@ -532,6 +542,7 @@ mod tests {
         assert!(matches!(decoded, Command::Status));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn ipc_client_server_roundtrip() {
         use tokio::io::AsyncWriteExt;
@@ -678,6 +689,7 @@ mod tests {
             .any(|w| w.message.contains("silence_timeout_ms")));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn ipc_error_response_roundtrip() {
         use tokio::io::AsyncWriteExt;

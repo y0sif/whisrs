@@ -1,58 +1,66 @@
-//! Clipboard operations — Wayland (wl-copy/wl-paste) and X11 (arboard).
-
-use std::process::Command;
+//! Clipboard operations — cross-platform via arboard, with Wayland override on Linux.
 
 use anyhow::Context;
 use tracing::{debug, warn};
 
 use super::ClipboardHandler;
 
-/// Detect whether we're running under Wayland.
+/// Detect whether we're running under Wayland (Linux only).
+#[cfg(target_os = "linux")]
 fn is_wayland() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok()
 }
 
-/// Concrete clipboard implementation that auto-detects Wayland vs X11.
+/// Concrete clipboard implementation that auto-detects the best backend.
 #[derive(Debug)]
 pub enum ClipboardOps {
+    /// Wayland: uses wl-copy/wl-paste (Linux only).
+    #[cfg(target_os = "linux")]
     Wayland,
-    X11,
+    /// Cross-platform: uses arboard (X11 on Linux, native on macOS/Windows).
+    Native,
 }
 
 impl ClipboardOps {
-    /// Create a new clipboard handler, auto-detecting the display server.
+    /// Create a new clipboard handler, auto-detecting the best backend.
     pub fn detect() -> Self {
+        #[cfg(target_os = "linux")]
         if is_wayland() {
             debug!("detected Wayland display server for clipboard");
-            Self::Wayland
-        } else {
-            debug!("detected X11 display server for clipboard");
-            Self::X11
+            return Self::Wayland;
         }
+
+        debug!("using native clipboard backend");
+        Self::Native
     }
 }
 
 impl ClipboardHandler for ClipboardOps {
     fn get_text(&self) -> anyhow::Result<String> {
         match self {
+            #[cfg(target_os = "linux")]
             ClipboardOps::Wayland => wayland_get_text(),
-            ClipboardOps::X11 => x11_get_text(),
+            ClipboardOps::Native => native_get_text(),
         }
     }
 
     fn set_text(&self, text: &str) -> anyhow::Result<()> {
         match self {
+            #[cfg(target_os = "linux")]
             ClipboardOps::Wayland => wayland_set_text(text),
-            ClipboardOps::X11 => x11_set_text(text),
+            ClipboardOps::Native => native_set_text(text),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Wayland: shell out to wl-copy / wl-paste
+// Wayland: shell out to wl-copy / wl-paste (Linux only)
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn wayland_get_text() -> anyhow::Result<String> {
+    use std::process::Command;
+
     let output = Command::new("wl-paste")
         .arg("--no-newline")
         .output()
@@ -70,8 +78,10 @@ fn wayland_get_text() -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+#[cfg(target_os = "linux")]
 fn wayland_set_text(text: &str) -> anyhow::Result<()> {
     use std::io::Write;
+    use std::process::Command;
 
     let mut child = Command::new("wl-copy")
         .stdin(std::process::Stdio::piped())
@@ -93,19 +103,17 @@ fn wayland_set_text(text: &str) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// X11: arboard crate
+// Native: arboard crate (cross-platform)
 // ---------------------------------------------------------------------------
 
-fn x11_get_text() -> anyhow::Result<String> {
-    let mut clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
-    clipboard
-        .get_text()
-        .context("failed to get text from X11 clipboard")
+fn native_get_text() -> anyhow::Result<String> {
+    let mut clipboard = arboard::Clipboard::new().context("failed to open clipboard")?;
+    clipboard.get_text().context("failed to get clipboard text")
 }
 
-fn x11_set_text(text: &str) -> anyhow::Result<()> {
-    let mut clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
+fn native_set_text(text: &str) -> anyhow::Result<()> {
+    let mut clipboard = arboard::Clipboard::new().context("failed to open clipboard")?;
     clipboard
         .set_text(text)
-        .context("failed to set text on X11 clipboard")
+        .context("failed to set clipboard text")
 }

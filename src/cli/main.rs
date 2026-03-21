@@ -2,7 +2,6 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 
 use whisrs::history::HistoryEntry;
 use whisrs::{encode_message, read_message, socket_path, Command, Response, State};
@@ -30,7 +29,7 @@ const RESET: &str = "\x1b[0m";
 #[derive(Parser)]
 #[command(
     name = "whisrs",
-    about = "Linux-first voice-to-text dictation tool",
+    about = "Voice-to-text dictation tool",
     long_version = ASCII_BANNER,
 )]
 struct Cli {
@@ -124,35 +123,15 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
     let path = socket_path();
     let use_color = is_tty();
 
-    let stream = match UnixStream::connect(&path).await {
+    let stream = match connect_to_daemon(&path).await {
         Ok(s) => s,
         Err(_) => {
-            if use_color {
-                eprintln!(
-                    "{RED}whisrsd is not running.{RESET} Start it with:\n\
-                     \n\
-                     \x20 whisrsd &\n\
-                     \n\
-                     Or enable the systemd service:\n\
-                     \n\
-                     \x20 systemctl --user enable --now whisrs.service"
-                );
-            } else {
-                eprintln!(
-                    "whisrsd is not running. Start it with:\n\
-                     \n\
-                     \x20 whisrsd &\n\
-                     \n\
-                     Or enable the systemd service:\n\
-                     \n\
-                     \x20 systemctl --user enable --now whisrs.service"
-                );
-            }
+            print_daemon_not_running(use_color);
             process::exit(1);
         }
     };
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Send command.
     let encoded = encode_message(&cmd)?;
@@ -184,6 +163,47 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Connect to the daemon via platform-appropriate IPC.
+#[cfg(unix)]
+async fn connect_to_daemon(path: &std::path::Path) -> std::io::Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(path).await
+}
+
+/// Connect to the daemon via named pipe (Windows — not yet implemented).
+#[cfg(windows)]
+async fn connect_to_daemon(_path: &std::path::Path) -> std::io::Result<tokio::net::TcpStream> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Windows IPC not yet implemented",
+    ))
+}
+
+/// Print a message when the daemon is not running.
+fn print_daemon_not_running(use_color: bool) {
+    if use_color {
+        eprintln!(
+            "{RED}whisrsd is not running.{RESET} Start it with:\n\
+             \n\
+             \x20 whisrsd &"
+        );
+    } else {
+        eprintln!(
+            "whisrsd is not running. Start it with:\n\
+             \n\
+             \x20 whisrsd &"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!(
+            "\nOr enable the systemd service:\n\
+             \n\
+             \x20 systemctl --user enable --now whisrs.service"
+        );
+    }
 }
 
 /// Display transcription history entries.

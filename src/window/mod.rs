@@ -1,10 +1,14 @@
 //! Window tracking: detect focused window and restore focus.
 //!
-//! Auto-detects the compositor at runtime and provides the appropriate backend.
+//! Auto-detects the compositor/desktop at runtime and provides the appropriate backend.
 
+#[cfg(target_os = "linux")]
 pub mod dbus;
+#[cfg(target_os = "linux")]
 pub mod hyprland;
+#[cfg(target_os = "linux")]
 pub mod sway;
+#[cfg(target_os = "linux")]
 pub mod x11;
 
 use tracing::{info, warn};
@@ -20,7 +24,8 @@ pub trait WindowTracker: Send + Sync {
 
 /// A no-op tracker that always succeeds without doing anything.
 ///
-/// Used as a graceful fallback when compositor detection fails.
+/// Used as a graceful fallback when compositor detection fails or
+/// on platforms without window tracking support yet.
 pub struct NoopTracker;
 
 impl WindowTracker for NoopTracker {
@@ -33,44 +38,54 @@ impl WindowTracker for NoopTracker {
     }
 }
 
-/// Auto-detect the compositor and return the appropriate `WindowTracker`.
+/// Auto-detect the compositor/desktop and return the appropriate `WindowTracker`.
 ///
-/// Detection order:
+/// **Linux** detection order:
 /// 1. `$HYPRLAND_INSTANCE_SIGNATURE` → Hyprland
 /// 2. `$SWAYSOCK` → Sway
 /// 3. `$XDG_SESSION_TYPE == x11` → X11
 /// 4. Fallback → NoopTracker
+///
+/// **macOS/Windows**: NoopTracker (not yet implemented).
 pub fn detect_tracker() -> Box<dyn WindowTracker> {
-    if std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok() {
-        info!("detected Hyprland compositor for window tracking");
-        return Box::new(hyprland::HyprlandTracker::new());
-    }
-
-    if std::env::var("SWAYSOCK").is_ok() {
-        info!("detected Sway compositor for window tracking");
-        return Box::new(sway::SwayTracker::new());
-    }
-
-    if std::env::var("XDG_SESSION_TYPE")
-        .map(|v| v == "x11")
-        .unwrap_or(false)
+    #[cfg(target_os = "linux")]
     {
-        info!("detected X11 session for window tracking");
-        match x11::X11Tracker::new() {
-            Ok(tracker) => return Box::new(tracker),
-            Err(e) => {
-                warn!("failed to initialize X11 tracker: {e}; falling back to noop");
+        if std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok() {
+            info!("detected Hyprland compositor for window tracking");
+            return Box::new(hyprland::HyprlandTracker::new());
+        }
+
+        if std::env::var("SWAYSOCK").is_ok() {
+            info!("detected Sway compositor for window tracking");
+            return Box::new(sway::SwayTracker::new());
+        }
+
+        if std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v == "x11")
+            .unwrap_or(false)
+        {
+            info!("detected X11 session for window tracking");
+            match x11::X11Tracker::new() {
+                Ok(tracker) => return Box::new(tracker),
+                Err(e) => {
+                    warn!("failed to initialize X11 tracker: {e}; falling back to noop");
+                }
+            }
+        }
+
+        // Check for GNOME/KDE on Wayland (stub/placeholder).
+        if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
+            let desktop_lower = desktop.to_lowercase();
+            if desktop_lower.contains("gnome") || desktop_lower.contains("kde") {
+                info!("detected {desktop} desktop — window tracking is limited; using D-Bus stub");
+                return Box::new(dbus::DbusTracker::new(&desktop));
             }
         }
     }
 
-    // Check for GNOME/KDE on Wayland (stub/placeholder).
-    if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
-        let desktop_lower = desktop.to_lowercase();
-        if desktop_lower.contains("gnome") || desktop_lower.contains("kde") {
-            info!("detected {desktop} desktop — window tracking is limited; using D-Bus stub");
-            return Box::new(dbus::DbusTracker::new(&desktop));
-        }
+    #[cfg(not(target_os = "linux"))]
+    {
+        info!("window tracking not yet implemented on this platform");
     }
 
     warn!("could not detect compositor — window tracking disabled (using noop)");
