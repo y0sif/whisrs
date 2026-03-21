@@ -10,8 +10,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check, Lint & Test
+  # ── Linux (full build with all features) ─────────────────────────────────
+  linux:
+    name: Linux — Check, Lint & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,3 +34,37 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  # ── Windows (build without local-whisper, no tray yet) ───────────────────
+  windows:
+    name: Windows — Build & Test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (no default features)
+        run: cargo build --no-default-features
+
+      - name: Test (no default features)
+        run: cargo test --no-default-features
+
+  # ── macOS (build without local-whisper, no tray yet) ─────────────────────
+  macos:
+    name: macOS — Build & Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (no default features)
+        run: cargo build --no-default-features
+
+      - name: Test (no default features)
+        run: cargo test --no-default-features

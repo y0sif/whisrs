@@ -136,16 +136,18 @@ pub fn run_setup() -> Result<()> {
         config_path.display()
     );
 
-    // 7. Check and optionally fix uinput permissions.
-    setup_uinput_permissions();
+    // 7. Platform-specific setup (uinput, systemd on Linux).
+    #[cfg(target_os = "linux")]
+    {
+        setup_uinput_permissions();
+        setup_systemd_service();
+    }
 
-    // 8. Offer to install and enable the systemd service.
-    setup_systemd_service();
-
-    // 9. Offer to add keybinding.
+    // 8. Offer to add keybinding (Linux-only: compositor-specific).
+    #[cfg(target_os = "linux")]
     setup_keybinding();
 
-    // 10. Print summary.
+    // 9. Print summary.
     print_done();
 
     Ok(())
@@ -568,6 +570,7 @@ fn write_config(config: &Config) -> Result<PathBuf> {
 }
 
 /// Check if /dev/uinput is accessible. If not, offer to fix it automatically.
+#[cfg(target_os = "linux")]
 fn setup_uinput_permissions() {
     use std::fs::OpenOptions;
 
@@ -678,6 +681,7 @@ fn setup_uinput_permissions() {
 }
 
 /// Offer to install and enable the systemd user service.
+#[cfg(target_os = "linux")]
 fn setup_systemd_service() {
     println!("\n{BOLD}Systemd service...{RESET}");
 
@@ -790,6 +794,7 @@ fn setup_systemd_service() {
 }
 
 /// Detect the compositor and offer to add a keybinding for `whisrs toggle`.
+#[cfg(target_os = "linux")]
 fn setup_keybinding() {
     println!("\n{BOLD}Keybinding...{RESET}");
 
@@ -812,6 +817,7 @@ fn setup_keybinding() {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Detect which compositor/WM is running.
 fn detect_compositor() -> Option<String> {
     // Check HYPRLAND_INSTANCE_SIGNATURE first (most specific).
@@ -845,6 +851,7 @@ fn detect_compositor() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "linux")]
 /// Offer to add a Hyprland keybinding.
 fn setup_hyprland_keybinding() {
     println!("  Detected: {GREEN}Hyprland{RESET}");
@@ -906,6 +913,7 @@ fn setup_hyprland_keybinding() {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Offer to add a Sway keybinding.
 fn setup_sway_keybinding() {
     println!("  Detected: {GREEN}Sway{RESET}");
@@ -967,6 +975,7 @@ fn setup_sway_keybinding() {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Find a file in the contrib/ directory relative to the executable or CWD.
 fn find_contrib_file(name: &str) -> Option<PathBuf> {
     // Try relative to the executable.
@@ -989,6 +998,7 @@ fn find_contrib_file(name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")]
 /// Get the path to the `whisrsd` binary.
 fn which_whisrsd() -> String {
     // Check if it's in PATH.
@@ -1004,6 +1014,7 @@ fn which_whisrsd() -> String {
         .to_string()
 }
 
+#[cfg(target_os = "linux")]
 /// Get the path to the `whisrs` binary.
 fn which_whisrs() -> String {
     if let Ok(output) = std::process::Command::new("which").arg("whisrs").output() {
@@ -1231,9 +1242,11 @@ fn select_llm_model(provider_idx: usize) -> Result<String> {
 
 /// Print the final success message.
 fn print_done() {
+    let config_path = crate::config_path();
     println!("\n{GREEN}{BOLD}You're all set!{RESET}");
     println!();
-    println!("  {DIM}Config:    ~/.config/whisrs/config.toml{RESET}");
+    println!("  {DIM}Config:    {}{RESET}", config_path.display());
+    #[cfg(target_os = "linux")]
     println!("  {DIM}Logs:      journalctl --user -u whisrs -f{RESET}");
     println!("  {DIM}Re-run:    whisrs setup (to change backend or settings){RESET}");
     println!();
