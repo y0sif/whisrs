@@ -632,6 +632,8 @@ async fn handle_toggle(
             match ds.state_machine.transition(Action::Toggle) {
                 Ok(new_state) => {
                     info!("started recording");
+                    // Broadcast recording state for tray.
+                    let _ = context.state_tx.send(new_state);
                     if context.config.general.audio_feedback {
                         feedback::play_start(context.config.general.audio_feedback_volume);
                     }
@@ -655,6 +657,8 @@ async fn handle_toggle(
             match ds.state_machine.transition(Action::Toggle) {
                 Ok(_) => {
                     info!("stopped recording, transitioning to transcribing");
+                    // Broadcast transcribing state for tray.
+                    let _ = context.state_tx.send(State::Transcribing);
                     if context.config.general.audio_feedback {
                         feedback::play_stop(context.config.general.audio_feedback_volume);
                     }
@@ -693,43 +697,47 @@ async fn handle_toggle(
                         .unwrap_or(0.0);
                     let mut ds = daemon_state.lock().await;
                     match ds.state_machine.transition(Action::TranscriptionDone) {
-                        Ok(new_state) => match result {
-                            Ok(text) => {
-                                info!("transcription complete: {} chars", text.len());
-                                if !text.is_empty() {
-                                    save_history_entry(
-                                        &text,
-                                        &context.config.general.backend,
-                                        &context.config.general.language,
-                                        duration_secs,
-                                    );
+                        Ok(new_state) => {
+                            // Broadcast idle state for tray.
+                            let _ = context.state_tx.send(new_state);
+                            match result {
+                                Ok(text) => {
+                                    info!("transcription complete: {} chars", text.len());
+                                    if !text.is_empty() {
+                                        save_history_entry(
+                                            &text,
+                                            &context.config.general.backend,
+                                            &context.config.general.language,
+                                            duration_secs,
+                                        );
+                                    }
+                                    if context.config.general.audio_feedback {
+                                        feedback::play_done(
+                                            context.config.general.audio_feedback_volume,
+                                        );
+                                    }
+                                    if context.notify {
+                                        let preview = if text.len() > 80 {
+                                            format!("{}...", &text[..77])
+                                        } else {
+                                            text.clone()
+                                        };
+                                        send_notification("whisrs", &format!("Done: {preview}"));
+                                    }
+                                    Response::Ok { state: new_state }
                                 }
-                                if context.config.general.audio_feedback {
-                                    feedback::play_done(
-                                        context.config.general.audio_feedback_volume,
-                                    );
+                                Err(e) => {
+                                    error!("transcription failed: {e:#}");
+                                    if context.notify {
+                                        send_notification(
+                                            "whisrs",
+                                            &format!("Transcription failed: {e}"),
+                                        );
+                                    }
+                                    Response::Ok { state: new_state }
                                 }
-                                if context.notify {
-                                    let preview = if text.len() > 80 {
-                                        format!("{}...", &text[..77])
-                                    } else {
-                                        text.clone()
-                                    };
-                                    send_notification("whisrs", &format!("Done: {preview}"));
-                                }
-                                Response::Ok { state: new_state }
                             }
-                            Err(e) => {
-                                error!("transcription failed: {e:#}");
-                                if context.notify {
-                                    send_notification(
-                                        "whisrs",
-                                        &format!("Transcription failed: {e}"),
-                                    );
-                                }
-                                Response::Ok { state: new_state }
-                            }
-                        },
+                        }
                         Err(e) => Response::Error {
                             message: e.to_string(),
                         },
