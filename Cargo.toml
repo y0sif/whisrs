@@ -1,6 +1,6 @@
 [package]
 name = "whisrs"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Linux-first voice-to-text dictation tool"
 license = "MIT"
