@@ -339,15 +339,20 @@ fn get_model_for_backend(config: &Config) -> String {
 }
 
 fn send_notification(summary: &str, body: &str) {
-    if let Err(e) = notify_rust::Notification::new()
-        .summary(summary)
-        .body(body)
-        .appname("whisrs")
-        .timeout(notify_rust::Timeout::Milliseconds(2000))
-        .show()
-    {
-        warn!("failed to send notification: {e}");
-    }
+    let summary = summary.to_string();
+    let body = body.to_string();
+    // Run on a blocking thread to avoid D-Bus block_on conflict with ksni tray.
+    std::thread::spawn(move || {
+        if let Err(e) = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .appname("whisrs")
+            .timeout(notify_rust::Timeout::Milliseconds(2000))
+            .show()
+        {
+            warn!("failed to send notification: {e}");
+        }
+    });
 }
 
 #[tokio::main]
