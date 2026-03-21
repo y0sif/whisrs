@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>whisrs - Linux Voice-to-Text Dictation Tool</title>
+  <meta name="description" content="Linux-first voice-to-text dictation tool written in Rust. Speech-to-text for Wayland, X11, Hyprland, Sway, GNOME, and KDE. Cloud and offline transcription.">
+  <meta name="keywords" content="voice-to-text, dictation, speech-to-text, linux, rust, wayland, hyprland, sway, whisper, transcription, speech recognition">
+  <meta name="author" content="y0sif">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="whisrs - Linux Voice-to-Text Dictation Tool">
+  <meta property="og:description" content="Press a hotkey, speak, and your words appear at the cursor. Works with any app on Wayland, X11, Hyprland, Sway, GNOME, and KDE.">
+  <meta property="og:url" content="https://y0sif.github.io/whisrs/">
+  <meta property="og:site_name" content="whisrs">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="whisrs - Linux Voice-to-Text Dictation Tool">
+  <meta name="twitter:description" content="Press a hotkey, speak, and your words appear at the cursor. Cloud and offline transcription for Linux.">
+
+  <!-- JSON-LD: SoftwareApplication -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "whisrs",
+    "description": "Linux-first voice-to-text dictation tool written in Rust. Supports cloud (Groq, OpenAI) and offline (whisper.cpp) transcription. Works on Wayland, X11, Hyprland, Sway, GNOME, and KDE.",
+    "applicationCategory": "UtilitiesApplication",
+    "operatingSystem": "Linux",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "license": "https://opensource.org/licenses/MIT",
+    "url": "https://y0sif.github.io/whisrs/",
+    "downloadUrl": "https://github.com/y0sif/whisrs/releases",
+    "softwareVersion": "0.1.4",
+    "author": {
+      "@type": "Person",
+      "name": "y0sif",
+      "url": "https://github.com/y0sif"
+    },
+    "codeRepository": "https://github.com/y0sif/whisrs",
+    "programmingLanguage": "Rust"
+  }
+  </script>
+
+  <!-- JSON-LD: FAQPage -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "Does whisrs work on Wayland?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. whisrs has native support for Wayland compositors including Hyprland, Sway, GNOME, and KDE. It uses compositor-specific protocols for window tracking and uinput for keyboard injection, so it does not depend on X11 tools like xdotool."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Can whisrs work offline?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. The local whisper.cpp backend runs transcription entirely on your machine. No API key, no internet connection, and no audio data leaves your device."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "What speech recognition backends does whisrs support?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Four backends: Groq (cloud, free tier), OpenAI REST (cloud), OpenAI Realtime (cloud, true streaming over WebSocket), and local whisper.cpp (offline, CPU/GPU). More local backends (Vosk, Parakeet) are planned."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Is whisrs a replacement for Wispr Flow or Superwhisper on Linux?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. Wispr Flow and Superwhisper are macOS-only dictation tools. whisrs brings the same workflow to Linux: press a hotkey, speak, and text appears at your cursor. It supports both cloud and local transcription backends."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "What Linux distributions does whisrs support?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "whisrs works on any Linux distribution with the required system dependencies. It has been primarily tested on Arch Linux but also supports Debian/Ubuntu, Fedora, NixOS, and others. Install methods include AUR, cargo, Nix flake, and a universal install script."
+        }
+      }
+    ]
+  }
+  </script>
+
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
+      --green: #3fb950;
+      --copy-bg: #1f2937;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-hover); text-decoration: underline; }
+
+    .container {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* Hero */
+    .hero {
+      text-align: center;
+      padding: 80px 0 48px;
+    }
+
+    .hero pre {
+      font-size: 14px;
+      line-height: 1.3;
+      color: var(--accent);
+      margin-bottom: 24px;
+      display: inline-block;
+      text-align: left;
+    }
+
+    .hero h1 {
+      font-size: 2.4rem;
+      font-weight: 700;
+      margin-bottom: 16px;
+    }
+
+    .hero p {
+      font-size: 1.2rem;
+      color: var(--text-muted);
+      max-width: 600px;
+      margin: 0 auto 32px;
+    }
+
+    .badges {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+      margin-bottom: 32px;
+    }
+
+    .badges img { height: 22px; }
+
+    /* Install box */
+    .install {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 32px;
+      margin-bottom: 64px;
+    }
+
+    .install h2 {
+      font-size: 1.1rem;
+      margin-bottom: 16px;
+      text-align: center;
+    }
+
+    .install-cmd {
+      display: flex;
+      align-items: center;
+      background: var(--copy-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 16px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.95rem;
+      margin-bottom: 12px;
+    }
+
+    .install-cmd code {
+      flex: 1;
+      color: var(--green);
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    .install-cmd button {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-muted);
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      margin-left: 12px;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+
+    .install-cmd button:hover {
+      color: var(--text);
+      border-color: var(--text-muted);
+    }
+
+    .install-methods {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .install-methods a { margin: 0 6px; }
+
+    /* Sections */
+    section {
+      margin-bottom: 64px;
+    }
+
+    section h2 {
+      font-size: 1.5rem;
+      margin-bottom: 24px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* Features grid */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 20px;
+    }
+
+    .feature {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+    }
+
+    .feature h3 {
+      font-size: 1.05rem;
+      margin-bottom: 8px;
+    }
+
+    .feature p {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    /* Tables */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+
+    th, td {
+      padding: 10px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      font-weight: 600;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    /* FAQ */
+    .faq-item {
+      margin-bottom: 24px;
+    }
+
+    .faq-item h3 {
+      font-size: 1rem;
+      margin-bottom: 6px;
+    }
+
+    .faq-item p {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+    }
+
+    /* Footer */
+    footer {
+      text-align: center;
+      padding: 48px 0;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      border-top: 1px solid var(--border);
+    }
+
+    /* Responsive */
+    @media (max-width: 600px) {
+      .hero { padding: 48px 0 32px; }
+      .hero pre { font-size: 10px; }
+      .hero h1 { font-size: 1.8rem; }
+      .hero p { font-size: 1rem; }
+      .install { padding: 20px; }
+      .install-cmd { font-size: 0.8rem; }
+      table { font-size: 0.8rem; }
+      th, td { padding: 8px 10px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Hero -->
+  <div class="hero">
+    <pre>
+ __      __| |__ (_)___  _ __ ___
+ \ \ /\ / /| '_ \| / __|| '__/ __|
+  \ V  V / | | | | \__ \| |  \__ \
+   \_/\_/  |_| |_|_|___/|_|  |___/</pre>
+    <h1>Voice-to-text dictation for Linux</h1>
+    <p>Press a hotkey, speak, and your words appear at the cursor. Any app, any window manager, any desktop environment.</p>
+    <div class="badges">
+      <a href="https://crates.io/crates/whisrs"><img src="https://img.shields.io/crates/v/whisrs" alt="crates.io version"></a>
+      <a href="https://aur.archlinux.org/packages/whisrs-git"><img src="https://img.shields.io/aur/version/whisrs-git" alt="AUR version"></a>
+      <a href="https://github.com/y0sif/whisrs"><img src="https://img.shields.io/github/license/y0sif/whisrs" alt="MIT License"></a>
+    </div>
+  </div>
+
+  <div class="container">
+
+    <!-- Install -->
+    <div class="install">
+      <h2>Quick Install</h2>
+      <div class="install-cmd">
+        <code>git clone https://github.com/y0sif/whisrs && cd whisrs && ./install.sh</code>
+        <button onclick="copyCmd(this)">Copy</button>
+      </div>
+      <p class="install-methods">
+        Also available via
+        <a href="https://aur.archlinux.org/packages/whisrs-git">AUR</a> /
+        <a href="https://crates.io/crates/whisrs">cargo</a> /
+        <a href="https://github.com/y0sif/whisrs#nix">Nix</a>
+      </p>
+    </div>
+
+    <!-- Features -->
+    <section>
+      <h2>Features</h2>
+      <div class="features">
+        <div class="feature">
+          <h3>Multiple Backends</h3>
+          <p>Groq (free tier), OpenAI REST, OpenAI Realtime (true streaming), and local whisper.cpp for offline use.</p>
+        </div>
+        <div class="feature">
+          <h3>Works Everywhere</h3>
+          <p>Hyprland, Sway, GNOME, KDE, and any X11 window manager. Text goes to whatever app has focus.</p>
+        </div>
+        <div class="feature">
+          <h3>Layout-Aware Typing</h3>
+          <p>Uses uinput + XKB reverse lookup. Respects your keyboard layout and works in any application.</p>
+        </div>
+        <div class="feature">
+          <h3>Fully Offline</h3>
+          <p>Local whisper.cpp backend. No API key, no internet, no data leaves your device.</p>
+        </div>
+        <div class="feature">
+          <h3>True Streaming</h3>
+          <p>OpenAI Realtime backend streams text to your cursor while you speak via WebSocket.</p>
+        </div>
+        <div class="feature">
+          <h3>Daemon + CLI</h3>
+          <p>Lightweight daemon runs in the background. Bind the CLI to any hotkey in your compositor.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Backends -->
+    <section>
+      <h2>Transcription Backends</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Backend</th>
+            <th>Type</th>
+            <th>Streaming</th>
+            <th>Cost</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Groq</strong></td>
+            <td>Cloud</td>
+            <td>Batch</td>
+            <td>Free tier available</td>
+          </tr>
+          <tr>
+            <td><strong>OpenAI Realtime</strong></td>
+            <td>Cloud (WebSocket)</td>
+            <td>True streaming</td>
+            <td>Paid</td>
+          </tr>
+          <tr>
+            <td><strong>OpenAI REST</strong></td>
+            <td>Cloud</td>
+            <td>Batch</td>
+            <td>Paid</td>
+          </tr>
+          <tr>
+            <td><strong>Local whisper.cpp</strong></td>
+            <td>Local (CPU/GPU)</td>
+            <td>Sliding window</td>
+            <td>Free</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Comparison -->
+    <section>
+      <h2>How whisrs Compares</h2>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>whisrs</th>
+              <th>nerd-dictation</th>
+              <th>Speech Note</th>
+              <th>Wispr Flow</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Platform</td><td>Linux</td><td>Linux</td><td>Linux</td><td>macOS only</td></tr>
+            <tr><td>Wayland support</td><td>Yes (native)</td><td>Partial (xdotool)</td><td>Yes (GUI app)</td><td>N/A</td></tr>
+            <tr><td>Offline transcription</td><td>Yes (whisper.cpp)</td><td>Yes (VOSK)</td><td>Yes (multiple)</td><td>No</td></tr>
+            <tr><td>Cloud transcription</td><td>Groq, OpenAI</td><td>No</td><td>No</td><td>Proprietary</td></tr>
+            <tr><td>True streaming</td><td>Yes</td><td>No</td><td>No</td><td>Yes</td></tr>
+            <tr><td>Keyboard injection</td><td>uinput + XKB</td><td>xdotool</td><td>Clipboard paste</td><td>Native</td></tr>
+            <tr><td>Window tracking</td><td>Yes (5 compositors)</td><td>No</td><td>No</td><td>Native</td></tr>
+            <tr><td>Architecture</td><td>Daemon + CLI</td><td>Script</td><td>GUI app</td><td>GUI app</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Supported Environments -->
+    <section>
+      <h2>Supported Environments</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Component</th>
+            <th>Support</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Hyprland</td><td>Tested, full support</td></tr>
+          <tr><td>Sway / i3</td><td>Implemented, needs community testing</td></tr>
+          <tr><td>X11 (any WM)</td><td>Implemented, needs community testing</td></tr>
+          <tr><td>GNOME Wayland</td><td>Limited (requires window-calls extension)</td></tr>
+          <tr><td>KDE Wayland</td><td>Implemented via D-Bus, needs testing</td></tr>
+          <tr><td>Audio</td><td>PipeWire, PulseAudio, ALSA (auto-detected)</td></tr>
+          <tr><td>Distros</td><td>Any Linux with system dependencies</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- FAQ -->
+    <section>
+      <h2>FAQ</h2>
+
+      <div class="faq-item">
+        <h3>Does whisrs work on Wayland?</h3>
+        <p>Yes. whisrs has native support for Wayland compositors including Hyprland, Sway, GNOME, and KDE. It uses compositor-specific protocols for window tracking and uinput for keyboard injection, so it does not depend on X11 tools like xdotool.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>Can whisrs work offline?</h3>
+        <p>Yes. The local whisper.cpp backend runs transcription entirely on your machine. No API key, no internet connection, and no audio data leaves your device. Run <code>whisrs setup</code> and select the local backend to get started.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>What speech recognition backends does whisrs support?</h3>
+        <p>Four backends: Groq (cloud, free tier), OpenAI REST (cloud), OpenAI Realtime (cloud, true streaming over WebSocket), and local whisper.cpp (offline, CPU/GPU). More local backends (Vosk, Parakeet) are planned.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>Is whisrs a replacement for Wispr Flow or Superwhisper on Linux?</h3>
+        <p>Yes. Wispr Flow and Superwhisper are macOS-only dictation tools. whisrs brings the same workflow to Linux: press a hotkey, speak, and text appears at your cursor. It supports both cloud and local transcription backends.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>What Linux distributions does whisrs support?</h3>
+        <p>whisrs works on any Linux distribution with the required system dependencies (alsa-lib, libxkbcommon, clang, cmake). It has been primarily tested on Arch Linux but also supports Debian/Ubuntu, Fedora, NixOS, and others.</p>
+      </div>
+    </section>
+
+  </div>
+
+  <footer>
+    <p>
+      <a href="https://github.com/y0sif/whisrs">GitHub</a> &middot;
+      <a href="https://crates.io/crates/whisrs">crates.io</a> &middot;
+      <a href="https://aur.archlinux.org/packages/whisrs-git">AUR</a> &middot;
+      MIT License
+    </p>
+  </footer>
+
+  <script>
+    function copyCmd(btn) {
+      const code = btn.parentElement.querySelector('code').textContent;
+      navigator.clipboard.writeText(code).then(() => {
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+      });
+    }
+  </script>
+
+</body>
+</html>
