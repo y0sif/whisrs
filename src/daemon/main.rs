@@ -477,13 +477,73 @@ async fn run_ipc_listener(
     }
 }
 
-/// Run the IPC listener loop (named pipe on Windows — not yet implemented).
+/// Run the IPC listener loop (named pipe on Windows).
 #[cfg(windows)]
 async fn run_ipc_listener(
-    _daemon_state: Arc<Mutex<DaemonState>>,
-    _context: Arc<DaemonContext>,
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
 ) -> Result<()> {
-    anyhow::bail!("Windows IPC (named pipes) is not yet implemented. Coming soon!")
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let pipe_name = r"\\.\pipe\whisrs";
+    info!("named pipe: {pipe_name}");
+
+    // Graceful shutdown on Ctrl+C.
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("received Ctrl+C, shutting down");
+        std::process::exit(0);
+    });
+
+    // Create the first pipe instance.
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(pipe_name)
+        .context("failed to create named pipe")?;
+
+    info!("listening on {pipe_name}");
+
+    loop {
+        // Wait for a client to connect.
+        server.connect().await.context("pipe connect failed")?;
+
+        // Hand off the connected pipe and create a new instance for the next client.
+        let connected = server;
+        server = ServerOptions::new()
+            .create(pipe_name)
+            .context("failed to create next named pipe instance")?;
+
+        let state = Arc::clone(&daemon_state);
+        let ctx = Arc::clone(&context);
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(connected, state, ctx).await {
+                error!("connection error: {e:#}");
+            }
+        });
+    }
+}
+
+/// Handle a single named pipe connection (Windows).
+#[cfg(windows)]
+async fn handle_connection(
+    stream: tokio::net::windows::named_pipe::NamedPipeServer,
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+) -> Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let cmd: Command = read_message(&mut reader).await?;
+    info!("received command: {cmd:?}");
+
+    let response = handle_command(cmd, Arc::clone(&daemon_state), Arc::clone(&context)).await;
+
+    // Broadcast state for tray updates.
+    let current = daemon_state.lock().await.state_machine.state();
+    let _ = context.state_tx.send(current);
+
+    let encoded = encode_message(&response)?;
+    writer.write_all(&encoded).await?;
+    writer.shutdown().await?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1157,9 +1217,17 @@ fn type_text_at_cursor(text: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Type text at the cursor using enigo (Windows/macOS).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn type_text_at_cursor(text: &str) -> Result<()> {
-    warn!("keyboard injection not yet implemented on this platform — text: {text:?}");
+    use whisrs::input::clipboard::ClipboardOps;
+    use whisrs::input::enigo_backend::EnigoKeyboard;
+    use whisrs::input::KeyInjector;
+
+    let clipboard = ClipboardOps::detect();
+    let mut keyboard = EnigoKeyboard::new(clipboard).context("failed to create enigo keyboard")?;
+
+    keyboard.type_text(text).context("failed to type text")?;
     Ok(())
 }
 
@@ -1558,16 +1626,16 @@ fn simulate_paste() -> anyhow::Result<()> {
     simulate_key_combo(evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_V)
 }
 
-/// Simulate copy (Ctrl+C / Cmd+C) — not yet implemented on this platform.
-#[cfg(not(target_os = "linux"))]
+/// Simulate copy (Ctrl+C / Cmd+C) via enigo (Windows/macOS).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn simulate_copy() -> anyhow::Result<()> {
-    anyhow::bail!("simulate_copy not yet implemented on this platform")
+    whisrs::input::enigo_backend::simulate_copy()
 }
 
-/// Simulate paste (Ctrl+V / Cmd+V) — not yet implemented on this platform.
-#[cfg(not(target_os = "linux"))]
+/// Simulate paste (Ctrl+V / Cmd+V) via enigo (Windows/macOS).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn simulate_paste() -> anyhow::Result<()> {
-    anyhow::bail!("simulate_paste not yet implemented on this platform")
+    whisrs::input::enigo_backend::simulate_paste()
 }
 
 async fn handle_cancel(

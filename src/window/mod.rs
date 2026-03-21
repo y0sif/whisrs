@@ -6,8 +6,12 @@
 pub mod dbus;
 #[cfg(target_os = "linux")]
 pub mod hyprland;
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod sway;
+#[cfg(target_os = "windows")]
+pub mod win32;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
@@ -83,13 +87,23 @@ pub fn detect_tracker() -> Box<dyn WindowTracker> {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
     {
-        info!("window tracking not yet implemented on this platform");
+        info!("using Win32 window tracker");
+        return Box::new(win32::Win32Tracker::new());
     }
 
-    warn!("could not detect compositor — window tracking disabled (using noop)");
-    Box::new(NoopTracker)
+    #[cfg(target_os = "macos")]
+    {
+        info!("using macOS window tracker (stub)");
+        return Box::new(macos::MacosTracker::new());
+    }
+
+    #[allow(unreachable_code)]
+    {
+        warn!("could not detect compositor — window tracking disabled (using noop)");
+        Box::new(NoopTracker)
+    }
 }
 
 #[cfg(test)]

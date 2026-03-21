@@ -1,6 +1,8 @@
 //! Input injection: virtual keyboard and clipboard operations.
 
 pub mod clipboard;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub mod enigo_backend;
 #[cfg(target_os = "linux")]
 pub mod keymap;
 #[cfg(target_os = "linux")]

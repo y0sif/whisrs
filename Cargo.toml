@@ -2,11 +2,11 @@
 name = "whisrs"
 version = "0.1.4"
 edition = "2021"
-description = "Linux-first voice-to-text dictation tool with Groq, OpenAI, and local Whisper backends"
+description = "Voice-to-text dictation tool with Groq, OpenAI, and local Whisper backends"
 license = "MIT"
 repository = "https://github.com/y0sif/whisrs"
 homepage = "https://y0sif.github.io/whisrs/"
-keywords = ["voice", "dictation", "speech-to-text", "whisper", "linux"]
+keywords = ["voice", "dictation", "speech-to-text", "whisper", "cross-platform"]
 categories = ["multimedia::audio", "accessibility", "command-line-utilities"]
 readme = "README.md"
 
@@ -70,3 +70,16 @@ swayipc = "3"
 x11rb = "0.13"
 xkbcommon = "0.8"
 zbus = "5"
+
+# ── Windows-only dependencies ────────────────────────────────────────────────
+[target.'cfg(target_os = "windows")'.dependencies]
+enigo = "0.3"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+# ── macOS-only dependencies ──────────────────────────────────────────────────
+[target.'cfg(target_os = "macos")'.dependencies]
+enigo = "0.3"

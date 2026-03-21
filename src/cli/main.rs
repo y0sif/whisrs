@@ -171,13 +171,13 @@ async fn connect_to_daemon(path: &std::path::Path) -> std::io::Result<tokio::net
     tokio::net::UnixStream::connect(path).await
 }
 
-/// Connect to the daemon via named pipe (Windows — not yet implemented).
+/// Connect to the daemon via named pipe (Windows).
 #[cfg(windows)]
-async fn connect_to_daemon(_path: &std::path::Path) -> std::io::Result<tokio::net::TcpStream> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Windows IPC not yet implemented",
-    ))
+async fn connect_to_daemon(
+    _path: &std::path::Path,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    ClientOptions::new().open(r"\\.\pipe\whisrs")
 }
 
 /// Print a message when the daemon is not running.
