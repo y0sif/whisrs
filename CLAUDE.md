@@ -141,15 +141,18 @@ cargo build                                    # must compile
 
 If any check fails, fix the issue before pushing. Do not push with the intent to "fix it in the next commit".
 
+**IMPORTANT: Always commit `Cargo.lock` alongside `Cargo.toml` changes.** This is a binary crate — `Cargo.lock` ensures reproducible builds and is required for `cargo publish` and `cargo install --locked`. Every commit that modifies dependencies must include the updated lock file.
+
 ## Releasing a New Version
 
 When a feature or set of changes warrants a version bump:
 
 1. **Bump version** in `Cargo.toml` and `flake.nix` (semver: `MAJOR.MINOR.PATCH`)
-2. **Run all CI checks** locally (see above)
-3. **Commit** and **push**
-4. **Publish to crates.io**: `cargo publish`
-5. **Update AUR** package locally and push to AUR
+2. **Always include `Cargo.lock`** in the version bump commit
+3. **Run all CI checks** locally (see above)
+4. **Commit** and **push**
+5. **Publish to crates.io**: `cargo publish`
+6. **Update AUR** package locally and push to AUR
 
 ## Packaging
 
