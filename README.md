@@ -12,8 +12,9 @@
 
 [![Crates.io](https://img.shields.io/crates/v/whisrs)](https://crates.io/crates/whisrs)
 [![docs.rs](https://img.shields.io/docsrs/whisrs)](https://docs.rs/whisrs)
+[![CI](https://img.shields.io/github/actions/workflow/status/y0sif/whisrs/ci.yml?label=CI)](https://github.com/y0sif/whisrs/actions)
 
-**Linux-first voice-to-text dictation tool, written in Rust.**
+**Linux-first voice-to-text dictation tool, written in Rust.** Also runs on Windows and macOS.
 
 Speech-to-text for Wayland, X11, Hyprland, Sway, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor. Works with any app, any window manager, any desktop environment. Supports cloud transcription (Groq, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source.
 
@@ -27,7 +28,7 @@ Dictation tools like Wispr Flow and Superwhisper are not available on Linux. [xh
 
 ## Installation
 
-### Quick install (any distro)
+### Quick install (Linux)
 
 ```bash
 git clone https://github.com/y0sif/whisrs && cd whisrs && ./install.sh
@@ -38,9 +39,9 @@ The install script handles everything: detects your distro, installs system depe
 After install, **press your hotkey** to start recording, **press again** to stop. Text appears at your cursor.
 
 <details>
-<summary><b>Other install methods (AUR, Cargo, Nix, manual)</b></summary>
+<summary><b>Other Linux install methods (AUR, Cargo, Nix, manual)</b></summary>
 
-### Arch Linux (AUR)
+#### Arch Linux (AUR)
 
 ```bash
 yay -S whisrs-git
@@ -48,7 +49,7 @@ yay -S whisrs-git
 
 After install, run `whisrs setup` to configure your backend, API keys, permissions, and keybindings.
 
-### Cargo
+#### Cargo
 
 ```bash
 cargo install whisrs
@@ -58,7 +59,7 @@ Requires system dependencies: `alsa-lib`, `libxkbcommon`, `clang`, `cmake`.
 
 After install, run `whisrs setup`.
 
-### Nix
+#### Nix
 
 ```bash
 nix profile install github:y0sif/whisrs
@@ -69,9 +70,9 @@ Or add to your flake inputs:
 inputs.whisrs.url = "github:y0sif/whisrs";
 ```
 
-### Manual install
+#### Manual install
 
-#### 1. Dependencies
+**1. Dependencies**
 
 ```bash
 # Arch Linux
@@ -84,7 +85,7 @@ sudo apt install build-essential libasound2-dev libxkbcommon-dev libclang-dev cm
 sudo dnf install gcc-c++ alsa-lib-devel libxkbcommon-devel clang-devel cmake
 ```
 
-#### 2. Build
+**2. Build**
 
 ```bash
 git clone https://github.com/y0sif/whisrs
@@ -92,7 +93,7 @@ cd whisrs
 cargo install --path .
 ```
 
-#### 3. Setup
+**3. Setup**
 
 ```bash
 whisrs setup
@@ -100,7 +101,7 @@ whisrs setup
 
 The interactive setup will walk you through backend selection, API keys / model download, microphone test, uinput permissions, systemd service, and keybindings.
 
-#### 4. Bind a hotkey
+**4. Bind a hotkey**
 
 Example for Hyprland (`~/.config/hypr/hyprland.conf`):
 ```
@@ -111,6 +112,54 @@ Example for Sway (`~/.config/sway/config`):
 ```
 bindsym $mod+w exec whisrs toggle
 ```
+
+</details>
+
+<details>
+<summary><b>Windows</b></summary>
+
+#### Cargo
+
+```powershell
+cargo install whisrs --no-default-features
+```
+
+No system dependencies required. After install, run `whisrs setup` to configure your transcription backend and API keys.
+
+**Running the daemon:**
+
+```powershell
+whisrsd
+```
+
+Then use `whisrs toggle` from another terminal (or bind it to a global shortcut in your system settings).
+
+> **Note:** The `--no-default-features` flag disables local whisper.cpp (which requires a C++ toolchain) and the Linux system tray. Cloud backends (Groq, OpenAI) work out of the box.
+
+</details>
+
+<details>
+<summary><b>macOS</b></summary>
+
+#### Cargo
+
+```bash
+cargo install whisrs --no-default-features
+```
+
+No system dependencies required beyond the Xcode Command Line Tools (`xcode-select --install`).
+
+After install, run `whisrs setup`.
+
+**Running the daemon:**
+
+```bash
+whisrsd &
+```
+
+Then use `whisrs toggle` from another terminal (or bind it to a global shortcut in System Settings > Keyboard > Shortcuts).
+
+> **Note:** macOS will prompt for **Accessibility** permission (required for keyboard injection) and **Microphone** permission (attributed to your terminal app) on first use. The `--no-default-features` flag disables local whisper.cpp and the Linux system tray.
 
 </details>
 
@@ -131,7 +180,7 @@ OpenAI Realtime is the premium option: true streaming over WebSocket means text 
 
 ### Local whisper.cpp
 
-Run transcription entirely on your machine. No API key, no internet, no data leaves your device. Included in every build.
+Run transcription entirely on your machine. No API key, no internet, no data leaves your device. Included by default on Linux builds.
 
 ```bash
 whisrs setup   # select Local > whisper.cpp, pick a model, download automatically
@@ -160,7 +209,7 @@ filler_words = []           # custom list (empty = use built-in defaults)
 audio_feedback = true       # play tones on record start/stop/done
 audio_feedback_volume = 0.5 # 0.0 to 1.0
 vocabulary = ["whisrs", "Hyprland"]  # custom terms for better transcription accuracy
-tray = true                 # system tray icon (requires SNI host like waybar)
+tray = true                 # system tray icon (Linux only, requires SNI host)
 
 [audio]
 device = "default"
@@ -182,7 +231,7 @@ api_key = "sk-..."
 model = "gpt-4o-mini"
 api_url = "https://api.openai.com/v1/chat/completions"
 
-# Built-in global hotkeys (optional, works without WM keybinds)
+# Built-in global hotkeys (Linux only)
 [hotkeys]
 toggle = "Super+Shift+W"
 cancel = "Super+Shift+D"
@@ -217,10 +266,11 @@ whisrs log --clear  # Clear all history
 | **X11 (any WM)** | Implemented, needs community testing |
 | **GNOME Wayland** | Limited, requires `window-calls` extension for window tracking |
 | **KDE Wayland** | Implemented via D-Bus, needs community testing |
-| **Audio** | PipeWire, PulseAudio, ALSA (auto-detected via cpal) |
-| **Distros** | Any Linux with the system dependencies above |
+| **Windows** | Core features (audio, transcription, typing), needs community testing |
+| **macOS** | Core features (audio, transcription, typing), needs community testing |
+| **Audio** | PipeWire, PulseAudio, ALSA, WASAPI, CoreAudio (auto-detected) |
 
-> **Note:** whisrs has been primarily tested on **Hyprland (Arch Linux)**. Testing on other compositors and distros is a valuable contribution. If you run into issues, please open an issue.
+> **Note:** whisrs has been primarily tested on **Hyprland (Arch Linux)**. Testing on other compositors, distros, and platforms is a valuable contribution. If you run into issues, please open an issue.
 
 ---
 
@@ -232,9 +282,9 @@ whisrs is functional and usable for daily dictation. The core features work:
 - [x] Audio capture and WAV encoding
 - [x] Groq, OpenAI REST, and OpenAI Realtime backends
 - [x] Local whisper.cpp backend (sliding window, prompt conditioning, model download)
-- [x] Layout-aware keyboard injection (uinput + XKB)
-- [x] Wayland/X11 clipboard with save/restore
-- [x] Window tracking (Hyprland, Sway, X11, GNOME, KDE)
+- [x] Layout-aware keyboard injection (uinput + XKB on Linux, enigo on Windows/macOS)
+- [x] Clipboard integration with save/restore
+- [x] Window tracking (Hyprland, Sway, X11, GNOME, KDE, Windows)
 - [x] Desktop notifications and audio feedback
 - [x] Interactive setup with LLM provider selection
 - [x] Filler word removal
@@ -242,8 +292,9 @@ whisrs is functional and usable for daily dictation. The core features work:
 - [x] Multi-language support (18 languages + auto-detect)
 - [x] Custom vocabulary for improved transcription accuracy
 - [x] LLM command mode (select text + voice instruction → rewrite)
-- [x] System tray indicator (idle/recording/transcribing)
-- [x] Configurable global hotkeys via evdev
+- [x] System tray indicator (idle/recording/transcribing, Linux)
+- [x] Configurable global hotkeys (Linux)
+- [x] Cross-platform support (Linux, Windows, macOS)
 - [x] Packaging ([AUR](https://aur.archlinux.org/packages/whisrs-git), Nix flake, crates.io)
 - [ ] Local Vosk backend
 - [ ] Local Parakeet backend (NVIDIA)
@@ -261,7 +312,7 @@ See [docs/troubleshooting.md](docs/troubleshooting.md).
 The biggest way to help right now:
 
 1. **Test on your compositor** — Sway, i3, KDE, GNOME. Report what works and what doesn't.
-2. **Test on your distro** — Ubuntu, Fedora, NixOS, etc. Build issues, missing deps, etc.
+2. **Test on your distro or platform** — Ubuntu, Fedora, NixOS, Windows, macOS. Build issues, missing deps, etc.
 3. **Bug reports** — if text goes to the wrong window, characters get dropped, or audio doesn't capture, open an issue.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and project structure.
