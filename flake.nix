@@ -26,7 +26,7 @@
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "whisrs";
-          version = "0.1.4";
+          version = "0.1.5";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 

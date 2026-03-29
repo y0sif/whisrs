@@ -31,6 +31,8 @@ struct CommandModeContext {
     selected_text: String,
     saved_clipboard: String,
     llm_config: llm::LlmConfig,
+    /// Whether the focused window is a terminal (use Ctrl+Shift+V to paste).
+    is_terminal: bool,
 }
 
 /// Shared daemon state protected by a mutex.
@@ -1312,38 +1314,74 @@ async fn command_mode_start(
     // Get LLM config.
     let llm_config = context.config.llm.clone().unwrap_or_default();
 
-    // Step 1: Copy the selected text via Ctrl+C and read clipboard.
-    info!("command mode: copying selected text");
+    // Step 1: Get the selected text.
+    // Try primary selection first (works everywhere, no key simulation needed),
+    // then fall back to clipboard copy (Ctrl+C or Ctrl+Shift+C for terminals).
+    info!("command mode: getting selected text");
     let clipboard = ClipboardOps::detect();
 
     // Save current clipboard content so we can restore it later.
     let saved_clipboard = clipboard.get_text().unwrap_or_default();
 
-    // Simulate Ctrl+C to copy the selection.
-    match tokio::task::spawn_blocking(simulate_copy).await {
+    // Detect if the focused window is a terminal (for Ctrl+Shift+C/V fallback).
+    // Terminal-aware copy/paste is Linux-only (evdev-based).
+    #[cfg(target_os = "linux")]
+    let is_terminal = context
+        .window_tracker
+        .get_focused_window_class()
+        .map(|c| is_terminal_class(&c))
+        .unwrap_or(false);
+    #[cfg(not(target_os = "linux"))]
+    let is_terminal = false;
+
+    // Get selected text via primary selection (highlighted text, no key simulation).
+    // Then simulate copy (Ctrl+C or Ctrl+Shift+C for terminals) to keep the
+    // selection active so that paste will replace it rather than append.
+    let selected_text = clipboard.get_primary_selection().unwrap_or_default();
+
+    #[cfg(target_os = "linux")]
+    let copy_fn: fn() -> anyhow::Result<()> = if is_terminal {
+        simulate_terminal_copy
+    } else {
+        simulate_copy
+    };
+    #[cfg(not(target_os = "linux"))]
+    let copy_fn: fn() -> anyhow::Result<()> = simulate_copy;
+
+    match tokio::task::spawn_blocking(copy_fn).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            return Response::Error {
-                message: format!("failed to copy selection: {e}"),
-            };
+            if selected_text.is_empty() {
+                return Response::Error {
+                    message: format!("failed to copy selection: {e}"),
+                };
+            }
+            // Copy failed but we have text from primary selection, continue.
+            warn!("copy simulation failed ({e}), using primary selection text");
         }
         Err(e) => {
-            return Response::Error {
-                message: format!("copy task panicked: {e}"),
-            };
+            if selected_text.is_empty() {
+                return Response::Error {
+                    message: format!("copy task panicked: {e}"),
+                };
+            }
+            warn!("copy task panicked ({e}), using primary selection text");
         }
     }
 
-    // Small delay for clipboard to update.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let selected_text = match clipboard.get_text() {
-        Ok(text) => text,
-        Err(e) => {
-            return Response::Error {
-                message: format!("failed to read clipboard: {e}"),
-            };
+    // If primary selection was empty, try the clipboard (copy may have worked).
+    let selected_text = if selected_text.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        match clipboard.get_text() {
+            Ok(text) => text,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("failed to read clipboard: {e}"),
+                };
+            }
         }
+    } else {
+        selected_text
     };
 
     if selected_text.is_empty() || selected_text == saved_clipboard {
@@ -1387,6 +1425,7 @@ async fn command_mode_start(
             selected_text,
             saved_clipboard,
             llm_config,
+            is_terminal,
         });
     }
 
@@ -1535,7 +1574,7 @@ async fn command_mode_background(
             }
         };
 
-    // Paste the result.
+    // Paste the result, replacing the original selection.
     info!("command mode: pasting {} chars", result.len());
     let clipboard = ClipboardOps::detect();
 
@@ -1548,6 +1587,25 @@ async fn command_mode_background(
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+    #[cfg(target_os = "linux")]
+    if cmd_ctx.is_terminal {
+        // In terminals, selections are a visual overlay — paste never replaces them.
+        // Clear the command line first (Ctrl+A → beginning, Ctrl+K → kill to end),
+        // then paste. Works across bash, zsh, and fish.
+        match tokio::task::spawn_blocking(simulate_terminal_clear_and_paste).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("failed to clear+paste in terminal: {e}"),
+            Err(e) => warn!("terminal clear+paste task panicked: {e}"),
+        }
+    } else {
+        match tokio::task::spawn_blocking(simulate_paste).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("failed to paste: {e}"),
+            Err(e) => warn!("paste task panicked: {e}"),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
     match tokio::task::spawn_blocking(simulate_paste).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!("failed to paste: {e}"),
@@ -1614,10 +1672,61 @@ fn simulate_key_combo(modifier: evdev::Key, key: evdev::Key) -> anyhow::Result<(
     Ok(())
 }
 
+/// Simulate a two-modifier + key combo (e.g. Ctrl+Shift+V) via a temporary uinput device.
+fn simulate_key_combo_2mod(
+    mod1: evdev::Key,
+    mod2: evdev::Key,
+    key: evdev::Key,
+) -> anyhow::Result<()> {
+    use evdev::{AttributeSet, EventType, InputEvent, Key};
+    use std::thread;
+    use std::time::Duration;
+
+    let mut keys = AttributeSet::<Key>::new();
+    keys.insert(mod1);
+    keys.insert(mod2);
+    keys.insert(key);
+
+    let mut device = evdev::uinput::VirtualDeviceBuilder::new()
+        .context("failed to create VirtualDeviceBuilder")?
+        .name("whisrs command")
+        .with_keys(&keys)
+        .context("failed to register key events")?
+        .build()
+        .context("failed to build uinput device")?;
+
+    thread::sleep(Duration::from_millis(200));
+
+    device.emit(&[InputEvent::new(EventType::KEY, mod1.code(), 1)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, mod2.code(), 1)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, key.code(), 1)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, key.code(), 0)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, mod2.code(), 0)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, mod1.code(), 0)])?;
+    thread::sleep(Duration::from_millis(2));
+
+    Ok(())
+}
+
 /// Simulate Ctrl+C (copy) via uinput.
 #[cfg(target_os = "linux")]
 fn simulate_copy() -> anyhow::Result<()> {
     simulate_key_combo(evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_C)
+}
+
+/// Simulate Ctrl+Shift+C (terminal copy) via uinput.
+#[cfg(target_os = "linux")]
+fn simulate_terminal_copy() -> anyhow::Result<()> {
+    simulate_key_combo_2mod(
+        evdev::Key::KEY_LEFTCTRL,
+        evdev::Key::KEY_LEFTSHIFT,
+        evdev::Key::KEY_C,
+    )
 }
 
 /// Simulate Ctrl+V (paste) via uinput.
@@ -1636,6 +1745,107 @@ fn simulate_copy() -> anyhow::Result<()> {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn simulate_paste() -> anyhow::Result<()> {
     whisrs::input::enigo_backend::simulate_paste()
+}
+
+/// Clear the terminal command line (Ctrl+A → Ctrl+K) then paste (Ctrl+Shift+V).
+///
+/// In terminals, selections are visual overlays — paste inserts at cursor, never
+/// replaces the selection. So we clear the line first then paste the new content.
+/// Ctrl+A (beginning of line) + Ctrl+K (kill to end) works in bash, zsh, and fish.
+#[cfg(target_os = "linux")]
+fn simulate_terminal_clear_and_paste() -> anyhow::Result<()> {
+    use evdev::{AttributeSet, EventType, InputEvent, Key};
+    use std::thread;
+    use std::time::Duration;
+
+    let mut keys = AttributeSet::<Key>::new();
+    keys.insert(Key::KEY_LEFTCTRL);
+    keys.insert(Key::KEY_LEFTSHIFT);
+    keys.insert(Key::KEY_A);
+    keys.insert(Key::KEY_K);
+    keys.insert(Key::KEY_V);
+
+    let mut device = evdev::uinput::VirtualDeviceBuilder::new()
+        .context("failed to create VirtualDeviceBuilder")?
+        .name("whisrs command")
+        .with_keys(&keys)
+        .context("failed to register key events")?
+        .build()
+        .context("failed to build uinput device")?;
+
+    thread::sleep(Duration::from_millis(200));
+
+    // Ctrl+A — move to beginning of line.
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 1)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_A.code(), 1)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_A.code(), 0)])?;
+    thread::sleep(Duration::from_millis(2));
+
+    // Ctrl+K — kill to end of line (Ctrl is still held).
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_K.code(), 1)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_K.code(), 0)])?;
+    thread::sleep(Duration::from_millis(2));
+
+    // Release Ctrl.
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 0)])?;
+    thread::sleep(Duration::from_millis(10));
+
+    // Ctrl+Shift+V — paste.
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 1)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(
+        EventType::KEY,
+        Key::KEY_LEFTSHIFT.code(),
+        1,
+    )])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 1)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 0)])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(
+        EventType::KEY,
+        Key::KEY_LEFTSHIFT.code(),
+        0,
+    )])?;
+    thread::sleep(Duration::from_millis(2));
+    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 0)])?;
+    thread::sleep(Duration::from_millis(2));
+
+    Ok(())
+}
+
+/// Known terminal emulator window classes (lowercase for matching).
+#[cfg(target_os = "linux")]
+const TERMINAL_CLASSES: &[&str] = &[
+    "alacritty",
+    "kitty",
+    "foot",
+    "wezterm",
+    "gnome-terminal",
+    "konsole",
+    "xterm",
+    "urxvt",
+    "terminator",
+    "tilix",
+    "st",
+    "xfce4-terminal",
+    "sakura",
+    "guake",
+    "yakuake",
+    "termite",
+    "cool-retro-term",
+    "ghostty",
+];
+
+/// Check if a window class corresponds to a terminal emulator.
+#[cfg(target_os = "linux")]
+fn is_terminal_class(class: &str) -> bool {
+    let lower = class.to_lowercase();
+    TERMINAL_CLASSES.iter().any(|t| lower.contains(t))
 }
 
 async fn handle_cancel(

@@ -51,6 +51,18 @@ impl ClipboardHandler for ClipboardOps {
             ClipboardOps::Native => native_set_text(text),
         }
     }
+
+    fn get_primary_selection(&self) -> anyhow::Result<String> {
+        match self {
+            #[cfg(target_os = "linux")]
+            ClipboardOps::Wayland => wayland_get_primary(),
+            // Primary selection is a Linux/X11 concept; on macOS/Windows return empty.
+            #[cfg(target_os = "linux")]
+            ClipboardOps::Native => x11_get_primary(),
+            #[cfg(not(target_os = "linux"))]
+            ClipboardOps::Native => Ok(String::new()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +85,26 @@ fn wayland_get_text() -> anyhow::Result<String> {
             return Ok(String::new());
         }
         anyhow::bail!("wl-paste failed: {stderr}");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_get_primary() -> anyhow::Result<String> {
+    use std::process::Command;
+
+    let output = Command::new("wl-paste")
+        .args(["--no-newline", "--primary"])
+        .output()
+        .context("failed to run wl-paste --primary — is wl-clipboard installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("no suitable type") || stderr.contains("nothing is copied") {
+            return Ok(String::new());
+        }
+        anyhow::bail!("wl-paste --primary failed: {stderr}");
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -116,4 +148,19 @@ fn native_set_text(text: &str) -> anyhow::Result<()> {
     clipboard
         .set_text(text)
         .context("failed to set clipboard text")
+}
+
+// ---------------------------------------------------------------------------
+// X11 primary selection via arboard (Linux only)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn x11_get_primary() -> anyhow::Result<String> {
+    use arboard::GetExtLinux;
+    let mut clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
+    clipboard
+        .get()
+        .clipboard(arboard::LinuxClipboardKind::Primary)
+        .text()
+        .context("failed to get text from X11 primary selection")
 }

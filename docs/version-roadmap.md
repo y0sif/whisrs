@@ -29,17 +29,27 @@ Incremental feature releases building toward v1.5.
 
 ---
 
-## v0.1.5 — Local Vosk Backend
+## v0.1.5 — Terminal-Aware Command Mode & Polish ✓
+
+- [x] **Terminal-aware command mode**: Fixed LLM command mode in terminal emulators. Uses primary selection (`wl-paste --primary` / arboard) to read highlighted text without Ctrl+C (which sends SIGINT in terminals). Detects terminal windows via `WindowTracker::get_focused_window_class()` and uses Ctrl+Shift+C/V. Clears command line (Ctrl+A → Ctrl+K) before pasting so the result replaces the original text.
+- [x] **Window class detection**: Added `get_focused_window_class()` to `WindowTracker` trait, implemented for Hyprland via `hyprctl activewindow -j` class field. Recognizes 18+ terminal emulators (Alacritty, Kitty, Foot, WezTerm, Ghostty, etc.).
+- [x] **Primary selection support**: Added `get_primary_selection()` to `ClipboardHandler` trait — Wayland (`wl-paste --primary`) and X11 (arboard `LinuxClipboardKind::Primary`).
+- [x] **Notification panic fix**: Resolved D-Bus `block_on` conflict with ksni tray runtime.
+- [x] **State broadcasting**: Tray updates at all state transition points.
+- [x] **curl install**: `curl -sSL https://y0sif.github.io/whisrs/install.sh | bash`
+
+---
+
+## v0.1.6 — Local Vosk Backend
 
 - [ ] **Vosk backend**: CPU-only local speech recognition via `vosk` crate — true streaming, small models (~40 MB), works on Intel (no GPU required)
-- [ ] Final polish pass for v1.5 readiness
+- [ ] Final polish pass
 
 ---
 
 ## Deferred
 
 - **Parakeet backend** — requires NVIDIA GPU
-- **Static binary releases / install script** — post-feature distribution work
 - **Cross-compositor testing** — community/contributor effort
 - **Non-QWERTY layout testing** — later
 - **Demo GIF** — later

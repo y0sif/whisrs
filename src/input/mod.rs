@@ -43,4 +43,7 @@ pub trait ClipboardHandler: Send + Sync {
 
     /// Set the clipboard to the given text.
     fn set_text(&self, text: &str) -> anyhow::Result<()>;
+
+    /// Read the primary selection (highlighted text, no Ctrl+C needed).
+    fn get_primary_selection(&self) -> anyhow::Result<String>;
 }

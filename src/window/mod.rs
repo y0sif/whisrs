@@ -24,6 +24,12 @@ pub trait WindowTracker: Send + Sync {
 
     /// Focus the window with the given identifier.
     fn focus_window(&self, id: &str) -> anyhow::Result<()>;
+
+    /// Get the window class of the currently focused window (e.g. "Alacritty", "firefox").
+    /// Returns `None` if the compositor does not support this query.
+    fn get_focused_window_class(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A no-op tracker that always succeeds without doing anything.
