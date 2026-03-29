@@ -45,7 +45,21 @@ The install script handles everything: detects your distro, installs system depe
 After install, **press your hotkey** to start recording, **press again** to stop. Text appears at your cursor.
 
 <details>
-<summary><b>Other Linux install methods (AUR, Cargo, Nix, manual)</b></summary>
+<summary><b>Other Linux install methods (AUR, Cargo, Nix, pre-built binary, manual)</b></summary>
+
+#### Pre-built binary
+
+Download the latest release from [GitHub Releases](https://github.com/y0sif/whisrs/releases):
+
+```bash
+tar xzf whisrs-linux-x86_64.tar.gz
+sudo mv whisrs whisrsd /usr/local/bin/
+whisrs setup
+```
+
+Two variants are available:
+- `whisrs-linux-x86_64.tar.gz` — full build with local whisper.cpp
+- `whisrs-linux-x86_64-minimal.tar.gz` — cloud backends only (smaller, no C++ deps)
 
 #### Arch Linux (AUR)
 
@@ -124,13 +138,21 @@ bindsym $mod+w exec whisrs toggle
 <details>
 <summary><b>Windows</b></summary>
 
+#### Pre-built binary (recommended)
+
+Download the latest release from [GitHub Releases](https://github.com/y0sif/whisrs/releases):
+
+1. Download `whisrs-windows-x86_64.zip`
+2. Extract and add the folder to your `PATH`
+3. Run `whisrs setup` to configure your transcription backend and API keys
+
 #### Cargo
 
 ```powershell
 cargo install whisrs --no-default-features
 ```
 
-No system dependencies required. After install, run `whisrs setup` to configure your transcription backend and API keys.
+No system dependencies required.
 
 **Running the daemon:**
 
@@ -147,6 +169,15 @@ Then use `whisrs toggle` from another terminal (or bind it to a global shortcut 
 <details>
 <summary><b>macOS</b></summary>
 
+#### Pre-built binary (recommended)
+
+Download the latest release from [GitHub Releases](https://github.com/y0sif/whisrs/releases):
+
+1. Download `whisrs-macos-aarch64.tar.gz` (Apple Silicon) or `whisrs-macos-x86_64.tar.gz` (Intel)
+2. Extract: `tar xzf whisrs-macos-*.tar.gz`
+3. Move binaries to your PATH: `sudo mv whisrs whisrsd /usr/local/bin/`
+4. Run `whisrs setup`
+
 #### Cargo
 
 ```bash
@@ -154,8 +185,6 @@ cargo install whisrs --no-default-features
 ```
 
 No system dependencies required beyond the Xcode Command Line Tools (`xcode-select --install`).
-
-After install, run `whisrs setup`.
 
 **Running the daemon:**
 
