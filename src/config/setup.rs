@@ -622,7 +622,7 @@ fn setup_uinput_permissions() {
                         }
                     } else {
                         // Write the rule inline if contrib file not found.
-                        let rule = "KERNEL==\"uinput\", SUBSYSTEM==\"misc\", MODE=\"0660\", GROUP=\"input\", TAG+=\"uaccess\"";
+                        let rule = "KERNEL==\"uinput\", SUBSYSTEM==\"misc\", MODE=\"0660\", GROUP=\"input\", TAG+=\"uaccess\"\nKERNEL==\"uinput\", SUBSYSTEM==\"misc\", TEST==\"/usr/bin/setfacl\", RUN+=\"/usr/bin/setfacl -m g:input:rw /dev/$name\"";
                         let status = std::process::Command::new("sudo")
                             .args([
                                 "bash",

@@ -1,4 +1,10 @@
 # Allow members of the "input" group to access /dev/uinput
 # Install: sudo cp 99-whisrs.rules /etc/udev/rules.d/
 # Reload: sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Note: MODE/GROUP alone are not enough if another udev rule (e.g. brltty)
+# sets an ACL on /dev/uinput, because ACLs override traditional Unix group
+# permissions. The setfacl call below ensures the input group always has
+# read-write access regardless of ACL state.
 KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", TAG+="uaccess"
+KERNEL=="uinput", SUBSYSTEM=="misc", TEST=="/usr/bin/setfacl", RUN+="/usr/bin/setfacl -m g:input:rw /dev/$name"
