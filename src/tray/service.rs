@@ -105,29 +105,54 @@ impl ksni::Tray for WhisrsTray {
     }
 }
 
+/// Maximum number of attempts to connect to the SNI tray host.
+const TRAY_MAX_RETRIES: u32 = 10;
+
+/// Initial retry delay (doubles each attempt, capped at 10 s).
+const TRAY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Spawn the system tray indicator.
 ///
 /// Runs in the background and updates the icon whenever the daemon state changes.
+/// Retries with exponential backoff if the SNI host isn't available yet (common
+/// on boot when the daemon starts before the desktop environment is fully ready).
 pub async fn spawn_tray(mut state_rx: watch::Receiver<State>) {
     let tray_state = Arc::new(Mutex::new(TrayState {
         current: State::Idle,
     }));
 
-    let tray = WhisrsTray {
-        state: Arc::clone(&tray_state),
-    };
+    // Retry spawning the tray with exponential backoff.
+    let mut delay = TRAY_INITIAL_DELAY;
+    let mut handle = None;
 
-    // Spawn the tray via ksni's async API.
-    let handle = match tray.spawn().await {
-        Ok(h) => {
-            info!("system tray started");
-            h
+    for attempt in 1..=TRAY_MAX_RETRIES {
+        let tray = WhisrsTray {
+            state: Arc::clone(&tray_state),
+        };
+
+        match tray.spawn().await {
+            Ok(h) => {
+                info!("system tray started (attempt {attempt})");
+                handle = Some(h);
+                break;
+            }
+            Err(e) => {
+                if attempt == TRAY_MAX_RETRIES {
+                    warn!(
+                        "failed to start system tray after {TRAY_MAX_RETRIES} attempts: {e} — continuing without tray"
+                    );
+                    return;
+                }
+                info!(
+                    "tray host not available (attempt {attempt}/{TRAY_MAX_RETRIES}): {e} — retrying in {delay:?}"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(10));
+            }
         }
-        Err(e) => {
-            warn!("failed to start system tray: {e} — continuing without tray");
-            return;
-        }
-    };
+    }
+
+    let handle = handle.expect("handle must be set after successful spawn");
 
     // Watch for state changes and update the tray.
     let state_ref = Arc::clone(&tray_state);

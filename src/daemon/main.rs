@@ -403,8 +403,9 @@ async fn main() -> Result<()> {
     });
 
     // Start system tray if enabled.
+    // Spawned as a background task so retries don't block the IPC server.
     if tray_enabled {
-        whisrs::tray::spawn_tray(state_rx).await;
+        tokio::spawn(whisrs::tray::spawn_tray(state_rx));
     }
 
     let sock_path = socket_path();
