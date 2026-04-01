@@ -7,6 +7,7 @@ mod parse;
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use evdev::{Device, EventType, InputEventKind, Key};
 use tokio::sync::mpsc;
@@ -14,6 +15,12 @@ use tracing::{debug, info, warn};
 
 use crate::{Command, HotkeyConfig};
 pub use parse::{parse_hotkey, HotkeyBinding};
+
+/// Maximum number of attempts to find keyboard input devices.
+const HOTKEY_MAX_RETRIES: u32 = 10;
+
+/// Initial retry delay (doubles each attempt, capped at 10 s).
+const HOTKEY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 
 /// A configured hotkey action.
 struct HotkeyAction {
@@ -24,7 +31,9 @@ struct HotkeyAction {
 /// Start the global hotkey listener.
 ///
 /// Enumerates keyboard input devices, listens for key events, and sends
-/// matching commands through the provided channel. Runs until dropped.
+/// matching commands through the provided channel. Retries with exponential
+/// backoff if no keyboards are found yet (common on boot when the daemon
+/// starts before input devices are fully initialized). Runs until dropped.
 pub async fn start_hotkey_listener(config: &HotkeyConfig, cmd_tx: mpsc::Sender<Command>) {
     let mut actions = Vec::new();
 
@@ -72,18 +81,48 @@ pub async fn start_hotkey_listener(config: &HotkeyConfig, cmd_tx: mpsc::Sender<C
         return;
     }
 
-    // Find all keyboard input devices.
-    let devices = match enumerate_keyboards() {
-        Ok(d) if d.is_empty() => {
-            warn!("no keyboard input devices found — hotkeys disabled");
-            return;
+    // Find keyboard input devices, retrying with backoff on boot.
+    let mut delay = HOTKEY_INITIAL_DELAY;
+    let mut devices = Vec::new();
+
+    for attempt in 1..=HOTKEY_MAX_RETRIES {
+        match enumerate_keyboards() {
+            Ok(d) if !d.is_empty() => {
+                if attempt > 1 {
+                    info!(
+                        "found {} keyboard device(s) (attempt {attempt})",
+                        d.len()
+                    );
+                }
+                devices = d;
+                break;
+            }
+            Ok(_) => {
+                if attempt == HOTKEY_MAX_RETRIES {
+                    warn!(
+                        "no keyboard input devices found after {HOTKEY_MAX_RETRIES} attempts — hotkeys disabled"
+                    );
+                    return;
+                }
+                info!(
+                    "no keyboard devices found (attempt {attempt}/{HOTKEY_MAX_RETRIES}) — retrying in {delay:?}"
+                );
+            }
+            Err(e) => {
+                if attempt == HOTKEY_MAX_RETRIES {
+                    warn!(
+                        "failed to enumerate input devices after {HOTKEY_MAX_RETRIES} attempts: {e} — hotkeys disabled"
+                    );
+                    return;
+                }
+                info!(
+                    "failed to enumerate input devices (attempt {attempt}/{HOTKEY_MAX_RETRIES}): {e} — retrying in {delay:?}"
+                );
+            }
         }
-        Ok(d) => d,
-        Err(e) => {
-            warn!("failed to enumerate input devices: {e} — hotkeys disabled");
-            return;
-        }
-    };
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(10));
+    }
 
     info!(
         "hotkey listener monitoring {} keyboard device(s)",

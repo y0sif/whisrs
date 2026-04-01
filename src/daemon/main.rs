@@ -434,14 +434,16 @@ async fn main() -> Result<()> {
     });
 
     // Start global hotkey listener if configured.
+    // Spawned as a background task so retries don't block the IPC server.
     if let Some(ref hk_config) = context.config.hotkeys {
-        let (hotkey_tx, mut hotkey_rx) = tokio::sync::mpsc::channel::<Command>(16);
-        whisrs::hotkey::start_hotkey_listener(hk_config, hotkey_tx).await;
-
-        // Process hotkey commands in the background.
+        let hk_config = hk_config.clone();
         let hk_state = Arc::clone(&daemon_state);
         let hk_ctx = Arc::clone(&context);
         tokio::spawn(async move {
+            let (hotkey_tx, mut hotkey_rx) = tokio::sync::mpsc::channel::<Command>(16);
+            whisrs::hotkey::start_hotkey_listener(&hk_config, hotkey_tx).await;
+
+            // Process hotkey commands.
             while let Some(cmd) = hotkey_rx.recv().await {
                 info!("hotkey command: {cmd:?}");
                 let _response =
