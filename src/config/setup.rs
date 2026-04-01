@@ -1233,13 +1233,157 @@ fn select_llm_model(provider_idx: usize) -> Result<String> {
 fn print_done() {
     println!("\n{GREEN}{BOLD}You're all set!{RESET}");
     println!();
-    println!("  {DIM}Config:    ~/.config/whisrs/config.toml{RESET}");
-    println!("  {DIM}Logs:      journalctl --user -u whisrs -f{RESET}");
-    println!("  {DIM}Re-run:    whisrs setup (to change backend or settings){RESET}");
+    println!(" {DIM}Config: ~/.config/whisrs/config.toml{RESET}");
+    println!(" {DIM}Logs: journalctl --user -u whisrs -f{RESET}");
+    println!(" {DIM}Re-run: whisrs setup (to change backend or settings){RESET}");
     println!();
-    println!("  You can adjust all settings (filler words, audio feedback, silence");
-    println!(
-        "  timeout, etc.) by editing the config file or re-running {BOLD}whisrs setup{RESET}."
-    );
+    println!(" You can adjust all settings (filler words, audio feedback, silence");
+    println!(" timeout, etc.) by editing the config file or re-running {BOLD}whisrs setup{RESET}.");
     println!();
+}
+
+/// Run the interactive uninstall flow.
+pub fn run_uninstall() -> Result<()> {
+    println!("\n{BOLD}whisrs uninstall{RESET} — remove all whisrs data\n");
+
+    let confirmed = Confirm::new()
+        .with_prompt("Are you sure you want to uninstall whisrs? This will delete all config, models, and history.")
+        .default(false)
+        .interact()
+        .context("failed to read confirmation")?;
+
+    if !confirmed {
+        println!("\n {DIM}Uninstall cancelled.{RESET}");
+        return Ok(());
+    }
+
+    println!();
+
+    let mut removed: Vec<&'static str> = Vec::new();
+    let mut failed: Vec<(&'static str, String)> = Vec::new();
+
+    // Stop and disable systemd service.
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "stop", "whisrs.service"])
+        .status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "disable", "whisrs.service"])
+        .status();
+
+    // Remove systemd service file.
+    let service_path = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("systemd/user/whisrs.service");
+    if service_path.exists() {
+        match fs::remove_file(&service_path) {
+            Ok(_) => removed.push("systemd service"),
+            Err(e) => failed.push(("systemd service", e.to_string())),
+        }
+    }
+
+    // Reload systemd.
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+
+    // Remove config directory.
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("whisrs");
+    if config_dir.exists() {
+        match fs::remove_dir_all(&config_dir) {
+            Ok(_) => removed.push("config directory"),
+            Err(e) => failed.push(("config directory", e.to_string())),
+        }
+    }
+
+    // Remove data directory (models, history).
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        .join("whisrs");
+    if data_dir.exists() {
+        match fs::remove_dir_all(&data_dir) {
+            Ok(_) => removed.push("data directory (models, history)"),
+            Err(e) => failed.push(("data directory", e.to_string())),
+        }
+    }
+
+    // Remove cache directory.
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("whisrs");
+    if cache_dir.exists() {
+        match fs::remove_dir_all(&cache_dir) {
+            Ok(_) => removed.push("cache directory"),
+            Err(e) => failed.push(("cache directory", e.to_string())),
+        }
+    }
+
+    // Remove runtime socket.
+    let socket = crate::socket_path();
+    if socket.exists() {
+        match fs::remove_file(&socket) {
+            Ok(_) => removed.push("socket"),
+            Err(e) => failed.push(("socket", e.to_string())),
+        }
+    }
+
+    // Offer to remove udev rule.
+    println!("{BOLD}Udev rule...{RESET}");
+    let udev_path = PathBuf::from("/etc/udev/rules.d/99-whisrs.rules");
+    if udev_path.exists() {
+        let remove_udev = Confirm::new()
+            .with_prompt("Remove udev rule (/etc/udev/rules.d/99-whisrs.rules)? (requires sudo)")
+            .default(true)
+            .interact()
+            .unwrap_or(false);
+
+        if remove_udev {
+            let status = std::process::Command::new("sudo")
+                .args(["rm", "-f", "/etc/udev/rules.d/99-whisrs.rules"])
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    println!(" {GREEN}Removed udev rule{RESET}");
+                    let _ = std::process::Command::new("sudo")
+                        .args(["udevadm", "control", "--reload-rules"])
+                        .status();
+                    let _ = std::process::Command::new("sudo")
+                        .args(["udevadm", "trigger"])
+                        .status();
+                }
+                _ => println!(" {YELLOW}Failed to remove udev rule{RESET}"),
+            }
+        }
+    } else {
+        println!(" {DIM}No udev rule installed{RESET}");
+    }
+
+    println!();
+
+    if removed.is_empty() && failed.is_empty() {
+        println!(" {DIM}Nothing to remove — whisrs was not installed.{RESET}");
+    } else {
+        if !removed.is_empty() {
+            println!("{GREEN}Removed:{RESET}");
+            for item in &removed {
+                println!("  {GREEN}✓{RESET} {item}");
+            }
+        }
+        if !failed.is_empty() {
+            println!("{RED}Failed:{RESET}");
+            for (item, err) in &failed {
+                println!("  {RED}✗{RESET} {item}: {err}");
+            }
+        }
+    }
+
+    println!("\n{GREEN}{BOLD}Done.{RESET}");
+    println!();
+    println!(" {DIM}To fully remove whisrs, also uninstall the package:{RESET}");
+    println!(" {DIM}  cargo uninstall whisrs{RESET}");
+    println!(" {DIM}  or use your package manager (e.g., pacman -R whisrs){RESET}");
+    println!();
+
+    Ok(())
 }
