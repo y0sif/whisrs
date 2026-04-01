@@ -1,10 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use whisrs::audio::capture::AudioCaptureHandle;
 use whisrs::audio::feedback;
@@ -164,6 +165,98 @@ fn load_config() -> (Config, Option<String>) {
         },
         None,
     )
+}
+
+/// Maximum number of attempts to detect compositor environment.
+const COMPOSITOR_ENV_MAX_RETRIES: u32 = 10;
+
+/// Initial retry delay for compositor env detection (doubles each attempt, capped at 10 s).
+const COMPOSITOR_ENV_INITIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// Compositor environment variables to import from systemd.
+const COMPOSITOR_ENV_VARS: &[&str] = &[
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "SWAYSOCK",
+    "XDG_CURRENT_DESKTOP",
+];
+
+/// Wait for compositor environment variables to become available.
+///
+/// When the daemon starts via systemd on boot, it may launch before the
+/// compositor sets session environment variables (WAYLAND_DISPLAY, etc.).
+/// Without these, clipboard operations (wl-paste) and window tracking fail.
+///
+/// Polls `systemctl --user show-environment` with exponential backoff until
+/// a display server variable is found, then imports all compositor-related
+/// vars into the process environment.
+async fn import_compositor_env() {
+    // Already have a display server — nothing to do.
+    if std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok() {
+        debug!("compositor environment already available");
+        return;
+    }
+
+    info!("compositor env vars not set — polling systemd user environment");
+
+    let mut delay = COMPOSITOR_ENV_INITIAL_DELAY;
+
+    for attempt in 1..=COMPOSITOR_ENV_MAX_RETRIES {
+        if let Some(imported) = try_import_from_systemd() {
+            info!("imported compositor environment from systemd (attempt {attempt}): {imported}");
+            return;
+        }
+
+        if attempt == COMPOSITOR_ENV_MAX_RETRIES {
+            warn!(
+                "compositor environment not available after {COMPOSITOR_ENV_MAX_RETRIES} attempts \
+                 — clipboard and window tracking may not work"
+            );
+            return;
+        }
+
+        info!(
+            "compositor env not available (attempt {attempt}/{COMPOSITOR_ENV_MAX_RETRIES}) \
+             — retrying in {delay:?}"
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(10));
+    }
+}
+
+/// Try to read compositor env vars from systemd's user environment.
+///
+/// Returns a summary string of imported vars on success, or None if no
+/// display server variable was found.
+fn try_import_from_systemd() -> Option<String> {
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut imported = Vec::new();
+
+    for line in stdout.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            if COMPOSITOR_ENV_VARS.contains(&key) && std::env::var(key).is_err() {
+                std::env::set_var(key, value);
+                imported.push(key.to_string());
+            }
+        }
+    }
+
+    // Only succeed if we found a display server.
+    if std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok() {
+        Some(imported.join(", "))
+    } else {
+        None
+    }
 }
 
 fn check_uinput_access() {
@@ -383,6 +476,10 @@ async fn main() -> Result<()> {
     }
 
     let backend = create_backend(&config);
+
+    // Wait for compositor environment on boot (WAYLAND_DISPLAY, etc.).
+    // Must run before window tracker detection and any clipboard operations.
+    import_compositor_env().await;
 
     let window_tracker: Arc<dyn WindowTracker> = Arc::from(window::detect_tracker());
     info!(
