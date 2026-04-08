@@ -153,8 +153,9 @@ When a feature or set of changes warrants a version bump:
 2. **Always include `Cargo.lock`** in the version bump commit
 3. **Run all CI checks** locally (see above)
 4. **Commit** and **push**
-5. **Publish to crates.io**: Always run `cargo publish` after pushing a version bump — do not skip this step
-6. **Update AUR** package: bump `pkgver` in `/home/y0sif/Projects/whisrs-git/PKGBUILD`, regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`, commit, and `git push` to AUR
+5. **Tag and release on GitHub**: `git tag v<VERSION>; git push origin v<VERSION>`, then create a GitHub release with `gh release create v<VERSION>` including release notes summarizing the changes
+6. **Publish to crates.io**: Always run `cargo publish` after pushing a version bump — do not skip this step
+7. **Update AUR** package: bump `pkgver` in `/home/y0sif/Projects/whisrs-git/PKGBUILD`, regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`, commit, and `git push` to AUR
 
 ## Packaging
 
