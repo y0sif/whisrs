@@ -56,6 +56,7 @@ src/
 │   └── recovery.rs         # Save/load audio on transcription failure
 ├── transcription/
 │   ├── mod.rs              # TranscriptionBackend trait
+│   ├── deepgram.rs         # Deepgram Nova API (REST + WebSocket streaming)
 │   ├── groq.rs             # Groq Whisper API (chunked HTTP, timestamp dedup)
 │   ├── openai_realtime.rs  # OpenAI Realtime API (WebSocket, true streaming)
 │   ├── openai_rest.rs      # OpenAI REST API (simple HTTP POST)
@@ -121,9 +122,10 @@ Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": 
 
 Path: `~/.config/whisrs/config.toml` (permissions: 0600)
 
-Backends: `groq`, `openai-realtime`, `openai`, `local-whisper`, `local-vosk`, `local-parakeet`
+Backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realtime`, `openai`, `local-whisper`, `local-vosk`, `local-parakeet`
 
 Environment variable overrides:
+- `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key`
 - `WHISRS_GROQ_API_KEY` — overrides `[groq] api_key`
 - `WHISRS_OPENAI_API_KEY` — overrides `[openai] api_key`
 - `RUST_LOG` — controls daemon log verbosity
@@ -152,7 +154,7 @@ When a feature or set of changes warrants a version bump:
 3. **Run all CI checks** locally (see above)
 4. **Commit** and **push**
 5. **Publish to crates.io**: Always run `cargo publish` after pushing a version bump — do not skip this step
-6. **Update AUR** package locally and push to AUR
+6. **Update AUR** package: bump `pkgver` in `/home/y0sif/Projects/whisrs-git/PKGBUILD`, regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`, commit, and `git push` to AUR
 
 ## Packaging
 
