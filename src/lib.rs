@@ -83,6 +83,8 @@ pub struct Config {
     #[serde(default)]
     pub audio: AudioConfig,
     #[serde(default)]
+    pub deepgram: Option<DeepgramConfig>,
+    #[serde(default)]
     pub groq: Option<GroqConfig>,
     #[serde(default)]
     pub openai: Option<OpenAiConfig>,
@@ -174,6 +176,13 @@ impl Default for AudioConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepgramConfig {
+    pub api_key: String,
+    #[serde(default = "default_deepgram_model")]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroqConfig {
     pub api_key: String,
     #[serde(default = "default_groq_model")]
@@ -219,6 +228,9 @@ fn default_device() -> String {
 }
 fn default_audio_feedback_volume() -> f32 {
     0.5
+}
+fn default_deepgram_model() -> String {
+    "nova-3".to_string()
 }
 fn default_groq_model() -> String {
     "whisper-large-v3-turbo".to_string()
@@ -278,6 +290,24 @@ impl Config {
         let backend = self.general.backend.as_str();
 
         match backend {
+            "deepgram" | "deepgram-streaming" => {
+                let has_config_key = self
+                    .deepgram
+                    .as_ref()
+                    .map(|d| !d.api_key.is_empty())
+                    .unwrap_or(false);
+                let has_env_key = std::env::var("WHISRS_DEEPGRAM_API_KEY")
+                    .map(|k| !k.is_empty())
+                    .unwrap_or(false);
+                if !has_config_key && !has_env_key {
+                    return Err(WhisrsError::Config(
+                        "Deepgram backend selected but no API key configured.\n\
+                         Set WHISRS_DEEPGRAM_API_KEY or add [deepgram] api_key to config.toml.\n\
+                         Run 'whisrs setup' to get started."
+                            .to_string(),
+                    ));
+                }
+            }
             "groq" => {
                 let has_config_key = self
                     .groq
@@ -365,8 +395,8 @@ impl Config {
             }
             other => {
                 return Err(WhisrsError::Config(format!(
-                    "Unknown backend '{other}'. Valid options: groq, openai, openai-realtime, \
-                     local-whisper, local-vosk, local-parakeet"
+                    "Unknown backend '{other}'. Valid options: deepgram, deepgram-streaming, \
+                     groq, openai, openai-realtime, local-whisper, local-vosk, local-parakeet"
                 )));
             }
         }
@@ -382,6 +412,15 @@ impl Config {
 
     /// Check if any transcription backend has an API key configured.
     pub fn has_any_backend_configured(&self) -> bool {
+        let has_deepgram = self
+            .deepgram
+            .as_ref()
+            .map(|d| !d.api_key.is_empty())
+            .unwrap_or(false)
+            || std::env::var("WHISRS_DEEPGRAM_API_KEY")
+                .map(|k| !k.is_empty())
+                .unwrap_or(false);
+
         let has_groq = self
             .groq
             .as_ref()
@@ -404,7 +443,7 @@ impl Config {
             || self.local_vosk.is_some()
             || self.local_parakeet.is_some();
 
-        has_groq || has_openai || has_local
+        has_deepgram || has_groq || has_openai || has_local
     }
 }
 
@@ -595,6 +634,7 @@ mod tests {
                 ..Default::default()
             },
             audio: Default::default(),
+            deepgram: None,
             groq: None,
             openai: None,
             local_whisper: None,
@@ -617,6 +657,7 @@ mod tests {
                 ..Default::default()
             },
             audio: Default::default(),
+            deepgram: None,
             groq: None,
             openai: None,
             local_whisper: None,
@@ -637,6 +678,7 @@ mod tests {
                 ..Default::default()
             },
             audio: Default::default(),
+            deepgram: None,
             groq: Some(GroqConfig {
                 api_key: "test-key".to_string(),
                 model: "whisper-large-v3-turbo".to_string(),
@@ -661,6 +703,7 @@ mod tests {
                 ..Default::default()
             },
             audio: Default::default(),
+            deepgram: None,
             groq: Some(GroqConfig {
                 api_key: "test-key".to_string(),
                 model: "whisper-large-v3-turbo".to_string(),

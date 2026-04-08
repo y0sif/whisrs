@@ -15,7 +15,7 @@
 
 **Linux-first voice-to-text dictation tool, written in Rust.**
 
-Speech-to-text for Wayland, X11, Hyprland, Sway, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor. Works with any app, any window manager, any desktop environment. Supports cloud transcription (Groq, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source.
+Speech-to-text for Wayland, X11, Hyprland, Sway, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor. Works with any app, any window manager, any desktop environment. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source.
 
 ---
 
@@ -127,11 +127,15 @@ bindsym $mod+w exec whisrs toggle
 | Backend | Type | Streaming | Cost | Best for |
 |---|---|---|---|---|
 | **Groq** | Cloud | Batch | Free tier available | Getting started, budget use |
+| **Deepgram Streaming** | Cloud (WebSocket) | True streaming | $200 free credit | Streaming with free credits |
+| **Deepgram REST** | Cloud | Batch | $200 free credit | Simple, 60+ languages |
 | **OpenAI Realtime** | Cloud (WebSocket) | True streaming | Paid | Best UX, text as you speak |
 | **OpenAI REST** | Cloud | Batch | Paid | Simple fallback |
 | **Local whisper.cpp** | Local (CPU/GPU) | Sliding window | Free | Privacy, offline use |
 
 Groq is the default. Fast, free tier, good accuracy with `whisper-large-v3-turbo`.
+
+Deepgram offers $200 in free credits on signup (no credit card required) and supports 60+ languages with the Nova-3 model. The streaming backend provides true real-time transcription over WebSocket.
 
 OpenAI Realtime is the premium option: true streaming over WebSocket means text appears at your cursor while you're still speaking.
 
@@ -157,7 +161,7 @@ Config file: `~/.config/whisrs/config.toml`
 
 ```toml
 [general]
-backend = "groq"            # groq | openai-realtime | openai | local-whisper
+backend = "groq"            # groq | deepgram-streaming | deepgram | openai-realtime | openai | local-whisper
 language = "en"             # ISO 639-1 or "auto"
 silence_timeout_ms = 2000   # auto-stop after silence (streaming only)
 notify = true               # desktop notifications
@@ -174,6 +178,10 @@ device = "default"
 [groq]
 api_key = "gsk_..."
 model = "whisper-large-v3-turbo"
+
+[deepgram]
+api_key = "..."
+model = "nova-3"
 
 [openai]
 api_key = "sk-..."
@@ -195,7 +203,7 @@ cancel = "Super+Shift+D"
 command = "Super+Shift+G"
 ```
 
-Environment variable overrides: `WHISRS_GROQ_API_KEY`, `WHISRS_OPENAI_API_KEY`
+Environment variable overrides: `WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, `WHISRS_OPENAI_API_KEY`
 
 ---
 
@@ -236,7 +244,7 @@ whisrs is functional and usable for daily dictation. The core features work:
 
 - [x] Daemon + CLI architecture
 - [x] Audio capture and WAV encoding
-- [x] Groq, OpenAI REST, and OpenAI Realtime backends
+- [x] Groq, Deepgram (REST + streaming), OpenAI REST, and OpenAI Realtime backends
 - [x] Local whisper.cpp backend (sliding window, prompt conditioning, model download)
 - [x] Layout-aware keyboard injection (uinput + XKB)
 - [x] Wayland/X11 clipboard with save/restore

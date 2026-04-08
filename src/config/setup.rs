@@ -12,7 +12,10 @@ use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, Password, Select};
 
 use crate::llm::LlmConfig;
-use crate::{AudioConfig, Config, GeneralConfig, GroqConfig, LocalWhisperConfig, OpenAiConfig};
+use crate::{
+    AudioConfig, Config, DeepgramConfig, GeneralConfig, GroqConfig, LocalWhisperConfig,
+    OpenAiConfig,
+};
 
 // ANSI color codes.
 const GREEN: &str = "\x1b[32m";
@@ -24,14 +27,23 @@ const RESET: &str = "\x1b[0m";
 
 /// Backend choices presented to the user.
 const BACKEND_CHOICES: &[&str] = &[
-    "Groq            (free, fast, cloud)",
-    "OpenAI Realtime (best streaming, cloud)",
-    "OpenAI REST     (simple, cloud)",
-    "Local           (offline, no API key needed)",
+    "Groq               (free, fast, cloud)",
+    "Deepgram Streaming (free credits, true streaming, cloud)",
+    "Deepgram REST      (free credits, simple, cloud)",
+    "OpenAI Realtime    (best streaming, cloud)",
+    "OpenAI REST        (simple, cloud)",
+    "Local              (offline, no API key needed)",
 ];
 
 /// Map selection index to backend string used in config.
-const BACKEND_VALUES: &[&str] = &["groq", "openai-realtime", "openai", "local"];
+const BACKEND_VALUES: &[&str] = &[
+    "groq",
+    "deepgram-streaming",
+    "deepgram",
+    "openai-realtime",
+    "openai",
+    "local",
+];
 
 /// Whisper model choices (name, file size, description).
 const WHISPER_MODEL_CHOICES: &[&str] = &[
@@ -90,7 +102,8 @@ pub fn run_setup() -> Result<()> {
     let backend = select_backend(None)?;
 
     // 2. Configure backend (API key or model download).
-    let (groq_config, openai_config, local_whisper_config) = configure_backend(&backend, None)?;
+    let (deepgram_config, groq_config, openai_config, local_whisper_config) =
+        configure_backend(&backend, None)?;
 
     // 3. Language.
     let language = select_language(None)?;
@@ -121,6 +134,7 @@ pub fn run_setup() -> Result<()> {
         audio: AudioConfig {
             device: "default".to_string(),
         },
+        deepgram: deepgram_config,
         groq: groq_config,
         openai: openai_config,
         local_whisper: local_whisper_config,
@@ -159,9 +173,11 @@ fn select_backend(existing: Option<&Config>) -> Result<String> {
             let b = cfg.general.backend.as_str();
             match b {
                 "groq" => 0,
-                "openai-realtime" => 1,
-                "openai" => 2,
-                _ if b.starts_with("local") => 3,
+                "deepgram-streaming" => 1,
+                "deepgram" => 2,
+                "openai-realtime" => 3,
+                "openai" => 4,
+                _ if b.starts_with("local") => 5,
                 _ => 0,
             }
         })
@@ -217,15 +233,32 @@ fn select_local_engine() -> Result<String> {
 }
 
 /// Configure the selected backend (API key or model path).
+#[allow(clippy::type_complexity)]
 fn configure_backend(
     backend: &str,
     existing: Option<&Config>,
 ) -> Result<(
+    Option<DeepgramConfig>,
     Option<GroqConfig>,
     Option<OpenAiConfig>,
     Option<LocalWhisperConfig>,
 )> {
     match backend {
+        "deepgram" | "deepgram-streaming" => {
+            let existing_key = existing
+                .and_then(|c| c.deepgram.as_ref())
+                .map(|d| &d.api_key);
+            let api_key = prompt_api_key_with_existing(
+                "Deepgram API key",
+                "Get one free ($200 credit) at https://console.deepgram.com/signup",
+                existing_key,
+            )?;
+            let model = existing
+                .and_then(|c| c.deepgram.as_ref())
+                .map(|d| d.model.clone())
+                .unwrap_or_else(|| "nova-3".to_string());
+            Ok((Some(DeepgramConfig { api_key, model }), None, None, None))
+        }
         "groq" => {
             let existing_key = existing.and_then(|c| c.groq.as_ref()).map(|g| &g.api_key);
             let api_key = prompt_api_key_with_existing(
@@ -237,7 +270,7 @@ fn configure_backend(
                 .and_then(|c| c.groq.as_ref())
                 .map(|g| g.model.clone())
                 .unwrap_or_else(|| "whisper-large-v3-turbo".to_string());
-            Ok((Some(GroqConfig { api_key, model }), None, None))
+            Ok((None, Some(GroqConfig { api_key, model }), None, None))
         }
         "openai-realtime" | "openai" => {
             let existing_key = existing.and_then(|c| c.openai.as_ref()).map(|o| &o.api_key);
@@ -266,7 +299,7 @@ fn configure_backend(
                 }
                 .to_string()
             };
-            Ok((None, Some(OpenAiConfig { api_key, model }), None))
+            Ok((None, None, Some(OpenAiConfig { api_key, model }), None))
         }
         "local-whisper" => {
             // Select model size.
@@ -306,9 +339,9 @@ fn configure_backend(
             }
 
             let model_path = dest.to_string_lossy().to_string();
-            Ok((None, None, Some(LocalWhisperConfig { model_path })))
+            Ok((None, None, None, Some(LocalWhisperConfig { model_path })))
         }
-        _ => Ok((None, None, None)),
+        _ => Ok((None, None, None, None)),
     }
 }
 

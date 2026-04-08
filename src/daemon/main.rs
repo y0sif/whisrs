@@ -16,6 +16,7 @@ use whisrs::input::ClipboardHandler;
 use whisrs::llm;
 use whisrs::post_processing::filler::remove_filler_words;
 use whisrs::state::{Action, StateMachine};
+use whisrs::transcription::deepgram::{DeepgramRestBackend, DeepgramStreamingBackend};
 use whisrs::transcription::groq::GroqBackend;
 use whisrs::transcription::local_parakeet::ParakeetBackend;
 use whisrs::transcription::local_vosk::VoskBackend;
@@ -111,6 +112,7 @@ fn load_config() -> (Config, Option<String>) {
                         Config {
                             general: Default::default(),
                             audio: Default::default(),
+                            deepgram: None,
                             groq: None,
                             openai: None,
                             local_whisper: None,
@@ -133,6 +135,7 @@ fn load_config() -> (Config, Option<String>) {
                     Config {
                         general: Default::default(),
                         audio: Default::default(),
+                        deepgram: None,
                         groq: None,
                         openai: None,
                         local_whisper: None,
@@ -155,6 +158,7 @@ fn load_config() -> (Config, Option<String>) {
         Config {
             general: Default::default(),
             audio: Default::default(),
+            deepgram: None,
             groq: None,
             openai: None,
             local_whisper: None,
@@ -335,8 +339,33 @@ fn resolve_openai_api_key(config: &Config) -> Option<String> {
     config.openai.as_ref().map(|o| o.api_key.clone())
 }
 
+fn resolve_deepgram_api_key(config: &Config) -> Option<String> {
+    if let Ok(key) = std::env::var("WHISRS_DEEPGRAM_API_KEY") {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+    config.deepgram.as_ref().map(|d| d.api_key.clone())
+}
+
 fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
     match config.general.backend.as_str() {
+        "deepgram" => {
+            let api_key = resolve_deepgram_api_key(config).unwrap_or_default();
+            if api_key.is_empty() {
+                warn!("no Deepgram API key configured");
+            }
+            info!("using Deepgram REST transcription backend");
+            Arc::new(DeepgramRestBackend::new(api_key))
+        }
+        "deepgram-streaming" => {
+            let api_key = resolve_deepgram_api_key(config).unwrap_or_default();
+            if api_key.is_empty() {
+                warn!("no Deepgram API key configured");
+            }
+            info!("using Deepgram streaming transcription backend");
+            Arc::new(DeepgramStreamingBackend::new(api_key))
+        }
         "groq" => {
             let api_key = resolve_groq_api_key(config).unwrap_or_default();
             if api_key.is_empty() {
@@ -416,6 +445,11 @@ fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
 
 fn get_model_for_backend(config: &Config) -> String {
     match config.general.backend.as_str() {
+        "deepgram" | "deepgram-streaming" => config
+            .deepgram
+            .as_ref()
+            .map(|d| d.model.clone())
+            .unwrap_or_else(|| "nova-3".to_string()),
         "groq" => config
             .groq
             .as_ref()

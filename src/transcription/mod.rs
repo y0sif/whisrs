@@ -1,6 +1,7 @@
 //! Transcription backends: trait definition and implementations.
 
 pub mod dedup;
+pub mod deepgram;
 pub mod groq;
 pub mod local_parakeet;
 pub mod local_vosk;
