@@ -1,0 +1,7 @@
+{
+  "uuid": "whisrs-overlay@eresende.github",
+  "name": "whisrs Overlay",
+  "description": "Bottom-screen recording overlay for whisrs on GNOME Wayland.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "version": 2
+}

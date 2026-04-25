@@ -6,6 +6,7 @@ pub mod history;
 pub mod hotkey;
 pub mod input;
 pub mod llm;
+pub mod overlay;
 pub mod post_processing;
 pub mod state;
 pub mod transcription;
@@ -142,6 +143,9 @@ pub struct GeneralConfig {
     /// Enable system tray icon.
     #[serde(default = "default_true")]
     pub tray: bool,
+    /// Enable bottom-screen recording overlay.
+    #[serde(default)]
+    pub overlay: bool,
 }
 
 impl Default for GeneralConfig {
@@ -157,6 +161,7 @@ impl Default for GeneralConfig {
             audio_feedback_volume: default_audio_feedback_volume(),
             vocabulary: Vec::new(),
             tray: true,
+            overlay: false,
         }
     }
 }
@@ -645,6 +650,22 @@ mod tests {
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("Unknown backend"));
+    }
+
+    #[test]
+    fn config_defaults_overlay_off_for_old_configs() {
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            backend = "local-whisper"
+
+            [audio]
+            device = "default"
+            "#,
+        )
+        .unwrap();
+
+        assert!(!config.general.overlay);
     }
 
     #[test]

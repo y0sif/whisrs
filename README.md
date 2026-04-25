@@ -171,6 +171,7 @@ audio_feedback = true       # play tones on record start/stop/done
 audio_feedback_volume = 0.5 # 0.0 to 1.0
 vocabulary = ["whisrs", "Hyprland"]  # custom terms for better transcription accuracy
 tray = true                 # system tray icon (requires SNI host like waybar)
+overlay = false             # bottom-screen recording overlay (Hyprland/Sway, GNOME extension)
 
 [audio]
 device = "default"
@@ -205,6 +206,23 @@ command = "Super+Shift+G"
 
 Environment variable overrides: `WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, `WHISRS_OPENAI_API_KEY`
 
+### GNOME overlay
+
+GNOME Wayland does not support the wlroots layer-shell protocol used by Hyprland
+and Sway. To use `overlay = true` on GNOME, install the bundled GNOME Shell
+extension:
+
+```bash
+mkdir -p ~/.local/share/gnome-shell/extensions
+cp -r contrib/gnome-shell-extension/whisrs-overlay@eresende.github \
+  ~/.local/share/gnome-shell/extensions/
+gnome-extensions enable whisrs-overlay@eresende.github
+systemctl --user restart whisrs.service
+```
+
+If GNOME has not discovered the extension yet, log out and back in, then run the
+`gnome-extensions enable` command again.
+
 ---
 
 ## CLI Commands
@@ -229,7 +247,7 @@ whisrs log --clear  # Clear all history
 | **Hyprland** | Tested, full support |
 | **Sway / i3** | Implemented, needs community testing |
 | **X11 (any WM)** | Implemented, needs community testing |
-| **GNOME Wayland** | Limited, requires `window-calls` extension for window tracking |
+| **GNOME Wayland** | Limited window tracking; overlay requires bundled GNOME Shell extension |
 | **KDE Wayland** | Implemented via D-Bus, needs community testing |
 | **Audio** | PipeWire, PulseAudio, ALSA (auto-detected via cpal) |
 | **Distros** | Any Linux with the system dependencies above |

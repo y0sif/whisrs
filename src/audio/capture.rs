@@ -54,6 +54,13 @@ impl AudioCaptureHandle {
     /// The capture runs on a dedicated thread. Audio chunks are sent through
     /// the internal channel; call `take_receiver()` to get the receiving end.
     pub fn start() -> anyhow::Result<Self> {
+        Self::start_with_level_tx(None)
+    }
+
+    /// Start capturing audio and optionally publish a normalized volume level.
+    pub fn start_with_level_tx(
+        level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<AudioChunk>();
         let stop_signal = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop_signal);
@@ -64,7 +71,7 @@ impl AudioCaptureHandle {
         let thread_handle = std::thread::Builder::new()
             .name("whisrs-audio".into())
             .spawn(move || {
-                run_capture(tx, stop_clone, init_tx);
+                run_capture(tx, stop_clone, init_tx, level_tx);
             })
             .context("failed to spawn audio capture thread")?;
 
@@ -130,8 +137,9 @@ fn run_capture(
     tx: mpsc::UnboundedSender<AudioChunk>,
     stop_signal: Arc<AtomicBool>,
     init_tx: std::sync::mpsc::Sender<anyhow::Result<()>>,
+    level_tx: Option<tokio::sync::watch::Sender<f32>>,
 ) {
-    let result = setup_and_run(tx, stop_signal, &init_tx);
+    let result = setup_and_run(tx, stop_signal, &init_tx, level_tx);
     if let Err(e) = result {
         // If init_tx hasn't been used yet, send the error.
         init_tx.send(Err(e)).ok();
@@ -142,6 +150,7 @@ fn setup_and_run(
     tx: mpsc::UnboundedSender<AudioChunk>,
     stop_signal: Arc<AtomicBool>,
     init_tx: &std::sync::mpsc::Sender<anyhow::Result<()>>,
+    level_tx: Option<tokio::sync::watch::Sender<f32>>,
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     let device = host
@@ -185,10 +194,14 @@ fn setup_and_run(
         error!("audio stream error: {err}");
     };
 
+    let callback_level_tx = level_tx.clone();
     let stream = device
         .build_input_stream(
             &config,
             move |data: &[i16], _info: &cpal::InputCallbackInfo| {
+                if let Some(level_tx) = &callback_level_tx {
+                    let _ = level_tx.send(audio_level(data));
+                }
                 if tx.send(data.to_vec()).is_err() {
                     // Channel closed — capture is stopping.
                 }
@@ -210,9 +223,31 @@ fn setup_and_run(
     }
 
     debug!("audio capture stopping");
+    if let Some(level_tx) = &level_tx {
+        let _ = level_tx.send(0.0);
+    }
     drop(stream);
 
     Ok(())
+}
+
+fn audio_level(data: &[i16]) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+
+    let sum_squares: f32 = data
+        .iter()
+        .map(|sample| {
+            let normalized = *sample as f32 / i16::MAX as f32;
+            normalized * normalized
+        })
+        .sum();
+    let rms = (sum_squares / data.len() as f32).sqrt();
+
+    // Map RMS to a perceptual 0–1 range.  A sqrt curve gives quiet speech
+    // visible movement while keeping loud speech below saturation.
+    (rms * 100.0).sqrt().clamp(0.0, 1.0)
 }
 
 /// Encode raw PCM samples (16kHz, mono, i16) to a WAV byte buffer.

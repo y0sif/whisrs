@@ -71,6 +71,8 @@ struct DaemonContext {
     notify: bool,
     /// Broadcast channel for state changes (consumed by system tray).
     state_tx: tokio::sync::watch::Sender<State>,
+    /// Normalized microphone level for speech-reactive overlays.
+    overlay_level_tx: Option<tokio::sync::watch::Sender<f32>>,
 }
 
 /// Try to connect to an existing socket.
@@ -536,22 +538,31 @@ async fn main() -> Result<()> {
         std::any::type_name_of_val(&*window_tracker)
     );
 
-    // State broadcast channel — consumed by system tray.
+    // State broadcast channel — consumed by system tray and overlay.
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
+    let (overlay_level_tx, overlay_level_rx) = tokio::sync::watch::channel(0.0_f32);
 
     let tray_enabled = config.general.tray;
+    let overlay_enabled = config.general.overlay;
     let context = Arc::new(DaemonContext {
         config,
         window_tracker,
         transcription_backend: backend,
         notify,
         state_tx,
+        overlay_level_tx: overlay_enabled.then_some(overlay_level_tx),
     });
 
     // Start system tray if enabled.
     // Spawned as a background task so retries don't block the IPC server.
     if tray_enabled {
-        tokio::spawn(whisrs::tray::spawn_tray(state_rx));
+        tokio::spawn(whisrs::tray::spawn_tray(state_rx.clone()));
+    }
+
+    // Start bottom recording overlay if enabled.
+    // Spawned as a background task so desktop integration failures do not stop the daemon.
+    if overlay_enabled {
+        tokio::spawn(whisrs::overlay::spawn_overlay(state_rx, overlay_level_rx));
     }
 
     let sock_path = socket_path();
@@ -691,19 +702,20 @@ async fn handle_toggle(
             };
 
             // Start recording.
-            let mut capture = match AudioCaptureHandle::start() {
-                Ok(c) => c,
-                Err(e) => {
-                    let msg = format!("{e}");
-                    let friendly = if msg.contains("no default audio input device") {
-                        format_no_microphone_error()
-                    } else {
-                        format!("Failed to start audio capture: {e}")
-                    };
-                    error!("{friendly}");
-                    return Response::Error { message: friendly };
-                }
-            };
+            let mut capture =
+                match AudioCaptureHandle::start_with_level_tx(context.overlay_level_tx.clone()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        let friendly = if msg.contains("no default audio input device") {
+                            format_no_microphone_error()
+                        } else {
+                            format!("Failed to start audio capture: {e}")
+                        };
+                        error!("{friendly}");
+                        return Response::Error { message: friendly };
+                    }
+                };
 
             // For streaming backends: start the streaming pipeline immediately.
             // Audio flows in real-time from microphone → API → text at cursor.
@@ -810,6 +822,9 @@ async fn handle_toggle(
                     info!("stopped recording, transitioning to transcribing");
                     // Broadcast transcribing state for tray.
                     let _ = context.state_tx.send(State::Transcribing);
+                    if let Some(level_tx) = &context.overlay_level_tx {
+                        let _ = level_tx.send(0.0);
+                    }
                     if context.config.general.audio_feedback {
                         feedback::play_stop(context.config.general.audio_feedback_volume);
                     }
@@ -851,6 +866,9 @@ async fn handle_toggle(
                         Ok(new_state) => {
                             // Broadcast idle state for tray.
                             let _ = context.state_tx.send(new_state);
+                            if let Some(level_tx) = &context.overlay_level_tx {
+                                let _ = level_tx.send(0.0);
+                            }
                             match result {
                                 Ok(text) => {
                                     info!("transcription complete: {} chars", text.len());
@@ -1432,14 +1450,15 @@ async fn command_mode_start(
         feedback::play_start(context.config.general.audio_feedback_volume);
     }
 
-    let mut capture = match AudioCaptureHandle::start() {
-        Ok(c) => c,
-        Err(e) => {
-            return Response::Error {
-                message: format!("failed to start audio capture: {e}"),
-            };
-        }
-    };
+    let mut capture =
+        match AudioCaptureHandle::start_with_level_tx(context.overlay_level_tx.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("failed to start audio capture: {e}"),
+                };
+            }
+        };
 
     let audio_rx = capture.take_receiver();
 
@@ -1657,6 +1676,9 @@ async fn command_mode_background(
     let mut ds = daemon_state.lock().await;
     let _ = ds.state_machine.transition(Action::TranscriptionDone);
     let _ = context.state_tx.send(ds.state_machine.state());
+    if let Some(level_tx) = &context.overlay_level_tx {
+        let _ = level_tx.send(0.0);
+    }
 }
 
 /// Simulate a key combo (e.g. Ctrl+C, Ctrl+V) via a temporary uinput device.
@@ -1869,6 +1891,9 @@ async fn handle_cancel(
                 task.abort();
             }
             ds.recording_window_id = None;
+            if let Some(level_tx) = &context.overlay_level_tx {
+                let _ = level_tx.send(0.0);
+            }
             info!("cancelled recording");
             if context.notify {
                 send_notification("whisrs", "Recording cancelled");

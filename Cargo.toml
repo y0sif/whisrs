@@ -23,9 +23,10 @@ name = "whisrsd"
 path = "src/daemon/main.rs"
 
 [features]
-default = ["local-whisper", "tray"]
+default = ["local-whisper", "tray", "overlay"]
 local-whisper = ["dep:whisper-rs"]
 tray = ["dep:ksni"]
+overlay = ["dep:smithay-client-toolkit", "dep:wayland-client"]
 
 [dependencies]
 anyhow = "1"
@@ -61,6 +62,14 @@ zbus = "5"
 
 [dependencies.ksni]
 version = "0.3"
+optional = true
+
+[dependencies.smithay-client-toolkit]
+version = "0.19"
+optional = true
+
+[dependencies.wayland-client]
+version = "0.31"
 optional = true
 
 [dependencies.whisper-rs]

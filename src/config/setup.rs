@@ -130,6 +130,7 @@ pub fn run_setup() -> Result<()> {
             audio_feedback_volume: 0.5,
             vocabulary: Vec::new(),
             tray: true,
+            overlay: false,
         },
         audio: AudioConfig {
             device: "default".to_string(),

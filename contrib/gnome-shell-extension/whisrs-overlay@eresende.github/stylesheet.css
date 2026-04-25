@@ -1,0 +1,61 @@
+.whisrs-overlay {
+  width: 260px;
+  height: 62px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  background-color: rgba(18, 22, 28, 0.91);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.34);
+  transition-duration: 120ms;
+}
+
+.whisrs-overlay-hidden {
+  opacity: 0;
+}
+
+.whisrs-overlay-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background-color: #ef4444;
+}
+
+.whisrs-overlay-recording .whisrs-overlay-dot {
+  background-color: #ef4444;
+  box-shadow: 0 0 0 6px rgba(239, 68, 68, 0.16);
+}
+
+.whisrs-overlay-transcribing .whisrs-overlay-dot {
+  background-color: #f59e0b;
+  box-shadow: 0 0 0 6px rgba(245, 158, 11, 0.16);
+}
+
+.whisrs-overlay-bars {
+  height: 32px;
+  width: 66px;
+  spacing: 5px;
+  align-items: center;
+}
+
+.whisrs-overlay-bar {
+  width: 5px;
+  border-radius: 999px;
+  background-color: #ef4444;
+  height: 8px;
+  min-height: 8px;
+  max-height: 34px;
+}
+
+.whisrs-overlay-recording .whisrs-overlay-bar {
+  background-color: #ef4444;
+}
+
+.whisrs-overlay-transcribing .whisrs-overlay-bar {
+  background-color: #f59e0b;
+}
+
+.whisrs-overlay-label {
+  color: #f5f5f5;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
