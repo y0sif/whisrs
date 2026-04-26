@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use super::clipboard::ClipboardOps;
 use super::keymap::XkbKeymap;
-use super::{ClipboardHandler, KeyInjector};
+use super::{ClipboardHandler, KeyInjector, KeyTap};
 
 /// Delay after creating the virtual device to let the kernel register it.
 const DEVICE_SETTLE_DELAY: Duration = Duration::from_millis(200);
@@ -66,38 +66,39 @@ impl UinputKeyboard {
         })
     }
 
-    /// Press and release a single key, optionally with Shift held.
-    fn tap_key(&mut self, keycode: u16, shift: bool) -> anyhow::Result<()> {
-        let key = Key::new(keycode);
+    fn set_modifier(&mut self, modifier: Key, pressed: bool) -> anyhow::Result<()> {
+        let value = if pressed { 1 } else { 0 };
+        self.device
+            .emit(&[InputEvent::new(EventType::KEY, modifier.code(), value)])?;
+        thread::sleep(self.key_delay);
+        Ok(())
+    }
 
-        if shift {
-            // Press Shift
-            self.device.emit(&[InputEvent::new(
-                EventType::KEY,
-                Key::KEY_LEFTSHIFT.code(),
-                1,
-            )])?;
-            thread::sleep(self.key_delay);
+    /// Press and release a single key, with Shift and/or AltGr held as needed.
+    ///
+    /// AltGr is `KEY_RIGHTALT`. Both modifiers can be held together for
+    /// level-3 chars on layouts like `us:intl` (e.g. Shift+AltGr+something
+    /// for less common accented forms).
+    fn tap_key(&mut self, tap: &KeyTap) -> anyhow::Result<()> {
+        if tap.shift {
+            self.set_modifier(Key::KEY_LEFTSHIFT, true)?;
+        }
+        if tap.altgr {
+            self.set_modifier(Key::KEY_RIGHTALT, true)?;
         }
 
-        // Press key
         self.device
-            .emit(&[InputEvent::new(EventType::KEY, key.code(), 1)])?;
+            .emit(&[InputEvent::new(EventType::KEY, tap.keycode, 1)])?;
+        thread::sleep(self.key_delay);
+        self.device
+            .emit(&[InputEvent::new(EventType::KEY, tap.keycode, 0)])?;
         thread::sleep(self.key_delay);
 
-        // Release key
-        self.device
-            .emit(&[InputEvent::new(EventType::KEY, key.code(), 0)])?;
-        thread::sleep(self.key_delay);
-
-        if shift {
-            // Release Shift
-            self.device.emit(&[InputEvent::new(
-                EventType::KEY,
-                Key::KEY_LEFTSHIFT.code(),
-                0,
-            )])?;
-            thread::sleep(self.key_delay);
+        if tap.altgr {
+            self.set_modifier(Key::KEY_RIGHTALT, false)?;
+        }
+        if tap.shift {
+            self.set_modifier(Key::KEY_LEFTSHIFT, false)?;
         }
 
         Ok(())
@@ -127,26 +128,14 @@ impl UinputKeyboard {
 
     /// Inject Ctrl+V to paste from clipboard.
     fn inject_ctrl_v(&mut self) -> anyhow::Result<()> {
-        // Press Ctrl
-        self.device
-            .emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 1)])?;
-        thread::sleep(self.key_delay);
-
-        // Press V
+        self.set_modifier(Key::KEY_LEFTCTRL, true)?;
         self.device
             .emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 1)])?;
         thread::sleep(self.key_delay);
-
-        // Release V
         self.device
             .emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 0)])?;
         thread::sleep(self.key_delay);
-
-        // Release Ctrl
-        self.device
-            .emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 0)])?;
-        thread::sleep(self.key_delay);
-
+        self.set_modifier(Key::KEY_LEFTCTRL, false)?;
         Ok(())
     }
 }
@@ -166,7 +155,14 @@ impl KeyInjector for UinputKeyboard {
                     self.paste_text(&paste_buf)?;
                     paste_buf.clear();
                 }
-                self.tap_key(mapping.keycode, mapping.shift)?;
+                self.tap_key(&mapping.main)?;
+                if let Some(follow) = mapping.follow.as_ref() {
+                    // Dead-key + follow trick: the main tap is a dead key,
+                    // the follow tap is either Space (for literal accents
+                    // like `'`) or a base letter (for accented chars like
+                    // `ã` = dead_tilde + a).
+                    self.tap_key(follow)?;
+                }
             } else {
                 // Character not in keymap — accumulate for clipboard paste.
                 paste_buf.push(ch);
@@ -185,7 +181,11 @@ impl KeyInjector for UinputKeyboard {
         self.release_all_modifiers()?;
 
         for _ in 0..count {
-            self.tap_key(Key::KEY_BACKSPACE.code(), false)?;
+            self.tap_key(&KeyTap {
+                keycode: Key::KEY_BACKSPACE.code(),
+                shift: false,
+                altgr: false,
+            })?;
         }
 
         Ok(())
