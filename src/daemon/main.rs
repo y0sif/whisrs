@@ -112,6 +112,7 @@ fn load_config() -> (Config, Option<String>) {
                         Config {
                             general: Default::default(),
                             audio: Default::default(),
+                            input: Default::default(),
                             deepgram: None,
                             groq: None,
                             openai: None,
@@ -135,6 +136,7 @@ fn load_config() -> (Config, Option<String>) {
                     Config {
                         general: Default::default(),
                         audio: Default::default(),
+                        input: Default::default(),
                         deepgram: None,
                         groq: None,
                         openai: None,
@@ -158,6 +160,7 @@ fn load_config() -> (Config, Option<String>) {
         Config {
             general: Default::default(),
             audio: Default::default(),
+            input: Default::default(),
             deepgram: None,
             groq: None,
             openai: None,
@@ -744,6 +747,8 @@ async fn handle_toggle(
                 let pipeline_backend_name = context.config.general.backend.clone();
                 let pipeline_language = context.config.general.language.clone();
                 let pipeline_state_tx = context.state_tx.clone();
+                let pipeline_key_delay =
+                    std::time::Duration::from_millis(context.config.input.key_delay_ms);
 
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
@@ -762,6 +767,7 @@ async fn handle_toggle(
                         pipeline_backend_name,
                         pipeline_language,
                         pipeline_state_tx,
+                        pipeline_key_delay,
                     )
                     .await
                 });
@@ -920,6 +926,7 @@ async fn run_streaming_pipeline(
     backend_name: String,
     language: String,
     state_tx: tokio::sync::watch::Sender<State>,
+    key_delay: std::time::Duration,
 ) -> Result<String> {
     let pipeline_start = std::time::Instant::now();
     let (audio_tx, backend_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(256);
@@ -992,7 +999,8 @@ async fn run_streaming_pipeline(
 
             info!("typing: {:?}", text_to_type);
             if let Err(e) =
-                tokio::task::spawn_blocking(move || type_text_at_cursor(&text_to_type)).await
+                tokio::task::spawn_blocking(move || type_text_at_cursor(&text_to_type, key_delay))
+                    .await
             {
                 warn!("failed to type text: {e}");
             }
@@ -1197,7 +1205,10 @@ async fn process_recording_batch(
 
     // Type the text at the cursor.
     let text_clone = text.clone();
-    if let Err(e) = tokio::task::spawn_blocking(move || type_text_at_cursor(&text_clone)).await? {
+    let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || type_text_at_cursor(&text_clone, key_delay)).await?
+    {
         warn!("failed to type text: {e}");
     }
 
@@ -1245,7 +1256,7 @@ fn format_api_error(err: &anyhow::Error) -> String {
 }
 
 /// Type text at the cursor using uinput (keyboard injection) or clipboard paste.
-fn type_text_at_cursor(text: &str) -> Result<()> {
+fn type_text_at_cursor(text: &str, key_delay: std::time::Duration) -> Result<()> {
     use whisrs::input::clipboard::ClipboardOps;
     use whisrs::input::keymap::XkbKeymap;
     use whisrs::input::uinput::UinputKeyboard;
@@ -1254,7 +1265,7 @@ fn type_text_at_cursor(text: &str) -> Result<()> {
     let detected_layout = whisrs::input::keymap::KeyboardLayout::detect();
     let keymap = XkbKeymap::from_layout(&detected_layout).context("failed to build XKB keymap")?;
     let clipboard = ClipboardOps::detect();
-    let mut keyboard = match UinputKeyboard::new(keymap, clipboard) {
+    let mut keyboard = match UinputKeyboard::new(keymap, clipboard, key_delay) {
         Ok(kb) => kb,
         Err(e) => {
             let msg = format!("{e:#}");

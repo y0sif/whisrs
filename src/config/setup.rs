@@ -13,8 +13,8 @@ use dialoguer::{Confirm, Input, Password, Select};
 
 use crate::llm::LlmConfig;
 use crate::{
-    AudioConfig, Config, DeepgramConfig, GeneralConfig, GroqConfig, LocalWhisperConfig,
-    OpenAiConfig,
+    AudioConfig, Config, DeepgramConfig, GeneralConfig, GroqConfig, InputConfig,
+    LocalWhisperConfig, OpenAiConfig,
 };
 
 // ANSI color codes.
@@ -134,6 +134,7 @@ pub fn run_setup() -> Result<()> {
         audio: AudioConfig {
             device: "default".to_string(),
         },
+        input: InputConfig::default(),
         deepgram: deepgram_config,
         groq: groq_config,
         openai: openai_config,

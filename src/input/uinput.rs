@@ -15,9 +15,6 @@ use super::clipboard::ClipboardOps;
 use super::keymap::XkbKeymap;
 use super::{ClipboardHandler, KeyInjector};
 
-/// Delay between individual key events to prevent dropped characters.
-const KEY_DELAY: Duration = Duration::from_millis(2);
-
 /// Delay after creating the virtual device to let the kernel register it.
 const DEVICE_SETTLE_DELAY: Duration = Duration::from_millis(200);
 
@@ -26,6 +23,7 @@ pub struct UinputKeyboard {
     device: evdev::uinput::VirtualDevice,
     keymap: XkbKeymap,
     clipboard: ClipboardOps,
+    key_delay: Duration,
 }
 
 impl UinputKeyboard {
@@ -33,7 +31,14 @@ impl UinputKeyboard {
     ///
     /// Requires write access to `/dev/uinput` (user must be in the `input`
     /// group or have the appropriate udev rule installed).
-    pub fn new(keymap: XkbKeymap, clipboard: ClipboardOps) -> anyhow::Result<Self> {
+    ///
+    /// `key_delay` is the inter-event delay. Raise it for TUIs that drop
+    /// characters in raw mode (e.g. Node/Ink-based apps like Claude Code).
+    pub fn new(
+        keymap: XkbKeymap,
+        clipboard: ClipboardOps,
+        key_delay: Duration,
+    ) -> anyhow::Result<Self> {
         // Register all key codes we might need.
         let mut keys = AttributeSet::<Key>::new();
         for code in 1..=247 {
@@ -57,6 +62,7 @@ impl UinputKeyboard {
             device,
             keymap,
             clipboard,
+            key_delay,
         })
     }
 
@@ -71,18 +77,18 @@ impl UinputKeyboard {
                 Key::KEY_LEFTSHIFT.code(),
                 1,
             )])?;
-            thread::sleep(KEY_DELAY);
+            thread::sleep(self.key_delay);
         }
 
         // Press key
         self.device
             .emit(&[InputEvent::new(EventType::KEY, key.code(), 1)])?;
-        thread::sleep(KEY_DELAY);
+        thread::sleep(self.key_delay);
 
         // Release key
         self.device
             .emit(&[InputEvent::new(EventType::KEY, key.code(), 0)])?;
-        thread::sleep(KEY_DELAY);
+        thread::sleep(self.key_delay);
 
         if shift {
             // Release Shift
@@ -91,7 +97,7 @@ impl UinputKeyboard {
                 Key::KEY_LEFTSHIFT.code(),
                 0,
             )])?;
-            thread::sleep(KEY_DELAY);
+            thread::sleep(self.key_delay);
         }
 
         Ok(())
@@ -114,7 +120,7 @@ impl UinputKeyboard {
             self.device
                 .emit(&[InputEvent::new(EventType::KEY, modifier.code(), 0)])?;
         }
-        thread::sleep(KEY_DELAY);
+        thread::sleep(self.key_delay);
 
         Ok(())
     }
@@ -124,22 +130,22 @@ impl UinputKeyboard {
         // Press Ctrl
         self.device
             .emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 1)])?;
-        thread::sleep(KEY_DELAY);
+        thread::sleep(self.key_delay);
 
         // Press V
         self.device
             .emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 1)])?;
-        thread::sleep(KEY_DELAY);
+        thread::sleep(self.key_delay);
 
         // Release V
         self.device
             .emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 0)])?;
-        thread::sleep(KEY_DELAY);
+        thread::sleep(self.key_delay);
 
         // Release Ctrl
         self.device
             .emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 0)])?;
-        thread::sleep(KEY_DELAY);
+        thread::sleep(self.key_delay);
 
         Ok(())
     }

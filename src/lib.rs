@@ -83,6 +83,8 @@ pub struct Config {
     #[serde(default)]
     pub audio: AudioConfig,
     #[serde(default)]
+    pub input: InputConfig,
+    #[serde(default)]
     pub deepgram: Option<DeepgramConfig>,
     #[serde(default)]
     pub groq: Option<GroqConfig>,
@@ -167,6 +169,24 @@ pub struct AudioConfig {
     pub device: String,
 }
 
+/// Keyboard injection (uinput) tuning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputConfig {
+    /// Delay between individual key events, in milliseconds. Raise this if
+    /// characters are dropped by TUIs that read stdin in raw mode (e.g.
+    /// Node/Ink-based apps like Claude Code).
+    #[serde(default = "default_key_delay_ms")]
+    pub key_delay_ms: u64,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            key_delay_ms: default_key_delay_ms(),
+        }
+    }
+}
+
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
@@ -228,6 +248,9 @@ fn default_device() -> String {
 }
 fn default_audio_feedback_volume() -> f32 {
     0.5
+}
+fn default_key_delay_ms() -> u64 {
+    2
 }
 fn default_deepgram_model() -> String {
     "nova-3".to_string()
@@ -634,6 +657,7 @@ mod tests {
                 ..Default::default()
             },
             audio: Default::default(),
+            input: Default::default(),
             deepgram: None,
             groq: None,
             openai: None,
@@ -657,6 +681,7 @@ mod tests {
                 ..Default::default()
             },
             audio: Default::default(),
+            input: Default::default(),
             deepgram: None,
             groq: None,
             openai: None,
@@ -678,6 +703,7 @@ mod tests {
                 ..Default::default()
             },
             audio: Default::default(),
+            input: Default::default(),
             deepgram: None,
             groq: Some(GroqConfig {
                 api_key: "test-key".to_string(),
@@ -703,6 +729,7 @@ mod tests {
                 ..Default::default()
             },
             audio: Default::default(),
+            input: Default::default(),
             deepgram: None,
             groq: Some(GroqConfig {
                 api_key: "test-key".to_string(),

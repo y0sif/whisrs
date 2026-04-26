@@ -175,6 +175,12 @@ tray = true                 # system tray icon (requires SNI host like waybar)
 [audio]
 device = "default"
 
+[input]
+# Inter-key delay for the virtual keyboard (uinput). Raise this if a TUI
+# drops characters while whisrs is typing — e.g. Node/Ink-based apps like
+# Claude Code in raw mode. Default: 2.
+key_delay_ms = 2
+
 [groq]
 api_key = "gsk_..."
 model = "whisper-large-v3-turbo"
