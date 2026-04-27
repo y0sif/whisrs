@@ -53,10 +53,10 @@ use crate::{OverlayConfig, State};
 
 const BOTTOM_MARGIN: i32 = 16;
 
-// Per-frame sleep matching the draw loop. ~24 ms ≈ 41 fps. Spawn animation
-// progress is wall-clock-driven (see `Overlay::spawn_t`), so this only
-// caps the redraw rate.
-const FRAME_MS: f32 = 24.0;
+// Per-frame sleep matching the draw loop. ~16 ms ≈ 60 fps for visibly
+// smoother motion. Spawn animation progress is wall-clock-driven (see
+// `Overlay::spawn_t`), so this only caps the redraw rate.
+const FRAME_MS: f32 = 16.0;
 
 // Spawn animation: the pill "draws out" from a 4-px sliver anchored at the
 // bottom of the surface up to its full configured height. Slight overshoot
@@ -76,15 +76,16 @@ const SPAWN_OVERSHOOT_C: f32 = 0.4;
 const BARS_GRACE_MS: f32 = 80.0;
 const BARS_FADE_MS: f32 = 80.0;
 
-// Bar layout. 5 bars × 4 px + 4 gaps × 3 px = 32 px wide, centered in the
-// pill. Max bar height = HEIGHT − 2·BAR_VPAD (e.g. 28 px on the default
-// 40 px pill). Bar height is purely level-driven — no per-bar phase
-// animation — so each bar stays anchored at the pill center and expands
-// symmetrically up and down with the audio amplitude, instead of
-// translating around frame-to-frame.
-const BAR_COUNT: u32 = 5;
-const BAR_W: f32 = 4.0;
-const BAR_GAP: f32 = 3.0;
+// Bar layout. 7 bars × 3 px + 6 gaps × 2 px = 33 px wide, centered in
+// the pill. More, thinner bars means motion reads as a continuous
+// equalizer ripple instead of a few chunky blocks. Max bar height =
+// HEIGHT − 2·BAR_VPAD (e.g. 28 px on the default 40 px pill). Bar height
+// is purely level-driven — no per-bar phase animation — so each bar
+// stays anchored at the pill center and expands symmetrically up and
+// down with the audio amplitude.
+const BAR_COUNT: u32 = 7;
+const BAR_W: f32 = 3.0;
+const BAR_GAP: f32 = 2.0;
 const BAR_PITCH: f32 = BAR_W + BAR_GAP;
 const BAR_BLOCK_W: f32 = BAR_COUNT as f32 * BAR_W + (BAR_COUNT - 1) as f32 * BAR_GAP;
 const BAR_BASELINE: f32 = 6.0;
@@ -378,6 +379,9 @@ fn run_overlay(
         spawn_in: false,
         frame: 0,
         level: 0.0,
+        level_target: 0.0,
+        level_velocity: 0.0,
+        last_update: Instant::now(),
         theme,
     };
 
@@ -416,7 +420,14 @@ struct Overlay {
     /// transitioning out. Determines easing direction and duration.
     spawn_in: bool,
     frame: u32,
+    /// Smoothed audio level driving bar heights. Advanced toward
+    /// `level_target` by a critically-damped spring stepped with the
+    /// real elapsed `dt` between calls — frame-rate-independent.
     level: f32,
+    level_target: f32,
+    level_velocity: f32,
+    /// Wall-clock instant of the previous spring step.
+    last_update: Instant,
     theme: Theme,
 }
 
@@ -462,20 +473,28 @@ impl Overlay {
                 self.spawn_started = Instant::now();
             }
         }
-        // Envelope follower: fast attack (track peaks instantly) + slow
-        // release (hold the loudness so the bars stay tall during speech
-        // instead of bouncing with every audio buffer's RMS variation).
-        // Without this the bars track raw RMS, which oscillates between
-        // 30 %–70 % several times per word and reads as "dots bouncing
-        // up and down" rather than "amplitude expanding".
+        // Drain incoming audio levels — keep only the latest as the
+        // spring target. The spring is stepped below using real elapsed
+        // `dt`, so it doesn't matter how many samples we drained.
         while let Ok(new) = self.level_rx.try_recv() {
-            let new = new.clamp(0.0, 1.0);
-            if new > self.level {
-                self.level = new;
-            } else {
-                // ~125 ms release at the typical 100 Hz audio callback rate.
-                self.level = self.level * 0.92 + new * 0.08;
-            }
+            self.level_target = new.clamp(0.0, 1.0);
+        }
+
+        // Critically-damped-ish spring on the displayed level. Stepped
+        // with wall-clock dt so the time constants are real-world ms,
+        // not "per dispatch tick". `STIFFNESS` and `DAMPING` are tuned
+        // to settle in ~150–200 ms with no perceptible overshoot — feels
+        // like the bars *track* the voice rather than chase it.
+        const STIFFNESS: f32 = 360.0;
+        const DAMPING: f32 = 32.0;
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_update).as_secs_f32().min(0.1);
+        self.last_update = now;
+        if dt > 0.0 {
+            let force = (self.level_target - self.level) * STIFFNESS;
+            let drag = self.level_velocity * DAMPING;
+            self.level_velocity += (force - drag) * dt;
+            self.level = (self.level + self.level_velocity * dt).clamp(0.0, 1.0);
         }
 
         // Once the despawn finishes, snap the renderer to Idle so the next
