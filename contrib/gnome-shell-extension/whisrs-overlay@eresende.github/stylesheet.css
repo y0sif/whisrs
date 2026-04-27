@@ -1,0 +1,66 @@
+/* Themes are matched by class:
+ *   .whisrs-theme-ember    — default amber "tally light"
+ *   .whisrs-theme-carbon   — monochrome terminal
+ *   .whisrs-theme-cyan     — cool electric blue
+ */
+
+.whisrs-overlay {
+  border-radius: 999px;
+  background-color: rgba(14, 14, 16, 0.92);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  transition-duration: 60ms;
+}
+
+.whisrs-overlay-hidden {
+  opacity: 0;
+}
+
+.whisrs-overlay-bars {
+  spacing: 2px;
+  align-items: center;
+}
+
+.whisrs-overlay-bar {
+  width: 3px;
+  border-radius: 1.5px;
+  background-color: #f0edf5;
+  height: 6px;
+  min-height: 6px;
+  max-height: 28px;
+}
+
+/* Ember (default) — amber recording, soft white transcribing. */
+.whisrs-theme-ember {
+  border: 1px solid rgba(249, 115, 22, 0.25);
+}
+.whisrs-theme-ember.whisrs-overlay-recording .whisrs-overlay-bar {
+  background-color: #f97316;
+  box-shadow: 0 0 4px rgba(249, 115, 22, 0.5);
+}
+.whisrs-theme-ember.whisrs-overlay-transcribing .whisrs-overlay-bar {
+  background-color: #f0edf5;
+}
+
+/* Carbon — monochrome. */
+.whisrs-theme-carbon {
+  border: 1px solid rgba(58, 58, 64, 0.5);
+}
+.whisrs-theme-carbon.whisrs-overlay-recording .whisrs-overlay-bar {
+  background-color: #f0edf5;
+}
+.whisrs-theme-carbon.whisrs-overlay-transcribing .whisrs-overlay-bar {
+  background-color: #9ca3af;
+}
+
+/* Cyan — electric blue. */
+.whisrs-theme-cyan {
+  border: 1px solid rgba(34, 211, 238, 0.25);
+  background-color: rgba(10, 15, 20, 0.92);
+}
+.whisrs-theme-cyan.whisrs-overlay-recording .whisrs-overlay-bar {
+  background-color: #22d3ee;
+  box-shadow: 0 0 4px rgba(34, 211, 238, 0.5);
+}
+.whisrs-theme-cyan.whisrs-overlay-transcribing .whisrs-overlay-bar {
+  background-color: #38bdf8;
+}

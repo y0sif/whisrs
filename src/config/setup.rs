@@ -114,6 +114,9 @@ pub fn run_setup() -> Result<()> {
     // 5. Extra options.
     let (remove_filler_words, audio_feedback) = configure_extras()?;
 
+    // 5b. Bottom recording overlay.
+    let (overlay, overlay_config) = configure_overlay();
+
     // 6. Command mode LLM (optional).
     let llm_config = configure_llm()?;
 
@@ -130,6 +133,7 @@ pub fn run_setup() -> Result<()> {
             audio_feedback_volume: 0.5,
             vocabulary: Vec::new(),
             tray: true,
+            overlay,
         },
         audio: AudioConfig {
             device: "default".to_string(),
@@ -143,6 +147,7 @@ pub fn run_setup() -> Result<()> {
         local_parakeet: None,
         llm: llm_config,
         hotkeys: None,
+        overlay: if overlay { overlay_config } else { None },
     };
 
     let config_path = write_config(&config)?;
@@ -1073,6 +1078,150 @@ fn configure_extras() -> Result<(bool, bool)> {
     }
 
     Ok((remove_fillers, audio_feedback))
+}
+
+/// Ask the user whether to enable the bottom recording overlay, and on GNOME
+/// offer to install the bundled Shell extension that renders it.
+fn configure_overlay() -> (bool, Option<crate::OverlayConfig>) {
+    println!("\n{BOLD}Recording overlay (optional)...{RESET}");
+    println!("  {DIM}A small audio meter at the bottom of the screen while recording.{RESET}");
+
+    let enable = Confirm::new()
+        .with_prompt("Enable the recording overlay?")
+        .default(false)
+        .interact()
+        .unwrap_or(false);
+
+    if !enable {
+        return (false, None);
+    }
+
+    let theme = pick_overlay_theme();
+
+    if detect_compositor().as_deref() == Some("gnome") {
+        offer_install_gnome_extension();
+    }
+
+    println!("  {GREEN}Overlay enabled (theme: {theme}){RESET}");
+    let cfg = crate::OverlayConfig {
+        theme,
+        ..crate::OverlayConfig::default()
+    };
+    (true, Some(cfg))
+}
+
+/// Theme picker for the overlay. Always returns a named theme — "custom" is
+/// left for power users to set in config.toml.
+fn pick_overlay_theme() -> String {
+    println!();
+    let selection = Select::new()
+        .with_prompt("Pick an overlay theme")
+        .items(&[
+            "Carbon  — monochrome, terminal-clean (recommended)",
+            "Ember   — warm amber \"tally light\"",
+            "Cyan    — electric blue, audio-equipment vibe",
+        ])
+        .default(0)
+        .interact()
+        .unwrap_or(0);
+
+    match selection {
+        1 => "ember".to_string(),
+        2 => "cyan".to_string(),
+        _ => "carbon".to_string(),
+    }
+}
+
+/// On GNOME, offer to copy the bundled Shell extension into the user's
+/// extensions directory and enable it. Falls back to printing manual
+/// instructions if anything fails (e.g. running from a `cargo install` build
+/// without the contrib/ tree).
+fn offer_install_gnome_extension() {
+    const UUID: &str = "whisrs-overlay@eresende.github";
+    let ext_src = find_contrib_file(&format!("gnome-shell-extension/{UUID}"));
+
+    let ext_target_root = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        .join("gnome-shell/extensions");
+    let ext_target = ext_target_root.join(UUID);
+
+    println!();
+    println!("  {DIM}GNOME does not support wlroots layer-shell. The bundled GNOME{RESET}");
+    println!("  {DIM}Shell extension renders the overlay inside the shell instead.{RESET}");
+
+    if ext_target.exists() {
+        println!(
+            "  {GREEN}Extension already installed at {}{RESET}",
+            ext_target.display()
+        );
+        return;
+    }
+
+    let choice = Select::new()
+        .with_prompt("Install the GNOME Shell extension now?")
+        .items(&["Yes — copy and enable", "No — I'll install it manually"])
+        .default(0)
+        .interact();
+
+    if !matches!(choice, Ok(0)) {
+        println!("  {DIM}Install manually with:{RESET}");
+        println!(
+            "    cp -r contrib/gnome-shell-extension/{UUID} ~/.local/share/gnome-shell/extensions/"
+        );
+        println!("    gnome-extensions enable {UUID}");
+        return;
+    }
+
+    let Some(src) = ext_src else {
+        println!(
+            "  {YELLOW}Extension source not found in contrib/ — install whisrs from a clone of{RESET}"
+        );
+        println!(
+            "  {YELLOW}https://github.com/y0sif/whisrs and re-run setup, or copy the extension{RESET}"
+        );
+        println!("  {YELLOW}directory manually as shown above.{RESET}");
+        return;
+    };
+
+    if let Err(e) = fs::create_dir_all(&ext_target_root) {
+        println!(
+            "  {RED}Failed to create {}: {e}{RESET}",
+            ext_target_root.display()
+        );
+        return;
+    }
+
+    let status = std::process::Command::new("cp")
+        .arg("-r")
+        .arg(&src)
+        .arg(&ext_target_root)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!(
+                "  {GREEN}Installed extension to {}{RESET}",
+                ext_target.display()
+            );
+        }
+        _ => {
+            println!("  {RED}Failed to copy extension files{RESET}");
+            return;
+        }
+    }
+
+    let status = std::process::Command::new("gnome-extensions")
+        .args(["enable", UUID])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("  {GREEN}Enabled GNOME Shell extension{RESET}");
+            println!("  {YELLOW}Log out and back in if it doesn't appear immediately.{RESET}");
+        }
+        _ => {
+            println!("  {YELLOW}Could not enable automatically. Run:{RESET}");
+            println!("    gnome-extensions enable {UUID}");
+        }
+    }
 }
 
 /// LLM provider choices for command mode.
