@@ -73,6 +73,27 @@ struct DaemonContext {
     state_tx: tokio::sync::watch::Sender<State>,
     /// Normalized microphone level for speech-reactive overlays.
     overlay_level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    /// `true` when the visual overlay is enabled. State-transition toasts
+    /// are suppressed in that case to avoid duplicate signaling — the
+    /// overlay already shows recording/transcribing state visually.
+    /// Error notifications still fire.
+    overlay_enabled: bool,
+}
+
+impl DaemonContext {
+    /// Should we surface a state/progress notification (not an error)?
+    /// Suppressed when the overlay is on so we don't double-signal the
+    /// same event.
+    fn notify_state(&self) -> bool {
+        self.notify && !self.overlay_enabled
+    }
+
+    /// Should we surface an error notification? Always yes when the user
+    /// has notifications enabled — errors are critical and the overlay
+    /// can't carry their detail.
+    fn notify_error(&self) -> bool {
+        self.notify
+    }
 }
 
 /// Try to connect to an existing socket.
@@ -555,6 +576,7 @@ async fn main() -> Result<()> {
         notify,
         state_tx,
         overlay_level_tx: overlay_enabled.then_some(overlay_level_tx),
+        overlay_enabled,
     });
 
     // Start system tray if enabled.
@@ -746,6 +768,7 @@ async fn handle_toggle(
                 let backend = Arc::clone(&context.transcription_backend);
                 let wid = window_id.clone();
                 let ctx_notify = context.notify;
+                let ctx_overlay = context.overlay_enabled;
                 let window_tracker_for_pipeline = Arc::clone(&context.window_tracker);
                 // Restore focus before starting the pipeline.
                 let wid_for_focus = wid.clone();
@@ -772,6 +795,7 @@ async fn handle_toggle(
                         config,
                         wid,
                         ctx_notify,
+                        ctx_overlay,
                         silence_timeout,
                         ds_ref,
                         window_tracker_for_pipeline,
@@ -808,7 +832,7 @@ async fn handle_toggle(
                     if context.config.general.audio_feedback {
                         feedback::play_start(context.config.general.audio_feedback_volume);
                     }
-                    if context.notify {
+                    if context.notify_state() {
                         send_notification("whisrs", "Recording...");
                     }
                     Response::Ok { state: new_state }
@@ -836,7 +860,7 @@ async fn handle_toggle(
                     if context.config.general.audio_feedback {
                         feedback::play_stop(context.config.general.audio_feedback_volume);
                     }
-                    if context.notify {
+                    if context.notify_state() {
                         send_notification("whisrs", "Transcribing...");
                     }
 
@@ -893,7 +917,7 @@ async fn handle_toggle(
                                             context.config.general.audio_feedback_volume,
                                         );
                                     }
-                                    if context.notify {
+                                    if context.notify_state() {
                                         let preview = truncate_preview(&text, 77);
                                         send_notification("whisrs", &format!("Done: {preview}"));
                                     }
@@ -901,7 +925,7 @@ async fn handle_toggle(
                                 }
                                 Err(e) => {
                                     error!("transcription failed: {e:#}");
-                                    if context.notify {
+                                    if context.notify_error() {
                                         send_notification(
                                             "whisrs",
                                             &format!("Transcription failed: {e}"),
@@ -936,6 +960,7 @@ async fn run_streaming_pipeline(
     config: TranscriptionConfig,
     window_id: Option<String>,
     notify: bool,
+    overlay_enabled: bool,
     silence_timeout_ms: u64,
     daemon_state: Arc<Mutex<DaemonState>>,
     window_tracker: Arc<dyn WindowTracker>,
@@ -947,6 +972,9 @@ async fn run_streaming_pipeline(
     language: String,
     state_tx: tokio::sync::watch::Sender<State>,
 ) -> Result<String> {
+    // State-progress toasts are noise when the overlay is on.
+    let notify_state = notify && !overlay_enabled;
+    let notify_error = notify;
     let pipeline_start = std::time::Instant::now();
     let (audio_tx, backend_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(256);
     let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -1034,7 +1062,7 @@ async fn run_streaming_pipeline(
         // Check for auto-stop.
         if auto_stop.feed(&chunk) {
             info!("silence auto-stop triggered after {silence_timeout_ms}ms");
-            if notify {
+            if notify_state {
                 send_notification("whisrs", "Auto-stopped (silence detected)");
             }
 
@@ -1090,9 +1118,10 @@ async fn run_streaming_pipeline(
     // Wait for typing to finish.
     let full_text = typing_task.await.unwrap_or_default();
 
-    // Notify user about streaming errors.
+    // Notify user about streaming errors. Errors always pop, even with the
+    // overlay on — the overlay can't carry the failure detail.
     if let Some(err_msg) = &stream_error {
-        if notify {
+        if notify_error {
             if full_text.is_empty() {
                 send_notification("whisrs", &format!("Transcription error: {err_msg}"));
             } else {
@@ -1118,7 +1147,7 @@ async fn run_streaming_pipeline(
         if audio_feedback {
             feedback::play_done(audio_feedback_volume);
         }
-        if notify {
+        if notify_state {
             let preview = truncate_preview(&full_text, 77);
             if !preview.is_empty() {
                 send_notification("whisrs", &format!("Done: {preview}"));
@@ -1174,7 +1203,7 @@ async fn process_recording_batch(
                         "audio saved for recovery: {} — retry with: whisrs transcribe-recovery",
                         path.display()
                     );
-                    if context.notify {
+                    if context.notify_error() {
                         send_notification(
                             "whisrs",
                             &format!(
@@ -1488,7 +1517,7 @@ async fn command_mode_start(
         });
     }
 
-    if context.notify {
+    if context.notify_state() {
         send_notification(
             "whisrs",
             "Command mode: speak your instruction... (press again to stop)",
@@ -1561,7 +1590,7 @@ async fn command_mode_background(
     }
 
     if all_samples.is_empty() {
-        if context.notify {
+        if context.notify_error() {
             send_notification("whisrs", "Command mode: no audio captured");
         }
         let mut ds = daemon_state.lock().await;
@@ -1569,7 +1598,7 @@ async fn command_mode_background(
         return;
     }
 
-    if context.notify {
+    if context.notify_state() {
         send_notification("whisrs", "Processing command...");
     }
 
@@ -1598,7 +1627,7 @@ async fn command_mode_background(
         Ok(text) => text,
         Err(e) => {
             error!("command mode: transcription failed: {e}");
-            if context.notify {
+            if context.notify_error() {
                 send_notification("whisrs", &format!("Command failed: {e}"));
             }
             let mut ds = daemon_state.lock().await;
@@ -1608,7 +1637,7 @@ async fn command_mode_background(
     };
 
     if instruction.is_empty() {
-        if context.notify {
+        if context.notify_error() {
             send_notification("whisrs", "Could not understand instruction — try again");
         }
         let mut ds = daemon_state.lock().await;
@@ -1624,7 +1653,7 @@ async fn command_mode_background(
             Ok(text) => text,
             Err(e) => {
                 error!("command mode: LLM failed: {e}");
-                if context.notify {
+                if context.notify_error() {
                     send_notification("whisrs", &format!("Command failed: {e}"));
                 }
                 let mut ds = daemon_state.lock().await;
@@ -1676,7 +1705,7 @@ async fn command_mode_background(
     if context.config.general.audio_feedback {
         feedback::play_done(context.config.general.audio_feedback_volume);
     }
-    if context.notify {
+    if context.notify_state() {
         send_notification("whisrs", &format!("Command applied: {instruction}"));
     }
 
@@ -1903,7 +1932,7 @@ async fn handle_cancel(
                 let _ = level_tx.send(0.0);
             }
             info!("cancelled recording");
-            if context.notify {
+            if context.notify_state() {
                 send_notification("whisrs", "Recording cancelled");
             }
             Response::Ok { state: new_state }

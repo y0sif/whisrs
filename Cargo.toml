@@ -26,7 +26,7 @@ path = "src/daemon/main.rs"
 default = ["local-whisper", "tray", "overlay"]
 local-whisper = ["dep:whisper-rs"]
 tray = ["dep:ksni"]
-overlay = ["dep:smithay-client-toolkit", "dep:wayland-client"]
+overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:tiny-skia"]
 
 [dependencies]
 anyhow = "1"
@@ -71,6 +71,12 @@ optional = true
 [dependencies.wayland-client]
 version = "0.31"
 optional = true
+
+[dependencies.tiny-skia]
+version = "0.12"
+optional = true
+default-features = false
+features = ["std", "simd"]
 
 [dependencies.whisper-rs]
 version = "0.16"

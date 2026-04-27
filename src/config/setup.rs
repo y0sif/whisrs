@@ -1116,8 +1116,8 @@ fn pick_overlay_theme() -> String {
     let selection = Select::new()
         .with_prompt("Pick an overlay theme")
         .items(&[
-            "Ember   — warm amber \"tally light\" (recommended)",
-            "Carbon  — monochrome, terminal-clean",
+            "Carbon  — monochrome, terminal-clean (recommended)",
+            "Ember   — warm amber \"tally light\"",
             "Cyan    — electric blue, audio-equipment vibe",
         ])
         .default(0)
@@ -1125,9 +1125,9 @@ fn pick_overlay_theme() -> String {
         .unwrap_or(0);
 
     match selection {
-        1 => "carbon".to_string(),
+        1 => "ember".to_string(),
         2 => "cyan".to_string(),
-        _ => "ember".to_string(),
+        _ => "carbon".to_string(),
     }
 }
 

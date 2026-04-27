@@ -150,7 +150,7 @@ pub struct OverlayColors {
 }
 
 fn default_overlay_theme() -> String {
-    "ember".to_string()
+    "carbon".to_string()
 }
 fn default_overlay_width() -> u32 {
     100

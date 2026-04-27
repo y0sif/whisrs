@@ -174,20 +174,22 @@ tray = true                 # system tray icon (requires SNI host like waybar)
 overlay = false             # bottom-screen recording overlay (Hyprland/Sway, GNOME extension)
 
 # Optional — controls overlay appearance when enabled.
-# Defaults to a 100×34 pill with the "ember" theme.
+# Defaults to a 100×34 pill with the "carbon" theme.
+# When the overlay is on, recording/transcribing toast notifications are
+# auto-suppressed (errors still pop) so the same event isn't double-signaled.
 [overlay]
-theme = "ember"             # "ember" (default) | "carbon" | "cyan" | "custom"
+theme = "carbon"            # "carbon" (default) | "ember" | "cyan" | "custom"
 width = 100                 # 90..=120 (clamped)
 height = 34                 # 28..=40 (clamped)
 
 # When theme = "custom", these override the named theme. Hex strings:
-# #RGB, #RRGGBB, or #RRGGBBAA. Anything missing falls back to ember.
+# #RGB, #RRGGBB, or #RRGGBBAA. Anything missing falls back to carbon.
 # [overlay.colors]
-# background   = "#0E0E10E5"
-# ring         = "#F9731640"
-# recording    = "#F97316"
-# transcribing = "#F0EDF5"
-# glow         = "#F97316"
+# background   = "#0E0E10EB"
+# ring         = "#3A3A4050"
+# recording    = "#F0EDF5"
+# transcribing = "#9CA3AF"
+# glow         = "#F0EDF5"
 
 [audio]
 device = "default"

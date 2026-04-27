@@ -19,6 +19,8 @@ enum OverlayError {
     DBus(#[from] zbus::Error),
     #[error("D-Bus signal error: {0}")]
     DBusSignal(#[from] zbus::fdo::Error),
+    #[error("tiny-skia pixmap allocation failed for {0}x{1}")]
+    Pixmap(u32, u32),
 }
 
 use smithay_client_toolkit::{
@@ -36,6 +38,9 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use tiny_skia::{
+    Color, FillRule, Paint, PathBuilder, Pixmap, PremultipliedColorU8, Rect, Stroke, Transform,
+};
 use tokio::sync::watch;
 use tracing::{info, warn};
 use wayland_client::{
@@ -47,16 +52,33 @@ use wayland_client::{
 use crate::{OverlayConfig, State};
 
 const BOTTOM_MARGIN: i32 = 16;
-const FADE_STEP: f32 = 0.55;
 
-// Bar layout — fixed for visual consistency. 18 bars × 2 px + 17 gaps × 2 px
-// = 70 px wide, centered in the pill (15 px side margin at default 100 px).
-const BAR_COUNT: u32 = 18;
-const BAR_W: u32 = 2;
-const BAR_GAP: u32 = 2;
-const BAR_PITCH: u32 = BAR_W + BAR_GAP;
-const BAR_BLOCK_W: u32 = BAR_COUNT * BAR_W + (BAR_COUNT - 1) * BAR_GAP;
-const BAR_BASELINE: i32 = 2;
+// Per-frame sleep matching the draw loop. ~24 ms ≈ 41 fps. The spawn
+// animation timings below are expressed in milliseconds and converted to
+// per-frame steps using this constant.
+const FRAME_MS: f32 = 24.0;
+
+// Spawn animation durations (ms). Slightly faster going away than coming in
+// — the asymmetry reads as "intentional dismiss" rather than a glitch.
+const SPAWN_IN_MS: f32 = 180.0;
+const SPAWN_OUT_MS: f32 = 140.0;
+
+// On appear, hold the bars at their baseline for this many milliseconds so
+// the audio reactivity doesn't fire while the pill is still flying in.
+const BARS_GRACE_MS: f32 = 80.0;
+
+// Slide-up offset (px) and scale start used by the spawn animation.
+const SPAWN_SLIDE_PX: f32 = 8.0;
+const SPAWN_SCALE_FROM: f32 = 0.92;
+
+// Bar layout — fixed for visual consistency.
+// 5 bars × 6 px + 4 gaps × 4 px = 46 px wide, centered in the pill.
+const BAR_COUNT: u32 = 5;
+const BAR_W: f32 = 6.0;
+const BAR_GAP: f32 = 4.0;
+const BAR_PITCH: f32 = BAR_W + BAR_GAP;
+const BAR_BLOCK_W: f32 = BAR_COUNT as f32 * BAR_W + (BAR_COUNT - 1) as f32 * BAR_GAP;
+const BAR_BASELINE: f32 = 3.0;
 
 /// Color palette for one overlay theme. Bytes are stored as `[A, R, G, B]`,
 /// matching the canvas pixel layout used by [`blend_pixel`].
@@ -326,11 +348,13 @@ fn run_overlay(
     layer.commit();
 
     let pool = SlotPool::new((width * height * 4) as usize, &shm)?;
+    let pixmap = Pixmap::new(width, height).ok_or(OverlayError::Pixmap(width, height))?;
     let mut overlay = Overlay {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         shm,
         pool,
+        pixmap,
         layer,
         state_rx,
         level_rx,
@@ -340,7 +364,9 @@ fn run_overlay(
         height,
         target_state: State::Idle,
         visible_state: State::Idle,
-        alpha: 0.0,
+        spawn_t: 0.0,
+        spawn_in: false,
+        bars_grace_ms: 0.0,
         frame: 0,
         level: 0.0,
         theme,
@@ -360,6 +386,7 @@ struct Overlay {
     output_state: OutputState,
     shm: Shm,
     pool: SlotPool,
+    pixmap: Pixmap,
     layer: LayerSurface,
     state_rx: mpsc::Receiver<State>,
     level_rx: mpsc::Receiver<f32>,
@@ -369,18 +396,52 @@ struct Overlay {
     height: u32,
     target_state: State,
     visible_state: State,
-    alpha: f32,
+    /// Progress through the current spawn animation, 0..=1. Hits 1 when the
+    /// animation finishes; reset to 0 each time `target_state` flips between
+    /// idle and active.
+    spawn_t: f32,
+    /// `true` while transitioning into a visible state, `false` while
+    /// transitioning out. Determines easing direction and duration.
+    spawn_in: bool,
+    /// Remaining grace period (ms) before bars unlock from baseline. Set
+    /// when the pill is appearing so audio reactivity doesn't fire while
+    /// the pill is still flying in.
+    bars_grace_ms: f32,
     frame: u32,
     level: f32,
     theme: Theme,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AnimState {
+    /// 0..=1
+    alpha: f32,
+    /// Vertical offset in px. Positive = drawn lower than rest position.
+    slide_y: f32,
+    /// Linear scale factor centered on the pill.
+    scale: f32,
+}
+
 impl Overlay {
     fn apply_state_updates(&mut self) {
         while let Ok(state) = self.state_rx.try_recv() {
+            let was_idle = self.target_state == State::Idle;
+            let now_idle = state == State::Idle;
             self.target_state = state;
-            if state != State::Idle {
+
+            if !now_idle {
                 self.visible_state = state;
+            }
+
+            // Trigger spawn / despawn only on the boundary between idle and
+            // visible. Recording ↔ Transcribing keeps the pill steady.
+            if was_idle && !now_idle {
+                self.spawn_in = true;
+                self.spawn_t = 0.0;
+                self.bars_grace_ms = BARS_GRACE_MS;
+            } else if !was_idle && now_idle {
+                self.spawn_in = false;
+                self.spawn_t = 0.0;
             }
         }
         while let Ok(level) = self.level_rx.try_recv() {
@@ -388,19 +449,47 @@ impl Overlay {
         }
         self.level = (self.level * 0.85).max(0.0);
 
-        let target_alpha = if self.target_state == State::Idle {
-            0.0
+        // Advance the spawn animation. `spawn_t` saturates at 1.0; at that
+        // point the pill is fully shown (`spawn_in = true`) or fully hidden
+        // (`spawn_in = false`).
+        let duration = if self.spawn_in {
+            SPAWN_IN_MS
         } else {
-            1.0
+            SPAWN_OUT_MS
         };
-        let diff = target_alpha - self.alpha;
-        if diff.abs() <= FADE_STEP {
-            self.alpha = target_alpha;
-        } else {
-            self.alpha += diff.signum() * FADE_STEP;
+        if self.spawn_t < 1.0 {
+            self.spawn_t = (self.spawn_t + FRAME_MS / duration).min(1.0);
         }
-        if self.alpha == 0.0 {
+
+        if !self.spawn_in && self.spawn_t >= 1.0 {
             self.visible_state = State::Idle;
+        }
+
+        if self.bars_grace_ms > 0.0 {
+            self.bars_grace_ms = (self.bars_grace_ms - FRAME_MS).max(0.0);
+        }
+    }
+
+    /// Compute the current animated transform: alpha for the cross-fade,
+    /// slide_y in px, and the centered scale factor. Uses `ease_out_cubic`
+    /// for the appear path so the pill decelerates into place, and
+    /// `ease_in_cubic` on the way out for a faster, more committed dismiss.
+    fn anim(&self) -> AnimState {
+        let t = self.spawn_t.clamp(0.0, 1.0);
+        if self.spawn_in {
+            let e = ease_out_cubic(t);
+            AnimState {
+                alpha: e,
+                slide_y: (1.0 - e) * SPAWN_SLIDE_PX,
+                scale: SPAWN_SCALE_FROM + e * (1.0 - SPAWN_SCALE_FROM),
+            }
+        } else {
+            let e = ease_in_cubic(t);
+            AnimState {
+                alpha: 1.0 - e,
+                slide_y: e * SPAWN_SLIDE_PX,
+                scale: 1.0 - e * 0.04,
+            }
         }
     }
 
@@ -411,6 +500,27 @@ impl Overlay {
         let height = self.height;
         let stride = width as i32 * 4;
 
+        // Render into our owned pixmap first so the buffer borrow on the
+        // shm pool doesn't conflict with the pixmap borrow.
+        let anim = self.anim();
+        // Audio reactivity is gated for the first few frames after
+        // appearing, so the bars don't react to speech while the pill is
+        // still flying in.
+        let level_gated = if self.bars_grace_ms > 0.0 {
+            0.0
+        } else {
+            self.level
+        };
+        draw_overlay(
+            &mut self.pixmap,
+            self.visible_state,
+            self.frame,
+            level_gated,
+            anim,
+            &self.theme,
+        );
+        self.frame = self.frame.wrapping_add(1);
+
         let Ok((buffer, canvas)) = self.pool.create_buffer(
             width as i32,
             height as i32,
@@ -420,18 +530,7 @@ impl Overlay {
             warn!("failed to allocate overlay buffer");
             return;
         };
-
-        draw_overlay(
-            canvas,
-            width,
-            height,
-            self.visible_state,
-            self.frame,
-            self.level,
-            self.alpha,
-            &self.theme,
-        );
-        self.frame = self.frame.wrapping_add(1);
+        copy_pixmap_to_argb8888(&self.pixmap, canvas);
 
         self.layer
             .wl_surface()
@@ -445,7 +544,32 @@ impl Overlay {
         }
         self.layer.commit();
 
-        std::thread::sleep(Duration::from_millis(24));
+        std::thread::sleep(Duration::from_millis(FRAME_MS as u64));
+    }
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    let inv = 1.0 - t;
+    1.0 - inv * inv * inv
+}
+
+fn ease_in_cubic(t: f32) -> f32 {
+    t * t * t
+}
+
+/// tiny-skia stores premultiplied RGBA bytes; the wl_shm Argb8888 format on
+/// little-endian systems is BGRA in memory. Convert by swapping R and B.
+/// Both formats use premultiplied alpha so no math is needed beyond the swap.
+fn copy_pixmap_to_argb8888(pixmap: &Pixmap, canvas: &mut [u8]) {
+    let src = pixmap.pixels();
+    debug_assert_eq!(src.len() * 4, canvas.len());
+    for (i, px) in src.iter().enumerate() {
+        let dst = &mut canvas[i * 4..i * 4 + 4];
+        let pre: PremultipliedColorU8 = *px;
+        dst[0] = pre.blue();
+        dst[1] = pre.green();
+        dst[2] = pre.red();
+        dst[3] = pre.alpha();
     }
 }
 
@@ -582,62 +706,106 @@ impl ProvidesRegistryState for Overlay {
     registry_handlers![OutputState];
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Render one frame of the overlay into `pixmap` using tiny-skia. The pixmap
+/// is the same size as the surface; coordinates are in pixels.
+///
+/// The animation transform (`anim`) controls a slide-up + scale + fade
+/// applied uniformly to the pill — implemented as a tiny-skia `Transform`
+/// so anti-aliasing handles the sub-pixel motion without us having to round.
 fn draw_overlay(
-    canvas: &mut [u8],
-    width: u32,
-    height: u32,
+    pixmap: &mut Pixmap,
     state: State,
     frame: u32,
     level: f32,
-    alpha: f32,
+    anim: AnimState,
     theme: &Theme,
 ) {
-    clear(canvas);
+    pixmap.fill(Color::TRANSPARENT);
 
-    if alpha <= 0.0 || state == State::Idle {
+    if anim.alpha <= 0.0 || state == State::Idle {
         return;
     }
 
-    let bg = scale_alpha(theme.bg, alpha);
-    let ring = scale_alpha(theme.ring, alpha);
+    let width = pixmap.width() as f32;
+    let height = pixmap.height() as f32;
+
+    // Translate-then-scale around the pill center so the spawn animation
+    // expands from the center, then translate again to apply the slide-up.
+    let cx = width / 2.0;
+    let cy = height / 2.0;
+    let transform = Transform::from_translate(cx, cy)
+        .pre_scale(anim.scale, anim.scale)
+        .post_translate(-cx, -cy)
+        .post_translate(0.0, anim.slide_y);
 
     // Pill background.
-    let radius = height / 2;
-    rounded_rect(canvas, width, height, 0, 0, width, height, radius, bg);
-    // 1 px inner ring: paint a slightly inset rect in the ring color, then
-    // re-paint the further-inset interior with the bg color. The result is a
-    // thin colored band hugging the pill edge.
-    if width > 4 && height > 4 {
-        rounded_rect(
-            canvas,
-            width,
-            height,
-            1,
-            1,
-            width - 2,
-            height - 2,
-            radius.saturating_sub(1).max(1),
-            ring,
-        );
-        rounded_rect(
-            canvas,
-            width,
-            height,
-            2,
-            2,
-            width - 4,
-            height - 4,
-            radius.saturating_sub(2).max(1),
-            bg,
-        );
+    let radius = height / 2.0;
+    let pill_path = build_round_rect(0.0, 0.0, width, height, radius);
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
+    paint.set_color(theme_color(theme.bg, anim.alpha));
+    if let Some(path) = &pill_path {
+        pixmap.fill_path(path, &paint, FillRule::Winding, transform, None);
+    }
+
+    // Hairline ring — drawn as a 1 px stroked pill.
+    let stroke = Stroke {
+        width: 1.0,
+        ..Default::default()
+    };
+    paint.set_color(theme_color(theme.ring, anim.alpha));
+    if let Some(path) = &pill_path {
+        pixmap.stroke_path(path, &paint, &stroke, transform, None);
     }
 
     match state {
-        State::Recording => draw_bars(canvas, width, height, theme, frame, level, alpha),
-        State::Transcribing => draw_sweep(canvas, width, height, theme, frame, alpha),
+        State::Recording => draw_bars(pixmap, theme, frame, level, anim, transform),
+        State::Transcribing => draw_sweep(pixmap, theme, frame, anim, transform),
         State::Idle => {}
     }
+}
+
+/// Build a centered rounded-rect path. tiny-skia doesn't ship a rounded-rect
+/// helper, so we approximate the corner arcs with cubic Bezier curves using
+/// the standard 0.5523 control-point offset.
+fn build_round_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    if r <= 0.0 {
+        return PathBuilder::from_rect(Rect::from_xywh(x, y, w, h)?).into();
+    }
+    // Standard "kappa" cubic-bezier circle approximation: 4·(√2 − 1)/3.
+    let k = 0.552_284_8_f32 * r;
+
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+/// Convert a `[A, R, G, B]` byte array to a tiny-skia non-premultiplied
+/// `Color`, with the alpha channel further scaled by `extra_alpha`.
+fn theme_color(bytes: [u8; 4], extra_alpha: f32) -> Color {
+    let a = (bytes[0] as f32 / 255.0 * extra_alpha.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    Color::from_rgba(
+        bytes[1] as f32 / 255.0,
+        bytes[2] as f32 / 255.0,
+        bytes[3] as f32 / 255.0,
+        a,
+    )
+    .unwrap_or(Color::TRANSPARENT)
 }
 
 /// Gaussian taper across the bar row — center bars draw at ~100 % of their
@@ -652,76 +820,25 @@ fn taper_factor(i: u32, count: u32) -> f32 {
     (-d * d).exp() // exp(-1) ≈ 0.367 at edges
 }
 
-fn clear(canvas: &mut [u8]) {
-    canvas.fill(0);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rounded_rect(
-    canvas: &mut [u8],
-    width: u32,
-    height: u32,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    radius: u32,
-    color: [u8; 4],
-) {
-    for py in y..y + h {
-        for px in x..x + w {
-            if inside_rounded_rect(px, py, x, y, w, h, radius) {
-                blend_pixel(canvas, width, height, px, py, color);
-            }
-        }
-    }
-}
-
-fn inside_rounded_rect(px: u32, py: u32, x: u32, y: u32, w: u32, h: u32, radius: u32) -> bool {
-    let right = x + w - 1;
-    let bottom = y + h - 1;
-    let cx = if px < x + radius {
-        x + radius
-    } else if px > right.saturating_sub(radius) {
-        right.saturating_sub(radius)
-    } else {
-        px
-    };
-    let cy = if py < y + radius {
-        y + radius
-    } else if py > bottom.saturating_sub(radius) {
-        bottom.saturating_sub(radius)
-    } else {
-        py
-    };
-    let dx = px as i32 - cx as i32;
-    let dy = py as i32 - cy as i32;
-    dx * dx + dy * dy <= (radius as i32) * (radius as i32)
-}
-
-fn scale_alpha(color: [u8; 4], alpha: f32) -> [u8; 4] {
-    let a = (color[0] as f32 * alpha.clamp(0.0, 1.0)).round() as u8;
-    [a, color[1], color[2], color[3]]
-}
-
 /// Vertical padding inside the pill (top + bottom). Bars never reach the
 /// pill edge.
-const BAR_VPAD: i32 = 5;
+const BAR_VPAD: f32 = 5.0;
 
-/// Recording bars: react to audio level, gaussian taper across the row, soft
-/// glow halo behind each bar at higher amplitudes.
+/// Recording bars: react to audio level, gaussian taper across the row,
+/// soft glow halo behind each bar at higher amplitudes.
 fn draw_bars(
-    canvas: &mut [u8],
-    width: u32,
-    height: u32,
+    pixmap: &mut Pixmap,
     theme: &Theme,
     frame: u32,
     level: f32,
-    alpha: f32,
+    anim: AnimState,
+    transform: Transform,
 ) {
-    let cy = (height / 2) as i32;
-    let max_h = (height as i32 - BAR_VPAD * 2).max(BAR_BASELINE + 2);
-    let bar_x_start = (width.saturating_sub(BAR_BLOCK_W)) / 2;
+    let width = pixmap.width() as f32;
+    let height = pixmap.height() as f32;
+    let cy = height / 2.0;
+    let max_h = (height - BAR_VPAD * 2.0).max(BAR_BASELINE + 2.0);
+    let bar_x_start = (width - BAR_BLOCK_W) / 2.0;
 
     for i in 0..BAR_COUNT {
         let taper = taper_factor(i, BAR_COUNT);
@@ -729,55 +846,61 @@ fn draw_bars(
         let phase = ((frame as f32 / 5.0) + i as f32 * 0.7).sin().abs();
         let effective = (level * taper).clamp(0.0, 1.0);
         let dynamic = effective * (0.7 + 0.3 * phase);
-        let h = (BAR_BASELINE as f32 + dynamic * (max_h - BAR_BASELINE) as f32)
-            .round()
-            .max(BAR_BASELINE as f32) as i32;
-        let bx = bar_x_start + i * BAR_PITCH;
-        let by = (cy - h / 2).max(0) as u32;
+        let h = (BAR_BASELINE + dynamic * (max_h - BAR_BASELINE)).max(BAR_BASELINE);
+        let bx = bar_x_start + i as f32 * BAR_PITCH;
+        let by = cy - h / 2.0;
 
         // Glow halo behind the bar — only visible above a small threshold.
         if effective > 0.02 {
             let glow_intensity = (effective * 0.9 + 0.1).clamp(0.0, 1.0);
-            let glow_a = (theme.glow[0] as f32 * glow_intensity * alpha).round() as u8;
-            let glow_color = [glow_a, theme.glow[1], theme.glow[2], theme.glow[3]];
-            let glow_w = BAR_W + 2;
-            let glow_h = (h + 2).max(BAR_BASELINE + 2) as u32;
-            let glow_x = bx.saturating_sub(1);
-            let glow_y = ((cy - glow_h as i32 / 2).max(0)) as u32;
-            rounded_rect(
-                canvas,
-                width,
-                height,
-                glow_x,
-                glow_y,
-                glow_w,
-                glow_h,
-                glow_w / 2,
-                glow_color,
-            );
+            let glow_a = theme.glow[0] as f32 / 255.0 * glow_intensity * anim.alpha;
+            let glow_color = Color::from_rgba(
+                theme.glow[1] as f32 / 255.0,
+                theme.glow[2] as f32 / 255.0,
+                theme.glow[3] as f32 / 255.0,
+                glow_a.clamp(0.0, 1.0),
+            )
+            .unwrap_or(Color::TRANSPARENT);
+            let glow_w = BAR_W + 2.0;
+            let glow_h = (h + 2.0).max(BAR_BASELINE + 2.0);
+            if let Some(path) =
+                build_round_rect(bx - 1.0, cy - glow_h / 2.0, glow_w, glow_h, glow_w / 2.0)
+            {
+                let mut paint = Paint {
+                    anti_alias: true,
+                    ..Default::default()
+                };
+                paint.set_color(glow_color);
+                pixmap.fill_path(&path, &paint, FillRule::Winding, transform, None);
+            }
         }
 
-        let bar_color = scale_alpha(theme.rec_bar, alpha);
-        rounded_rect(
-            canvas,
-            width,
-            height,
-            bx,
-            by,
-            BAR_W,
-            h as u32,
-            BAR_W / 2,
-            bar_color,
-        );
+        if let Some(path) = build_round_rect(bx, by, BAR_W, h, BAR_W / 2.0) {
+            let mut paint = Paint {
+                anti_alias: true,
+                ..Default::default()
+            };
+            paint.set_color(theme_color(theme.rec_bar, anim.alpha));
+            pixmap.fill_path(&path, &paint, FillRule::Winding, transform, None);
+        }
     }
 }
 
-/// Transcribing state: no audio level, just a center-out shimmer that travels
-/// across the bar row to communicate "working on it" without flat staticness.
-fn draw_sweep(canvas: &mut [u8], width: u32, height: u32, theme: &Theme, frame: u32, alpha: f32) {
-    let cy = (height / 2) as i32;
-    let max_h = (height as i32 - BAR_VPAD * 2).max(BAR_BASELINE + 2);
-    let bar_x_start = (width.saturating_sub(BAR_BLOCK_W)) / 2;
+/// Transcribing state: no audio level, just a center-out shimmer that
+/// travels across the bar row to communicate "working on it" without
+/// flat staticness.
+fn draw_sweep(
+    pixmap: &mut Pixmap,
+    theme: &Theme,
+    frame: u32,
+    anim: AnimState,
+    transform: Transform,
+) {
+    let width = pixmap.width() as f32;
+    let height = pixmap.height() as f32;
+    let cy = height / 2.0;
+    let max_h = (height - BAR_VPAD * 2.0).max(BAR_BASELINE + 2.0);
+    let bar_x_start = (width - BAR_BLOCK_W) / 2.0;
 
     // Sliding focus point that pings back and forth across the row.
     let cycle = (BAR_COUNT as i32) * 2 - 2;
@@ -794,40 +917,28 @@ fn draw_sweep(canvas: &mut [u8], width: u32, height: u32, theme: &Theme, frame: 
         // Bell-shaped intensity centered on `active`, ~3 bars wide.
         let intensity = (-dist * dist / 4.0).exp().max(0.15);
         let dynamic = intensity * taper;
-        let h = (BAR_BASELINE as f32 + dynamic * (max_h - BAR_BASELINE) as f32 * 0.85)
-            .round()
-            .max(BAR_BASELINE as f32) as i32;
-        let bx = bar_x_start + i * BAR_PITCH;
-        let by = (cy - h / 2).max(0) as u32;
+        let h = (BAR_BASELINE + dynamic * (max_h - BAR_BASELINE) * 0.85).max(BAR_BASELINE);
+        let bx = bar_x_start + i as f32 * BAR_PITCH;
+        let by = cy - h / 2.0;
 
-        let bar_a = (theme.trans_bar[0] as f32 * (0.3 + 0.7 * intensity) * alpha).round() as u8;
-        let bar_color = [
-            bar_a,
-            theme.trans_bar[1],
-            theme.trans_bar[2],
-            theme.trans_bar[3],
-        ];
-        rounded_rect(
-            canvas,
-            width,
-            height,
-            bx,
-            by,
-            BAR_W,
-            h as u32,
-            BAR_W / 2,
-            bar_color,
-        );
+        let bar_a = theme.trans_bar[0] as f32 / 255.0 * (0.3 + 0.7 * intensity) * anim.alpha;
+        let bar_color = Color::from_rgba(
+            theme.trans_bar[1] as f32 / 255.0,
+            theme.trans_bar[2] as f32 / 255.0,
+            theme.trans_bar[3] as f32 / 255.0,
+            bar_a.clamp(0.0, 1.0),
+        )
+        .unwrap_or(Color::TRANSPARENT);
+
+        if let Some(path) = build_round_rect(bx, by, BAR_W, h, BAR_W / 2.0) {
+            let mut paint = Paint {
+                anti_alias: true,
+                ..Default::default()
+            };
+            paint.set_color(bar_color);
+            pixmap.fill_path(&path, &paint, FillRule::Winding, transform, None);
+        }
     }
-}
-
-fn blend_pixel(canvas: &mut [u8], width: u32, height: u32, x: u32, y: u32, color: [u8; 4]) {
-    if x >= width || y >= height {
-        return;
-    }
-
-    let index = ((y * width + x) * 4) as usize;
-    canvas[index..index + 4].copy_from_slice(&u32::from_be_bytes(color).to_le_bytes());
 }
 
 #[cfg(test)]
@@ -837,28 +948,48 @@ mod tests {
     const W: u32 = 100;
     const H: u32 = 34;
 
+    fn fresh_pixmap() -> Pixmap {
+        Pixmap::new(W, H).unwrap()
+    }
+
+    fn shown() -> AnimState {
+        AnimState {
+            alpha: 1.0,
+            slide_y: 0.0,
+            scale: 1.0,
+        }
+    }
+    fn hidden() -> AnimState {
+        AnimState {
+            alpha: 0.0,
+            slide_y: 0.0,
+            scale: 1.0,
+        }
+    }
+
     #[test]
     fn idle_draw_is_transparent() {
-        let mut canvas = vec![1; (W * H * 4) as usize];
+        let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut canvas, W, H, State::Idle, 0, 0.0, 0.0, &t);
-        assert!(canvas.iter().all(|b| *b == 0));
+        draw_overlay(&mut pm, State::Idle, 0, 0.0, hidden(), &t);
+        assert!(pm.data().iter().all(|b| *b == 0));
     }
 
     #[test]
     fn faded_out_draw_is_transparent() {
-        let mut canvas = vec![1; (W * H * 4) as usize];
+        let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut canvas, W, H, State::Recording, 0, 1.0, 0.0, &t);
-        assert!(canvas.iter().all(|b| *b == 0));
+        draw_overlay(&mut pm, State::Recording, 0, 1.0, hidden(), &t);
+        assert!(pm.data().iter().all(|b| *b == 0));
     }
 
     #[test]
     fn active_draw_has_visible_pixels() {
-        let mut canvas = vec![0; (W * H * 4) as usize];
+        let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut canvas, W, H, State::Recording, 0, 1.0, 1.0, &t);
-        assert!(canvas.chunks_exact(4).any(|px| px[3] != 0));
+        draw_overlay(&mut pm, State::Recording, 0, 1.0, shown(), &t);
+        // tiny-skia stores premultiplied RGBA; alpha lives in the 4th byte.
+        assert!(pm.data().chunks_exact(4).any(|px| px[3] != 0));
     }
 
     #[test]
@@ -873,25 +1004,32 @@ mod tests {
     }
 
     #[test]
+    fn ease_curves_hit_endpoints() {
+        assert!((ease_out_cubic(0.0) - 0.0).abs() < 1e-6);
+        assert!((ease_out_cubic(1.0) - 1.0).abs() < 1e-6);
+        assert!((ease_in_cubic(0.0) - 0.0).abs() < 1e-6);
+        assert!((ease_in_cubic(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn silence_draws_minimal_baseline() {
-        // Recording bars in the ember theme are amber (#F97316); count
-        // amber-dominant pixels to measure bar area independent of the bg
-        // pill. ARGB on disk is little-endian B,G,R,A — each pixel is
-        // [B, G, R, A].
-        fn amber_pixels(canvas: &[u8]) -> usize {
-            canvas
-                .chunks_exact(4)
-                .filter(|px| px[2] > 220 && px[1] > 80 && px[1] < 180 && px[0] < 60)
+        // Recording bars in the ember theme are amber (#F97316). tiny-skia
+        // pixmap pixels are premultiplied RGBA in memory order [R, G, B, A];
+        // count amber-dominant pixels (high R, mid G, low B) to measure
+        // bar area independent of the bg pill.
+        fn amber_pixels(data: &[u8]) -> usize {
+            data.chunks_exact(4)
+                .filter(|px| px[0] > 200 && px[1] > 70 && px[1] < 180 && px[2] < 60)
                 .count()
         }
 
         let t = Theme::ember();
-        let mut quiet = vec![0; (W * H * 4) as usize];
-        let mut loud = vec![0; (W * H * 4) as usize];
-        draw_overlay(&mut quiet, W, H, State::Recording, 0, 0.0, 1.0, &t);
-        draw_overlay(&mut loud, W, H, State::Recording, 0, 1.0, 1.0, &t);
-        let count_quiet = amber_pixels(&quiet);
-        let count_loud = amber_pixels(&loud);
+        let mut quiet = fresh_pixmap();
+        let mut loud = fresh_pixmap();
+        draw_overlay(&mut quiet, State::Recording, 0, 0.0, shown(), &t);
+        draw_overlay(&mut loud, State::Recording, 0, 1.0, shown(), &t);
+        let count_quiet = amber_pixels(quiet.data());
+        let count_loud = amber_pixels(loud.data());
         assert!(
             count_loud > count_quiet,
             "loud audio should fill more bar area than silence (silence={count_quiet}, loud={count_loud})"

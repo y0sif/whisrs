@@ -15,19 +15,23 @@ const THEME_SIGNAL = 'ThemeChanged';
 const OVERLAY_WIDTH = 100;
 const OVERLAY_HEIGHT = 34;
 const BOTTOM_MARGIN = 16;
-const BAR_COUNT = 18;
-const BAR_W = 2;
-const BAR_GAP = 2;
-const BAR_BASELINE = 2;
+const BAR_COUNT = 5;
+const BAR_W = 6;
+const BAR_GAP = 4;
+const BAR_BASELINE = 3;
+
+const SPAWN_IN_MS = 180;
+const SPAWN_OUT_MS = 140;
+const BARS_GRACE_MS = 80;
 
 const KNOWN_THEMES = ['ember', 'carbon', 'cyan'];
 
 export default class WhisrsOverlayExtension extends Extension {
     enable() {
-        this._theme = 'ember';
+        this._theme = 'carbon';
 
         this._actor = new St.Widget({
-            style_class: 'whisrs-overlay whisrs-overlay-hidden whisrs-theme-ember',
+            style_class: 'whisrs-overlay whisrs-overlay-hidden whisrs-theme-carbon',
             layout_manager: new Clutter.FixedLayout(),
             reactive: false,
             visible: false,
@@ -112,7 +116,7 @@ export default class WhisrsOverlayExtension extends Extension {
 
     _setTheme(theme) {
         if (!this._actor) return;
-        const next = KNOWN_THEMES.includes(String(theme)) ? String(theme) : 'ember';
+        const next = KNOWN_THEMES.includes(String(theme)) ? String(theme) : 'carbon';
         if (next === this._theme) return;
         this._actor.remove_style_class_name(`whisrs-theme-${this._theme}`);
         this._actor.add_style_class_name(`whisrs-theme-${next}`);
@@ -123,6 +127,9 @@ export default class WhisrsOverlayExtension extends Extension {
         if (!this._actor) return;
 
         const normalized = String(state).toLowerCase();
+        const wasIdle = this._state === 'idle';
+        const nowIdle = normalized === 'idle';
+
         this._actor.remove_style_class_name('whisrs-overlay-recording');
         this._actor.remove_style_class_name('whisrs-overlay-transcribing');
         this._actor.remove_style_class_name('whisrs-overlay-hidden');
@@ -131,22 +138,60 @@ export default class WhisrsOverlayExtension extends Extension {
             this._state = 'recording';
             this._actor.add_style_class_name('whisrs-overlay-recording');
             this._actor.visible = true;
+            if (wasIdle) this._spawnIn();
             this._startAnimation();
         } else if (normalized === 'transcribing') {
             this._state = 'transcribing';
             this._actor.add_style_class_name('whisrs-overlay-transcribing');
             this._actor.visible = true;
+            if (wasIdle) this._spawnIn();
             this._startAnimation();
         } else {
             this._state = 'idle';
             this._actor.add_style_class_name('whisrs-overlay-hidden');
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 80, () => {
-                if (this._state === 'idle' && this._actor)
-                    this._actor.visible = false;
-                return GLib.SOURCE_REMOVE;
-            });
+            if (!wasIdle) this._spawnOut();
             this._stopAnimation();
         }
+
+        if (!wasIdle && !nowIdle) {
+            // Recording <-> Transcribing — keep the pill steady.
+        }
+    }
+
+    /// Slide the pill up + scale up + fade in. Clutter applies the easing.
+    _spawnIn() {
+        if (!this._actor) return;
+        // Snap to the start state without easing.
+        this._actor.set_easing_duration(0);
+        this._actor.translation_y = 8;
+        this._actor.set_pivot_point(0.5, 0.5);
+        this._actor.set_scale(0.92, 0.92);
+        this._actor.opacity = 0;
+
+        // Then animate to the rest state.
+        this._actor.set_easing_mode(Clutter.AnimationMode.EASE_OUT_CUBIC);
+        this._actor.set_easing_duration(SPAWN_IN_MS);
+        this._actor.translation_y = 0;
+        this._actor.set_scale(1.0, 1.0);
+        this._actor.opacity = 255;
+
+        // Hold bars at baseline while the pill is still flying in.
+        this._barsGraceUntil = Date.now() + BARS_GRACE_MS;
+    }
+
+    /// Reverse the spawn: slide down + slight shrink + fade out, then hide.
+    _spawnOut() {
+        if (!this._actor) return;
+        this._actor.set_easing_mode(Clutter.AnimationMode.EASE_IN_CUBIC);
+        this._actor.set_easing_duration(SPAWN_OUT_MS);
+        this._actor.translation_y = 8;
+        this._actor.set_scale(0.96, 0.96);
+        this._actor.opacity = 0;
+
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, SPAWN_OUT_MS + 20, () => {
+            if (this._state === 'idle' && this._actor) this._actor.visible = false;
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _position() {
@@ -201,7 +246,8 @@ export default class WhisrsOverlayExtension extends Extension {
         const maxH = OVERLAY_HEIGHT - 10;
 
         if (this._state === 'recording') {
-            const raw = Number.isFinite(this._level) ? this._level : 0;
+            const grace = this._barsGraceUntil && Date.now() < this._barsGraceUntil;
+            const raw = grace ? 0 : (Number.isFinite(this._level) ? this._level : 0);
             const level = Math.max(0, Math.min(1, raw));
             for (let i = 0; i < this._bars.length; i++) {
                 const taper = this._taper(i);
