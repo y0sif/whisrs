@@ -1,7 +1,7 @@
 //! Wayland layer-shell overlay shown while recording or transcribing.
 
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 enum OverlayError {
@@ -53,9 +53,9 @@ use crate::{OverlayConfig, State};
 
 const BOTTOM_MARGIN: i32 = 16;
 
-// Per-frame sleep matching the draw loop. ~24 ms ≈ 41 fps. The spawn
-// animation timings below are expressed in milliseconds and converted to
-// per-frame steps using this constant.
+// Per-frame sleep matching the draw loop. ~24 ms ≈ 41 fps. Spawn animation
+// progress is wall-clock-driven (see `Overlay::spawn_t`), so this only
+// caps the redraw rate.
 const FRAME_MS: f32 = 24.0;
 
 // Spawn animation: the pill "draws out" from a 4-px sliver anchored at the
@@ -87,7 +87,7 @@ const BAR_W: f32 = 4.0;
 const BAR_GAP: f32 = 3.0;
 const BAR_PITCH: f32 = BAR_W + BAR_GAP;
 const BAR_BLOCK_W: f32 = BAR_COUNT as f32 * BAR_W + (BAR_COUNT - 1) as f32 * BAR_GAP;
-const BAR_BASELINE: f32 = 3.0;
+const BAR_BASELINE: f32 = 6.0;
 const BAR_VPAD: f32 = 6.0;
 
 /// Color palette for one overlay theme. Bytes are stored as `[A, R, G, B]`,
@@ -374,9 +374,8 @@ fn run_overlay(
         height,
         target_state: State::Idle,
         visible_state: State::Idle,
-        spawn_t: 0.0,
+        spawn_started: Instant::now(),
         spawn_in: false,
-        bars_grace_ms: 0.0,
         frame: 0,
         level: 0.0,
         theme,
@@ -406,17 +405,16 @@ struct Overlay {
     height: u32,
     target_state: State,
     visible_state: State,
-    /// Progress through the current spawn animation, 0..=1. Hits 1 when the
-    /// animation finishes; reset to 0 each time `target_state` flips between
-    /// idle and active.
-    spawn_t: f32,
+    /// Wall-clock instant when the current spawn animation started. The
+    /// animation progress `t` is derived from `(now - spawn_started) /
+    /// duration`, so the timing is honest regardless of how often the
+    /// dispatch loop ticks. (Previously this was a per-call increment that
+    /// over-advanced when the loop fired multiple times per rendered
+    /// frame, making the animation visually pop instead of ease.)
+    spawn_started: Instant,
     /// `true` while transitioning into a visible state, `false` while
     /// transitioning out. Determines easing direction and duration.
     spawn_in: bool,
-    /// Remaining grace period (ms) before bars unlock from baseline. Set
-    /// when the pill is appearing so audio reactivity doesn't fire while
-    /// the pill is still flying in.
-    bars_grace_ms: f32,
     frame: u32,
     level: f32,
     theme: Theme,
@@ -458,11 +456,10 @@ impl Overlay {
             // visible. Recording ↔ Transcribing keeps the pill steady.
             if was_idle && !now_idle {
                 self.spawn_in = true;
-                self.spawn_t = 0.0;
-                self.bars_grace_ms = BARS_GRACE_MS;
+                self.spawn_started = Instant::now();
             } else if !was_idle && now_idle {
                 self.spawn_in = false;
-                self.spawn_t = 0.0;
+                self.spawn_started = Instant::now();
             }
         }
         // Envelope follower: fast attack (track peaks instantly) + slow
@@ -481,25 +478,22 @@ impl Overlay {
             }
         }
 
-        // Advance the spawn animation. `spawn_t` saturates at 1.0; at that
-        // point the pill is fully shown (`spawn_in = true`) or fully hidden
-        // (`spawn_in = false`).
+        // Once the despawn finishes, snap the renderer to Idle so the next
+        // appearance starts from a clean state.
+        if !self.spawn_in && self.spawn_t() >= 1.0 {
+            self.visible_state = State::Idle;
+        }
+    }
+
+    /// Wall-clock progress through the current spawn animation, 0..=1.
+    fn spawn_t(&self) -> f32 {
         let duration = if self.spawn_in {
             SPAWN_IN_MS
         } else {
             SPAWN_OUT_MS
         };
-        if self.spawn_t < 1.0 {
-            self.spawn_t = (self.spawn_t + FRAME_MS / duration).min(1.0);
-        }
-
-        if !self.spawn_in && self.spawn_t >= 1.0 {
-            self.visible_state = State::Idle;
-        }
-
-        if self.bars_grace_ms > 0.0 {
-            self.bars_grace_ms = (self.bars_grace_ms - FRAME_MS).max(0.0);
-        }
+        let elapsed_ms = self.spawn_started.elapsed().as_secs_f32() * 1000.0;
+        (elapsed_ms / duration).clamp(0.0, 1.0)
     }
 
     /// Compute the current animated transform.
@@ -520,7 +514,7 @@ impl Overlay {
     ///   `easeInCubic` accelerate — sharper exit than entry.
     /// - Pill and bar alpha fade in lockstep with the height collapse.
     fn anim(&self, full_height: f32) -> AnimState {
-        let t = self.spawn_t.clamp(0.0, 1.0);
+        let t = self.spawn_t();
         if self.spawn_in {
             let h_curve = ease_out_back(t, SPAWN_OVERSHOOT_C).clamp(0.0, 1.4);
             let pill_height = SPAWN_PILL_MIN_H + h_curve * (full_height - SPAWN_PILL_MIN_H);
@@ -824,7 +818,13 @@ fn draw_overlay(
         return;
     }
 
-    let pill_cy = pill_y + pill_h / 2.0;
+    // Bars sit at the *final* pill center — the surface midpoint — not at
+    // the currently animating pill_cy. While the pill is still growing
+    // upward from the bottom edge, this keeps the bars planted at one fixed
+    // y so they read as "expanding amplitude" rather than "translating up
+    // with the pill". The pill's bottom-anchored grow still happens
+    // visually; the bars just don't follow its center-of-mass.
+    let pill_cy = surface_h / 2.0;
     match state {
         State::Recording => draw_bars(pixmap, theme, level, anim, pill_cy),
         State::Transcribing => draw_sweep(pixmap, theme, frame, anim, pill_cy),
@@ -837,31 +837,44 @@ fn draw_overlay(
 /// approximation — so the silhouette has no minor inward dents at the
 /// corner joins, which were visible against colored rings.
 ///
-/// When `w == h` it falls back to a single circle. When `h <= 0` or
-/// `w <= 0` it returns `None`.
+/// Handles both orientations: horizontal pills (`w > h`) get end caps on
+/// the left/right; vertical pills (`h > w`) get end caps on the top/bottom.
+/// Square (or near-square) input collapses to a single circle. Returns
+/// `None` for non-positive dimensions.
 fn build_stadium(x: f32, y: f32, w: f32, h: f32) -> Option<tiny_skia::Path> {
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
-    let r = (h / 2.0).min(w / 2.0);
-    if (w - 2.0 * r).abs() < 0.01 {
-        // Square (or near-square) input ⇒ pure circle.
-        return PathBuilder::from_circle(x + r, y + r, r);
+    if w >= h {
+        let r = h / 2.0;
+        if (w - 2.0 * r).abs() < 0.01 {
+            return PathBuilder::from_circle(x + r, y + r, r);
+        }
+        let mut pb = PathBuilder::new();
+        if let Some(rect) = Rect::from_xywh(x + r, y, w - 2.0 * r, h) {
+            pb.push_rect(rect);
+        }
+        if let Some(cap) = PathBuilder::from_circle(x + r, y + r, r) {
+            pb.push_path(&cap);
+        }
+        if let Some(cap) = PathBuilder::from_circle(x + w - r, y + r, r) {
+            pb.push_path(&cap);
+        }
+        pb.finish()
+    } else {
+        let r = w / 2.0;
+        let mut pb = PathBuilder::new();
+        if let Some(rect) = Rect::from_xywh(x, y + r, w, h - 2.0 * r) {
+            pb.push_rect(rect);
+        }
+        if let Some(cap) = PathBuilder::from_circle(x + r, y + r, r) {
+            pb.push_path(&cap);
+        }
+        if let Some(cap) = PathBuilder::from_circle(x + r, y + h - r, r) {
+            pb.push_path(&cap);
+        }
+        pb.finish()
     }
-    let mut pb = PathBuilder::new();
-    // Middle rectangle, between the two end-cap centers.
-    if let Some(rect) = Rect::from_xywh(x + r, y, w - 2.0 * r, h) {
-        pb.push_rect(rect);
-    }
-    // Left end-cap.
-    if let Some(cap) = PathBuilder::from_circle(x + r, y + r, r) {
-        pb.push_path(&cap);
-    }
-    // Right end-cap.
-    if let Some(cap) = PathBuilder::from_circle(x + w - r, y + r, r) {
-        pb.push_path(&cap);
-    }
-    pb.finish()
 }
 
 /// Convert a `[A, R, G, B]` byte array to a tiny-skia non-premultiplied
