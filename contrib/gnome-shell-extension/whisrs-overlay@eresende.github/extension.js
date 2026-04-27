@@ -13,13 +13,13 @@ const LEVEL_SIGNAL = 'LevelChanged';
 const THEME_SIGNAL = 'ThemeChanged';
 
 const OVERLAY_WIDTH = 100;
-const OVERLAY_HEIGHT = 64;
+const OVERLAY_HEIGHT = 40;
 const BOTTOM_MARGIN = 16;
 const BAR_COUNT = 5;
-const BAR_W = 3;
+const BAR_W = 4;
 const BAR_GAP = 3;
-const BAR_BASELINE = 2;
-const BAR_VPAD = 7;
+const BAR_BASELINE = 3;
+const BAR_VPAD = 6;
 
 // Spawn animation: pill height morphs from a 4-px sliver to its full
 // height, anchored to the bottom of its placement. Slight overshoot via
@@ -276,13 +276,12 @@ export default class WhisrsOverlayExtension extends Extension {
             const grace = this._barsGraceUntil && Date.now() < this._barsGraceUntil;
             const raw = grace ? 0 : (Number.isFinite(this._level) ? this._level : 0);
             const level = Math.max(0, Math.min(1, raw));
+            // Pure level-driven: each bar stays anchored at the pill
+            // center and grows symmetrically. No per-frame phase wobble.
             for (let i = 0; i < this._bars.length; i++) {
                 const taper = this._taper(i);
-                const phase = Math.abs(Math.sin(this._frame / 5 + i * 0.7));
                 const effective = Math.min(1, Math.max(0, level * taper));
-                // Audio-led: 85% level, 15% phase animation.
-                const dynamic = effective * (0.85 + 0.15 * phase);
-                const h = Math.max(BAR_BASELINE, Math.round(BAR_BASELINE + dynamic * (maxH - BAR_BASELINE)));
+                const h = Math.max(BAR_BASELINE, Math.round(BAR_BASELINE + effective * (maxH - BAR_BASELINE)));
                 this._bars[i].set_height(h);
                 this._bars[i].opacity = 255;
             }

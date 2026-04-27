@@ -21,12 +21,12 @@
 }
 
 .whisrs-overlay-bar {
-  width: 3px;
+  width: 4px;
   border-radius: 2px;
   background-color: #f0edf5;
-  height: 2px;
-  min-height: 2px;
-  max-height: 50px;
+  height: 3px;
+  min-height: 3px;
+  max-height: 28px;
 }
 
 /* Ember (default) — amber recording, soft white transcribing. */

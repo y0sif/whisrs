@@ -76,16 +76,19 @@ const SPAWN_OVERSHOOT_C: f32 = 0.4;
 const BARS_GRACE_MS: f32 = 80.0;
 const BARS_FADE_MS: f32 = 80.0;
 
-// Bar layout — thin and dense. 5 bars × 3 px + 4 gaps × 3 px = 27 px wide,
-// centered in the pill. Max bar height = HEIGHT − 2·BAR_VPAD (e.g. 50 px on
-// the default 64 px pill), giving real vertical expansion under speech.
+// Bar layout. 5 bars × 4 px + 4 gaps × 3 px = 32 px wide, centered in the
+// pill. Max bar height = HEIGHT − 2·BAR_VPAD (e.g. 28 px on the default
+// 40 px pill). Bar height is purely level-driven — no per-bar phase
+// animation — so each bar stays anchored at the pill center and expands
+// symmetrically up and down with the audio amplitude, instead of
+// translating around frame-to-frame.
 const BAR_COUNT: u32 = 5;
-const BAR_W: f32 = 3.0;
+const BAR_W: f32 = 4.0;
 const BAR_GAP: f32 = 3.0;
 const BAR_PITCH: f32 = BAR_W + BAR_GAP;
 const BAR_BLOCK_W: f32 = BAR_COUNT as f32 * BAR_W + (BAR_COUNT - 1) as f32 * BAR_GAP;
-const BAR_BASELINE: f32 = 2.0;
-const BAR_VPAD: f32 = 7.0;
+const BAR_BASELINE: f32 = 3.0;
+const BAR_VPAD: f32 = 6.0;
 
 /// Color palette for one overlay theme. Bytes are stored as `[A, R, G, B]`,
 /// matching the canvas pixel layout used by [`blend_pixel`].
@@ -812,7 +815,7 @@ fn draw_overlay(
 
     let pill_cy = pill_y + pill_h / 2.0;
     match state {
-        State::Recording => draw_bars(pixmap, theme, frame, level, anim, pill_cy),
+        State::Recording => draw_bars(pixmap, theme, level, anim, pill_cy),
         State::Transcribing => draw_sweep(pixmap, theme, frame, anim, pill_cy),
         State::Idle => {}
     }
@@ -880,14 +883,7 @@ fn taper_factor(i: u32, count: u32) -> f32 {
 /// the dominant driver — only ~15 % of the bar height comes from the
 /// per-bar phase animation, so silence reads as actually quiet and loud
 /// speech reaches near the pill edge.
-fn draw_bars(
-    pixmap: &mut Pixmap,
-    theme: &Theme,
-    frame: u32,
-    level: f32,
-    anim: AnimState,
-    pill_cy: f32,
-) {
+fn draw_bars(pixmap: &mut Pixmap, theme: &Theme, level: f32, anim: AnimState, pill_cy: f32) {
     let surface_w = pixmap.width() as f32;
     // Track the *currently displayed* pill height so bars stay within the
     // pill while it's still growing during the spawn animation.
@@ -896,11 +892,13 @@ fn draw_bars(
 
     for i in 0..BAR_COUNT {
         let taper = taper_factor(i, BAR_COUNT);
-        // Audio-led: 85 % level + taper, only 15 % per-bar phase animation.
-        let phase = ((frame as f32 / 5.0) + i as f32 * 0.7).sin().abs();
+        // Pure level-driven height. Each bar's center is anchored to
+        // `pill_cy` and the bar grows symmetrically up and down. No
+        // per-bar phase animation — that creates the illusion of bars
+        // translating instead of expanding, which reads as "moving up
+        // and down" rather than "amplitude".
         let effective = (level * taper).clamp(0.0, 1.0);
-        let dynamic = effective * (0.85 + 0.15 * phase);
-        let h = (BAR_BASELINE + dynamic * (max_h - BAR_BASELINE)).max(BAR_BASELINE);
+        let h = (BAR_BASELINE + effective * (max_h - BAR_BASELINE)).max(BAR_BASELINE);
         let bx = bar_x_start + i as f32 * BAR_PITCH;
         let by = pill_cy - h / 2.0;
 
