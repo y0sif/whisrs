@@ -13,16 +13,22 @@ const LEVEL_SIGNAL = 'LevelChanged';
 const THEME_SIGNAL = 'ThemeChanged';
 
 const OVERLAY_WIDTH = 100;
-const OVERLAY_HEIGHT = 34;
+const OVERLAY_HEIGHT = 64;
 const BOTTOM_MARGIN = 16;
 const BAR_COUNT = 5;
-const BAR_W = 6;
-const BAR_GAP = 4;
-const BAR_BASELINE = 3;
+const BAR_W = 3;
+const BAR_GAP = 3;
+const BAR_BASELINE = 2;
+const BAR_VPAD = 7;
 
-const SPAWN_IN_MS = 180;
+// Spawn animation: pill height morphs from a 4-px sliver to its full
+// height, anchored to the bottom of its placement. Slight overshoot via
+// EASE_OUT_BACK for a "physical arrival" pop.
+const SPAWN_IN_MS = 220;
 const SPAWN_OUT_MS = 140;
+const SPAWN_PILL_MIN_H = 4;
 const BARS_GRACE_MS = 80;
+const BARS_FADE_MS = 80;
 
 const KNOWN_THEMES = ['ember', 'carbon', 'cyan'];
 
@@ -158,34 +164,55 @@ export default class WhisrsOverlayExtension extends Extension {
         }
     }
 
-    /// Slide the pill up + scale up + fade in. Clutter applies the easing.
+    /// Pill "draws out" from a thin line at the bottom edge, growing to
+    /// full height with EASE_OUT_BACK overshoot. Bars stay invisible
+    /// during the grow, then fade in once the pill is mostly settled.
     _spawnIn() {
         if (!this._actor) return;
-        // Snap to the start state without easing.
-        this._actor.set_easing_duration(0);
-        this._actor.translation_y = 8;
-        this._actor.set_pivot_point(0.5, 0.5);
-        this._actor.set_scale(0.92, 0.92);
-        this._actor.opacity = 0;
 
-        // Then animate to the rest state.
-        this._actor.set_easing_mode(Clutter.AnimationMode.EASE_OUT_CUBIC);
+        // Snap to the start state.
+        this._actor.set_easing_duration(0);
+        this._actor.set_pivot_point(0.5, 1.0); // bottom-center
+        this._actor.set_scale(1.0, SPAWN_PILL_MIN_H / OVERLAY_HEIGHT);
+        this._actor.opacity = 0;
+        if (this._barsBox) this._barsBox.opacity = 0;
+
+        // Then animate to full size — Clutter's EASE_OUT_BACK gives the
+        // small overshoot that makes the arrival feel physical.
+        this._actor.set_easing_mode(Clutter.AnimationMode.EASE_OUT_BACK);
         this._actor.set_easing_duration(SPAWN_IN_MS);
-        this._actor.translation_y = 0;
         this._actor.set_scale(1.0, 1.0);
+
+        this._actor.set_easing_mode(Clutter.AnimationMode.EASE_OUT_QUAD);
+        this._actor.set_easing_duration(Math.round(SPAWN_IN_MS * 0.64));
         this._actor.opacity = 255;
 
-        // Hold bars at baseline while the pill is still flying in.
-        this._barsGraceUntil = Date.now() + BARS_GRACE_MS;
+        // Bars: grace, then a quick fade-in once the pill is mostly grown.
+        this._barsGraceUntil = Date.now() + BARS_GRACE_MS + BARS_FADE_MS;
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, BARS_GRACE_MS, () => {
+            if (this._barsBox && this._state !== 'idle') {
+                this._barsBox.set_easing_mode(Clutter.AnimationMode.EASE_OUT_QUAD);
+                this._barsBox.set_easing_duration(BARS_FADE_MS);
+                this._barsBox.opacity = 255;
+            }
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
-    /// Reverse the spawn: slide down + slight shrink + fade out, then hide.
+    /// Reverse: collapse height back to a sliver while fading out, then
+    /// hide. EASE_IN_CUBIC for a sharp accelerated dismiss.
     _spawnOut() {
         if (!this._actor) return;
+
+        if (this._barsBox) {
+            this._barsBox.set_easing_mode(Clutter.AnimationMode.EASE_IN_QUAD);
+            this._barsBox.set_easing_duration(Math.round(SPAWN_OUT_MS * 0.7));
+            this._barsBox.opacity = 0;
+        }
+
         this._actor.set_easing_mode(Clutter.AnimationMode.EASE_IN_CUBIC);
         this._actor.set_easing_duration(SPAWN_OUT_MS);
-        this._actor.translation_y = 8;
-        this._actor.set_scale(0.96, 0.96);
+        this._actor.set_scale(1.0, SPAWN_PILL_MIN_H / OVERLAY_HEIGHT);
         this._actor.opacity = 0;
 
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, SPAWN_OUT_MS + 20, () => {
@@ -206,7 +233,7 @@ export default class WhisrsOverlayExtension extends Extension {
         const cy = Math.floor(OVERLAY_HEIGHT / 2);
         const barBlock = BAR_COUNT * BAR_W + (BAR_COUNT - 1) * BAR_GAP;
         const barsX = Math.floor((OVERLAY_WIDTH - barBlock) / 2);
-        const maxH = OVERLAY_HEIGHT - 10;
+        const maxH = OVERLAY_HEIGHT - BAR_VPAD * 2;
         if (this._barsBox) {
             this._barsBox.set_position(barsX, cy - Math.floor(maxH / 2));
             this._barsBox.set_size(barBlock, maxH);
@@ -253,7 +280,8 @@ export default class WhisrsOverlayExtension extends Extension {
                 const taper = this._taper(i);
                 const phase = Math.abs(Math.sin(this._frame / 5 + i * 0.7));
                 const effective = Math.min(1, Math.max(0, level * taper));
-                const dynamic = effective * (0.7 + 0.3 * phase);
+                // Audio-led: 85% level, 15% phase animation.
+                const dynamic = effective * (0.85 + 0.15 * phase);
                 const h = Math.max(BAR_BASELINE, Math.round(BAR_BASELINE + dynamic * (maxH - BAR_BASELINE)));
                 this._bars[i].set_height(h);
                 this._bars[i].opacity = 255;

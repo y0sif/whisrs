@@ -174,13 +174,13 @@ tray = true                 # system tray icon (requires SNI host like waybar)
 overlay = false             # bottom-screen recording overlay (Hyprland/Sway, GNOME extension)
 
 # Optional — controls overlay appearance when enabled.
-# Defaults to a 100×34 pill with the "carbon" theme.
+# Defaults to a 100×64 pill with the "carbon" theme.
 # When the overlay is on, recording/transcribing toast notifications are
 # auto-suppressed (errors still pop) so the same event isn't double-signaled.
 [overlay]
 theme = "carbon"            # "carbon" (default) | "ember" | "cyan" | "custom"
 width = 100                 # 90..=120 (clamped)
-height = 34                 # 28..=40 (clamped)
+height = 64                 # 56..=72 (clamped)
 
 # When theme = "custom", these override the named theme. Hex strings:
 # #RGB, #RRGGBB, or #RRGGBBAA. Anything missing falls back to carbon.

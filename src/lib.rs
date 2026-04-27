@@ -156,7 +156,7 @@ fn default_overlay_width() -> u32 {
     100
 }
 fn default_overlay_height() -> u32 {
-    34
+    64
 }
 
 impl Default for OverlayConfig {
@@ -177,7 +177,7 @@ impl OverlayConfig {
         self.width.clamp(90, 120)
     }
     pub fn clamped_height(&self) -> u32 {
-        self.height.clamp(28, 40)
+        self.height.clamp(56, 72)
     }
 }
 
