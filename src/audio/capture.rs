@@ -245,10 +245,11 @@ fn audio_level(data: &[i16]) -> f32 {
         .sum();
     let rms = (sum_squares / data.len() as f32).sqrt();
 
-    // Soft compressor: 1 - exp(-k*rms). Keeps quiet speech visible without
-    // saturating on the first loud syllable, so bars actually track speech
-    // dynamics instead of pegging at full deflection.
-    (1.0 - (-rms * 12.0).exp()).clamp(0.0, 1.0)
+    // Soft compressor: 1 - exp(-k*rms). k=18 maps typical speech RMS
+    // (~0.05–0.15) to the 0.6–0.95 range, so the visualizer reaches the
+    // top of its dynamic range during normal speech instead of hovering
+    // around 30 % deflection.
+    (1.0 - (-rms * 18.0).exp()).clamp(0.0, 1.0)
 }
 
 /// Encode raw PCM samples (16kHz, mono, i16) to a WAV byte buffer.

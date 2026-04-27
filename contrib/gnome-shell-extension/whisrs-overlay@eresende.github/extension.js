@@ -243,10 +243,17 @@ export default class WhisrsOverlayExtension extends Extension {
     _startAnimation() {
         if (this._animationId) return;
 
+        // Envelope follower: fast attack (instant peak tracking) + slow
+        // release. Holds the bar height during speech so the bars don't
+        // bounce with every audio buffer's RMS variation.
         this._animationId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 24, () => {
             this._frame++;
             const target = this._targetLevel ?? 0;
-            this._level = target > this._level ? target : Math.max(0, this._level * 0.85);
+            if (target > this._level) {
+                this._level = target;
+            } else {
+                this._level = this._level * 0.85 + target * 0.15;
+            }
             this._updateBars();
             return GLib.SOURCE_CONTINUE;
         });

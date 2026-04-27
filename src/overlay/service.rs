@@ -465,10 +465,21 @@ impl Overlay {
                 self.spawn_t = 0.0;
             }
         }
-        while let Ok(level) = self.level_rx.try_recv() {
-            self.level = level.clamp(0.0, 1.0);
+        // Envelope follower: fast attack (track peaks instantly) + slow
+        // release (hold the loudness so the bars stay tall during speech
+        // instead of bouncing with every audio buffer's RMS variation).
+        // Without this the bars track raw RMS, which oscillates between
+        // 30 %–70 % several times per word and reads as "dots bouncing
+        // up and down" rather than "amplitude expanding".
+        while let Ok(new) = self.level_rx.try_recv() {
+            let new = new.clamp(0.0, 1.0);
+            if new > self.level {
+                self.level = new;
+            } else {
+                // ~125 ms release at the typical 100 Hz audio callback rate.
+                self.level = self.level * 0.92 + new * 0.08;
+            }
         }
-        self.level = (self.level * 0.85).max(0.0);
 
         // Advance the spawn animation. `spawn_t` saturates at 1.0; at that
         // point the pill is fully shown (`spawn_in = true`) or fully hidden
