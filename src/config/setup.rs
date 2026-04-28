@@ -132,6 +132,7 @@ pub fn run_setup() -> Result<()> {
             audio_feedback,
             audio_feedback_volume: 0.5,
             vocabulary: Vec::new(),
+            prompt: None,
             tray: true,
             overlay,
         },

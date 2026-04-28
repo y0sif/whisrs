@@ -762,11 +762,7 @@ async fn handle_toggle(
                     }
                 };
 
-                let config = TranscriptionConfig {
-                    language: context.config.general.language.clone(),
-                    model: get_model_for_backend(&context.config),
-                    prompt: vocabulary_prompt(&context.config.general.vocabulary),
-                };
+                let config = build_transcription_config(&context.config);
 
                 let backend = Arc::clone(&context.transcription_backend);
                 let wid = window_id.clone();
@@ -1188,11 +1184,7 @@ async fn process_recording_batch(
     let wav_data = encode_wav(&samples)?;
     info!("encoded WAV: {} bytes", wav_data.len());
 
-    let config = TranscriptionConfig {
-        language: context.config.general.language.clone(),
-        model: get_model_for_backend(&context.config),
-        prompt: vocabulary_prompt(&context.config.general.vocabulary),
-    };
+    let config = build_transcription_config(&context.config);
 
     let text = match context
         .transcription_backend
@@ -1338,16 +1330,29 @@ fn type_text_at_cursor(text: &str, key_delay: std::time::Duration) -> Result<()>
     Ok(())
 }
 
-/// Build a prompt string from custom vocabulary words.
-///
-/// Returns `None` if vocabulary is empty. The prompt is formatted as a
-/// comma-separated list which nudges the transcription model to recognise
-/// these terms.
-fn vocabulary_prompt(vocabulary: &[String]) -> Option<String> {
-    if vocabulary.is_empty() {
+fn build_transcription_config(config: &Config) -> TranscriptionConfig {
+    TranscriptionConfig {
+        language: config.general.language.clone(),
+        model: get_model_for_backend(config),
+        prompt: transcription_prompt(config.general.prompt.as_deref(), &config.general.vocabulary),
+    }
+}
+
+/// Joins `prompt` and `vocabulary` with `". "`, prompt first. Blank prompts
+/// are treated as absent; returns `None` only when both inputs are empty so
+/// backends skip the hint entirely rather than receiving an empty string.
+fn transcription_prompt(prompt: Option<&str>, vocabulary: &[String]) -> Option<String> {
+    let prompt = prompt.map(str::trim).filter(|s| !s.is_empty());
+    let vocab = if vocabulary.is_empty() {
         None
     } else {
         Some(vocabulary.join(", "))
+    };
+    match (prompt, vocab) {
+        (Some(p), Some(v)) => Some(format!("{p}. {v}")),
+        (Some(p), None) => Some(p.to_string()),
+        (None, Some(v)) => Some(v),
+        (None, None) => None,
     }
 }
 
@@ -2038,5 +2043,51 @@ mod tests {
     #[test]
     fn truncate_empty() {
         assert_eq!(truncate_preview("", 77), "");
+    }
+
+    #[test]
+    fn transcription_prompt_neither() {
+        assert_eq!(transcription_prompt(None, &[]), None);
+    }
+
+    #[test]
+    fn transcription_prompt_vocab_only() {
+        let vocab = vec!["whisrs".to_string(), "Hyprland".to_string()];
+        assert_eq!(
+            transcription_prompt(None, &vocab),
+            Some("whisrs, Hyprland".to_string())
+        );
+    }
+
+    #[test]
+    fn transcription_prompt_prose_only() {
+        assert_eq!(
+            transcription_prompt(Some("Embedded Linux dictation."), &[]),
+            Some("Embedded Linux dictation.".to_string())
+        );
+    }
+
+    #[test]
+    fn transcription_prompt_both_combined_with_separator() {
+        let vocab = vec!["whisrs".to_string(), "Hyprland".to_string()];
+        assert_eq!(
+            transcription_prompt(Some("Embedded Linux dictation"), &vocab),
+            Some("Embedded Linux dictation. whisrs, Hyprland".to_string())
+        );
+    }
+
+    #[test]
+    fn transcription_prompt_blank_prose_treated_as_absent() {
+        let vocab = vec!["whisrs".to_string()];
+        // Whitespace-only prompt must not bleed an empty "" into the output.
+        assert_eq!(
+            transcription_prompt(Some("   \t\n  "), &vocab),
+            Some("whisrs".to_string())
+        );
+    }
+
+    #[test]
+    fn transcription_prompt_empty_string_with_empty_vocab_is_none() {
+        assert_eq!(transcription_prompt(Some(""), &[]), None);
     }
 }

@@ -9,11 +9,14 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioChunk;
 
 use super::{TranscriptionBackend, TranscriptionConfig};
+
+/// OpenAI Realtime API rejects transcription prompts longer than this.
+const PROMPT_MAX_CHARS: usize = 1024;
 
 /// OpenAI Realtime API transcription backend.
 pub struct OpenAIRealtimeBackend {
@@ -60,6 +63,8 @@ struct AudioTranscriptionConfig {
     model: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,7 +105,7 @@ struct ServerError {
 }
 
 impl SessionUpdate {
-    fn new(model: &str, language: &str) -> Self {
+    fn new(model: &str, language: &str, prompt: Option<&str>) -> Self {
         // Map "auto" to empty string (let the API auto-detect).
         let lang = if language == "auto" {
             String::new()
@@ -114,12 +119,29 @@ impl SessionUpdate {
                 input_audio_transcription: AudioTranscriptionConfig {
                     model: model.to_string(),
                     language: lang,
+                    prompt: clamp_prompt(prompt),
                 },
                 turn_detection: TurnDetectionConfig {
                     detection_type: "server_vad".to_string(),
                 },
             },
         }
+    }
+}
+
+/// Trim, drop empties, and truncate at the API's 1024-char limit on a char
+/// boundary. Truncation is logged so users notice their prompt was clipped.
+fn clamp_prompt(prompt: Option<&str>) -> Option<String> {
+    let trimmed = prompt.map(str::trim).filter(|s| !s.is_empty())?;
+    let char_count = trimmed.chars().count();
+    if char_count > PROMPT_MAX_CHARS {
+        warn!(
+            "openai-realtime: transcription prompt is {char_count} chars; \
+             truncating to API limit of {PROMPT_MAX_CHARS}"
+        );
+        Some(trimmed.chars().take(PROMPT_MAX_CHARS).collect())
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -243,7 +265,7 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
         info!("connected to OpenAI Realtime API");
 
         // Send transcription session configuration.
-        let session_update = SessionUpdate::new(model, &config.language);
+        let session_update = SessionUpdate::new(model, &config.language, config.prompt.as_deref());
         let session_json = serde_json::to_string(&session_update)?;
         ws_sink
             .send(tungstenite::Message::Text(session_json.into()))
@@ -376,7 +398,7 @@ mod tests {
 
     #[test]
     fn session_update_serialization() {
-        let msg = SessionUpdate::new("gpt-4o-mini-transcribe", "en");
+        let msg = SessionUpdate::new("gpt-4o-mini-transcribe", "en", None);
         let json = serde_json::to_value(&msg).unwrap();
 
         assert_eq!(json["type"], "transcription_session.update");
@@ -394,13 +416,66 @@ mod tests {
 
     #[test]
     fn session_update_auto_language_omitted() {
-        let msg = SessionUpdate::new("gpt-4o-transcribe", "auto");
+        let msg = SessionUpdate::new("gpt-4o-transcribe", "auto", None);
         let json = serde_json::to_value(&msg).unwrap();
 
         // "auto" should be converted to empty string and skipped
         assert!(json["session"]["input_audio_transcription"]
             .get("language")
             .is_none());
+    }
+
+    #[test]
+    fn session_update_with_prompt_includes_field() {
+        let msg = SessionUpdate::new("gpt-4o-transcribe", "en", Some("Yocto, Hyprland, NixOS"));
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            json["session"]["input_audio_transcription"]["prompt"],
+            "Yocto, Hyprland, NixOS"
+        );
+    }
+
+    #[test]
+    fn session_update_without_prompt_omits_field() {
+        let msg = SessionUpdate::new("gpt-4o-transcribe", "en", None);
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json["session"]["input_audio_transcription"]
+            .get("prompt")
+            .is_none());
+    }
+
+    #[test]
+    fn session_update_blank_prompt_omits_field() {
+        let msg = SessionUpdate::new("gpt-4o-transcribe", "en", Some("   \t\n  "));
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json["session"]["input_audio_transcription"]
+            .get("prompt")
+            .is_none());
+    }
+
+    #[test]
+    fn clamp_prompt_truncates_at_limit() {
+        let long = "a".repeat(PROMPT_MAX_CHARS + 500);
+        let clamped = clamp_prompt(Some(&long)).unwrap();
+        assert_eq!(clamped.chars().count(), PROMPT_MAX_CHARS);
+    }
+
+    #[test]
+    fn clamp_prompt_handles_multibyte_at_boundary() {
+        // Each "字" is 1 char but 3 bytes. If we sliced by bytes we'd panic
+        // mid-codepoint; truncating by chars must yield valid UTF-8.
+        let long: String = "字".repeat(PROMPT_MAX_CHARS + 50);
+        let clamped = clamp_prompt(Some(&long)).unwrap();
+        assert_eq!(clamped.chars().count(), PROMPT_MAX_CHARS);
+        // Must be valid UTF-8 (assertion implicit — String guarantees it,
+        // but the count would be wrong if we sliced mid-codepoint).
+        assert!(clamped.is_char_boundary(0));
+    }
+
+    #[test]
+    fn clamp_prompt_passes_through_short_prompt() {
+        let clamped = clamp_prompt(Some("  hello world  ")).unwrap();
+        assert_eq!(clamped, "hello world");
     }
 
     #[test]

@@ -240,6 +240,11 @@ pub struct GeneralConfig {
     /// Passed as a prompt hint to transcription backends to improve accuracy.
     #[serde(default)]
     pub vocabulary: Vec<String>,
+    /// Free-form prompt prepended to the vocabulary list before being sent to
+    /// the transcription backend. Use this for sentence-style context (style,
+    /// register, language hints) that doesn't fit a single-term vocabulary.
+    #[serde(default)]
+    pub prompt: Option<String>,
     /// Enable system tray icon.
     #[serde(default = "default_true")]
     pub tray: bool,
@@ -260,6 +265,7 @@ impl Default for GeneralConfig {
             audio_feedback: false,
             audio_feedback_volume: default_audio_feedback_volume(),
             vocabulary: Vec::new(),
+            prompt: None,
             tray: true,
             overlay: false,
         }
