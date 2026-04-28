@@ -405,12 +405,11 @@ fn build_reverse_map(keymap: &xkbcommon::xkb::Keymap) -> HashMap<char, KeyMappin
         };
         // Don't chain follow-taps (a base letter that is itself a
         // dead-key fallback would imply a 3-tap sequence we don't model).
+        // Tripwire: currently unreachable because Pass 1 only inserts
+        // follow=Space entries and `ACCENTED_VIA_DEAD_KEY` only contains
+        // alphabetic bases — no `'`/`"`/`~`/`` ` ``/`^` here. Stays as a
+        // guard for future table additions.
         if base_map.follow.is_some() {
-            debug!(
-                "dead-key synthesis pass 2: base letter '{base}' is itself a \
-                 follow-tap mapping (would require 3-tap chain); \
-                 '{ch}' will use clipboard fallback"
-            );
             continue;
         }
         map.insert(
