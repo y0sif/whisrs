@@ -6,9 +6,10 @@
 use std::collections::HashMap;
 use std::process::Command;
 
+use evdev::Key;
 use tracing::{debug, warn};
 
-use super::KeyMapping;
+use super::{KeyMapping, KeyTap};
 
 /// Detected keyboard layout (XKB layout name and optional variant).
 #[derive(Debug, Clone)]
@@ -185,9 +186,88 @@ impl XkbKeymap {
     }
 }
 
+// Dead-key keysyms re-exported from xkbcommon, named locally for legibility
+// in the synthesis tables below.
+use xkbcommon::xkb::keysyms::{
+    KEY_dead_acute as XK_DEAD_ACUTE, KEY_dead_cedilla as XK_DEAD_CEDILLA,
+    KEY_dead_circumflex as XK_DEAD_CIRCUMFLEX, KEY_dead_diaeresis as XK_DEAD_DIAERESIS,
+    KEY_dead_grave as XK_DEAD_GRAVE, KEY_dead_tilde as XK_DEAD_TILDE,
+};
+
+/// Accented characters synthesised as `dead_X + base_letter` when they
+/// are missing from the direct layout mapping. Covers the Romance-language
+/// set used in everyday Portuguese/Spanish/French/Italian; layouts that
+/// already expose these chars at level 2 (e.g. `us:intl` puts `á` directly
+/// on AltGr+a) skip the synthesis and use the direct entry.
+///
+/// This is intentionally a Romance-language seed list rather than an
+/// exhaustive dead-key table. Most other scripts (German `ß`, Polish ą/ę,
+/// Nordic å/ø/æ, Hungarian ő/ű) expose their accented characters directly
+/// at level 2 or 3 of their native layout, so the level 0..=3 walk above
+/// catches them and they don't need synthesis here. Extend per-script
+/// when a real-world layout falls through both routes.
+const ACCENTED_VIA_DEAD_KEY: &[(char, char, u32)] = &[
+    // tilde
+    ('ã', 'a', XK_DEAD_TILDE),
+    ('õ', 'o', XK_DEAD_TILDE),
+    ('ñ', 'n', XK_DEAD_TILDE),
+    ('Ã', 'A', XK_DEAD_TILDE),
+    ('Õ', 'O', XK_DEAD_TILDE),
+    ('Ñ', 'N', XK_DEAD_TILDE),
+    // acute
+    ('á', 'a', XK_DEAD_ACUTE),
+    ('é', 'e', XK_DEAD_ACUTE),
+    ('í', 'i', XK_DEAD_ACUTE),
+    ('ó', 'o', XK_DEAD_ACUTE),
+    ('ú', 'u', XK_DEAD_ACUTE),
+    ('ý', 'y', XK_DEAD_ACUTE),
+    ('Á', 'A', XK_DEAD_ACUTE),
+    ('É', 'E', XK_DEAD_ACUTE),
+    ('Í', 'I', XK_DEAD_ACUTE),
+    ('Ó', 'O', XK_DEAD_ACUTE),
+    ('Ú', 'U', XK_DEAD_ACUTE),
+    // circumflex
+    ('â', 'a', XK_DEAD_CIRCUMFLEX),
+    ('ê', 'e', XK_DEAD_CIRCUMFLEX),
+    ('î', 'i', XK_DEAD_CIRCUMFLEX),
+    ('ô', 'o', XK_DEAD_CIRCUMFLEX),
+    ('û', 'u', XK_DEAD_CIRCUMFLEX),
+    ('Â', 'A', XK_DEAD_CIRCUMFLEX),
+    ('Ê', 'E', XK_DEAD_CIRCUMFLEX),
+    ('Ô', 'O', XK_DEAD_CIRCUMFLEX),
+    // grave
+    ('à', 'a', XK_DEAD_GRAVE),
+    ('è', 'e', XK_DEAD_GRAVE),
+    ('ì', 'i', XK_DEAD_GRAVE),
+    ('ò', 'o', XK_DEAD_GRAVE),
+    ('ù', 'u', XK_DEAD_GRAVE),
+    ('À', 'A', XK_DEAD_GRAVE),
+    // diaeresis / umlaut
+    ('ä', 'a', XK_DEAD_DIAERESIS),
+    ('ë', 'e', XK_DEAD_DIAERESIS),
+    ('ï', 'i', XK_DEAD_DIAERESIS),
+    ('ö', 'o', XK_DEAD_DIAERESIS),
+    ('ü', 'u', XK_DEAD_DIAERESIS),
+    // cedilla
+    ('ç', 'c', XK_DEAD_CEDILLA),
+    ('Ç', 'C', XK_DEAD_CEDILLA),
+];
+
 /// Iterate all keycodes and shift levels to build a `char → KeyMapping` table.
+///
+/// Levels 0..=3 are all surfaced as direct mappings, with the appropriate
+/// modifiers (`shift`, `altgr`) recorded — so e.g. `ç` (level 2 on us:intl)
+/// becomes a single-keypress tap with AltGr held, no clipboard fallback.
+///
+/// In addition, dead-key keysyms encountered during the walk are recorded
+/// so a small fallback table can be appended for the literal punctuation
+/// they produce when followed by Space (`'`, `"`, `~`, `` ` ``, `^`).
 fn build_reverse_map(keymap: &xkbcommon::xkb::Keymap) -> HashMap<char, KeyMapping> {
-    let mut map = HashMap::new();
+    let mut map: HashMap<char, KeyMapping> = HashMap::new();
+    // Dead keysym → KeyTap so we know which physical key (and modifiers)
+    // produces each dead key on this layout. Used by the fallback passes
+    // below to synthesise dead+space and dead+base sequences.
+    let mut dead_keys: HashMap<u32, KeyTap> = HashMap::new();
 
     // xkb keycodes: iterate from min to max.
     let min = keymap.min_keycode().raw();
@@ -204,33 +284,141 @@ fn build_reverse_map(keymap: &xkbcommon::xkb::Keymap) -> HashMap<char, KeyMappin
             for level in 0..num_levels {
                 let syms = keymap.key_get_syms_by_level(keycode, layout, level);
 
+                // Skip levels we can't drive with the modifiers we have
+                // wired up (Shift, AltGr, Shift+AltGr — that covers 0..=3).
+                if level > 3 {
+                    continue;
+                }
+
+                // The evdev keycode is the XKB keycode minus 8
+                // (XKB adds 8 to Linux input keycodes). Linux KEY_MAX is
+                // ~767 so the cast is safe; saturate explicitly rather
+                // than truncating with `as` to keep the intent obvious.
+                let evdev_keycode: u16 =
+                    raw_keycode.saturating_sub(8).try_into().unwrap_or(u16::MAX);
+                let shift = level == 1 || level == 3;
+                let altgr = level == 2 || level == 3;
+
                 for &sym in syms {
+                    let raw = sym.raw();
+
+                    // Track dead keysyms separately — they have no Unicode
+                    // value of their own but we'll need their keycodes for
+                    // the fallback synthesis below.
+                    if matches!(
+                        raw,
+                        XK_DEAD_GRAVE
+                            | XK_DEAD_ACUTE
+                            | XK_DEAD_CIRCUMFLEX
+                            | XK_DEAD_TILDE
+                            | XK_DEAD_DIAERESIS
+                            | XK_DEAD_CEDILLA
+                    ) {
+                        dead_keys.entry(raw).or_insert(KeyTap {
+                            keycode: evdev_keycode,
+                            shift,
+                            altgr,
+                        });
+                        continue;
+                    }
+
                     let unicode = xkbcommon::xkb::keysym_to_utf32(sym);
                     if unicode == 0 {
                         continue;
                     }
 
                     if let Some(ch) = char::from_u32(unicode) {
-                        // The evdev keycode is the XKB keycode minus 8
-                        // (XKB adds 8 to Linux input keycodes).
-                        let evdev_keycode = raw_keycode.saturating_sub(8);
-
-                        // Level 0 = no modifiers, Level 1 = Shift
-                        let shift = level >= 1;
-
                         let mapping = KeyMapping {
-                            keycode: evdev_keycode as u16,
-                            shift,
+                            main: KeyTap {
+                                keycode: evdev_keycode,
+                                shift,
+                                altgr,
+                            },
+                            follow: None,
                         };
 
-                        // Prefer un-shifted mappings (level 0) over shifted ones.
-                        // Only insert if not already present (first-come wins,
-                        // and level 0 is iterated first).
+                        // Prefer the lowest-level mapping. Iteration is in
+                        // level order so first-come (level 0) wins.
                         map.entry(ch).or_insert(mapping);
                     }
                 }
             }
         }
+    }
+
+    // Pass 1: literal punctuation via `dead_X + Space`. Used on layouts
+    // where the apostrophe, tilde, etc. exist only as dead keys (us:intl).
+    for (ch, dead_sym) in [
+        ('\'', XK_DEAD_ACUTE),
+        ('"', XK_DEAD_DIAERESIS),
+        ('~', XK_DEAD_TILDE),
+        ('`', XK_DEAD_GRAVE),
+        ('^', XK_DEAD_CIRCUMFLEX),
+    ] {
+        if map.contains_key(&ch) {
+            continue;
+        }
+        if let Some(dk) = dead_keys.get(&dead_sym) {
+            map.insert(
+                ch,
+                KeyMapping {
+                    main: *dk,
+                    follow: Some(KeyTap {
+                        keycode: Key::KEY_SPACE.code(),
+                        shift: false,
+                        altgr: false,
+                    }),
+                },
+            );
+        } else {
+            // No dead key for this accent on the active layout — `ch` will
+            // fall through to clipboard paste, which is broken in terminal
+            // emulators. Logged so a future regression on a layout that
+            // used to support this is debuggable.
+            debug!(
+                "dead-key synthesis pass 1: no `{dead_sym:#x}` on this layout; \
+                 '{ch}' will use clipboard fallback"
+            );
+        }
+    }
+
+    // Pass 2: accented letters via `dead_X + base_letter`. Used for chars
+    // like `ã` on us:intl, where the layout doesn't expose them at any
+    // directly-reachable level but the dead key for the accent exists.
+    for &(ch, base, dead_sym) in ACCENTED_VIA_DEAD_KEY {
+        if map.contains_key(&ch) {
+            continue;
+        }
+        let Some(dk) = dead_keys.get(&dead_sym) else {
+            debug!(
+                "dead-key synthesis pass 2: no `{dead_sym:#x}` on this layout; \
+                 '{ch}' will use clipboard fallback"
+            );
+            continue;
+        };
+        let Some(base_map) = map.get(&base).copied() else {
+            debug!(
+                "dead-key synthesis pass 2: base letter '{base}' not in keymap; \
+                 '{ch}' will use clipboard fallback"
+            );
+            continue;
+        };
+        // Don't chain follow-taps (a base letter that is itself a
+        // dead-key fallback would imply a 3-tap sequence we don't model).
+        // Tripwire: currently unreachable because Pass 1 only inserts
+        // follow=Space entries and `ACCENTED_VIA_DEAD_KEY` only contains
+        // alphabetic bases — no `'`/`"`/`~`/`` ` ``/`^` here. Stays as a
+        // guard for future table additions.
+        if base_map.follow.is_some() {
+            continue;
+        }
+        map.insert(
+            ch,
+            KeyMapping {
+                main: *dk,
+                follow: Some(base_map.main),
+            },
+        );
     }
 
     map
@@ -262,7 +450,7 @@ mod tests {
         if let Ok(km) = km {
             if let Some(mapping) = km.lookup('A') {
                 assert!(
-                    mapping.shift,
+                    mapping.main.shift,
                     "uppercase 'A' should require shift on standard layouts"
                 );
             }
@@ -277,6 +465,7 @@ mod tests {
     }
 
     /// Helper: assert a character maps to the expected evdev keycode and shift state.
+    /// Asserts altgr is false (the common case for level-0/1 chars).
     fn assert_key(
         km: &XkbKeymap,
         ch: char,
@@ -284,17 +473,33 @@ mod tests {
         expected_shift: bool,
         label: &str,
     ) {
+        assert_key_full(km, ch, expected_keycode, expected_shift, false, label);
+    }
+
+    /// Helper: assert keycode + shift + altgr.
+    fn assert_key_full(
+        km: &XkbKeymap,
+        ch: char,
+        expected_keycode: u16,
+        expected_shift: bool,
+        expected_altgr: bool,
+        label: &str,
+    ) {
         let mapping = km
             .lookup(ch)
             .unwrap_or_else(|| panic!("'{ch}' should be in {label} keymap"));
         assert_eq!(
-            mapping.keycode, expected_keycode,
+            mapping.main.keycode, expected_keycode,
             "'{ch}' should be at evdev {expected_keycode} on {label}, got {}",
-            mapping.keycode
+            mapping.main.keycode
         );
         assert_eq!(
-            mapping.shift, expected_shift,
+            mapping.main.shift, expected_shift,
             "'{ch}' shift should be {expected_shift} on {label}"
+        );
+        assert_eq!(
+            mapping.main.altgr, expected_altgr,
+            "'{ch}' altgr should be {expected_altgr} on {label}"
         );
     }
 
@@ -432,9 +637,127 @@ mod tests {
         let km = XkbKeymap::from_layout(&layout("pl", "")).unwrap();
         assert_key(&km, 'a', 30, false, "Polish");
         assert_key(&km, 'z', 44, false, "Polish");
-        // Polish special chars via AltGr (mapped as shift in our model).
-        assert_key(&km, 'ą', 30, true, "Polish");
-        assert_key(&km, 'ę', 18, true, "Polish");
+        // Polish accented characters live at level 2 (AltGr) and now go
+        // through uinput directly, no clipboard fallback needed.
+        assert_key_full(&km, 'ą', 30, false, true, "Polish");
+        assert_key_full(&km, 'ę', 18, false, true, "Polish");
+    }
+
+    #[test]
+    fn us_intl_typeable_via_uinput() {
+        let km = XkbKeymap::from_layout(&KeyboardLayout {
+            layout: "us".to_string(),
+            variant: "intl".to_string(),
+        })
+        .unwrap();
+        // Every character that previously had to fall back to clipboard
+        // paste (and was therefore broken in terminals like Alacritty)
+        // must now have a direct uinput route — either as a level 2/3
+        // AltGr key, or via the dead-key + Space fallback table.
+        for ch in [
+            '\'', '"', '~', '`', '^', 'ç', 'á', 'é', 'í', 'ó', 'ú', 'ã', 'ñ',
+        ] {
+            assert!(
+                km.lookup(ch).is_some(),
+                "'{ch}' must be reachable via uinput on us:intl, got no mapping"
+            );
+        }
+    }
+
+    // --- Synthesis routing (locks in direct vs dead-key+follow paths) ---
+
+    /// Pass 1 (literal accent via `dead_X + Space`): for each of the
+    /// chars Pass 1 covers, on us:intl the char must be reachable, and
+    /// — if it ended up routed through synthesis rather than a direct
+    /// level mapping — the follow tap must be unmodified Space.
+    /// Whether any specific char is direct vs synthesized is layout-
+    /// dependent (us:intl puts some literal accents at level 2 directly),
+    /// but the invariant holds: synthesized routes always end with Space.
+    #[test]
+    fn us_intl_pass1_chars_synthesized_routes_end_with_space() {
+        let km = XkbKeymap::from_layout(&KeyboardLayout {
+            layout: "us".to_string(),
+            variant: "intl".to_string(),
+        })
+        .unwrap();
+        for ch in ['\'', '"', '~', '`', '^'] {
+            let mapping = km
+                .lookup(ch)
+                .unwrap_or_else(|| panic!("'{ch}' must be reachable on us:intl"));
+            if let Some(follow) = mapping.follow {
+                assert_eq!(
+                    follow.keycode,
+                    evdev::Key::KEY_SPACE.code(),
+                    "'{ch}' was synthesized; follow tap must be SPACE \
+                     (dead_X + space sequence)"
+                );
+                assert!(
+                    !follow.shift && !follow.altgr,
+                    "'{ch}' synthesis follow tap must be unmodified SPACE"
+                );
+            }
+        }
+    }
+
+    /// Pass 2 (accented letter via `dead_X + base_letter`): `ã` is not
+    /// reachable at any level on us:intl, so it must be synthesized as
+    /// `dead_tilde + a`. This is the deterministic test that proves
+    /// Pass 2 actually fires; the Polish/Spanish tests below cover the
+    /// no-overwrite invariant for layouts that do expose the char
+    /// directly.
+    #[test]
+    fn us_intl_tilde_letter_uses_dead_key_synthesis() {
+        let km = XkbKeymap::from_layout(&KeyboardLayout {
+            layout: "us".to_string(),
+            variant: "intl".to_string(),
+        })
+        .unwrap();
+        let a_main = km.lookup('a').expect("'a' must be in keymap").main;
+        let mapping = km.lookup('ã').expect("ã must be reachable on us:intl");
+        let follow = mapping.follow.expect(
+            "ã on us:intl must be synthesized via dead_tilde + a — \
+             the literal char is not at any level on this layout",
+        );
+        assert_eq!(
+            follow.keycode, a_main.keycode,
+            "ã follow tap must target the same evdev keycode as 'a' \
+             (dead_tilde + a sequence)"
+        );
+    }
+
+    /// Polish exposes `ą` at level 2 directly. The synthesis pass MUST
+    /// NOT overwrite that direct entry — `ą` must keep `follow=None`
+    /// and use AltGr, not synthesize via dead_ogonek + a.
+    #[test]
+    fn polish_accented_letter_is_direct_not_synthesized() {
+        let km = XkbKeymap::from_layout(&layout("pl", "")).unwrap();
+        let mapping = km.lookup('ą').expect("ą must be reachable on Polish");
+        assert!(
+            mapping.follow.is_none(),
+            "ą on Polish must be a direct AltGr tap, not synthesized — \
+             synthesis pass must not overwrite a direct mapping"
+        );
+        assert!(mapping.main.altgr, "ą on Polish must hold AltGr");
+    }
+
+    /// Spanish exposes `ñ` at level 0 directly (it's on the dedicated
+    /// `ñ` key). Even though `ñ` is in `ACCENTED_VIA_DEAD_KEY`, the
+    /// synthesis pass must skip it because the direct entry already
+    /// exists — locks in the cross-layout no-overwrite invariant.
+    #[test]
+    fn spanish_enye_is_direct_not_synthesized() {
+        let km = XkbKeymap::from_layout(&layout("es", "")).unwrap();
+        let mapping = km.lookup('ñ').expect("ñ must be reachable on Spanish");
+        assert!(
+            mapping.follow.is_none(),
+            "ñ on Spanish must be a direct level-0 tap, not synthesized — \
+             synthesis pass must not overwrite even when the char is in \
+             the synthesis table"
+        );
+        assert!(
+            !mapping.main.altgr && !mapping.main.shift,
+            "ñ on Spanish is on a dedicated key — no modifiers required"
+        );
     }
 
     // --- Alternative Latin layouts ---

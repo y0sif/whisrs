@@ -4,19 +4,25 @@ pub mod clipboard;
 pub mod keymap;
 pub mod uinput;
 
-/// A modifier key that may need to be held during key injection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Modifier {
-    Shift,
+/// A single keypress with optional Shift and/or AltGr modifiers.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyTap {
+    pub keycode: u16,
+    pub shift: bool,
+    pub altgr: bool,
 }
 
-/// Information needed to produce a character via a physical keypress.
+/// Information needed to produce a character at the cursor.
+///
+/// For most characters this is a single `KeyTap`. For characters that
+/// XKB only exposes as a dead-key combination (e.g. `ã` = `dead_tilde + a`
+/// on `us:intl`, or `'` = `dead_acute + space`), a `follow` tap is
+/// recorded so the typer emits the dead-key keypress followed by the
+/// base-letter (or space) keypress in sequence.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyMapping {
-    /// The evdev keycode (physical key position).
-    pub keycode: u16,
-    /// Whether Shift must be held.
-    pub shift: bool,
+    pub main: KeyTap,
+    pub follow: Option<KeyTap>,
 }
 
 /// Trait for injecting keystrokes at the cursor.
