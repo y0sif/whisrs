@@ -199,6 +199,13 @@ use xkbcommon::xkb::keysyms::{
 /// set used in everyday Portuguese/Spanish/French/Italian; layouts that
 /// already expose these chars at level 2 (e.g. `us:intl` puts `á` directly
 /// on AltGr+a) skip the synthesis and use the direct entry.
+///
+/// This is intentionally a Romance-language seed list rather than an
+/// exhaustive dead-key table. Most other scripts (German `ß`, Polish ą/ę,
+/// Nordic å/ø/æ, Hungarian ő/ű) expose their accented characters directly
+/// at level 2 or 3 of their native layout, so the level 0..=3 walk above
+/// catches them and they don't need synthesis here. Extend per-script
+/// when a real-world layout falls through both routes.
 const ACCENTED_VIA_DEAD_KEY: &[(char, char, u32)] = &[
     // tilde
     ('ã', 'a', XK_DEAD_TILDE),
@@ -284,8 +291,11 @@ fn build_reverse_map(keymap: &xkbcommon::xkb::Keymap) -> HashMap<char, KeyMappin
                 }
 
                 // The evdev keycode is the XKB keycode minus 8
-                // (XKB adds 8 to Linux input keycodes).
-                let evdev_keycode = raw_keycode.saturating_sub(8) as u16;
+                // (XKB adds 8 to Linux input keycodes). Linux KEY_MAX is
+                // ~767 so the cast is safe; saturate explicitly rather
+                // than truncating with `as` to keep the intent obvious.
+                let evdev_keycode: u16 =
+                    raw_keycode.saturating_sub(8).try_into().unwrap_or(u16::MAX);
                 let shift = level == 1 || level == 3;
                 let altgr = level == 2 || level == 3;
 
@@ -631,6 +641,108 @@ mod tests {
                 "'{ch}' must be reachable via uinput on us:intl, got no mapping"
             );
         }
+    }
+
+    // --- Synthesis routing (locks in direct vs dead-key+follow paths) ---
+
+    /// Pass 1 (literal accent via `dead_X + Space`): for each of the
+    /// chars Pass 1 covers, on us:intl the char must be reachable, and
+    /// — if it ended up routed through synthesis rather than a direct
+    /// level mapping — the follow tap must be unmodified Space.
+    /// Whether any specific char is direct vs synthesized is layout-
+    /// dependent (us:intl puts some literal accents at level 2 directly),
+    /// but the invariant holds: synthesized routes always end with Space.
+    #[test]
+    fn us_intl_pass1_chars_synthesized_routes_end_with_space() {
+        let km = XkbKeymap::from_layout(&KeyboardLayout {
+            layout: "us".to_string(),
+            variant: "intl".to_string(),
+        })
+        .unwrap();
+        for ch in ['\'', '"', '~', '`', '^'] {
+            let mapping = km
+                .lookup(ch)
+                .unwrap_or_else(|| panic!("'{ch}' must be reachable on us:intl"));
+            if let Some(follow) = mapping.follow {
+                assert_eq!(
+                    follow.keycode,
+                    evdev::Key::KEY_SPACE.code(),
+                    "'{ch}' was synthesized; follow tap must be SPACE \
+                     (dead_X + space sequence)"
+                );
+                assert!(
+                    !follow.shift && !follow.altgr,
+                    "'{ch}' synthesis follow tap must be unmodified SPACE"
+                );
+            }
+        }
+    }
+
+    /// Pass 2 (accented letter via `dead_X + base_letter`): `ã` is
+    /// reachable on us:intl. Whichever route the layout exposes, the
+    /// mapping must be self-consistent: if synthesized, the follow tap
+    /// must be `a`; if direct, the main tap must hold AltGr.
+    #[test]
+    fn us_intl_tilde_letter_route_is_self_consistent() {
+        let km = XkbKeymap::from_layout(&KeyboardLayout {
+            layout: "us".to_string(),
+            variant: "intl".to_string(),
+        })
+        .unwrap();
+        let a_main = km.lookup('a').expect("'a' must be in keymap").main;
+        let mapping = km.lookup('ã').expect("ã must be reachable on us:intl");
+        match mapping.follow {
+            Some(follow) => {
+                // Synthesized: follow tap must produce the base letter 'a'.
+                assert_eq!(
+                    follow.keycode, a_main.keycode,
+                    "ã follow tap must target the same evdev keycode as 'a' \
+                     (dead_tilde + a sequence)"
+                );
+            }
+            None => {
+                // Direct: must hold AltGr (level 2 or 3 reach).
+                assert!(
+                    mapping.main.altgr,
+                    "if ã is reached directly, it must hold AltGr (level 2/3)"
+                );
+            }
+        }
+    }
+
+    /// Polish exposes `ą` at level 2 directly. The synthesis pass MUST
+    /// NOT overwrite that direct entry — `ą` must keep `follow=None`
+    /// and use AltGr, not synthesize via dead_ogonek + a.
+    #[test]
+    fn polish_accented_letter_is_direct_not_synthesized() {
+        let km = XkbKeymap::from_layout(&layout("pl", "")).unwrap();
+        let mapping = km.lookup('ą').expect("ą must be reachable on Polish");
+        assert!(
+            mapping.follow.is_none(),
+            "ą on Polish must be a direct AltGr tap, not synthesized — \
+             synthesis pass must not overwrite a direct mapping"
+        );
+        assert!(mapping.main.altgr, "ą on Polish must hold AltGr");
+    }
+
+    /// Spanish exposes `ñ` at level 0 directly (it's on the dedicated
+    /// `ñ` key). Even though `ñ` is in `ACCENTED_VIA_DEAD_KEY`, the
+    /// synthesis pass must skip it because the direct entry already
+    /// exists — locks in the cross-layout no-overwrite invariant.
+    #[test]
+    fn spanish_enye_is_direct_not_synthesized() {
+        let km = XkbKeymap::from_layout(&layout("es", "")).unwrap();
+        let mapping = km.lookup('ñ').expect("ñ must be reachable on Spanish");
+        assert!(
+            mapping.follow.is_none(),
+            "ñ on Spanish must be a direct level-0 tap, not synthesized — \
+             synthesis pass must not overwrite even when the char is in \
+             the synthesis table"
+        );
+        assert!(
+            !mapping.main.altgr && !mapping.main.shift,
+            "ñ on Spanish is on a dedicated key — no modifiers required"
+        );
     }
 
     // --- Alternative Latin layouts ---
