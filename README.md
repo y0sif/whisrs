@@ -176,15 +176,15 @@ whisrs log --clear  # Clear all history
 
 | Component | Support |
 |---|---|
-| **Hyprland** | Tested, full support |
-| **Sway / i3** | Implemented, needs community testing |
-| **X11 (any WM)** | Implemented, needs community testing |
-| **GNOME Wayland** | Limited window tracking; overlay requires the bundled [GNOME Shell extension](contrib/gnome-shell-extension/README.md) |
-| **KDE Wayland** | Implemented via D-Bus, needs community testing |
+| **Hyprland** | Tested by maintainer and community (Arch Linux) |
+| **Sway / i3** | Implemented; additional reports welcome |
+| **X11 (any WM)** | Tested by community on Ubuntu 24.04 (Xorg) |
+| **GNOME Wayland** | Tested by community on Ubuntu 24.04 and Arch (mutter); overlay via the bundled [GNOME Shell extension](contrib/gnome-shell-extension/README.md) |
+| **KDE Wayland** | Implemented via D-Bus; reports welcome |
 | **Audio** | PipeWire, PulseAudio, ALSA (auto-detected via cpal) |
-| **Distros** | Any Linux with the system dependencies above |
+| **Distros** | Confirmed on Arch Linux and Ubuntu 24.04; any Linux with the system dependencies above |
 
-> **Note:** whisrs has been primarily tested on **Hyprland (Arch Linux)**. Testing on other compositors and distros is a valuable contribution. If you run into issues, please open an issue.
+> **Note:** whisrs is daily-driven on Hyprland (Arch Linux), with community confirmation on GNOME Wayland (Ubuntu 24.04 + Arch) and Xorg (Ubuntu 24.04). Sway, i3, and KDE reports are still wanted — if you use whisrs there, please open an issue with what works and what doesn't.
 
 ---
 
