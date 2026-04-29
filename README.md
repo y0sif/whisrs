@@ -44,7 +44,31 @@ The install script handles everything: detects your distro, installs system depe
 After install, **press your hotkey** to start recording, **press again** to stop. Text appears at your cursor.
 
 <details>
-<summary><b>Other install methods (AUR, Cargo, Nix, manual)</b></summary>
+<summary><b>Other install methods (pre-built binary, AUR, Cargo, Nix, manual)</b></summary>
+
+### Pre-built binary (Linux x86_64)
+
+Each tagged release publishes a tarball on [GitHub Releases](https://github.com/y0sif/whisrs/releases/latest) with both `whisrs` and `whisrsd` plus the contrib files (udev rule, systemd unit, man pages).
+
+```bash
+# Full build (cloud + local whisper.cpp)
+curl -sSL -o whisrs.tar.gz https://github.com/y0sif/whisrs/releases/latest/download/whisrs-linux-x86_64.tar.gz
+
+# Or the minimal build (cloud backends only — smaller, no whisper.cpp)
+curl -sSL -o whisrs.tar.gz https://github.com/y0sif/whisrs/releases/latest/download/whisrs-linux-x86_64-minimal.tar.gz
+
+tar xzf whisrs.tar.gz
+sudo install -m755 whisrs whisrsd /usr/local/bin/
+sudo install -m644 contrib/99-whisrs.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo usermod -aG input $USER   # log out / back in for the group change
+whisrs setup
+```
+
+| Variant | Includes local whisper.cpp | Tarball |
+|---|---|---|
+| `whisrs-linux-x86_64.tar.gz` | yes | full build |
+| `whisrs-linux-x86_64-minimal.tar.gz` | no (cloud backends only) | minimal build |
 
 ### Arch Linux (AUR)
 
