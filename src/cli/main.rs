@@ -59,6 +59,8 @@ enum SubCmd {
     },
     /// Command mode: select text, speak an instruction, LLM rewrites it in place
     Command,
+    /// Remove all whisrs data (config, models, history, systemd service)
+    Uninstall,
 }
 
 /// Check if stdout is a TTY for color support.
@@ -113,6 +115,16 @@ async fn main() -> anyhow::Result<()> {
         }
         SubCmd::Command => {
             send_command(Command::CommandMode).await?;
+        }
+        SubCmd::Uninstall => {
+            if let Err(e) = whisrs::config::setup::run_uninstall() {
+                if is_tty() {
+                    eprintln!("{RED}uninstall failed:{RESET} {e:#}");
+                } else {
+                    eprintln!("uninstall failed: {e:#}");
+                }
+                process::exit(1);
+            }
         }
     }
 
