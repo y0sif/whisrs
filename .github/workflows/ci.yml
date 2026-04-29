@@ -33,3 +33,26 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  release-build:
+    name: Release build — ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: full (default features)
+            features: ""
+          - name: minimal (--no-default-features)
+            features: "--no-default-features"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Release build
+        run: cargo build --release ${{ matrix.features }}
