@@ -13,7 +13,7 @@ Six backends: Groq (cloud, free tier), Deepgram Nova REST and Streaming (cloud, 
 whisrs creates a virtual keyboard using Linux's uinput subsystem and performs XKB reverse lookups to find the correct keycode and modifier combination for each character. This means it respects your keyboard layout and works in any application, including terminals, editors, and browsers.
 
 **Is whisrs a replacement for Wispr Flow or Superwhisper on Linux?**
-Yes. Wispr Flow and Superwhisper are macOS-only dictation tools. whisrs brings the same workflow to Linux: press a hotkey, speak, and text appears at your cursor. It supports both cloud and local transcription backends.
+Yes. Wispr Flow ships clients for macOS and Windows; Superwhisper is macOS-only. Neither has a Linux client. whisrs brings the same workflow to Linux: press a hotkey, speak, and text appears at your cursor. It supports both cloud and local transcription backends.
 
 **What Linux distributions does whisrs support?**
 whisrs works on any Linux distribution with the required system dependencies (alsa-lib, libxkbcommon, clang, cmake). It has been primarily tested on Arch Linux but also supports Debian/Ubuntu, Fedora, NixOS, and others. Install methods include AUR, cargo, Nix flake, and a universal install script.

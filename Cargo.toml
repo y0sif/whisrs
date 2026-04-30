@@ -2,11 +2,11 @@
 name = "whisrs"
 version = "0.1.9"
 edition = "2021"
-description = "Linux-first voice-to-text dictation tool with Groq, OpenAI, and local Whisper backends"
+description = "Open source Wispr Flow alternative for Linux — voice dictation for Wayland, X11, Hyprland, Sway, GNOME, KDE with offline whisper.cpp and cloud backends"
 license = "MIT"
 repository = "https://github.com/y0sif/whisrs"
 homepage = "https://y0sif.github.io/whisrs/"
-keywords = ["voice", "dictation", "speech-to-text", "whisper", "linux"]
+keywords = ["dictation", "speech-to-text", "whisper", "linux", "wayland"]
 categories = ["multimedia::audio", "accessibility", "command-line-utilities"]
 readme = "README.md"
 
