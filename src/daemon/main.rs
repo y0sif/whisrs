@@ -1080,11 +1080,12 @@ async fn run_streaming_pipeline(
             full_text.push_str(&text_to_type);
 
             info!("typing: {:?}", text_to_type);
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || type_text_at_cursor(&text_to_type, key_delay))
-                    .await
+            match tokio::task::spawn_blocking(move || type_text_at_cursor(&text_to_type, key_delay))
+                .await
             {
-                warn!("failed to type text: {e}");
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("failed to type text: {e:#}",),
+                Err(e) => warn!("failed to join typing task: {e}"),
             }
         }
 
@@ -1334,10 +1335,10 @@ async fn process_recording_batch(
     // Type the text at the cursor.
     let text_clone = text.clone();
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
-    if let Err(e) =
-        tokio::task::spawn_blocking(move || type_text_at_cursor(&text_clone, key_delay)).await?
-    {
-        warn!("failed to type text: {e}");
+    match tokio::task::spawn_blocking(move || type_text_at_cursor(&text_clone, key_delay)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("failed to type text: {e:#}"),
+        Err(e) => warn!("failed to join typing task: {e}"),
     }
 
     Ok(text)
