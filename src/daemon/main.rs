@@ -1117,6 +1117,8 @@ async fn run_streaming_pipeline(
                 // Transition to transcribing (pipeline is draining).
                 if let Err(e) = ds.state_machine.transition(Action::Toggle) {
                     warn!("auto-stop state transition failed: {e}");
+                } else {
+                    let _ = state_tx.send(ds.state_machine.state());
                 }
             }
             break;
