@@ -989,17 +989,17 @@ async fn run_streaming_pipeline(
     window_tracker: Arc<dyn WindowTracker>,
     filler_enabled: bool,
     filler_words: Vec<String>,
-    audio_feedback: bool,
-    audio_feedback_volume: f32,
-    backend_name: String,
-    language: String,
+    _audio_feedback: bool,
+    _audio_feedback_volume: f32,
+    _backend_name: String,
+    _language: String,
     state_tx: tokio::sync::watch::Sender<State>,
     key_delay: std::time::Duration,
 ) -> Result<String> {
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
     let notify_error = notify;
-    let pipeline_start = std::time::Instant::now();
+    let _pipeline_start = std::time::Instant::now();
     let (audio_tx, backend_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(256);
     let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
 
