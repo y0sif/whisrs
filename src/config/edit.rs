@@ -121,6 +121,7 @@ fn default_config() -> Config {
         local_vosk: None,
         local_parakeet: None,
         asr_sidecar: None,
+        openai_compatible_realtime: None,
         llm: None,
         tts: None,
         hotkeys: None,
@@ -152,6 +153,17 @@ fn current_key_summary(config: &Config) -> String {
         "openai" | "openai-realtime" => config.openai.as_ref().map(|o| o.api_key.as_str()),
         "local-whisper" | "local" | "local-vosk" | "local-parakeet" => {
             return format!("{DIM}(local backend — no API key needed){RESET}");
+        }
+        "openai-compatible-realtime" => {
+            return match config
+                .openai_compatible_realtime
+                .as_ref()
+                .and_then(|r| r.api_key.as_deref())
+                .filter(|key| !key.is_empty())
+            {
+                Some(key) => format!("{BOLD}{}{RESET}", setup::mask_api_key(key)),
+                None => format!("{DIM}(optional bearer token not set){RESET}"),
+            };
         }
         "asr-sidecar" | "asr" | "vibevoice" => {
             return format!("{DIM}(sidecar backend — no API key needed){RESET}");
@@ -188,26 +200,28 @@ fn edit_backend(config: &mut Config) -> Result<()> {
     println!("\n  {BOLD}Backend & API keys{RESET}");
     let new_backend = setup::select_backend(Some(config))?;
 
-    let (deepgram, groq, openai, local_whisper, asr_sidecar) =
-        setup::configure_backend(&new_backend, Some(config))?;
+    let backend_config = setup::configure_backend(&new_backend, Some(config))?;
 
     // Only overwrite the section the user just edited. Other backend sections
     // are preserved so the user can switch back without re-entering a key.
     config.general.backend = new_backend;
-    if deepgram.is_some() {
-        config.deepgram = deepgram;
+    if backend_config.deepgram.is_some() {
+        config.deepgram = backend_config.deepgram;
     }
-    if groq.is_some() {
-        config.groq = groq;
+    if backend_config.groq.is_some() {
+        config.groq = backend_config.groq;
     }
-    if openai.is_some() {
-        config.openai = openai;
+    if backend_config.openai.is_some() {
+        config.openai = backend_config.openai;
     }
-    if local_whisper.is_some() {
-        config.local_whisper = local_whisper;
+    if backend_config.local_whisper.is_some() {
+        config.local_whisper = backend_config.local_whisper;
     }
-    if asr_sidecar.is_some() {
-        config.asr_sidecar = asr_sidecar;
+    if backend_config.asr_sidecar.is_some() {
+        config.asr_sidecar = backend_config.asr_sidecar;
+    }
+    if backend_config.openai_compatible_realtime.is_some() {
+        config.openai_compatible_realtime = backend_config.openai_compatible_realtime;
     }
     Ok(())
 }
@@ -516,6 +530,9 @@ fn render_masked_toml(config: &Config) -> Result<String> {
     }
     if let Some(o) = clone.openai.as_mut() {
         o.api_key = setup::mask_api_key(&o.api_key);
+    }
+    if let Some(r) = clone.openai_compatible_realtime.as_mut() {
+        r.api_key = r.api_key.as_ref().map(|key| setup::mask_api_key(key));
     }
     if let Some(l) = clone.llm.as_mut() {
         l.api_key = setup::mask_api_key(&l.api_key);

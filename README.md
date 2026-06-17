@@ -156,12 +156,15 @@ bindsym $mod+w exec whisrs toggle
 | **Deepgram REST** | Cloud | Batch | $200 free credit | Simple, 60+ languages |
 | **OpenAI Realtime** | Cloud (WebSocket) | True streaming | Paid | Best UX, text as you speak |
 | **OpenAI REST** | Cloud | Batch | Paid | Simple fallback |
+| **OpenAI-compatible Realtime** | External WebSocket | Completed-utterance realtime | Free / self-hosted | Lemonade and similar OpenAI-style ASR servers |
 | **Local whisper.cpp** | Local (CPU/GPU) | Sliding window | Free | Privacy, offline use |
 | **ASR sidecar** | Local sidecar | Batch | Free | Bring-your-own local ASR (Moonshine, Parakeet, VibeVoice-ASR, …) |
 
 Groq is the default. For fully offline use, run `whisrs setup` and select **Local > whisper.cpp** — `base.en` (142 MB, ~388 MB RAM) is recommended; `tiny.en` (75 MB) for low-end hardware, `small.en` (466 MB) for higher accuracy.
 
 For local ASR models without a Rust runtime (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR), use the generic ASR sidecar backend — it talks to a small local HTTP service that hosts the model. See [`contrib/asr-sidecars/`](contrib/asr-sidecars/) for ready-to-run sidecars.
+
+For external realtime servers that speak the OpenAI Realtime transcription event model over WebSocket, use `backend = "openai-compatible-realtime"`. Lemonade is the first supported profile. Unlike OpenAI cloud, Lemonade-style interim partials are replaceable, so whisrs types completed phrases as they stabilize instead of blindly appending every partial hypothesis.
 
 ---
 
@@ -171,7 +174,7 @@ Config file: `~/.config/whisrs/config.toml` — `whisrs setup` writes a working 
 
 ```toml
 [general]
-backend = "groq"   # groq | deepgram-streaming | deepgram | openai-realtime | openai | local-whisper | asr-sidecar
+backend = "groq"   # groq | deepgram-streaming | deepgram | openai-realtime | openai | openai-compatible-realtime | local-whisper | asr-sidecar
 language = "en"    # ISO 639-1 or "auto"
 overlay = false    # bottom-screen recording overlay
 
@@ -181,7 +184,7 @@ api_key = "gsk_..."
 
 Env-var overrides: `WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, `WHISRS_OPENAI_API_KEY`.
 
-For the full reference (overlay, `[input]`, `[asr-sidecar]`, `[llm]`, `[hotkeys]`, GNOME extension setup), see [docs/configuration.md](docs/configuration.md).
+For the full reference (overlay, `[input]`, `[openai-compatible-realtime]`, `[asr-sidecar]`, `[llm]`, `[hotkeys]`, GNOME extension setup), see [docs/configuration.md](docs/configuration.md).
 
 ---
 

@@ -27,7 +27,9 @@ pub mod local_whisper {
         }
     }
 }
+pub mod openai_compatible_realtime;
 pub mod openai_realtime;
+pub mod openai_realtime_protocol;
 pub mod openai_rest;
 
 use async_trait::async_trait;

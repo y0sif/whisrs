@@ -2,6 +2,11 @@
 
 Status: proposal for [issue #49](https://github.com/y0sif/whisrs/issues/49)
 
+Related documents:
+
+- [DESIGN.md](./DESIGN.md)
+- [TASKS.md](./TASKS.md)
+
 ## Decision
 
 Add a generic `openai-compatible-realtime` transcription backend for external

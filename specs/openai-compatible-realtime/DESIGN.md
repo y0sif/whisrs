@@ -55,7 +55,7 @@ Relevant files and APIs:
   - Interactive `whisrs setup` backend selection and backend-specific prompts.
 - `src/config/edit.rs`
   - Interactive `whisrs config` backend editing and current backend summary.
-- `docs/configuration.md`, `README.md`, `contrib/asr-sidecars/README.md`
+- `docs/configuration.md` and `README.md`
   - Backend and config documentation to update.
 
 Existing dependencies already cover the implementation:

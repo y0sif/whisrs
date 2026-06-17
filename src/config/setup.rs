@@ -14,7 +14,7 @@ use dialoguer::{Confirm, Input, Password, Select};
 use crate::llm::LlmConfig;
 use crate::{
     AsrSidecarConfig, AudioConfig, Config, DeepgramConfig, GeneralConfig, GroqConfig,
-    InjectorBackend, InputConfig, LocalWhisperConfig, OpenAiConfig,
+    InjectorBackend, InputConfig, LocalWhisperConfig, OpenAiCompatibleRealtimeConfig, OpenAiConfig,
 };
 
 // ANSI color codes.
@@ -32,6 +32,7 @@ pub(crate) const BACKEND_CHOICES: &[&str] = &[
     "Deepgram REST      (free credits, simple, cloud)",
     "OpenAI Realtime    (best streaming, cloud)",
     "OpenAI REST        (simple, cloud)",
+    "OpenAI-compatible Realtime (external WebSocket, Lemonade-style)",
     "Local              (offline, no API key needed)",
     "ASR sidecar        (local HTTP sidecar, model-agnostic)",
 ];
@@ -43,9 +44,20 @@ pub(crate) const BACKEND_VALUES: &[&str] = &[
     "deepgram",
     "openai-realtime",
     "openai",
+    "openai-compatible-realtime",
     "local",
     "asr-sidecar",
 ];
+
+#[derive(Default)]
+pub(crate) struct BackendConfigSelection {
+    pub deepgram: Option<DeepgramConfig>,
+    pub groq: Option<GroqConfig>,
+    pub openai: Option<OpenAiConfig>,
+    pub local_whisper: Option<LocalWhisperConfig>,
+    pub asr_sidecar: Option<AsrSidecarConfig>,
+    pub openai_compatible_realtime: Option<OpenAiCompatibleRealtimeConfig>,
+}
 
 /// Whisper model choices (name, file size, description).
 pub(crate) const WHISPER_MODEL_CHOICES: &[&str] = &[
@@ -104,8 +116,7 @@ pub fn run_setup() -> Result<()> {
     let backend = select_backend(None)?;
 
     // 2. Configure backend (API key or model download).
-    let (deepgram_config, groq_config, openai_config, local_whisper_config, asr_sidecar_config) =
-        configure_backend(&backend, None)?;
+    let backend_config = configure_backend(&backend, None)?;
 
     // 3. Language.
     let language = select_language(None)?;
@@ -148,13 +159,14 @@ pub fn run_setup() -> Result<()> {
             backend: injector_backend,
             ..InputConfig::default()
         },
-        deepgram: deepgram_config,
-        groq: groq_config,
-        openai: openai_config,
-        local_whisper: local_whisper_config,
+        deepgram: backend_config.deepgram,
+        groq: backend_config.groq,
+        openai: backend_config.openai,
+        local_whisper: backend_config.local_whisper,
         local_vosk: None,
         local_parakeet: None,
-        asr_sidecar: asr_sidecar_config,
+        asr_sidecar: backend_config.asr_sidecar,
+        openai_compatible_realtime: backend_config.openai_compatible_realtime,
         llm: llm_config,
         tts: None,
         hotkeys: None,
@@ -194,8 +206,9 @@ pub(crate) fn select_backend(existing: Option<&Config>) -> Result<String> {
                 "deepgram" => 2,
                 "openai-realtime" => 3,
                 "openai" => 4,
-                _ if b.starts_with("local") => 5,
-                "asr-sidecar" | "asr" | "vibevoice" => 6,
+                "openai-compatible-realtime" => 5,
+                _ if b.starts_with("local") => 6,
+                "asr-sidecar" | "asr" | "vibevoice" => 7,
                 _ => 0,
             }
         })
@@ -286,17 +299,10 @@ fn select_local_engine() -> Result<String> {
 }
 
 /// Configure the selected backend (API key or model path).
-#[allow(clippy::type_complexity)]
 pub(crate) fn configure_backend(
     backend: &str,
     existing: Option<&Config>,
-) -> Result<(
-    Option<DeepgramConfig>,
-    Option<GroqConfig>,
-    Option<OpenAiConfig>,
-    Option<LocalWhisperConfig>,
-    Option<AsrSidecarConfig>,
-)> {
+) -> Result<BackendConfigSelection> {
     match backend {
         "deepgram" | "deepgram-streaming" => {
             let existing_key = existing
@@ -311,13 +317,10 @@ pub(crate) fn configure_backend(
                 .and_then(|c| c.deepgram.as_ref())
                 .map(|d| d.model.clone())
                 .unwrap_or_else(|| "nova-3".to_string());
-            Ok((
-                Some(DeepgramConfig { api_key, model }),
-                None,
-                None,
-                None,
-                None,
-            ))
+            Ok(BackendConfigSelection {
+                deepgram: Some(DeepgramConfig { api_key, model }),
+                ..BackendConfigSelection::default()
+            })
         }
         "groq" => {
             let existing_key = existing.and_then(|c| c.groq.as_ref()).map(|g| &g.api_key);
@@ -330,7 +333,10 @@ pub(crate) fn configure_backend(
                 .and_then(|c| c.groq.as_ref())
                 .map(|g| g.model.clone())
                 .unwrap_or_else(|| "whisper-large-v3-turbo".to_string());
-            Ok((None, Some(GroqConfig { api_key, model }), None, None, None))
+            Ok(BackendConfigSelection {
+                groq: Some(GroqConfig { api_key, model }),
+                ..BackendConfigSelection::default()
+            })
         }
         "openai-realtime" | "openai" => {
             let existing_key = existing.and_then(|c| c.openai.as_ref()).map(|o| &o.api_key);
@@ -359,13 +365,81 @@ pub(crate) fn configure_backend(
                 }
                 .to_string()
             };
-            Ok((
-                None,
-                None,
-                Some(OpenAiConfig { api_key, model }),
-                None,
-                None,
-            ))
+            Ok(BackendConfigSelection {
+                openai: Some(OpenAiConfig { api_key, model }),
+                ..BackendConfigSelection::default()
+            })
+        }
+        "openai-compatible-realtime" => {
+            let existing_realtime = existing.and_then(|c| c.openai_compatible_realtime.as_ref());
+            let url: String = Input::new()
+                .with_prompt("Realtime WebSocket URL")
+                .default(existing_realtime.map(|v| v.url.clone()).unwrap_or_else(|| {
+                    "ws://localhost:12345/realtime?model=Whisper-Tiny".to_string()
+                }))
+                .interact_text()
+                .context("failed to read realtime WebSocket URL")?;
+
+            let model: String = Input::new()
+                .with_prompt("Realtime model")
+                .default(
+                    existing_realtime
+                        .map(|v| v.model.clone())
+                        .unwrap_or_else(|| "Whisper-Tiny".to_string()),
+                )
+                .interact_text()
+                .context("failed to read realtime model")?;
+
+            let profile_items = ["lemonade (recommended)"];
+            let profile_default = existing_realtime
+                .map(|v| usize::from(v.profile.trim() != "lemonade"))
+                .unwrap_or(0);
+            let profile_selection = Select::new()
+                .with_prompt("Compatibility profile")
+                .items(&profile_items)
+                .default(profile_default.min(profile_items.len() - 1))
+                .interact()
+                .context("failed to read realtime profile")?;
+            let profile = match profile_selection {
+                0 => "lemonade".to_string(),
+                _ => unreachable!(),
+            };
+
+            let turn_detection_items = [
+                "server-vad    (recommended — type completed phrases while you keep speaking)",
+                "manual-commit (flush only when recording stops)",
+            ];
+            let turn_detection_default = existing_realtime
+                .map(|v| usize::from(v.turn_detection.trim() == "manual-commit"))
+                .unwrap_or(0);
+            let turn_detection = match Select::new()
+                .with_prompt("Turn detection")
+                .items(&turn_detection_items)
+                .default(turn_detection_default)
+                .interact()
+                .context("failed to read realtime turn detection")?
+            {
+                0 => "server-vad".to_string(),
+                1 => "manual-commit".to_string(),
+                _ => unreachable!(),
+            };
+
+            let api_key = prompt_optional_api_key_with_existing(
+                "Optional bearer token",
+                "Leave blank for servers that do not require auth (Lemonade commonly does not).",
+                existing_realtime.and_then(|v| v.api_key.as_ref()),
+            )?;
+
+            Ok(BackendConfigSelection {
+                openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
+                    url,
+                    model,
+                    profile,
+                    turn_detection,
+                    api_key,
+                }),
+                ..BackendConfigSelection::default()
+            })
         }
         "local-whisper" => {
             // Select model size.
@@ -405,13 +479,10 @@ pub(crate) fn configure_backend(
             }
 
             let model_path = dest.to_string_lossy().to_string();
-            Ok((
-                None,
-                None,
-                None,
-                Some(LocalWhisperConfig { model_path }),
-                None,
-            ))
+            Ok(BackendConfigSelection {
+                local_whisper: Some(LocalWhisperConfig { model_path }),
+                ..BackendConfigSelection::default()
+            })
         }
         "asr-sidecar" | "asr" | "vibevoice" => {
             let existing_sidecar = existing.and_then(|c| c.asr_sidecar.as_ref());
@@ -435,15 +506,12 @@ pub(crate) fn configure_backend(
                 .interact_text()
                 .context("failed to read ASR sidecar model")?;
 
-            Ok((
-                None,
-                None,
-                None,
-                None,
-                Some(AsrSidecarConfig { url, model }),
-            ))
+            Ok(BackendConfigSelection {
+                asr_sidecar: Some(AsrSidecarConfig { url, model }),
+                ..BackendConfigSelection::default()
+            })
         }
-        _ => Ok((None, None, None, None, None)),
+        _ => Ok(BackendConfigSelection::default()),
     }
 }
 
@@ -556,6 +624,36 @@ pub(crate) fn prompt_api_key_with_existing(
         println!("  {YELLOW}Warning: empty API key — you can set it later in config.toml{RESET}");
     }
     Ok(key)
+}
+
+pub(crate) fn prompt_optional_api_key_with_existing(
+    prompt: &str,
+    hint: &str,
+    existing_key: Option<&String>,
+) -> Result<Option<String>> {
+    if let Some(key) = existing_key {
+        if !key.is_empty() {
+            println!(
+                "  Existing bearer token found ({BOLD}{}{RESET})",
+                mask_api_key(key)
+            );
+            let keep = Confirm::new()
+                .with_prompt("Keep existing token?")
+                .default(true)
+                .interact()
+                .unwrap_or(true);
+            if keep {
+                return Ok(Some(key.clone()));
+            }
+        }
+    }
+    println!("  {DIM}{hint}{RESET}");
+    let key = Password::new()
+        .with_prompt(prompt)
+        .allow_empty_password(true)
+        .interact()
+        .context("failed to read optional bearer token")?;
+    Ok((!key.trim().is_empty()).then_some(key))
 }
 
 /// Common languages with their ISO 639-1 codes.

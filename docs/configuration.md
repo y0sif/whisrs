@@ -8,7 +8,7 @@ The interactive `whisrs setup` will write a working file for you. The reference 
 
 ```toml
 [general]
-backend = "groq"            # groq | deepgram-streaming | deepgram | openai-realtime | openai | local-whisper | asr-sidecar
+backend = "groq"            # groq | deepgram-streaming | deepgram | openai-realtime | openai | openai-compatible-realtime | local-whisper | asr-sidecar
 language = "en"             # ISO 639-1 or "auto"
 silence_timeout_ms = 2000   # auto-stop after silence (streaming only)
 notify = true               # desktop notifications
@@ -65,6 +65,29 @@ model = "nova-3"
 [openai]
 api_key = "sk-..."
 model = "gpt-4o-mini-transcribe"
+
+# External OpenAI-compatible realtime server (WebSocket).
+# Use this for Lemonade-style services that speak the OpenAI Realtime
+# transcription event model over WebSocket instead of HTTP.
+# In the current whisrs typing pipeline, replaceable interim partials are kept
+# internal and only completed phrases are typed at the cursor.
+[openai-compatible-realtime]
+url = "ws://localhost:12345/realtime?model=Whisper-Tiny"
+model = "Whisper-Tiny"
+profile = "lemonade"        # currently only "lemonade"
+turn_detection = "server-vad"  # recommended; see notes below
+# api_key = "optional bearer token"
+
+# turn_detection:
+# - "server-vad" (recommended): the server watches for pauses in your speech
+#   and sends completed phrases as you talk. Choose this if you want text to
+#   appear a phrase at a time during a longer dictation session.
+# - "manual-commit": the server waits until whisrs stops recording before it
+#   flushes the final phrase. Choose this if your server's pause detection is
+#   too eager, or if you would rather get one result only when you stop.
+#
+# In both modes, whisrs only types completed text for this backend. It does
+# not type unstable partial hypotheses as they change.
 
 [local-whisper]
 model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"

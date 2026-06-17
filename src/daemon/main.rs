@@ -21,6 +21,7 @@ use whisrs::transcription::groq::GroqBackend;
 use whisrs::transcription::local_parakeet::ParakeetBackend;
 use whisrs::transcription::local_vosk::VoskBackend;
 use whisrs::transcription::local_whisper::LocalWhisperBackend;
+use whisrs::transcription::openai_compatible_realtime::OpenAiCompatibleRealtimeBackend;
 use whisrs::transcription::openai_realtime::OpenAIRealtimeBackend;
 use whisrs::transcription::openai_rest::OpenAIRestBackend;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
@@ -155,6 +156,7 @@ fn load_config() -> (Config, Option<String>) {
                             local_vosk: None,
                             local_parakeet: None,
                             asr_sidecar: None,
+                            openai_compatible_realtime: None,
                             llm: None,
                             tts: None,
                             hotkeys: None,
@@ -182,6 +184,7 @@ fn load_config() -> (Config, Option<String>) {
                         local_vosk: None,
                         local_parakeet: None,
                         asr_sidecar: None,
+                        openai_compatible_realtime: None,
                         llm: None,
                         tts: None,
                         hotkeys: None,
@@ -209,6 +212,7 @@ fn load_config() -> (Config, Option<String>) {
             local_vosk: None,
             local_parakeet: None,
             asr_sidecar: None,
+            openai_compatible_realtime: None,
             llm: None,
             tts: None,
             hotkeys: None,
@@ -423,6 +427,17 @@ fn resolve_deepgram_api_key(config: &Config) -> Option<String> {
     config.deepgram.as_ref().map(|d| d.api_key.clone())
 }
 
+fn sanitize_ws_endpoint_for_log(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return "<invalid ws endpoint>".to_string();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
+}
+
 fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
     match config.general.backend.as_str() {
         "deepgram" => {
@@ -519,6 +534,39 @@ fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
             info!("using ASR sidecar transcription backend ({url})");
             Arc::new(AsrSidecarBackend::new(url))
         }
+        "openai-compatible-realtime" => {
+            let realtime = config.openai_compatible_realtime.as_ref().cloned();
+            let Some(realtime) = realtime else {
+                warn!(
+                    "openai-compatible-realtime backend selected but config section is missing; falling back to groq"
+                );
+                let api_key = resolve_groq_api_key(config).unwrap_or_default();
+                return Arc::new(GroqBackend::new(api_key));
+            };
+
+            let endpoint_display = sanitize_ws_endpoint_for_log(&realtime.url);
+            info!(
+                "using OpenAI-compatible realtime transcription backend ({endpoint_display}, profile={}, turn_detection={})",
+                realtime.profile, realtime.turn_detection
+            );
+
+            match OpenAiCompatibleRealtimeBackend::new(
+                realtime.url,
+                realtime.model,
+                realtime.profile,
+                realtime.turn_detection,
+                realtime.api_key,
+            ) {
+                Ok(backend) => Arc::new(backend),
+                Err(e) => {
+                    warn!(
+                        "failed to initialize OpenAI-compatible realtime backend for {endpoint_display}: {e}; falling back to groq"
+                    );
+                    let api_key = resolve_groq_api_key(config).unwrap_or_default();
+                    Arc::new(GroqBackend::new(api_key))
+                }
+            }
+        }
         other => {
             warn!("unknown backend '{other}', falling back to groq");
             let api_key = resolve_groq_api_key(config).unwrap_or_default();
@@ -549,6 +597,11 @@ fn get_model_for_backend(config: &Config) -> String {
             .as_ref()
             .map(|o| o.model.clone())
             .unwrap_or_else(|| "gpt-4o-mini-transcribe".to_string()),
+        "openai-compatible-realtime" => config
+            .openai_compatible_realtime
+            .as_ref()
+            .map(|v| v.model.clone())
+            .unwrap_or_else(|| "Whisper-Tiny".to_string()),
         "local-whisper" | "local" => "base.en".to_string(),
         "local-vosk" => "small-en-us".to_string(),
         "local-parakeet" => "eou-120m".to_string(),
@@ -1109,6 +1162,11 @@ async fn run_streaming_pipeline(
         let mut focused = false;
         let batch_delay = std::time::Duration::from_millis(150);
 
+        // The daemon text channel is intentionally append-only. For OpenAI
+        // realtime this still feels token-by-token because the backend emits
+        // stable append deltas. For Lemonade-compatible profiles, the protocol
+        // layer only forwards completed utterances, so this loop naturally
+        // types phrase-sized chunks without needing any replacement semantics.
         loop {
             // Wait for the first delta (blocking).
             let first = text_rx.recv().await;
@@ -2730,5 +2788,44 @@ mod tests {
         assert!(!leads_with_punct("\u{2018}"));
         // U+201C LEFT DOUBLE QUOTATION MARK
         assert!(!leads_with_punct("\u{201C}"));
+    }
+
+    #[test]
+    fn sanitize_ws_endpoint_for_log_strips_credentials_and_query() {
+        assert_eq!(
+            sanitize_ws_endpoint_for_log("ws://user:secret@localhost:1234/realtime?token=abc"),
+            "ws://localhost:1234/realtime"
+        );
+    }
+
+    #[test]
+    fn get_model_for_openai_compatible_realtime_backend() {
+        let config = Config {
+            general: whisrs::GeneralConfig {
+                backend: "openai-compatible-realtime".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: None,
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: Some(whisrs::OpenAiCompatibleRealtimeConfig {
+                url: "ws://localhost:1234/realtime".to_string(),
+                model: "Whisper-Tiny".to_string(),
+                profile: "lemonade".to_string(),
+                turn_detection: "server-vad".to_string(),
+                api_key: None,
+            }),
+            llm: None,
+            hotkeys: None,
+            overlay: None,
+        };
+
+        assert_eq!(get_model_for_backend(&config), "Whisper-Tiny");
     }
 }

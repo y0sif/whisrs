@@ -14,145 +14,145 @@ Implementation task plan for `specs/openai-compatible-realtime/README.md` and `D
 
 ## Phase 1: Shared Protocol Module
 
-- [ ] Create `src/transcription/openai_realtime_protocol.rs`.
-- [ ] Move OpenAI-compatible client message types out of `src/transcription/openai_realtime.rs`:
-  - [ ] `session.update`
-  - [ ] `input_audio_buffer.append`
-  - [ ] `input_audio_buffer.commit`
-- [ ] Move OpenAI-compatible server event parsing out of `src/transcription/openai_realtime.rs`:
-  - [ ] `conversation.item.input_audio_transcription.delta`
-  - [ ] `conversation.item.input_audio_transcription.completed`
-  - [ ] `conversation.item.input_audio_transcription.failed`
-  - [ ] `error`
-  - [ ] session/audio-buffer lifecycle events used for logging.
-- [ ] Move PCM16 little-endian base64 encoding into the shared module.
-- [ ] Move the existing 16 kHz to 24 kHz resampler into the shared module.
-- [ ] Keep the existing OpenAI prompt clamp behavior and 1024 character limit.
-- [ ] Add `OpenAiRealtimeProfile` with `OpenAi` and `Lemonade`.
-- [ ] Add `TurnDetectionMode` with `ServerVad` and `ManualCommit`.
-- [ ] Add profile helpers for parsing supported profile names, input sample rate, delta semantics, session update serialization, and commit behavior.
-- [ ] Add `OpenAiRealtimeProtocolEngine` with `new`, `transcribe`, and `transcribe_stream`.
-- [ ] Implement one shared WebSocket connect/send/receive lifecycle in the engine.
-- [ ] Ensure provider wrappers do not serialize audio, parse server events, or own their own WebSocket loops.
+- [x] Create `src/transcription/openai_realtime_protocol.rs`.
+- [x] Move OpenAI-compatible client message types out of `src/transcription/openai_realtime.rs`:
+  - [x] `session.update`
+  - [x] `input_audio_buffer.append`
+  - [x] `input_audio_buffer.commit`
+- [x] Move OpenAI-compatible server event parsing out of `src/transcription/openai_realtime.rs`:
+  - [x] `conversation.item.input_audio_transcription.delta`
+  - [x] `conversation.item.input_audio_transcription.completed`
+  - [x] `conversation.item.input_audio_transcription.failed`
+  - [x] `error`
+  - [x] session/audio-buffer lifecycle events used for logging.
+- [x] Move PCM16 little-endian base64 encoding into the shared module.
+- [x] Move the existing 16 kHz to 24 kHz resampler into the shared module.
+- [x] Keep the existing OpenAI prompt clamp behavior and 1024 character limit.
+- [x] Add `OpenAiRealtimeProfile` with `OpenAi` and `Lemonade`.
+- [x] Add `TurnDetectionMode` with `ServerVad` and `ManualCommit`.
+- [x] Add profile helpers for parsing supported profile names, input sample rate, delta semantics, session update serialization, and commit behavior.
+- [x] Add `OpenAiRealtimeProtocolEngine` with `new`, `transcribe`, and `transcribe_stream`.
+- [x] Implement one shared WebSocket connect/send/receive lifecycle in the engine.
+- [x] Ensure provider wrappers do not serialize audio, parse server events, or own their own WebSocket loops.
 
 ## Phase 2: Correct Stream Lifecycle
 
-- [ ] Replace the current “first completed event is terminal” behavior with commit-aware finalization.
-- [ ] Track whether the input audio channel has closed.
-- [ ] Track whether `input_audio_buffer.commit` has been sent.
-- [ ] Track latest interim transcript text per item when replaceable deltas include an item ID.
-- [ ] Allow any number of `completed` events before end-of-audio.
-- [ ] Emit completed transcripts during recording when they represent stable utterances.
-- [ ] Treat only post-commit completion as satisfying final flush.
-- [ ] Add a final-response timeout with clear error context.
-- [ ] Close the WebSocket cleanly after final completion, explicit server close, error, or timeout.
-- [ ] Preserve text already sent to the daemon if a later stream error occurs.
+- [x] Replace the current “first completed event is terminal” behavior with commit-aware finalization.
+- [x] Track whether the input audio channel has closed.
+- [x] Track whether `input_audio_buffer.commit` has been sent.
+- [x] Track latest interim transcript text per item when replaceable deltas include an item ID.
+- [x] Allow any number of `completed` events before end-of-audio.
+- [x] Emit completed transcripts during recording when they represent stable utterances.
+- [x] Treat only post-commit completion as satisfying final flush.
+- [x] Add a final-response timeout with clear error context.
+- [x] Close the WebSocket cleanly after final completion, explicit server close, error, or timeout.
+- [x] Preserve text already sent to the daemon if a later stream error occurs.
 
 ## Phase 3: Transcript Semantics
 
-- [ ] For `OpenAiRealtimeProfile::OpenAi`, continue emitting non-empty append-only deltas to `text_tx`.
-- [ ] For `OpenAiRealtimeProfile::Lemonade`, parse interim `delta` events without sending them to `text_tx`.
-- [ ] For Lemonade deltas, update latest-interim state when an item ID is available.
-- [ ] For Lemonade deltas without an item ID, debug-log the interim text but do not emit it.
-- [ ] For Lemonade, emit each non-empty `completed` transcript once.
-- [ ] Clear latest-interim state for an item after its `completed` transcript is handled.
-- [ ] Suppress duplicate completed transcripts, preferring stable item IDs if present and otherwise using trimmed transcript text.
-- [ ] Avoid re-emitting completed text already emitted through append-only deltas.
-- [ ] Do not change the daemon-level `TranscriptionBackend::transcribe_stream` signature in this feature.
-- [ ] Document in code comments that Lemonade v1 typing is completed-utterance realtime, not live interim replacement.
+- [x] For `OpenAiRealtimeProfile::OpenAi`, continue emitting non-empty append-only deltas to `text_tx`.
+- [x] For `OpenAiRealtimeProfile::Lemonade`, parse interim `delta` events without sending them to `text_tx`.
+- [x] For Lemonade deltas, update latest-interim state when an item ID is available.
+- [x] For Lemonade deltas without an item ID, debug-log the interim text but do not emit it.
+- [x] For Lemonade, emit each non-empty `completed` transcript once.
+- [x] Clear latest-interim state for an item after its `completed` transcript is handled.
+- [x] Suppress duplicate completed transcripts, preferring stable item IDs if present and otherwise using trimmed transcript text.
+- [x] Avoid re-emitting completed text already emitted through append-only deltas.
+- [x] Do not change the daemon-level `TranscriptionBackend::transcribe_stream` signature in this feature.
+- [x] Document in code comments that Lemonade v1 typing is completed-utterance realtime, not live interim replacement.
 
 ## Phase 4: Refactor Existing OpenAI Backend
 
-- [ ] Update `src/transcription/mod.rs` to export the shared protocol module.
-- [ ] Refactor `src/transcription/openai_realtime.rs` into a thin wrapper.
-- [ ] Preserve `OpenAIRealtimeBackend::new(api_key: String) -> Self`.
-- [ ] Keep API key resolution from configured `[openai] api_key` and `WHISRS_OPENAI_API_KEY`.
-- [ ] Configure the wrapper with the fixed OpenAI realtime URL, bearer auth, and `OpenAiRealtimeProfile::OpenAi`.
-- [ ] Delegate both `transcribe()` and `transcribe_stream()` to `OpenAiRealtimeProtocolEngine`.
-- [ ] Keep `supports_streaming() -> true`.
-- [ ] Confirm existing OpenAI behavior remains covered by tests.
+- [x] Update `src/transcription/mod.rs` to export the shared protocol module.
+- [x] Refactor `src/transcription/openai_realtime.rs` into a thin wrapper.
+- [x] Preserve `OpenAIRealtimeBackend::new(api_key: String) -> Self`.
+- [x] Keep API key resolution from configured `[openai] api_key` and `WHISRS_OPENAI_API_KEY`.
+- [x] Configure the wrapper with the fixed OpenAI realtime URL, bearer auth, and `OpenAiRealtimeProfile::OpenAi`.
+- [x] Delegate both `transcribe()` and `transcribe_stream()` to `OpenAiRealtimeProtocolEngine`.
+- [x] Keep `supports_streaming() -> true`.
+- [x] Confirm existing OpenAI behavior remains covered by tests.
 
 ## Phase 5: Add External Backend Wrapper
 
-- [ ] Create `src/transcription/openai_compatible_realtime.rs`.
-- [ ] Add `OpenAiCompatibleRealtimeBackend`.
-- [ ] Add constructor validation for non-empty URL, `ws`/`wss` scheme, non-empty model, supported profile, and supported turn detection.
-- [ ] Support optional bearer auth from `api_key`.
-- [ ] Configure the shared engine with `OpenAiRealtimeProfile::Lemonade`.
-- [ ] Delegate both `transcribe()` and `transcribe_stream()` to the shared engine.
-- [ ] Return `supports_streaming() -> true`.
-- [ ] Ensure logs use sanitized endpoint display and never include bearer tokens.
+- [x] Create `src/transcription/openai_compatible_realtime.rs`.
+- [x] Add `OpenAiCompatibleRealtimeBackend`.
+- [x] Add constructor validation for non-empty URL, `ws`/`wss` scheme, non-empty model, supported profile, and supported turn detection.
+- [x] Support optional bearer auth from `api_key`.
+- [x] Configure the shared engine with `OpenAiRealtimeProfile::Lemonade`.
+- [x] Delegate both `transcribe()` and `transcribe_stream()` to the shared engine.
+- [x] Return `supports_streaming() -> true`.
+- [x] Ensure logs use sanitized endpoint display and never include bearer tokens.
 
 ## Phase 6: Config Model and Validation
 
-- [ ] Add `OpenAiCompatibleRealtimeConfig` to `src/lib.rs`.
-- [ ] Add `Config.openai_compatible_realtime` with `#[serde(default, rename = "openai-compatible-realtime")]`.
-- [ ] Add defaults for model, profile, and turn detection.
-- [ ] Update `Config::validate()` to accept `openai-compatible-realtime`.
-- [ ] Reject missing/empty URL, non-WebSocket URL, empty model, unknown profile, and unknown turn detection.
-- [ ] Update unknown-backend error text to include `openai-compatible-realtime`.
-- [ ] Update `Config::has_any_backend_configured()` to treat a configured external realtime URL as configured.
-- [ ] Add config parse/validation tests in `src/lib.rs`.
+- [x] Add `OpenAiCompatibleRealtimeConfig` to `src/lib.rs`.
+- [x] Add `Config.openai_compatible_realtime` with `#[serde(default, rename = "openai-compatible-realtime")]`.
+- [x] Add defaults for model, profile, and turn detection.
+- [x] Update `Config::validate()` to accept `openai-compatible-realtime`.
+- [x] Reject missing/empty URL, non-WebSocket URL, empty model, unknown profile, and unknown turn detection.
+- [x] Update unknown-backend error text to include `openai-compatible-realtime`.
+- [x] Update `Config::has_any_backend_configured()` to treat a configured external realtime URL as configured.
+- [x] Add config parse/validation tests in `src/lib.rs`.
 
 ## Phase 7: Daemon Wiring
 
-- [ ] Import `OpenAiCompatibleRealtimeBackend` in `src/daemon/main.rs`.
-- [ ] Add `openai-compatible-realtime` case in `create_backend()`.
-- [ ] Avoid logging full configured URL if it may contain credentials or sensitive query parameters.
-- [ ] Add `openai-compatible-realtime` case in `get_model_for_backend()`.
-- [ ] Verify `build_transcription_config()` needs no API changes.
-- [ ] Confirm `run_streaming_pipeline()` consumes only completed Lemonade transcript chunks as normal append-only strings.
-- [ ] Confirm no Lemonade interim delta is sent to the daemon text channel.
-- [ ] Keep batch HTTP `asr-sidecar` daemon wiring unchanged.
+- [x] Import `OpenAiCompatibleRealtimeBackend` in `src/daemon/main.rs`.
+- [x] Add `openai-compatible-realtime` case in `create_backend()`.
+- [x] Avoid logging full configured URL if it may contain credentials or sensitive query parameters.
+- [x] Add `openai-compatible-realtime` case in `get_model_for_backend()`.
+- [x] Verify `build_transcription_config()` needs no API changes.
+- [x] Confirm `run_streaming_pipeline()` consumes only completed Lemonade transcript chunks as normal append-only strings.
+- [x] Confirm no Lemonade interim delta is sent to the daemon text channel.
+- [x] Keep batch HTTP `asr-sidecar` daemon wiring unchanged.
 
 ## Phase 8: Setup and Config Editor
 
-- [ ] Update `src/config/setup.rs` backend choices to include `OpenAI-compatible Realtime`.
-- [ ] Add backend value `openai-compatible-realtime`.
-- [ ] Update default selection mapping for existing configs.
-- [ ] Add prompts for WebSocket URL, model, profile, turn detection, and optional API key.
-- [ ] Replace the growing `configure_backend()` return tuple with a small struct, or extend the tuple carefully if keeping the existing pattern.
-- [ ] Update `run_setup()` to write the new config section.
-- [ ] Update `src/config/edit.rs` to preserve and update `[openai-compatible-realtime]`.
-- [ ] Update current key summary to treat this as an optional-key external backend.
-- [ ] Ensure save validation errors are user-readable.
+- [x] Update `src/config/setup.rs` backend choices to include `OpenAI-compatible Realtime`.
+- [x] Add backend value `openai-compatible-realtime`.
+- [x] Update default selection mapping for existing configs.
+- [x] Add prompts for WebSocket URL, model, profile, turn detection, and optional API key.
+- [x] Replace the growing `configure_backend()` return tuple with a small struct, or extend the tuple carefully if keeping the existing pattern.
+- [x] Update `run_setup()` to write the new config section.
+- [x] Update `src/config/edit.rs` to preserve and update `[openai-compatible-realtime]`.
+- [x] Update current key summary to treat this as an optional-key external backend.
+- [x] Ensure save validation errors are user-readable.
 
 ## Phase 9: Documentation
 
-- [ ] Update `README.md` backend table to include `OpenAI-compatible Realtime`.
-- [ ] Update README minimal config backend list.
-- [ ] Update `docs/configuration.md` backend list.
-- [ ] Add `[openai-compatible-realtime]` config reference to `docs/configuration.md`.
-- [ ] Update `contrib/asr-sidecars/README.md` to distinguish batch HTTP sidecars from OpenAI-compatible realtime external servers.
-- [ ] Update `specs/openai-compatible-realtime/README.md` references now that the spec lives under `specs/`.
-- [ ] Link `DESIGN.md` and `TASKS.md` from the spec README if useful.
+- [x] Update `README.md` backend table to include `OpenAI-compatible Realtime`.
+- [x] Update README minimal config backend list.
+- [x] Update `docs/configuration.md` backend list.
+- [x] Add `[openai-compatible-realtime]` config reference to `docs/configuration.md`.
+- [x] Update `specs/openai-compatible-realtime/README.md` references now that the spec lives under `specs/`.
+- [x] Link `DESIGN.md` and `TASKS.md` from the spec README if useful.
 
 ## Phase 10: Unit Tests
 
 - [ ] Add or move protocol tests into `src/transcription/openai_realtime_protocol.rs`.
-- [ ] Test OpenAI session update serialization, including nested shape, 24 kHz format, model, auto language omission, prompt handling, and manual-commit behavior.
-- [ ] Test Lemonade session update serialization, including flat `session.model`, server VAD, manual commit, and omitted undocumented prompt/language fields.
-- [ ] Test audio handling: Lemonade direct 16 kHz, OpenAI 24 kHz resampling, and base64 PCM round trip.
-- [ ] Test append, commit, delta, completed, failed, and error message serialization/parsing.
-- [ ] Test event semantics for OpenAI deltas, Lemonade buffered/logged deltas, completed emission, duplicate suppression, pre-close completion, and post-commit finalization.
-- [ ] Test Lemonade partial sequence such as `hel`, `hello wor`, `hello world` emits nothing until `completed`.
-- [ ] Test Lemonade `completed = "hello world"` emits exactly one `"hello world"` after that partial sequence.
-- [ ] Add wrapper tests in `src/transcription/openai_compatible_realtime.rs` for URL/profile/turn-detection validation.
-- [ ] Add config tests in `src/lib.rs` for TOML parse, defaults, validation, and unknown-backend message.
+  Note: the protocol module was already split into `engine.rs`, `profile.rs`, and `wire.rs`, so tests remain colocated there instead of being moved back into a single file.
+- [x] Test OpenAI session update serialization, including nested shape, 24 kHz format, model, auto language omission, prompt handling, and manual-commit behavior.
+- [x] Test Lemonade session update serialization, including flat `session.model`, server VAD, manual commit, and omitted undocumented prompt/language fields.
+- [x] Test audio handling: Lemonade direct 16 kHz, OpenAI 24 kHz resampling, and base64 PCM round trip.
+- [x] Test append, commit, delta, completed, failed, and error message serialization/parsing.
+- [x] Test event semantics for OpenAI deltas, Lemonade buffered/logged deltas, completed emission, duplicate suppression, pre-close completion, and post-commit finalization.
+- [x] Test Lemonade partial sequence such as `hel`, `hello wor`, `hello world` emits nothing until `completed`.
+- [x] Test Lemonade `completed = "hello world"` emits exactly one `"hello world"` after that partial sequence.
+- [x] Add wrapper tests in `src/transcription/openai_compatible_realtime.rs` for URL/profile/turn-detection validation.
+- [x] Add config tests in `src/lib.rs` for TOML parse, defaults, validation, and unknown-backend message.
 
 ## Phase 11: Mock WebSocket Integration Tests
 
-- [ ] Add a local mock WebSocket test if it can remain stable without external services.
-- [ ] Start a localhost WebSocket listener with `tokio_tungstenite`.
-- [ ] Instantiate `OpenAiCompatibleRealtimeBackend` against the mock URL.
-- [ ] Assert first message is Lemonade-style `session.update`.
-- [ ] Send audio chunks and assert `input_audio_buffer.append` messages arrive.
-- [ ] Send two completed events while the audio channel is still open and assert both are emitted.
-- [ ] Before each completed event, send replaceable interim deltas and assert they are not emitted to `text_tx`.
-- [ ] Close the audio channel and assert `input_audio_buffer.commit` arrives.
-- [ ] Send final completed event and assert clean shutdown.
-- [ ] Repeat with server `error` event.
-- [ ] Repeat with final-response timeout using a short test-only timeout.
+- [x] Add a local mock WebSocket test if it can remain stable without external services.
+- [x] Start a localhost WebSocket listener with `tokio_tungstenite`.
+- [x] Instantiate `OpenAiCompatibleRealtimeBackend` against the mock URL.
+- [x] Assert first message is Lemonade-style `session.update`.
+- [x] Send audio chunks and assert `input_audio_buffer.append` messages arrive.
+- [x] Send two completed events while the audio channel is still open and assert both are emitted.
+- [x] Before each completed event, send replaceable interim deltas and assert they are not emitted to `text_tx`.
+- [x] Close the audio channel and assert `input_audio_buffer.commit` arrives.
+- [x] Send final completed event and assert clean shutdown.
+- [x] Repeat with server `error` event.
+- [x] Repeat with final-response timeout using a short test-only timeout.
 
 ## Phase 12: Manual Acceptance
 

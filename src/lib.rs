@@ -15,6 +15,8 @@ pub mod window;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::transcription::openai_realtime_protocol::{OpenAiRealtimeProfile, TurnDetectionMode};
+
 // ---------------------------------------------------------------------------
 // IPC protocol
 // ---------------------------------------------------------------------------
@@ -108,6 +110,8 @@ pub struct Config {
     pub local_parakeet: Option<LocalParakeetConfig>,
     #[serde(default, rename = "asr-sidecar", alias = "asr", alias = "vibevoice")]
     pub asr_sidecar: Option<AsrSidecarConfig>,
+    #[serde(default, rename = "openai-compatible-realtime")]
+    pub openai_compatible_realtime: Option<OpenAiCompatibleRealtimeConfig>,
     /// LLM configuration for command mode (text rewriting).
     #[serde(default)]
     pub llm: Option<llm::LlmConfig>,
@@ -447,6 +451,19 @@ pub struct AsrSidecarConfig {
     pub model: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiCompatibleRealtimeConfig {
+    pub url: String,
+    #[serde(default = "default_openai_compatible_realtime_model")]
+    pub model: String,
+    #[serde(default = "default_openai_compatible_realtime_profile")]
+    pub profile: String,
+    #[serde(default = "default_openai_compatible_realtime_turn_detection")]
+    pub turn_detection: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
 fn default_backend() -> String {
     "groq".to_string()
 }
@@ -488,6 +505,15 @@ fn default_asr_sidecar_url() -> String {
 }
 fn default_asr_sidecar_model() -> String {
     "microsoft/VibeVoice-ASR-HF".to_string()
+}
+fn default_openai_compatible_realtime_model() -> String {
+    "Whisper-Tiny".to_string()
+}
+fn default_openai_compatible_realtime_profile() -> String {
+    "lemonade".to_string()
+}
+fn default_openai_compatible_realtime_turn_detection() -> String {
+    "server-vad".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -718,10 +744,67 @@ impl Config {
                     ));
                 }
             }
+            "openai-compatible-realtime" => {
+                let config = self.openai_compatible_realtime.as_ref().ok_or_else(|| {
+                    WhisrsError::Config(
+                        "OpenAI-compatible realtime backend selected but no config section found.\n\
+                         Add [openai-compatible-realtime] to config.toml."
+                            .to_string(),
+                    )
+                })?;
+
+                let url = config.url.trim();
+                if url.is_empty() {
+                    return Err(WhisrsError::Config(
+                        "OpenAI-compatible realtime backend selected but no WebSocket URL configured.\n\
+                         Add [openai-compatible-realtime] url to config.toml."
+                            .to_string(),
+                    ));
+                }
+
+                let parsed_url = reqwest::Url::parse(url).map_err(|e| {
+                    WhisrsError::Config(format!("OpenAI-compatible realtime URL is invalid: {e}"))
+                })?;
+                match parsed_url.scheme() {
+                    "ws" | "wss" => {}
+                    scheme => {
+                        return Err(WhisrsError::Config(format!(
+                            "OpenAI-compatible realtime URL must use ws:// or wss://, got {scheme}://"
+                        )));
+                    }
+                }
+
+                if config.model.trim().is_empty() {
+                    return Err(WhisrsError::Config(
+                        "OpenAI-compatible realtime backend selected but model is empty.\n\
+                         Set [openai-compatible-realtime] model in config.toml."
+                            .to_string(),
+                    ));
+                }
+
+                OpenAiRealtimeProfile::parse(config.profile.trim()).map_err(|e| {
+                    WhisrsError::Config(format!(
+                        "OpenAI-compatible realtime profile is invalid: {e}"
+                    ))
+                })?;
+                if config.profile.trim() != "lemonade" {
+                    return Err(WhisrsError::Config(
+                        "OpenAI-compatible realtime backend currently supports only profile 'lemonade'."
+                            .to_string(),
+                    ));
+                }
+
+                TurnDetectionMode::parse(config.turn_detection.trim()).map_err(|e| {
+                    WhisrsError::Config(format!(
+                        "OpenAI-compatible realtime turn detection is invalid: {e}"
+                    ))
+                })?;
+            }
             other => {
                 return Err(WhisrsError::Config(format!(
                     "Unknown backend '{other}'. Valid options: deepgram, deepgram-streaming, \
-                     groq, openai, openai-realtime, local-whisper, local-vosk, local-parakeet, asr-sidecar"
+                     groq, openai, openai-realtime, openai-compatible-realtime, \
+                     local-whisper, local-vosk, local-parakeet, asr-sidecar"
                 )));
             }
         }
@@ -774,7 +857,18 @@ impl Config {
             .map(|v| !v.url.trim().is_empty())
             .unwrap_or(false);
 
-        has_deepgram || has_groq || has_openai || has_local || has_asr_sidecar
+        let has_openai_compatible_realtime = self
+            .openai_compatible_realtime
+            .as_ref()
+            .map(|v| !v.url.trim().is_empty())
+            .unwrap_or(false);
+
+        has_deepgram
+            || has_groq
+            || has_openai
+            || has_local
+            || has_asr_sidecar
+            || has_openai_compatible_realtime
     }
 }
 
@@ -1190,6 +1284,7 @@ mod tests {
             local_vosk: None,
             local_parakeet: None,
             asr_sidecar: None,
+            openai_compatible_realtime: None,
             llm: None,
             tts: None,
             hotkeys: None,
@@ -1197,6 +1292,7 @@ mod tests {
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("Unknown backend"));
+        assert!(err.to_string().contains("openai-compatible-realtime"));
     }
 
     #[test]
@@ -1233,6 +1329,7 @@ mod tests {
             local_vosk: None,
             local_parakeet: None,
             asr_sidecar: None,
+            openai_compatible_realtime: None,
             llm: None,
             tts: None,
             hotkeys: None,
@@ -1261,6 +1358,7 @@ mod tests {
             local_vosk: None,
             local_parakeet: None,
             asr_sidecar: None,
+            openai_compatible_realtime: None,
             llm: None,
             tts: None,
             hotkeys: None,
@@ -1306,6 +1404,7 @@ mod tests {
                 url: "http://127.0.0.1:8765/transcribe".to_string(),
                 model: "microsoft/VibeVoice-ASR-HF".to_string(),
             }),
+            openai_compatible_realtime: None,
             llm: None,
             tts: None,
             hotkeys: None,
@@ -1353,6 +1452,7 @@ mod tests {
             local_vosk: None,
             local_parakeet: None,
             asr_sidecar: None,
+            openai_compatible_realtime: None,
             llm: None,
             tts: None,
             hotkeys: None,
@@ -1362,6 +1462,214 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|w| w.message.contains("silence_timeout_ms")));
+    }
+
+    #[test]
+    fn config_parse_openai_compatible_realtime_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            backend = "openai-compatible-realtime"
+
+            [openai-compatible-realtime]
+            url = "ws://localhost:1234/realtime"
+            "#,
+        )
+        .unwrap();
+
+        let realtime = config.openai_compatible_realtime.unwrap();
+        assert_eq!(realtime.url, "ws://localhost:1234/realtime");
+        assert_eq!(realtime.model, "Whisper-Tiny");
+        assert_eq!(realtime.profile, "lemonade");
+        assert_eq!(realtime.turn_detection, "server-vad");
+        assert!(realtime.api_key.is_none());
+    }
+
+    #[test]
+    fn config_validate_openai_compatible_realtime_with_valid_config() {
+        let config = Config {
+            general: GeneralConfig {
+                backend: "openai-compatible-realtime".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: None,
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
+                url: "ws://localhost:1234/realtime".to_string(),
+                model: "Whisper-Tiny".to_string(),
+                profile: "lemonade".to_string(),
+                turn_detection: "server-vad".to_string(),
+                api_key: None,
+            }),
+            llm: None,
+            hotkeys: None,
+            overlay: None,
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_validate_openai_compatible_realtime_rejects_missing_url() {
+        let config = Config {
+            general: GeneralConfig {
+                backend: "openai-compatible-realtime".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: None,
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
+                url: " ".to_string(),
+                model: "Whisper-Tiny".to_string(),
+                profile: "lemonade".to_string(),
+                turn_detection: "server-vad".to_string(),
+                api_key: None,
+            }),
+            llm: None,
+            hotkeys: None,
+            overlay: None,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("WebSocket URL"));
+    }
+
+    #[test]
+    fn config_validate_openai_compatible_realtime_rejects_non_websocket_url() {
+        let config = Config {
+            general: GeneralConfig {
+                backend: "openai-compatible-realtime".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: None,
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
+                url: "http://localhost:1234/realtime".to_string(),
+                model: "Whisper-Tiny".to_string(),
+                profile: "lemonade".to_string(),
+                turn_detection: "server-vad".to_string(),
+                api_key: None,
+            }),
+            llm: None,
+            hotkeys: None,
+            overlay: None,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("ws:// or wss://"));
+    }
+
+    #[test]
+    fn config_validate_openai_compatible_realtime_rejects_unknown_profile() {
+        let config = Config {
+            general: GeneralConfig {
+                backend: "openai-compatible-realtime".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: None,
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
+                url: "ws://localhost:1234/realtime".to_string(),
+                model: "Whisper-Tiny".to_string(),
+                profile: "bogus".to_string(),
+                turn_detection: "server-vad".to_string(),
+                api_key: None,
+            }),
+            llm: None,
+            hotkeys: None,
+            overlay: None,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("profile is invalid"));
+    }
+
+    #[test]
+    fn config_validate_openai_compatible_realtime_rejects_unsupported_turn_detection() {
+        let config = Config {
+            general: GeneralConfig {
+                backend: "openai-compatible-realtime".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: None,
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
+                url: "ws://localhost:1234/realtime".to_string(),
+                model: "Whisper-Tiny".to_string(),
+                profile: "lemonade".to_string(),
+                turn_detection: "bogus".to_string(),
+                api_key: None,
+            }),
+            llm: None,
+            hotkeys: None,
+            overlay: None,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("turn detection is invalid"));
+    }
+
+    #[test]
+    fn has_any_backend_configured_counts_openai_compatible_realtime_url() {
+        let config = Config {
+            general: Default::default(),
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: None,
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
+                url: "ws://localhost:1234/realtime".to_string(),
+                model: "Whisper-Tiny".to_string(),
+                profile: "lemonade".to_string(),
+                turn_detection: "server-vad".to_string(),
+                api_key: None,
+            }),
+            llm: None,
+            hotkeys: None,
+            overlay: None,
+        };
+
+        assert!(config.has_any_backend_configured());
     }
 
     #[tokio::test]
