@@ -31,6 +31,7 @@ use whisrs::{
 };
 
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
+const TYPING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Context saved when command mode starts recording.
 struct CommandModeContext {
@@ -1297,8 +1298,37 @@ async fn run_streaming_pipeline(
         }
     }
 
-    // Wait for typing to finish.
-    let full_text = typing_task.await.unwrap_or_default();
+    // Wait for the typing side to observe the closed text channel and drain
+    // any final batch. If that somehow gets stuck, abort it so the daemon can
+    // return to Idle instead of staying in Transcribing forever.
+    debug!("waiting for typing task to finish");
+    let mut typing_task = typing_task;
+    let full_text = tokio::select! {
+        result = &mut typing_task => {
+            match result {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!("typing task join failed during pipeline shutdown: {e}");
+                    String::new()
+                }
+            }
+        }
+        _ = tokio::time::sleep(TYPING_DRAIN_TIMEOUT) => {
+            warn!(
+                "typing task did not finish within {:?}; aborting to unblock daemon state",
+                TYPING_DRAIN_TIMEOUT
+            );
+            typing_task.abort();
+            match typing_task.await {
+                Ok(text) => text,
+                Err(e) if e.is_cancelled() => String::new(),
+                Err(e) => {
+                    warn!("typing task reported an unexpected shutdown error after abort: {e}");
+                    String::new()
+                }
+            }
+        }
+    };
 
     // Notify user about streaming errors. Errors always pop, even with the
     // overlay on — the overlay can't carry the failure detail.
@@ -1324,6 +1354,7 @@ async fn run_streaming_pipeline(
     // If auto-stop happened, we need to transition to Idle.
     let mut ds = daemon_state.lock().await;
     if ds.state_machine.state() == State::Transcribing {
+        debug!("streaming pipeline transitioning daemon state back to idle");
         ds.state_machine.transition(Action::TranscriptionDone).ok();
         let _ = state_tx.send(ds.state_machine.state());
         if audio_feedback {
@@ -1516,6 +1547,10 @@ fn format_no_microphone_error() -> String {
 
 fn format_api_error(err: &anyhow::Error) -> String {
     let msg = format!("{err}");
+    if msg.contains("final transcription completion") {
+        return "Realtime transcription timed out waiting for the server to finish after stop"
+            .to_string();
+    }
     if msg.contains("invalid API key") || msg.contains("401") {
         return "Invalid API key — check your config at ~/.config/whisrs/config.toml".to_string();
     }
@@ -2827,5 +2862,16 @@ mod tests {
         };
 
         assert_eq!(get_model_for_backend(&config), "Whisper-Tiny");
+    }
+
+    #[test]
+    fn format_api_error_preserves_realtime_flush_timeout_context() {
+        let err = anyhow::anyhow!(
+            "timed out waiting for final transcription completion from ws://example after commit"
+        );
+        assert_eq!(
+            format_api_error(&err),
+            "Realtime transcription timed out waiting for the server to finish after stop"
+        );
     }
 }

@@ -523,6 +523,22 @@ impl OpenAiRealtimeProtocolEngine {
                         | "input_audio_buffer.speech_stopped" => {
                             debug!("audio buffer event: {}", server_msg.msg_type);
                         }
+                        "input_audio_buffer.cleared" => {
+                            debug!("audio buffer event: {}", server_msg.msg_type);
+                            // Lemonade may clear the committed buffer without
+                            // emitting a second completed item when the last
+                            // utterance already finalized before stop. In that
+                            // case, treat buffer-cleared as the terminal post-
+                            // commit flush signal instead of waiting until the
+                            // timeout fires.
+                            if profile == OpenAiRealtimeProfile::Lemonade
+                                && state.awaiting_post_commit_completion()
+                            {
+                                debug!("post-commit buffer cleared observed; finalizing stream");
+                                state.final_completion_seen = true;
+                                return Ok(true);
+                            }
+                        }
                         other => {
                             debug!("unhandled server message type: {other}");
                         }
@@ -816,5 +832,37 @@ mod tests {
         assert!(second.emit_text.is_none());
         assert!(third.emit_text.is_none());
         assert_eq!(completed.emit_text.as_deref(), Some("hello world"));
+    }
+
+    #[tokio::test]
+    async fn lemonade_buffer_cleared_after_commit_finalizes_stream() {
+        let engine = OpenAiRealtimeProtocolEngine::new(RealtimeEngineConfig {
+            url: "ws://localhost:1234/realtime".to_string(),
+            endpoint_display: "ws://localhost:1234/realtime".to_string(),
+            auth_bearer: None,
+            host_header: None,
+            profile: OpenAiRealtimeProfile::Lemonade,
+            turn_detection: TurnDetectionMode::ServerVad,
+            final_completion_timeout: None,
+        });
+        let (text_tx, _text_rx) = mpsc::channel::<String>(1);
+        let mut state = StreamState::default();
+        state.note_input_closed();
+        state.note_commit_sent();
+
+        let finalized = engine
+            .handle_server_message(
+                Ok(tungstenite::Message::Text(
+                    r#"{"type":"input_audio_buffer.cleared"}"#.to_string().into(),
+                )),
+                &text_tx,
+                OpenAiRealtimeProfile::Lemonade,
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        assert!(finalized);
+        assert!(state.final_completion_seen);
     }
 }

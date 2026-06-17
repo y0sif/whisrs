@@ -1,10 +1,8 @@
 //! System tray implementation using ksni (StatusNotifierItem).
 
-use std::sync::{Arc, Mutex};
-
 use ksni::{Icon, ToolTip, TrayMethods};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::State;
 
@@ -61,14 +59,19 @@ mod icons {
     }
 }
 
-/// Shared state that the tray reads.
+/// Small mutable state owned by the tray service itself.
+///
+/// Keeping this directly on the tray object is important: `ksni::Handle::update`
+/// expects the closure to mutate the tray instance so the host knows which
+/// properties changed. When the state lives out-of-band, some tray hosts can
+/// miss icon refreshes and leave the old color visible.
 struct TrayState {
     current: State,
 }
 
 /// The ksni tray implementation.
 struct WhisrsTray {
-    state: Arc<Mutex<TrayState>>,
+    state: TrayState,
 }
 
 impl ksni::Tray for WhisrsTray {
@@ -77,8 +80,7 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn title(&self) -> String {
-        let state = self.state.lock().unwrap();
-        match state.current {
+        match self.state.current {
             State::Idle => "whisrs — idle".to_string(),
             State::Recording => "whisrs — recording".to_string(),
             State::Transcribing => "whisrs — transcribing".to_string(),
@@ -88,8 +90,7 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        let state = self.state.lock().unwrap();
-        let data = match state.current {
+        let data = match self.state.current {
             State::Idle => icons::idle(),
             State::Recording => icons::recording(),
             State::Transcribing => icons::transcribing(),
@@ -104,8 +105,7 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn tool_tip(&self) -> ToolTip {
-        let state = self.state.lock().unwrap();
-        let description = match state.current {
+        let description = match self.state.current {
             State::Idle => "Idle — ready to record",
             State::Recording => "Recording...",
             State::Transcribing => "Transcribing...",
@@ -133,17 +133,15 @@ const TRAY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1
 /// Retries with exponential backoff if the SNI host isn't available yet (common
 /// on boot when the daemon starts before the desktop environment is fully ready).
 pub async fn spawn_tray(mut state_rx: watch::Receiver<State>) {
-    let tray_state = Arc::new(Mutex::new(TrayState {
-        current: State::Idle,
-    }));
-
     // Retry spawning the tray with exponential backoff.
     let mut delay = TRAY_INITIAL_DELAY;
     let mut handle = None;
 
     for attempt in 1..=TRAY_MAX_RETRIES {
         let tray = WhisrsTray {
-            state: Arc::clone(&tray_state),
+            state: TrayState {
+                current: *state_rx.borrow(),
+            },
         };
 
         match tray.spawn().await {
@@ -171,16 +169,17 @@ pub async fn spawn_tray(mut state_rx: watch::Receiver<State>) {
     let handle = handle.expect("handle must be set after successful spawn");
 
     // Watch for state changes and update the tray.
-    let state_ref = Arc::clone(&tray_state);
     tokio::spawn(async move {
         while state_rx.changed().await.is_ok() {
             let new_state = *state_rx.borrow();
-            {
-                let mut ts = state_ref.lock().unwrap();
-                ts.current = new_state;
-            }
-            // Trigger ksni to re-read properties.
-            handle.update(|_tray| {}).await;
+            debug!("tray state update: {new_state:?}");
+            // Mutate the tray object itself so ksni emits the corresponding
+            // D-Bus property changes for title, tooltip, and icon pixmap.
+            handle
+                .update(|tray| {
+                    tray.state.current = new_state;
+                })
+                .await;
         }
     });
 }

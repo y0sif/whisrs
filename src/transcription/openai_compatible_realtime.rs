@@ -569,4 +569,78 @@ mod tests {
 
         server.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn mock_ws_buffer_cleared_after_commit_finishes_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            let session = recv_json(&mut ws).await;
+            assert_eq!(session["type"], "session.update");
+
+            let append = recv_json(&mut ws).await;
+            assert_eq!(append["type"], "input_audio_buffer.append");
+
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "hello there"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let commit = recv_json(&mut ws).await;
+            assert_eq!(commit["type"], "input_audio_buffer.commit");
+
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "input_audio_buffer.cleared"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            match ws.next().await.unwrap().unwrap() {
+                Message::Close(_) => {}
+                other => panic!("expected close frame, got {other:?}"),
+            }
+        });
+
+        let backend = OpenAiCompatibleRealtimeBackend::new(
+            format!("ws://{addr}/realtime"),
+            "Whisper-Tiny".to_string(),
+            "lemonade".to_string(),
+            "server-vad".to_string(),
+            None,
+        )
+        .unwrap();
+        let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(4);
+        let (text_tx, mut text_rx) = mpsc::channel::<String>(4);
+
+        let backend_task = tokio::spawn(async move {
+            backend
+                .transcribe_stream(audio_rx, text_tx, &test_request())
+                .await
+        });
+
+        audio_tx.send(vec![8; 160]).await.unwrap();
+        let first = timeout(Duration::from_secs(1), text_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, "hello there");
+
+        drop(audio_tx);
+
+        assert!(backend_task.await.unwrap().is_ok());
+        server.await.unwrap();
+    }
 }
