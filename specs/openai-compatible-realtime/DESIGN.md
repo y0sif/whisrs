@@ -284,7 +284,7 @@ backend = "openai-compatible-realtime"
 language = "auto"
 
 [openai-compatible-realtime]
-url = "ws://localhost:12345/realtime?model=Whisper-Tiny"
+url = "ws://localhost:12345/realtime"
 model = "Whisper-Tiny"
 profile = "lemonade"
 turn_detection = "server-vad"

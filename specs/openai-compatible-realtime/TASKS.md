@@ -156,39 +156,39 @@ Implementation task plan for `specs/openai-compatible-realtime/README.md` and `D
 
 ## Phase 12: Manual Acceptance
 
-- [ ] Start Lemonade and resolve its realtime WebSocket URL.
-- [ ] Configure `backend = "openai-compatible-realtime"` with a Lemonade `ws://` URL.
-- [ ] Run with debug logging.
-- [ ] Dictate multiple phrases separated by silence without manually stopping.
-- [ ] Verify each completed phrase is typed once while recording remains active.
-- [ ] Verify interim Lemonade partials do not appear at the cursor before completion.
-- [ ] Stop during speech and verify trailing speech flushes after commit.
-- [ ] Verify logs show Lemonade audio is encoded at 16 kHz without 24 kHz resampling.
-- [ ] Verify no replaceable partial text is blindly appended.
-- [ ] Note expected latency: Lemonade text appears after server-VAD completion or stop/commit, not on every interim hypothesis.
+- [x] Start Lemonade and resolve its realtime WebSocket URL.
+- [x] Configure `backend = "openai-compatible-realtime"` with a Lemonade `ws://` URL.
+- [x] Run with debug logging.
+- [x] Dictate multiple phrases separated by silence without manually stopping.
+- [x] Verify each completed phrase is typed once while recording remains active.
+- [x] Verify interim Lemonade partials do not appear at the cursor before completion.
+- [x] Stop during speech and verify trailing speech flushes after commit.
+- [x] Verify logs show Lemonade audio is encoded at 16 kHz without 24 kHz resampling.
+- [x] Verify no replaceable partial text is blindly appended.
+- [x] Note expected latency: Lemonade text appears after server-VAD completion or stop/commit, not on every interim hypothesis.
+- [x] Regression test `asr-sidecar` with lemonade `https://localhost:port/v1/audio/transcriptions` still works via batch (no text appears until recording stops)
 - [ ] Switch back to `backend = "openai-realtime"` and verify existing OpenAI behavior still works.
 
 ## Phase 13: Final Verification
 
-- [ ] Run `cargo fmt`.
-- [ ] Run `cargo fmt -- --check`.
-- [ ] Run `cargo test`.
-- [ ] Run `cargo clippy --all-targets -- -D warnings`.
-- [ ] Run `cargo build`.
-- [ ] Confirm `Cargo.toml` and `Cargo.lock` are unchanged unless a dependency was intentionally added.
-- [ ] Confirm no bearer tokens or credential-bearing URLs appear in logs, tests, docs, or committed fixtures.
-- [ ] Confirm `git diff` does not include unrelated formatting or refactors.
+- [x] Run `cargo fmt`.
+- [x] Run `cargo fmt -- --check`.
+- [x] Run `cargo test`.
+- [x] Run `cargo clippy --all-targets -- -D warnings`.
+- [x] Run `cargo build`.
+- [x] Confirm `Cargo.toml` and `Cargo.lock` are unchanged unless a dependency was intentionally added.
+- [x] Confirm no bearer tokens or credential-bearing URLs appear in logs, tests, docs, or committed fixtures.
+- [x] Confirm `git diff` does not include unrelated formatting or refactors.
 
 ## Completion Checklist
 
-- [ ] Lemonade realtime transcription works through `backend = "openai-compatible-realtime"`.
+- [x] Lemonade realtime transcription works through `backend = "openai-compatible-realtime"`.
 - [ ] Existing `openai-realtime` backend still works without config changes.
-- [ ] OpenAI cloud and external realtime share one protocol engine and one message type set.
-- [ ] There is no Lemonade-specific WebSocket loop outside the shared protocol engine.
-- [ ] Existing batch HTTP `asr-sidecar` behavior is unchanged.
-- [ ] Server-VAD completed items do not prematurely close active streams.
-- [ ] End-of-audio commit flushes trailing audio.
-- [ ] Replaceable Lemonade partials cannot corrupt typed text.
-- [ ] Lemonade partials are received/buffered or logged internally, but only completed transcripts are emitted to the append-only daemon channel.
-- [ ] Tests cover protocol serialization, event semantics, config validation, and at least one mock WebSocket happy path.
-- [ ] Documentation clearly distinguishes HTTP sidecars from OpenAI-compatible realtime external servers.
+- [x] OpenAI cloud and external realtime share one protocol engine and one message type set.
+- [x] There is no Lemonade-specific WebSocket loop outside the shared protocol engine.
+- [x] Existing batch HTTP `asr-sidecar` behavior is unchanged.
+- [x] Server-VAD completed items do not prematurely close active streams.
+- [x] End-of-audio commit flushes trailing audio.
+- [x] Replaceable Lemonade partials cannot corrupt typed text.
+- [x] Lemonade partials are received/buffered or logged internally, but only completed transcripts are emitted to the append-only daemon channel.
+- [x] Tests cover protocol serialization, event semantics, config validation, and at least one mock WebSocket happy path.

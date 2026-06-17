@@ -72,7 +72,7 @@ model = "gpt-4o-mini-transcribe"
 # In the current whisrs typing pipeline, replaceable interim partials are kept
 # internal and only completed phrases are typed at the cursor.
 [openai-compatible-realtime]
-url = "ws://localhost:12345/realtime?model=Whisper-Tiny"
+url = "ws://localhost:12345/realtime"
 model = "Whisper-Tiny"
 profile = "lemonade"        # currently only "lemonade"
 turn_detection = "server-vad"  # recommended; see notes below

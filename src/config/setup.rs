@@ -374,9 +374,11 @@ pub(crate) fn configure_backend(
             let existing_realtime = existing.and_then(|c| c.openai_compatible_realtime.as_ref());
             let url: String = Input::new()
                 .with_prompt("Realtime WebSocket URL")
-                .default(existing_realtime.map(|v| v.url.clone()).unwrap_or_else(|| {
-                    "ws://localhost:12345/realtime?model=Whisper-Tiny".to_string()
-                }))
+                .default(
+                    existing_realtime
+                        .map(|v| v.url.clone())
+                        .unwrap_or_else(|| "ws://localhost:12345/realtime".to_string()),
+                )
                 .interact_text()
                 .context("failed to read realtime WebSocket URL")?;
 

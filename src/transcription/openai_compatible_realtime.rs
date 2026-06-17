@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn trims_optional_bearer_and_sanitizes_endpoint_display() {
         let backend = OpenAiCompatibleRealtimeBackend::new(
-            "ws://user:secret@localhost:1234/realtime?model=Whisper-Tiny".to_string(),
+            "ws://user:secret@localhost:1234/realtime".to_string(),
             "Whisper-Tiny".to_string(),
             "lemonade".to_string(),
             "manual-commit".to_string(),

@@ -89,7 +89,7 @@ provider's behavior.
 
 | Behavior | OpenAI cloud | Lemonade |
 |---|---|---|
-| URL | Fixed OpenAI URL with `intent=transcription` | User URL, commonly `ws://localhost:<port>/realtime?model=Whisper-Tiny` |
+| URL | Fixed OpenAI URL with `intent=transcription` | User URL, commonly `ws://localhost:<port>/realtime` |
 | Authentication | Required bearer token | None by default |
 | Input audio | 24 kHz mono PCM16 | 16 kHz mono PCM16 |
 | Session shape | Nested transcription session/audio input config | Flat `session.model` and `session.turn_detection` fields |
@@ -112,7 +112,7 @@ backend = "openai-compatible-realtime"
 language = "auto"
 
 [openai-compatible-realtime]
-url = "ws://localhost:12345/realtime?model=Whisper-Tiny"
+url = "ws://localhost:12345/realtime"
 model = "Whisper-Tiny"
 profile = "lemonade"
 turn_detection = "server-vad"
