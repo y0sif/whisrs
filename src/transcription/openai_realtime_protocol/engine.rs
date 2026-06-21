@@ -14,6 +14,15 @@ use super::{encode_pcm_base64, resample_16k_to_24k};
 
 const FINAL_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+// Short post-commit wait used once we have already typed at least one
+// transcript this session. Server VAD can finalize the last turn before
+// recording stops, leaving the trailing end-of-stream commit with nothing to
+// flush and no post-commit completion to follow. Since we already have output
+// (and for append-only profiles any final completion is a duplicate that gets
+// deduped anyway), we only grant a brief grace for a real completion before
+// finalizing gracefully, instead of stalling the daemon for the full timeout.
+const POST_COMMIT_GRACE_AFTER_TEXT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Immutable connection options for the shared realtime engine.
 #[derive(Debug, Clone)]
 pub struct RealtimeEngineConfig {
@@ -53,6 +62,12 @@ struct StreamState {
     // Append-only providers stream stable text through delta events. Keep a
     // running copy so a later completed event cannot re-emit the same content.
     emitted_append_text: String,
+    // Set once we have forwarded at least one transcript to the downstream
+    // typing channel. Used to decide whether a missing post-commit completion is
+    // a graceful finalize or a genuine failure. Only flipped when text is
+    // actually emitted downstream — not on empty/duplicate completions or on
+    // buffered Lemonade interim deltas that are never typed.
+    emitted_any_text: bool,
 }
 
 #[derive(Debug)]
@@ -82,6 +97,18 @@ impl StreamState {
         self.input_closed && self.commit_sent && !self.final_completion_seen
     }
 
+    // When input has already closed and we have already typed at least one
+    // transcript this session, a missing post-commit completion (timeout, clean
+    // close, or empty-commit error) is not a real failure: server VAD can finish
+    // the final turn before recording stops, leaving the trailing commit with
+    // nothing to flush. In that case we finalize gracefully and keep the typed
+    // text instead of erroring into the recovery-save path. When nothing was
+    // ever emitted, the original error/bail behavior is kept so genuine failures
+    // still surface.
+    fn can_finalize_without_post_commit_completion(&self) -> bool {
+        self.input_closed && self.emitted_any_text
+    }
+
     fn note_input_closed(&mut self) {
         self.input_closed = true;
     }
@@ -101,6 +128,7 @@ impl StreamState {
             // preserves the text stream exactly as emitted by the provider.
             DeltaMode::AppendOnly => {
                 self.emitted_append_text.push_str(&delta);
+                self.emitted_any_text = true;
                 DeltaAction {
                     emit_text: Some(delta),
                 }
@@ -172,6 +200,9 @@ impl StreamState {
             if let Some(normalized) = Self::normalized_transcript_key(text) {
                 self.emitted_completed_text.insert(normalized);
             }
+            // Only record that we forwarded text when a non-empty, non-duplicate
+            // completed transcript actually reaches the typing channel.
+            self.emitted_any_text = true;
         }
 
         // The stream only becomes terminal once we have closed input, sent an
@@ -197,6 +228,14 @@ impl OpenAiRealtimeProtocolEngine {
         self.config
             .final_completion_timeout
             .unwrap_or(FINAL_COMPLETION_TIMEOUT)
+    }
+
+    // Grace period to wait for a real post-commit completion once text was
+    // already emitted. Never longer than the configured final-completion timeout
+    // so tests that pin a tiny timeout keep their tight bounds.
+    fn post_commit_grace_timeout(&self) -> std::time::Duration {
+        self.final_completion_timeout()
+            .min(POST_COMMIT_GRACE_AFTER_TEXT)
     }
 
     async fn connect(
@@ -312,17 +351,52 @@ impl OpenAiRealtimeProtocolEngine {
                     // the audio channel and wait specifically for the final
                     // completion event. This prevents us from returning early on
                     // providers that emit multiple completed events over a session.
-                    let msg_result =
-                        tokio::time::timeout(self.final_completion_timeout(), ws_source.next())
-                            .await
-                            .map_err(|_| {
-                                anyhow::anyhow!(
-                                    "timed out waiting for final transcription completion from {} after commit",
+                    //
+                    // Timeout selection: if we have already typed at least one
+                    // transcript, a missing post-commit completion is benign
+                    // (server VAD finalized the last turn before stop), so we only
+                    // grant a short grace period before finalizing gracefully and
+                    // never stall the daemon for the full timeout. If nothing has
+                    // been emitted yet we are still waiting for the only result,
+                    // so we keep the full FINAL_COMPLETION_TIMEOUT.
+                    let post_commit_timeout = if state.emitted_any_text {
+                        self.post_commit_grace_timeout()
+                    } else {
+                        self.final_completion_timeout()
+                    };
+
+                    let timed_out =
+                        tokio::time::timeout(post_commit_timeout, ws_source.next()).await;
+
+                    let msg_result = match timed_out {
+                        Ok(msg_result) => msg_result,
+                        Err(_) => {
+                            // A post-commit timeout only fails the stream if we
+                            // never typed anything; otherwise keep the text.
+                            if state.can_finalize_without_post_commit_completion() {
+                                warn!(
+                                    "no post-commit completion from {} within grace period; finalizing with already-typed transcript",
                                     self.config.endpoint_display
-                                )
-                            })?;
+                                );
+                                break;
+                            }
+                            anyhow::bail!(
+                                "timed out waiting for final transcription completion from {} after commit",
+                                self.config.endpoint_display
+                            );
+                        }
+                    };
 
                     let Some(msg_result) = msg_result else {
+                        // Clean close with no post-commit completion: finalize
+                        // gracefully if we already typed text, else surface it.
+                        if state.can_finalize_without_post_commit_completion() {
+                            warn!(
+                                "realtime endpoint {} closed before post-commit completion; finalizing with already-typed transcript",
+                                self.config.endpoint_display
+                            );
+                            break;
+                        }
                         anyhow::bail!(
                             "realtime transcription endpoint {} closed before final completion after commit",
                             self.config.endpoint_display
@@ -370,6 +444,16 @@ impl OpenAiRealtimeProtocolEngine {
                             // audio is still arriving is different from closing after
                             // input ended but before the provider produced its final turn.
                             if state.input_closed {
+                                // Closed after input ended without a post-commit
+                                // completion: finalize gracefully if we already
+                                // typed text, else surface the failure.
+                                if state.can_finalize_without_post_commit_completion() {
+                                    warn!(
+                                        "realtime endpoint {} closed after input ended without a post-commit completion; finalizing with already-typed transcript",
+                                        self.config.endpoint_display
+                                    );
+                                    break;
+                                }
                                 anyhow::bail!(
                                     "realtime transcription endpoint {} closed before final completion after commit",
                                     self.config.endpoint_display
@@ -505,6 +589,21 @@ impl OpenAiRealtimeProtocolEngine {
                                 .error
                                 .map(|e| e.message)
                                 .unwrap_or_else(|| "unknown error".to_string());
+                            // An empty-commit error after input closed means the
+                            // final turn was already completed before recording
+                            // stopped, so the trailing commit had nothing to
+                            // flush. If we already typed a transcript, treat this
+                            // as a graceful finalize rather than a failure.
+                            if is_empty_commit_error(&err_msg)
+                                && state.can_finalize_without_post_commit_completion()
+                            {
+                                warn!(
+                                    "realtime endpoint {} reported an empty-commit after input ended ({err_msg}); finalizing with already-typed transcript",
+                                    self.config.endpoint_display
+                                );
+                                state.final_completion_seen = true;
+                                return Ok(true);
+                            }
                             error!("realtime transcription error: {err_msg}");
                             debug!("raw error message: {text}");
                             anyhow::bail!(
@@ -553,6 +652,17 @@ impl OpenAiRealtimeProtocolEngine {
             }
             Ok(tungstenite::Message::Close(_)) => {
                 if state.awaiting_post_commit_completion() {
+                    // Server-initiated close before the post-commit completion:
+                    // finalize gracefully if we already typed text, else surface
+                    // the failure so genuine problems still reach the user.
+                    if state.can_finalize_without_post_commit_completion() {
+                        warn!(
+                            "realtime endpoint {} sent close before post-commit completion; finalizing with already-typed transcript",
+                            self.config.endpoint_display
+                        );
+                        state.final_completion_seen = true;
+                        return Ok(true);
+                    }
                     anyhow::bail!(
                         "realtime transcription endpoint {} closed before final completion after commit",
                         self.config.endpoint_display
@@ -572,6 +682,19 @@ impl OpenAiRealtimeProtocolEngine {
 
         Ok(false)
     }
+}
+
+// Recognize the family of "you committed an empty / already-flushed audio
+// buffer" errors that OpenAI-compatible servers raise when server VAD finished
+// the final turn before the client's end-of-stream commit. Matching is
+// conservative and case-insensitive so it cannot swallow genuine failures such
+// as auth or decoder errors.
+fn is_empty_commit_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("commit_empty")
+        || lowered.contains("buffer is empty")
+        || lowered.contains("buffer too small")
+        || lowered.contains("empty audio buffer")
 }
 
 fn host_header_from_url(url: &str) -> Option<String> {
@@ -804,6 +927,127 @@ mod tests {
     }
 
     #[test]
+    fn append_only_delta_marks_text_as_emitted() {
+        let mut state = StreamState::default();
+        assert!(!state.emitted_any_text);
+
+        state.on_delta(
+            OpenAiRealtimeProfile::OpenAi,
+            Some("item-1"),
+            "hello".to_string(),
+        );
+
+        assert!(state.emitted_any_text);
+    }
+
+    #[test]
+    fn lemonade_completed_marks_text_as_emitted() {
+        let mut state = StreamState::default();
+        assert!(!state.emitted_any_text);
+
+        state.on_completed(
+            OpenAiRealtimeProfile::Lemonade,
+            Some("item-1"),
+            Some("hello world".to_string()),
+        );
+
+        assert!(state.emitted_any_text);
+    }
+
+    #[test]
+    fn empty_completed_does_not_mark_text_as_emitted() {
+        let mut state = StreamState::default();
+
+        state.on_completed(
+            OpenAiRealtimeProfile::Lemonade,
+            Some("item-1"),
+            Some("   ".to_string()),
+        );
+
+        assert!(!state.emitted_any_text);
+    }
+
+    #[test]
+    fn buffered_lemonade_interim_delta_does_not_mark_text_as_emitted() {
+        let mut state = StreamState::default();
+
+        // Replaceable interim previews are buffered, not typed downstream, so
+        // they must not flip emitted_any_text.
+        let action = state.on_delta(
+            OpenAiRealtimeProfile::Lemonade,
+            Some("item-1"),
+            "hello wor".to_string(),
+        );
+
+        assert!(action.emit_text.is_none());
+        assert!(!state.emitted_any_text);
+    }
+
+    #[test]
+    fn duplicate_completed_does_not_re_mark_when_already_emitted_via_append() {
+        // If append-only deltas already typed the text, a later completed event
+        // is a duplicate that is not forwarded — but emitted_any_text is already
+        // true from the delta path, which is the behavior we want.
+        let mut state = StreamState {
+            emitted_append_text: "hello world".to_string(),
+            emitted_any_text: true,
+            ..StreamState::default()
+        };
+
+        let action = state.on_completed(
+            OpenAiRealtimeProfile::Lemonade,
+            Some("item-1"),
+            Some("hello world".to_string()),
+        );
+
+        assert!(action.emit_text.is_none());
+        assert!(state.emitted_any_text);
+    }
+
+    #[test]
+    fn graceful_finalize_requires_closed_input_and_emitted_text() {
+        let mut state = StreamState::default();
+        // Nothing happened yet: a missing completion is a genuine failure.
+        assert!(!state.can_finalize_without_post_commit_completion());
+
+        // Input closed but no text typed: still a genuine failure.
+        state.note_input_closed();
+        assert!(!state.can_finalize_without_post_commit_completion());
+
+        // Input closed and a transcript already typed: safe to finalize.
+        state.on_completed(
+            OpenAiRealtimeProfile::Lemonade,
+            Some("item-1"),
+            Some("hello world".to_string()),
+        );
+        assert!(state.can_finalize_without_post_commit_completion());
+    }
+
+    #[test]
+    fn text_emitted_before_input_close_does_not_allow_finalize_yet() {
+        let mut state = StreamState::default();
+        state.on_completed(
+            OpenAiRealtimeProfile::Lemonade,
+            Some("item-1"),
+            Some("hello world".to_string()),
+        );
+
+        // Text was typed, but input is still open, so we must keep listening.
+        assert!(state.emitted_any_text);
+        assert!(!state.can_finalize_without_post_commit_completion());
+    }
+
+    #[test]
+    fn empty_commit_errors_are_recognized() {
+        assert!(is_empty_commit_error("input_audio_buffer_commit_empty"));
+        assert!(is_empty_commit_error("Error: COMMIT_EMPTY"));
+        assert!(is_empty_commit_error("the audio buffer is empty"));
+        assert!(is_empty_commit_error("audio buffer too small to commit"));
+        assert!(!is_empty_commit_error("bad auth"));
+        assert!(!is_empty_commit_error("decoder failed"));
+    }
+
+    #[test]
     fn lemonade_partial_sequence_emits_nothing_until_completed() {
         let mut state = StreamState::default();
 
@@ -864,5 +1108,360 @@ mod tests {
 
         assert!(finalized);
         assert!(state.final_completion_seen);
+    }
+}
+
+#[cfg(test)]
+mod stream_lifecycle_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::Value;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::{timeout, Duration, Instant};
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    fn test_request() -> TranscriptionConfig {
+        TranscriptionConfig {
+            language: "en".to_string(),
+            model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+        }
+    }
+
+    // Use the real 30s FINAL_COMPLETION_TIMEOUT (final_completion_timeout: None)
+    // so we exercise the production short-grace path: once text was emitted the
+    // engine must finalize within POST_COMMIT_GRACE_AFTER_TEXT, NOT wait 30s.
+    fn openai_engine_default_timeout(url: String) -> OpenAiRealtimeProtocolEngine {
+        OpenAiRealtimeProtocolEngine::new(RealtimeEngineConfig {
+            endpoint_display: url.clone(),
+            url,
+            auth_bearer: None,
+            host_header: None,
+            profile: OpenAiRealtimeProfile::OpenAi,
+            turn_detection: TurnDetectionMode::ServerVad,
+            final_completion_timeout: None,
+        })
+    }
+
+    fn openai_engine_with_short_timeout(url: String) -> OpenAiRealtimeProtocolEngine {
+        OpenAiRealtimeProtocolEngine::new(RealtimeEngineConfig {
+            endpoint_display: url.clone(),
+            url,
+            auth_bearer: None,
+            host_header: None,
+            profile: OpenAiRealtimeProfile::OpenAi,
+            turn_detection: TurnDetectionMode::ServerVad,
+            final_completion_timeout: Some(Duration::from_millis(50)),
+        })
+    }
+
+    async fn recv_json(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> Value {
+        let msg = ws.next().await.unwrap().unwrap();
+        let Message::Text(text) = msg else {
+            panic!("expected text message, got {msg:?}");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    // OpenAI server-VAD append-only profile: a transcript (append-only delta)
+    // arrives BEFORE end-of-stream, then NO post-commit completion ever arrives.
+    // The engine must finalize cleanly (Ok), preserve the already-typed text,
+    // and finish via the SHORT grace period instead of stalling for the full
+    // 30s FINAL_COMPLETION_TIMEOUT.
+    #[tokio::test]
+    async fn openai_no_post_commit_completion_after_timeout_preserves_text() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (delta_sent_tx, delta_sent_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            let session = recv_json(&mut ws).await;
+            assert_eq!(session["type"], "session.update");
+
+            let append = recv_json(&mut ws).await;
+            assert_eq!(append["type"], "input_audio_buffer.append");
+
+            // Server VAD finalizes the turn before recording stops: send the
+            // append-only delta now, while audio input is still open.
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": "item-1",
+                    "delta": "hello world"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            delta_sent_tx.send(()).ok();
+
+            // After end-of-stream the client commits, but there is nothing left
+            // to flush, so the server never sends a post-commit completion.
+            let commit = recv_json(&mut ws).await;
+            assert_eq!(commit["type"], "input_audio_buffer.commit");
+
+            // Hold the connection open without completing so the client hits its
+            // post-commit grace timeout instead of a clean close.
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None => {}
+                other => panic!("expected close or end, got {other:?}"),
+            }
+        });
+
+        let engine = openai_engine_default_timeout(format!("ws://{addr}/realtime"));
+        let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(8);
+        let (text_tx, mut text_rx) = mpsc::channel::<String>(8);
+
+        let request = test_request();
+        let backend_task =
+            tokio::spawn(
+                async move { engine.transcribe_stream(audio_rx, text_tx, &request).await },
+            );
+
+        audio_tx.send(vec![1; 160]).await.unwrap();
+        delta_sent_rx.await.unwrap();
+
+        // The append-only delta should reach the typing channel immediately.
+        let emitted = timeout(Duration::from_secs(1), text_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(emitted, "hello world");
+
+        // Close input; the engine commits and then no post-commit completion
+        // arrives. It must finalize gracefully via the short grace period.
+        let finalize_start = Instant::now();
+        drop(audio_tx);
+
+        // Comfortably above POST_COMMIT_GRACE_AFTER_TEXT (2s) but far below the
+        // 30s FINAL_COMPLETION_TIMEOUT, proving we use the short grace.
+        let result = timeout(Duration::from_secs(5), backend_task)
+            .await
+            .expect("must not stall for the full final-completion timeout")
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "post-commit timeout must finalize gracefully when text was already emitted, got {result:?}"
+        );
+        assert!(
+            finalize_start.elapsed() < Duration::from_secs(10),
+            "finalize took too long; expected the short grace period, not the full timeout"
+        );
+
+        server.await.unwrap();
+    }
+
+    // Same lifecycle, but the server cleanly closes the WebSocket after the
+    // commit instead of timing out. The already-typed text must still survive.
+    #[tokio::test]
+    async fn openai_clean_close_after_commit_preserves_text() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (delta_sent_tx, delta_sent_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            let session = recv_json(&mut ws).await;
+            assert_eq!(session["type"], "session.update");
+
+            let append = recv_json(&mut ws).await;
+            assert_eq!(append["type"], "input_audio_buffer.append");
+
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": "item-1",
+                    "delta": "hello world"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            delta_sent_tx.send(()).ok();
+
+            let commit = recv_json(&mut ws).await;
+            assert_eq!(commit["type"], "input_audio_buffer.commit");
+
+            // Clean close, no post-commit completion.
+            ws.send(Message::Close(None)).await.ok();
+        });
+
+        let engine = openai_engine_default_timeout(format!("ws://{addr}/realtime"));
+        let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(8);
+        let (text_tx, mut text_rx) = mpsc::channel::<String>(8);
+
+        let request = test_request();
+        let backend_task =
+            tokio::spawn(
+                async move { engine.transcribe_stream(audio_rx, text_tx, &request).await },
+            );
+
+        audio_tx.send(vec![1; 160]).await.unwrap();
+        delta_sent_rx.await.unwrap();
+
+        let emitted = timeout(Duration::from_secs(1), text_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(emitted, "hello world");
+
+        drop(audio_tx);
+
+        let result = timeout(Duration::from_secs(5), backend_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "clean close after commit must finalize gracefully when text was already emitted, got {result:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    // The empty-commit server error after input closed must finalize gracefully
+    // when text was already typed, rather than failing into the recovery path.
+    #[tokio::test]
+    async fn openai_empty_commit_error_after_input_close_preserves_text() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (delta_sent_tx, delta_sent_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            let session = recv_json(&mut ws).await;
+            assert_eq!(session["type"], "session.update");
+
+            let append = recv_json(&mut ws).await;
+            assert_eq!(append["type"], "input_audio_buffer.append");
+
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": "item-1",
+                    "delta": "hello world"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            delta_sent_tx.send(()).ok();
+
+            let commit = recv_json(&mut ws).await;
+            assert_eq!(commit["type"], "input_audio_buffer.commit");
+
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "error",
+                    "error": { "message": "input_audio_buffer_commit_empty" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None => {}
+                other => panic!("expected close or end, got {other:?}"),
+            }
+        });
+
+        let engine = openai_engine_default_timeout(format!("ws://{addr}/realtime"));
+        let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(8);
+        let (text_tx, mut text_rx) = mpsc::channel::<String>(8);
+
+        let request = test_request();
+        let backend_task =
+            tokio::spawn(
+                async move { engine.transcribe_stream(audio_rx, text_tx, &request).await },
+            );
+
+        audio_tx.send(vec![1; 160]).await.unwrap();
+        delta_sent_rx.await.unwrap();
+
+        let emitted = timeout(Duration::from_secs(1), text_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(emitted, "hello world");
+
+        drop(audio_tx);
+
+        let result = timeout(Duration::from_secs(5), backend_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "empty-commit error after input close must finalize gracefully when text was already emitted, got {result:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    // Guardrail: if NOTHING was ever emitted, a post-commit timeout must still
+    // surface as an error so genuine failures trigger the recovery-save path.
+    // This path keeps the full final-completion timeout (here overridden short).
+    #[tokio::test]
+    async fn openai_no_text_ever_emitted_still_errors_on_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            let session = recv_json(&mut ws).await;
+            assert_eq!(session["type"], "session.update");
+
+            let append = recv_json(&mut ws).await;
+            assert_eq!(append["type"], "input_audio_buffer.append");
+
+            let commit = recv_json(&mut ws).await;
+            assert_eq!(commit["type"], "input_audio_buffer.commit");
+
+            // Never send any transcript, just hold the socket open.
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None => {}
+                other => panic!("expected close or end, got {other:?}"),
+            }
+        });
+
+        let engine = openai_engine_with_short_timeout(format!("ws://{addr}/realtime"));
+        let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(8);
+        let (text_tx, _text_rx) = mpsc::channel::<String>(8);
+
+        let request = test_request();
+        audio_tx.send(vec![1; 160]).await.unwrap();
+        drop(audio_tx);
+
+        let result = timeout(
+            Duration::from_secs(2),
+            engine.transcribe_stream(audio_rx, text_tx, &request),
+        )
+        .await
+        .unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for final transcription completion"),
+            "expected a timeout error when no text was emitted, got: {err}"
+        );
+
+        server.await.unwrap();
     }
 }

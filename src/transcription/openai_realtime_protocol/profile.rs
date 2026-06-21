@@ -73,10 +73,19 @@ impl OpenAiRealtimeProfile {
         Ok(value)
     }
 
-    // Both currently supported profiles need an explicit commit at end-of-audio
-    // to flush any trailing speech, even when server VAD is enabled. Keep the
-    // turn-detection parameter in the signature because a future provider may
-    // need different EOS behavior for server-VAD vs manual-commit sessions.
+    // Decision: keep this `true` for every profile, including the OpenAI
+    // append-only / server-VAD profile. Both currently supported profiles need
+    // an explicit commit at end-of-audio to flush any trailing speech, even
+    // when server VAD is enabled. The risk that server VAD already finalized
+    // the last turn before recording stopped (so the commit has nothing to
+    // flush and the post-commit completion never arrives) is handled in the
+    // engine: once input has closed and at least one transcript was already
+    // typed, a missing post-commit completion finalizes gracefully (after a
+    // short grace period) instead of erroring or stalling for the full timeout.
+    // That keeps the commit-aware lifecycle the design wants without discarding
+    // correct transcripts. The turn-detection parameter stays in the signature
+    // because a future provider may need different EOS behavior for server-VAD
+    // vs manual-commit sessions.
     pub fn should_send_commit_on_eos(self, _turn_detection: TurnDetectionMode) -> bool {
         true
     }
