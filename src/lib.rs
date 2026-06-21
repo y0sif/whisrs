@@ -1511,6 +1511,7 @@ mod tests {
             llm: None,
             hotkeys: None,
             overlay: None,
+            tts: None,
         };
 
         assert!(config.validate().is_ok());
@@ -1542,6 +1543,7 @@ mod tests {
             llm: None,
             hotkeys: None,
             overlay: None,
+            tts: None,
         };
 
         let err = config.validate().unwrap_err();
@@ -1574,6 +1576,7 @@ mod tests {
             llm: None,
             hotkeys: None,
             overlay: None,
+            tts: None,
         };
 
         let err = config.validate().unwrap_err();
@@ -1606,6 +1609,7 @@ mod tests {
             llm: None,
             hotkeys: None,
             overlay: None,
+            tts: None,
         };
 
         let err = config.validate().unwrap_err();
@@ -1638,6 +1642,7 @@ mod tests {
             llm: None,
             hotkeys: None,
             overlay: None,
+            tts: None,
         };
 
         let err = config.validate().unwrap_err();
@@ -1667,6 +1672,7 @@ mod tests {
             llm: None,
             hotkeys: None,
             overlay: None,
+            tts: None,
         };
 
         assert!(config.has_any_backend_configured());

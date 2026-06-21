@@ -2859,6 +2859,7 @@ mod tests {
             llm: None,
             hotkeys: None,
             overlay: None,
+            tts: None,
         };
 
         assert_eq!(get_model_for_backend(&config), "Whisper-Tiny");
