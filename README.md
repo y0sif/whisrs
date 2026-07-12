@@ -195,7 +195,8 @@ For the full reference (overlay, `[input]`, `[openai-compatible-realtime]`, `[as
 ```
 whisrs setup     # Interactive onboarding
 whisrs config    # Interactive editor for ~/.config/whisrs/config.toml
-whisrs toggle    # Start/stop recording
+whisrs toggle    # Start/stop recording (uses general.language)
+whisrs toggle -l en  # Start/stop recording, overriding the language for this session
 whisrs cancel    # Cancel recording, discard audio
 whisrs status    # Query daemon state
 whisrs restart   # Restart the daemon (uses the systemd user service when present)
@@ -205,6 +206,24 @@ whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries
 whisrs log --clear  # Clear all history
 ```
+
+### Per-language keys
+
+`toggle` accepts an optional `--language`/`-l <CODE>` (ISO 639-1, or `auto`) that
+overrides `general.language` for that one session only -- no config edit or daemon
+restart. Bind a separate key per language so you can dictate in each without
+switching settings. Hyprland:
+```
+bind = , F1, exec, whisrs toggle -l en
+bind = , F2, exec, whisrs toggle -l pl
+```
+Sway:
+```
+bindsym F1 exec whisrs toggle -l en
+bindsym F2 exec whisrs toggle -l pl
+```
+Without `-l`, `whisrs toggle` keeps using `general.language`, so an existing
+plain-toggle key is unaffected.
 
 ---
 

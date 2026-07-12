@@ -49,7 +49,11 @@ enum SubCmd {
     /// Edit any part of ~/.config/whisrs/config.toml; restarts the daemon on save
     Config,
     /// Toggle recording on/off (start dictation or stop and transcribe)
-    Toggle,
+    Toggle {
+        /// Override the transcription language for this session (e.g. `en`, `pl`)
+        #[arg(short, long)]
+        language: Option<String>,
+    },
     /// Cancel the current recording and discard audio
     Cancel,
     /// Query the daemon state (idle, recording, transcribing)
@@ -118,8 +122,8 @@ async fn main() -> anyhow::Result<()> {
                 process::exit(1);
             }
         }
-        SubCmd::Toggle => {
-            send_command(Command::Toggle).await?;
+        SubCmd::Toggle { language } => {
+            send_command(Command::Toggle { language }).await?;
         }
         SubCmd::Cancel => {
             send_command(Command::Cancel).await?;

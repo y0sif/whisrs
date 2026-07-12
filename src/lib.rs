@@ -25,7 +25,12 @@ use crate::transcription::openai_realtime_protocol::{OpenAiRealtimeProfile, Turn
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub enum Command {
-    Toggle,
+    /// Toggle recording. `language` overrides `general.language` for this
+    /// session only; `None` uses the configured default.
+    Toggle {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
     Cancel,
     Status,
     /// Retrieve recent transcription history.
@@ -955,10 +960,21 @@ mod tests {
 
     #[test]
     fn command_serialization_roundtrip() {
-        let cmd = Command::Toggle;
+        let cmd = Command::Toggle { language: None };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: Command = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Command::Toggle));
+        assert!(matches!(parsed, Command::Toggle { language: None }));
+    }
+
+    #[test]
+    fn toggle_language_serialization_roundtrip() {
+        let cmd = Command::Toggle {
+            language: Some("pl".to_string()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"cmd":"toggle","language":"pl"}"#);
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Command::Toggle { language: Some(l) } if l == "pl"));
     }
 
     #[test]
@@ -978,7 +994,7 @@ mod tests {
 
     #[test]
     fn command_json_format() {
-        let cmd = Command::Toggle;
+        let cmd = Command::Toggle { language: None };
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, r#"{"cmd":"toggle"}"#);
     }
@@ -1199,7 +1215,7 @@ mod tests {
             let (mut reader, mut writer) = stream.into_split();
 
             let cmd: Command = read_message(&mut reader).await.unwrap();
-            assert!(matches!(cmd, Command::Toggle));
+            assert!(matches!(cmd, Command::Toggle { language: None }));
 
             let response = Response::Ok {
                 state: State::Recording,
@@ -1213,7 +1229,7 @@ mod tests {
         let stream = UnixStream::connect(&sock_path).await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
 
-        let cmd = Command::Toggle;
+        let cmd = Command::Toggle { language: None };
         let encoded = encode_message(&cmd).unwrap();
         writer.write_all(&encoded).await.unwrap();
         writer.shutdown().await.unwrap();

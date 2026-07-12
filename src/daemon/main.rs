@@ -829,7 +829,7 @@ async fn handle_command(
     context: Arc<DaemonContext>,
 ) -> Response {
     match cmd {
-        Command::Toggle => handle_toggle(daemon_state, context).await,
+        Command::Toggle { language } => handle_toggle(daemon_state, context, language).await,
         Command::Cancel => handle_cancel(daemon_state, context).await,
         Command::Status => {
             let ds = daemon_state.lock().await;
@@ -862,9 +862,13 @@ async fn handle_command(
 async fn handle_toggle(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
+    language: Option<String>,
 ) -> Response {
     let mut ds = daemon_state.lock().await;
     let current_state = ds.state_machine.state();
+    // Resolve the session language once: per-toggle override, else config default.
+    // Only consulted on the Idle->Recording start branch below.
+    let language = resolve_language(language, &context.config.general.language);
 
     match current_state {
         State::Idle => {
@@ -908,7 +912,7 @@ async fn handle_toggle(
                     }
                 };
 
-                let config = build_transcription_config(&context.config);
+                let config = build_transcription_config(&context.config, &language);
 
                 let backend = Arc::clone(&context.transcription_backend);
                 let wid = window_id.clone();
@@ -930,7 +934,7 @@ async fn handle_toggle(
                 let pipeline_audio_volume = context.config.general.audio_feedback_volume;
 
                 let pipeline_backend_name = context.config.general.backend.clone();
-                let pipeline_language = context.config.general.language.clone();
+                let pipeline_language = language.clone();
                 let pipeline_state_tx = context.state_tx.clone();
                 let pipeline_key_delay =
                     std::time::Duration::from_millis(context.config.input.key_delay_ms);
@@ -1499,7 +1503,7 @@ async fn process_recording_batch(
     let wav_data = encode_wav(&samples)?;
     info!("encoded WAV: {} bytes", wav_data.len());
 
-    let config = build_transcription_config(&context.config);
+    let config = build_transcription_config(&context.config, &context.config.general.language);
 
     let text = match context
         .transcription_backend
@@ -1772,9 +1776,15 @@ fn new_keyboard(
     }
 }
 
-fn build_transcription_config(config: &Config) -> TranscriptionConfig {
+/// Resolve the effective session language: the per-toggle `override_lang` when
+/// present, otherwise the configured default.
+fn resolve_language(override_lang: Option<String>, default_lang: &str) -> String {
+    override_lang.unwrap_or_else(|| default_lang.to_string())
+}
+
+fn build_transcription_config(config: &Config, language: &str) -> TranscriptionConfig {
     TranscriptionConfig {
-        language: config.general.language.clone(),
+        language: language.to_string(),
         model: get_model_for_backend(config),
         prompt: transcription_prompt(config.general.prompt.as_deref(), &config.general.vocabulary),
     }
@@ -2705,6 +2715,16 @@ async fn handle_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_language_prefers_override() {
+        assert_eq!(resolve_language(Some("pl".to_string()), "en"), "pl");
+    }
+
+    #[test]
+    fn resolve_language_falls_back_to_default() {
+        assert_eq!(resolve_language(None, "en"), "en");
+    }
 
     #[test]
     fn truncate_ascii_short() {

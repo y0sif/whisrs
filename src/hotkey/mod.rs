@@ -43,7 +43,7 @@ pub async fn start_hotkey_listener(config: &HotkeyConfig, cmd_tx: mpsc::Sender<C
                 info!("hotkey: toggle = {s}");
                 actions.push(HotkeyAction {
                     binding,
-                    command: Command::Toggle,
+                    command: Command::Toggle { language: None },
                 });
             }
             Err(e) => warn!("invalid toggle hotkey '{s}': {e}"),
