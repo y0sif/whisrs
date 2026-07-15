@@ -33,6 +33,10 @@ path = "src/cli/main.rs"
 name = "whisrsd"
 path = "src/daemon/main.rs"
 
+[[example]]
+name = "issue55_stream_check"
+required-features = ["local-whisper"]
+
 [features]
 default = ["local-whisper", "tray", "overlay"]
 local-whisper = ["dep:whisper-rs"]

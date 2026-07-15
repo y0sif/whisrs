@@ -1,4 +1,5 @@
 /target
+/fixtures/
 crates/*/target/
 crates/*/Cargo.lock
 /docs/*
