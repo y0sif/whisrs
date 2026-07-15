@@ -617,4 +617,155 @@ mod tests {
         // Index past the end clamps to len.
         assert_eq!(floor_char_boundary(s, 100), s.len());
     }
+
+    // ─── Issue #55 reproductions ─────────────────────────────────────────
+    //
+    // These tests DOCUMENT CURRENT BUGGY BEHAVIOR of the sliding-window
+    // text dedup (https://github.com/y0sif/whisrs/issues/55: local whisper
+    // repeats phrases / types invented text). Each assertion pins what the
+    // code does *today* so the suite stays green; the comment above each
+    // assertion states the desired behavior. When the dedup fix lands,
+    // FLIP these assertions to the desired outputs.
+    //
+    // Root causes exercised here:
+    //   1. Anchors are only suffixes of the previous window's FINAL words
+    //      (remove_overlap builds every anchor ending at prev's last word),
+    //      so when whisper re-words the tail of the previous window, no
+    //      anchor matches and dedup fails OPEN — the entire new window is
+    //      emitted, duplicating everything already typed.
+    //   2. The anchor is only searched in the first 75% of the new text
+    //      (`search_limit`), so a long verbatim overlap is never found.
+    //   3. Nothing tracks what was already EMITTED beyond the previous
+    //      window's tail, so a hallucinated echo of an earlier phrase
+    //      sails through.
+    //   4. `recent_text` persists across pauses, so a coincidental phrase
+    //      reuse in a brand-new utterance is treated as overlap and the
+    //      novel words before it are silently DELETED.
+    mod issue_55_repro {
+        use super::*;
+
+        #[test]
+        fn issue_55_repro_rephrased_tail_fails_open() {
+            // Window N's audio cut off mid-phrase, so whisper guessed a tail
+            // ("if this is...") that window N+1 — hearing more audio — re-words
+            // as "if this might be actually enough". Every anchor is a suffix
+            // ending at prev's final word "is...", which never appears in the
+            // new text, so all anchor lengths (8..=3) fail. The strict
+            // prefix-alignment fallback also fails (the two windows share a
+            // *prefix*, not a prev-suffix == new-prefix alignment). Dedup
+            // fails open and returns the ENTIRE new window.
+            //
+            // This reproduces the duplicated sentence from issue #55:
+            //   "Well, let me try to figure out if this is... Well, let me
+            //    try to figure out if this might be actually enough. ..."
+            let mut tracker = TextDedup::new();
+            tracker.filter_text("Well, let me try to figure out if this is...");
+            let result = tracker.filter_text(
+                "Well, let me try to figure out if this might be actually enough. \
+                 So anyways, I typed my code in the description.",
+            );
+            // BUG (current behavior): the full window is emitted, so the user
+            // sees "Well, let me try to figure out ..." typed twice.
+            // DESIRED after fix: only the novel continuation, e.g.
+            // "might be actually enough. So anyways, I typed my code in the
+            // description." — the repeated stem must not be re-emitted.
+            assert_eq!(
+                result,
+                "Well, let me try to figure out if this might be actually enough. \
+                 So anyways, I typed my code in the description."
+            );
+        }
+
+        #[test]
+        fn issue_55_surviving_tail_anchor_still_matches() {
+            // Contrast case (asserts CORRECT behavior — keep green after the
+            // fix): when prev's final words survive verbatim in the new
+            // window, the anchor search works. Here the 4-word anchor
+            // ["might","be","actually","enough."] is found at position 9,
+            // within search_limit (16 of 22 words), even though the longer
+            // anchors (8..=5, which straddle the dropped "is...") all fail.
+            // The rephrased-tail bug above only strikes when the rephrase
+            // reaches prev's LAST words.
+            let mut tracker = TextDedup::new();
+            tracker.filter_text(
+                "Well, let me try to figure out if this is... might be actually enough.",
+            );
+            let result = tracker.filter_text(
+                "Well, let me try to figure out if this might be actually enough. \
+                 So anyways, I typed my code in the description.",
+            );
+            assert_eq!(result, "So anyways, I typed my code in the description.");
+        }
+
+        #[test]
+        fn issue_55_repro_long_overlap_beyond_search_limit_fails_open() {
+            // The new window repeats 39 words of the previous window VERBATIM,
+            // then adds two new words. The anchor (prev's last 3..=8 words)
+            // sits at positions 31..=36 of the 41-word new text, but the
+            // search stops at search_limit = 41 * 3/4 = 30 — so the anchor is
+            // never found despite being textually identical. The strict
+            // prefix fallback dies on the first word ("Okay" vs "Look,", a
+            // typical whisper re-hearing of a window that now starts
+            // mid-word). Dedup fails open: all 39 already-typed words are
+            // emitted again.
+            let prev = "Okay so today I want to walk through the entire deployment \
+                        pipeline because several people asked how the staging \
+                        environment gets promoted into production and honestly the \
+                        documentation we have right now does not explain any of it \
+                        clearly";
+            let new = "Look, so today I want to walk through the entire deployment \
+                       pipeline because several people asked how the staging \
+                       environment gets promoted into production and honestly the \
+                       documentation we have right now does not explain any of it \
+                       clearly which hurts.";
+            let mut tracker = TextDedup::new();
+            tracker.filter_text(prev);
+            let result = tracker.filter_text(new);
+            // BUG (current behavior): the entire new window comes back.
+            // DESIRED after fix: only the novel suffix "which hurts.".
+            assert_eq!(result, new);
+        }
+
+        #[test]
+        fn issue_55_repro_resurrected_earlier_phrase_passes_dedup() {
+            // Prompt-echo / invented text: the previous window ended normally,
+            // and the new window ends with a hallucinated resurrection of a
+            // phrase emitted TWO windows ago ("Might be actually enough." —
+            // the trailing invented line from the issue #55 transcript).
+            // Anchors only cover prev's last 3..=8 words, so once prev's tail
+            // is correctly stripped (7-word anchor matches at position 0),
+            // everything after it is emitted — including the echo of older
+            // text that dedup has no memory of.
+            let mut tracker = TextDedup::new();
+            tracker.filter_text("So anyways, I typed my code in the description.");
+            let result = tracker
+                .filter_text("I typed my code in the description. Might be actually enough.");
+            // BUG (current behavior): the resurrected phrase is typed again.
+            // DESIRED after fix: text repeating anything already emitted
+            // (not just prev's tail) should be suppressed → "".
+            assert_eq!(result, "Might be actually enough.");
+        }
+
+        #[test]
+        fn issue_55_repro_stale_anchor_after_pause_deletes_novel_words() {
+            // Stale state across a pause: the tracker still holds the last
+            // window of the PREVIOUS utterance. The user then starts a
+            // brand-new sentence that happens to reuse the phrase "check the
+            // reports". The 4-word anchor ["to","check","the","reports"]
+            // coincidentally matches at position 4 of the new text, so
+            // everything up to and including it is treated as overlap and
+            // silently DELETED — eight legitimate words are never typed.
+            let mut tracker = TextDedup::new();
+            tracker.filter_text("Please remember to check the reports");
+            // ... user pauses; a new utterance begins ...
+            let result = tracker
+                .filter_text("Yesterday I asked him to check the reports again before the meeting");
+            // BUG (current behavior): "Yesterday I asked him to check the
+            // reports" is swallowed; only the trailing words survive.
+            // DESIRED after fix: the full new sentence is emitted (fresh
+            // utterance — state should reset on pause, and a mid-text match
+            // must not discard the novel words before it).
+            assert_eq!(result, "again before the meeting");
+        }
+    }
 }
