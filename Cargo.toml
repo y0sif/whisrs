@@ -100,3 +100,5 @@ optional = true
 
 [dev-dependencies]
 tempfile = "3"
+# start_paused tests need tokio's paused clock ("test-util" is not in "full").
+tokio = { version = "1", features = ["test-util"] }

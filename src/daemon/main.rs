@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -51,6 +52,15 @@ struct DaemonState {
     recording_window_id: Option<String>,
     /// Handle to the background streaming pipeline (if active).
     streaming_task: Option<tokio::task::JoinHandle<Result<String>>>,
+    /// Cancel flag for the active streaming pipeline.
+    ///
+    /// Aborting `streaming_task` only drops the outer pipeline future — the
+    /// spawned backend and typing tasks are detached JoinHandles that keep
+    /// running, and the backend treats the dropped audio channel as a normal
+    /// end-of-stream (it flushes and the typing task types the trailing
+    /// phrase). Setting this flag makes the typing loop discard everything
+    /// instead, so `cancel` never types text. Created per recording.
+    streaming_cancel: Option<Arc<AtomicBool>>,
     /// When recording started (for duration tracking).
     recording_started_at: Option<std::time::Instant>,
     /// Active command mode context (set when command mode is recording).
@@ -71,6 +81,7 @@ impl DaemonState {
             audio_capture: None,
             recording_window_id: None,
             streaming_task: None,
+            streaming_cancel: None,
             recording_started_at: None,
             command_mode: None,
             tts_stop: None,
@@ -925,6 +936,12 @@ async fn handle_toggle(
                     std::time::Duration::from_millis(context.config.input.key_delay_ms);
                 let pipeline_injector_backend = context.config.input.backend;
 
+                // Per-recording cancel flag: lets `handle_cancel` stop the
+                // typing loop, which keeps running detached when the outer
+                // pipeline future is aborted.
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                let pipeline_cancel = Arc::clone(&cancel_flag);
+
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
                         audio_rx,
@@ -945,11 +962,13 @@ async fn handle_toggle(
                         pipeline_state_tx,
                         pipeline_key_delay,
                         pipeline_injector_backend,
+                        pipeline_cancel,
                     )
                     .await
                 });
 
                 ds.streaming_task = Some(task);
+                ds.streaming_cancel = Some(cancel_flag);
 
                 // Focus the window now (so text goes to the right place from the start).
                 if let Some(wid) = &wid_for_focus {
@@ -980,6 +999,7 @@ async fn handle_toggle(
                     ds.audio_capture = None;
                     ds.recording_window_id = None;
                     ds.streaming_task = None;
+                    ds.streaming_cancel = None;
                     Response::Error {
                         message: e.to_string(),
                     }
@@ -1006,6 +1026,9 @@ async fn handle_toggle(
                     let capture = ds.audio_capture.take();
                     let window_id = ds.recording_window_id.take();
                     let streaming_task = ds.streaming_task.take();
+                    // Normal stop: drop the cancel flag untriggered so the
+                    // pipeline drains and types the remaining text.
+                    ds.streaming_cancel = None;
                     let recording_started_at = ds.recording_started_at.take();
 
                     // Release lock before slow operations.
@@ -1138,13 +1161,14 @@ async fn run_streaming_pipeline(
     state_tx: tokio::sync::watch::Sender<State>,
     key_delay: std::time::Duration,
     injector_backend: InjectorBackend,
+    cancel_flag: Arc<AtomicBool>,
 ) -> Result<String> {
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
     let notify_error = notify;
     let pipeline_start = std::time::Instant::now();
     let (audio_tx, backend_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(256);
-    let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
 
     // Build the filler filter once for the lifetime of this pipeline so the
     // batch loop below isn't recompiling regexes on every typed delta.
@@ -1169,81 +1193,41 @@ async fn run_streaming_pipeline(
     // We collect deltas for a short window to avoid creating a new virtual
     // keyboard for every single word delta from the streaming API.
     let wid = window_id.clone();
+    let typing_cancel = Arc::clone(&cancel_flag);
     let typing_task = tokio::spawn(async move {
-        let mut full_text = String::new();
-        let mut focused = false;
-        let batch_delay = std::time::Duration::from_millis(150);
-
-        // The daemon text channel is intentionally append-only. For OpenAI
-        // realtime this still feels token-by-token because the backend emits
-        // stable append deltas. For Lemonade-compatible profiles, the protocol
-        // layer only forwards completed utterances, so this loop naturally
-        // types phrase-sized chunks without needing any replacement semantics.
-        loop {
-            // Wait for the first delta (blocking).
-            let first = text_rx.recv().await;
-            let Some(first) = first else { break };
-
-            // Collect this delta and any others that arrive within the batch window.
-            let mut batch = first;
-            while let Ok(Some(more)) = tokio::time::timeout(batch_delay, text_rx.recv()).await {
-                batch.push_str(&more);
-            }
-
-            if batch.is_empty() {
-                continue;
-            }
-
-            // Apply filler word removal if enabled.
-            if let Some(filter) = filler_filter.as_ref() {
-                batch = filter.apply(&batch);
-                if batch.is_empty() {
-                    continue;
-                }
-            }
-
-            // Focus the original window (only once, or re-focus if needed).
-            if !focused {
-                if let Some(wid) = &wid {
-                    let wid_clone = wid.clone();
-                    let tracker = Arc::clone(&window_tracker);
-                    if let Err(e) = tracker.focus_window(&wid_clone) {
-                        warn!("failed to refocus window {wid_clone} before typing: {e}");
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Focus the original window before the first batch (only once).
+        // Sequenced by the batcher awaiting each sink call, so a plain
+        // atomic is enough to carry the flag into the 'static sink futures.
+        let focused = Arc::new(AtomicBool::new(false));
+        run_typing_batcher(text_rx, typing_cancel, filler_filter, move |text_to_type| {
+            let wid = wid.clone();
+            let tracker = Arc::clone(&window_tracker);
+            let focused = Arc::clone(&focused);
+            async move {
+                // Focus the original window (only once, or re-focus if needed).
+                if !focused.swap(true, Ordering::SeqCst) {
+                    if let Some(wid) = &wid {
+                        if let Err(e) = tracker.focus_window(wid) {
+                            warn!("failed to refocus window {wid} before typing: {e}");
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
                     }
                 }
-                focused = true;
+
+                info!("typing: {:?}", text_to_type);
+                match tokio::task::spawn_blocking(move || {
+                    type_text_at_cursor(&text_to_type, key_delay, injector_backend)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("failed to type text: {e:#}"),
+                    Err(e) => warn!("failed to join typing task: {e}"),
+                }
             }
-
-            // Add space separator between turns if needed.
-            // Don't insert a space before punctuation streaming deltas,
-            // as they arrive as bare tokens.
-            let text_to_type = if full_text.is_empty()
-                || batch.starts_with(' ')
-                || full_text.ends_with(' ')
-                || leads_with_punct(&batch)
-            {
-                batch.clone()
-            } else {
-                format!(" {batch}")
-            };
-
-            full_text.push_str(&text_to_type);
-
-            info!("typing: {:?}", text_to_type);
-            match tokio::task::spawn_blocking(move || {
-                type_text_at_cursor(&text_to_type, key_delay, injector_backend)
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("failed to type text: {e:#}",),
-                Err(e) => warn!("failed to join typing task: {e}"),
-            }
-        }
-
-        full_text
+        })
+        .await
     });
 
     // Forward audio from capture to backend, with auto-stop detection.
@@ -1380,6 +1364,93 @@ async fn run_streaming_pipeline(
     }
 
     Ok(full_text)
+}
+
+/// Batches streaming text deltas and hands them to `sink` (the key injector
+/// in production). This is the single choke point through which all streamed
+/// text reaches the cursor.
+///
+/// Deltas arriving within 150ms of each other are coalesced into one batch so
+/// we don't create a new virtual keyboard per word delta. Returns the full
+/// accumulated (typed) text. Exits when the text channel closes or `cancel`
+/// is set.
+///
+/// The cancel flag is checked when a delta arrives and again right before a
+/// batch reaches the sink, so a cancelled recording never types the text the
+/// backend flushes on shutdown (a batch already inside the sink still
+/// finishes). Exiting drops `text_rx`, which makes subsequent backend sends
+/// fail fast and winds the detached backend task down.
+///
+/// The daemon text channel is intentionally append-only. For OpenAI realtime
+/// this still feels token-by-token because the backend emits stable append
+/// deltas. For Lemonade-compatible profiles, the protocol layer only forwards
+/// completed utterances, so this loop naturally types phrase-sized chunks
+/// without needing any replacement semantics.
+async fn run_typing_batcher<F, Fut>(
+    mut text_rx: tokio::sync::mpsc::Receiver<String>,
+    cancel: Arc<AtomicBool>,
+    filler_filter: Option<FillerFilter>,
+    mut sink: F,
+) -> String
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut full_text = String::new();
+    let batch_delay = std::time::Duration::from_millis(150);
+
+    loop {
+        // Wait for the first delta (blocking).
+        let first = text_rx.recv().await;
+        let Some(first) = first else { break };
+
+        // Cancelled while we were waiting: discard everything from here on.
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Collect this delta and any others that arrive within the batch window.
+        let mut batch = first;
+        while let Ok(Some(more)) = tokio::time::timeout(batch_delay, text_rx.recv()).await {
+            batch.push_str(&more);
+        }
+
+        if batch.is_empty() {
+            continue;
+        }
+
+        // Apply filler word removal if enabled.
+        if let Some(filter) = filler_filter.as_ref() {
+            batch = filter.apply(&batch);
+            if batch.is_empty() {
+                continue;
+            }
+        }
+
+        // Add space separator between turns if needed.
+        // Don't insert a space before punctuation streaming deltas,
+        // as they arrive as bare tokens.
+        let text_to_type = if full_text.is_empty()
+            || batch.starts_with(' ')
+            || full_text.ends_with(' ')
+            || leads_with_punct(&batch)
+        {
+            batch
+        } else {
+            format!(" {batch}")
+        };
+
+        // Last gate before the sink: cancel may have arrived while this
+        // batch was being collected.
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+
+        full_text.push_str(&text_to_type);
+        sink(text_to_type).await;
+    }
+
+    full_text
 }
 
 /// Batch mode: collect all audio, transcribe in one shot, type result.
@@ -2598,6 +2669,14 @@ async fn handle_cancel(
                 capture.stop();
                 tokio::task::spawn_blocking(move || drop(capture));
             }
+            // Stop the typing loop BEFORE aborting the pipeline. Aborting
+            // only drops the outer pipeline future; the detached backend and
+            // typing tasks keep running, the backend treats the dropped audio
+            // channel as a normal end-of-stream and flushes the trailing
+            // phrase — without this flag the typing task would type it.
+            if let Some(cancel) = ds.streaming_cancel.take() {
+                cancel.store(true, Ordering::SeqCst);
+            }
             if let Some(task) = ds.streaming_task.take() {
                 task.abort();
             }
@@ -2885,5 +2964,81 @@ mod tests {
             format_api_error(&err),
             "Realtime transcription timed out waiting for the server to finish after stop"
         );
+    }
+
+    /// Spawn `run_typing_batcher` with a recording sink; returns the text
+    /// channel sender, the cancel flag, the sink log, and the join handle.
+    #[allow(clippy::type_complexity)]
+    fn spawn_test_batcher() -> (
+        tokio::sync::mpsc::Sender<String>,
+        Arc<AtomicBool>,
+        Arc<StdMutex<Vec<String>>>,
+        tokio::task::JoinHandle<String>,
+    ) {
+        let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let typed = Arc::new(StdMutex::new(Vec::<String>::new()));
+
+        let sink_log = Arc::clone(&typed);
+        let batcher = tokio::spawn(run_typing_batcher(
+            text_rx,
+            Arc::clone(&cancel),
+            None,
+            move |text| {
+                let sink_log = Arc::clone(&sink_log);
+                async move {
+                    sink_log.lock().unwrap().push(text);
+                }
+            },
+        ));
+
+        (text_tx, cancel, typed, batcher)
+    }
+
+    /// Issue: `whisrs cancel` during a streaming recording still typed the
+    /// phrase the backend flushed on shutdown. Once the cancel flag is set,
+    /// nothing further may reach the sink and the loop must exit.
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_discards_text_after_cancel() {
+        let (text_tx, cancel, typed, batcher) = spawn_test_batcher();
+
+        // A delta before cancel is batched and typed.
+        text_tx.send("hello".to_string()).await.unwrap();
+        // Paused clock: sleeping past the 150ms batch window deterministically
+        // lets the batcher flush the batch to the sink.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(*typed.lock().unwrap(), vec!["hello".to_string()]);
+
+        // Cancel, then simulate the backend flushing a trailing phrase.
+        cancel.store(true, Ordering::SeqCst);
+        text_tx
+            .send(" flushed trailing phrase".to_string())
+            .await
+            .unwrap();
+
+        // The sink never fires again and the loop exits, returning only the
+        // text typed before cancel.
+        let full_text = batcher.await.unwrap();
+        assert_eq!(full_text, "hello");
+        assert_eq!(*typed.lock().unwrap(), vec!["hello".to_string()]);
+
+        // Exiting dropped text_rx, so backend sends now fail fast.
+        assert!(text_tx.send("more".to_string()).await.is_err());
+    }
+
+    /// Cancel arriving while a batch is still being coalesced (inside the
+    /// 150ms window) must drop that batch before it reaches the sink.
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_drops_batch_cancelled_during_window() {
+        let (text_tx, cancel, typed, batcher) = spawn_test_batcher();
+
+        text_tx.send("hello".to_string()).await.unwrap();
+        // Cancel mid-window, before the batch flushes at 150ms.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel.store(true, Ordering::SeqCst);
+
+        let full_text = batcher.await.unwrap();
+        assert_eq!(full_text, "");
+        assert!(typed.lock().unwrap().is_empty());
     }
 }
