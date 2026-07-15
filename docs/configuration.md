@@ -92,6 +92,15 @@ turn_detection = "server-vad"  # recommended; see notes below
 
 [local-whisper]
 model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
+# segmentation: how streaming audio is split before decoding.
+# - "silence" (default): split into phrases at natural pauses and decode each
+#   phrase exactly once. No overlap, no dedup — prevents repeated/invented
+#   text. Continuous speech is force-split at 20 s so it still emits.
+# - "window": legacy 8s/2s overlapping sliding window with text-based dedup.
+# segmentation = "silence"
+# phrase_silence_ms: continuous silence (ms) that ends a phrase in "silence"
+# mode. Lower = snappier output, higher = fewer mid-sentence splits.
+# phrase_silence_ms = 400
 
 # Generic local ASR sidecar — talks to a small HTTP service that hosts the
 # model (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR, …). Keeps

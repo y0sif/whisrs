@@ -431,6 +431,26 @@ impl Default for TtsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalWhisperConfig {
     pub model_path: String,
+    /// Streaming segmentation strategy: `"silence"` (default) splits audio
+    /// into phrases at natural pauses and decodes each exactly once;
+    /// `"window"` is the legacy overlapping sliding window with text dedup.
+    #[serde(default = "default_local_whisper_segmentation")]
+    pub segmentation: String,
+    /// Milliseconds of continuous silence that ends a phrase in `"silence"`
+    /// segmentation mode.
+    #[serde(default = "default_phrase_silence_ms")]
+    pub phrase_silence_ms: u64,
+}
+
+impl LocalWhisperConfig {
+    /// Config for `model_path` with default segmentation settings.
+    pub fn new(model_path: String) -> Self {
+        Self {
+            model_path,
+            segmentation: default_local_whisper_segmentation(),
+            phrase_silence_ms: default_phrase_silence_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -499,6 +519,12 @@ fn default_tts_backend() -> String {
 }
 fn default_tts_response_format() -> String {
     "wav".to_string()
+}
+fn default_local_whisper_segmentation() -> String {
+    "silence".to_string()
+}
+fn default_phrase_silence_ms() -> u64 {
+    400
 }
 fn default_asr_sidecar_url() -> String {
     "http://127.0.0.1:8765/transcribe".to_string()

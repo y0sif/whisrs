@@ -482,7 +482,7 @@ pub(crate) fn configure_backend(
 
             let model_path = dest.to_string_lossy().to_string();
             Ok(BackendConfigSelection {
-                local_whisper: Some(LocalWhisperConfig { model_path }),
+                local_whisper: Some(LocalWhisperConfig::new(model_path)),
                 ..BackendConfigSelection::default()
             })
         }

@@ -6,14 +6,19 @@
 # separated by 2-6 s silence gaps, including a trailing incomplete phrase
 # right before a pause (the golden repro for the repetition bug).
 #
-# Output (gitignored, never commit the WAV):
-#   fixtures/issue55.wav   16 kHz mono s16 test audio (~45 s)
-#   fixtures/issue55.txt   ground-truth transcript (one line)
+# Also builds a continuous no-pause fixture (~28 s of speech with no gaps)
+# used to prove that pause-free dictation still emits (20 s max-segment cap).
+#
+# Output (gitignored, never commit the WAVs):
+#   fixtures/issue55.wav           16 kHz mono s16 test audio (~45 s, pauses)
+#   fixtures/issue55.txt           ground-truth transcript (one line)
+#   fixtures/issue55_nopause.wav   16 kHz mono s16 test audio (~28 s, no gaps)
+#   fixtures/issue55_nopause.txt   ground-truth transcript (one line)
 #
 # Requires: espeak-ng, ffmpeg
 #
 # Usage:
-#   ./scripts/gen-issue55-fixture.sh          # writes fixtures/issue55.wav
+#   ./scripts/gen-issue55-fixture.sh          # writes the fixtures
 #   ./scripts/gen-issue55-fixture.sh --force  # regenerate even if present
 
 set -euo pipefail
@@ -52,9 +57,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIXTURE_DIR="$REPO_ROOT/fixtures"
 OUT_WAV="$FIXTURE_DIR/issue55.wav"
 OUT_TXT="$FIXTURE_DIR/issue55.txt"
+OUT_NP_WAV="$FIXTURE_DIR/issue55_nopause.wav"
+OUT_NP_TXT="$FIXTURE_DIR/issue55_nopause.txt"
 
-if [ -f "$OUT_WAV" ] && [ "$FORCE" -eq 0 ]; then
-    info "Exists:" "$OUT_WAV (use --force to regenerate)"
+if [ -f "$OUT_WAV" ] && [ -f "$OUT_NP_WAV" ] && [ "$FORCE" -eq 0 ]; then
+    info "Exists:" "$OUT_WAV + $OUT_NP_WAV (use --force to regenerate)"
     exit 0
 fi
 
@@ -117,3 +124,40 @@ DURATION="$(ffprobe -loglevel error -show_entries format=duration \
 
 info "Wrote:" "$OUT_WAV (${DURATION%.*}s, 16 kHz mono s16)"
 info "Wrote:" "$OUT_TXT (ground truth)"
+
+# ---------------------------------------------------------------------------
+# Continuous no-pause fixture: one long run-on utterance with no punctuation
+# (espeak-ng inserts pauses at clause boundaries, so the text avoids them).
+# Exercises the streaming max-segment cap: continuous speech past 20 s must
+# still be emitted in full.
+# ---------------------------------------------------------------------------
+NOPAUSE_TEXT="this recording keeps going without any pauses so the streaming \
+backend must split the audio on its own the quick brown fox jumps over the \
+lazy dog while the developer keeps talking about testing the local whisper \
+backend and the words continue to flow one after another until the very end \
+of the recording where the final words prove the whole utterance was \
+transcribed"
+
+NP_RAW="$WORK_DIR/nopause_raw.wav"
+NP_SEG="$WORK_DIR/nopause_seg.wav"
+NP_LIST="$WORK_DIR/nopause_concat.txt"
+
+espeak-ng -v "$ESPEAK_VOICE" -s "$ESPEAK_SPEED" -w "$NP_RAW" "$NOPAUSE_TEXT"
+ffmpeg -loglevel error -y -i "$NP_RAW" -ar 16000 -ac 1 -c:a pcm_s16le "$NP_SEG"
+
+silence 0.3 "$WORK_DIR/np_lead.wav"
+silence 0.5 "$WORK_DIR/np_tail.wav"
+{
+    echo "file '$WORK_DIR/np_lead.wav'"
+    echo "file '$NP_SEG'"
+    echo "file '$WORK_DIR/np_tail.wav'"
+} > "$NP_LIST"
+
+ffmpeg -loglevel error -y -f concat -safe 0 -i "$NP_LIST" -c copy "$OUT_NP_WAV"
+printf '%s\n' "$NOPAUSE_TEXT" > "$OUT_NP_TXT"
+
+NP_DURATION="$(ffprobe -loglevel error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$OUT_NP_WAV")"
+
+info "Wrote:" "$OUT_NP_WAV (${NP_DURATION%.*}s, 16 kHz mono s16, no pauses)"
+info "Wrote:" "$OUT_NP_TXT (ground truth)"

@@ -482,9 +482,8 @@ fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
             Arc::new(OpenAIRestBackend::new(api_key))
         }
         "local-whisper" | "local" => {
-            let model_path = config
-                .local_whisper
-                .as_ref()
+            let local_whisper = config.local_whisper.as_ref();
+            let model_path = local_whisper
                 .map(|l| l.model_path.clone())
                 .unwrap_or_else(|| {
                     dirs::data_dir()
@@ -493,8 +492,20 @@ fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
                         .to_string_lossy()
                         .to_string()
                 });
-            info!("using local whisper transcription backend (model: {model_path})");
-            Arc::new(LocalWhisperBackend::new(model_path))
+            // Serde defaults only apply when the [local-whisper] section
+            // exists; mirror them here for a fully absent section.
+            let segmentation = local_whisper
+                .map(|l| l.segmentation.clone())
+                .unwrap_or_else(|| "silence".to_string());
+            let phrase_silence_ms = local_whisper.map(|l| l.phrase_silence_ms).unwrap_or(400);
+            info!(
+                "using local whisper transcription backend \
+                 (model: {model_path}, segmentation: {segmentation})"
+            );
+            Arc::new(
+                LocalWhisperBackend::new(model_path)
+                    .with_segmentation(&segmentation, phrase_silence_ms),
+            )
         }
         "local-vosk" => {
             let model_path = config

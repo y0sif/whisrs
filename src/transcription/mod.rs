@@ -15,6 +15,9 @@ pub mod local_whisper {
         pub fn new(_model_path: String) -> Self {
             Self
         }
+        pub fn with_segmentation(self, _mode: &str, _phrase_silence_ms: u64) -> Self {
+            self
+        }
     }
     #[async_trait::async_trait]
     impl super::TranscriptionBackend for LocalWhisperBackend {
@@ -31,6 +34,7 @@ pub mod openai_compatible_realtime;
 pub mod openai_realtime;
 pub mod openai_realtime_protocol;
 pub mod openai_rest;
+pub mod phrase_split;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;

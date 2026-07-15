@@ -15,8 +15,16 @@
 //!   MODEL_PATH  ~/.local/share/whisrs/models/ggml-base.en.bin ($WHISRS_ISSUE55_MODEL)
 //!   TRUTH_PATH  fixtures/issue55.txt if present             ($WHISRS_ISSUE55_TRUTH)
 //!
-//! Exit code: 0 if the transcript is clean, 1 if repetition was detected —
-//! so once the bug is fixed this doubles as a regression check.
+//! Extra env knobs:
+//!   WHISRS_ISSUE55_SEGMENTATION       "silence" (default) | "window"
+//!   WHISRS_ISSUE55_PHRASE_SILENCE_MS  phrase split threshold (default 400)
+//!   WHISRS_ISSUE55_MIN_COVERAGE       if set (e.g. "0.8"), fail when less
+//!                                     than that fraction of ground-truth
+//!                                     words appears in the transcript
+//!
+//! Exit code: 0 if the transcript is clean (and coverage passes when
+//! required), 1 otherwise — so once the bug is fixed this doubles as a
+//! regression check.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -136,6 +144,28 @@ fn inserted_words(transcript: &[String], truth: &[String]) -> Vec<(String, usize
     out
 }
 
+/// Fraction of ground-truth words present in the transcript (multiset:
+/// each transcript word can satisfy at most one truth occurrence).
+fn truth_coverage(transcript: &[String], truth: &[String]) -> f64 {
+    if truth.is_empty() {
+        return 1.0;
+    }
+    let mut available: HashMap<&str, usize> = HashMap::new();
+    for w in transcript {
+        *available.entry(w.as_str()).or_default() += 1;
+    }
+    let mut matched = 0usize;
+    for w in truth {
+        if let Some(c) = available.get_mut(w.as_str()) {
+            if *c > 0 {
+                *c -= 1;
+                matched += 1;
+            }
+        }
+    }
+    matched as f64 / truth.len() as f64
+}
+
 fn read_wav_samples(path: &str) -> anyhow::Result<Vec<i16>> {
     let reader = hound::WavReader::open(path)
         .map_err(|e| anyhow::anyhow!("failed to open WAV {path}: {e}"))?;
@@ -183,16 +213,28 @@ async fn main() -> anyhow::Result<ExitCode> {
                 .then(|| default.to_string())
         });
 
+    let segmentation =
+        std::env::var("WHISRS_ISSUE55_SEGMENTATION").unwrap_or_else(|_| "silence".to_string());
+    let phrase_silence_ms: u64 = std::env::var("WHISRS_ISSUE55_PHRASE_SILENCE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    let min_coverage: Option<f64> = std::env::var("WHISRS_ISSUE55_MIN_COVERAGE")
+        .ok()
+        .and_then(|v| v.parse().ok());
+
     let samples = read_wav_samples(&wav_path)?;
     println!(
         "== issue #55 stream check ==\n\
          wav:   {wav_path} ({:.1}s, {} samples)\n\
-         model: {model_path}",
+         model: {model_path}\n\
+         mode:  {segmentation} (phrase_silence_ms={phrase_silence_ms})",
         samples.len() as f64 / 16_000.0,
         samples.len(),
     );
 
-    let backend = LocalWhisperBackend::new(model_path);
+    let backend =
+        LocalWhisperBackend::new(model_path).with_segmentation(&segmentation, phrase_silence_ms);
     let config = TranscriptionConfig {
         language: "en".to_string(),
         model: "base.en".to_string(),
@@ -222,7 +264,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     backend_task.await??;
     let chunks = collector.await?;
 
-    println!("\n-- per-window emissions ({}) --", chunks.len());
+    println!("\n-- emitted batches ({}) --", chunks.len());
     for (i, c) in chunks.iter().enumerate() {
         println!("[{i:>2}] {c:?}");
     }
@@ -262,8 +304,32 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
     }
 
+    let mut coverage_failed = false;
+    if let Some(truth_words) = &truth_words {
+        let coverage = truth_coverage(&words, truth_words);
+        println!("\n-- ground-truth coverage --");
+        println!(
+            "{:.1}% of {} truth words present in transcript",
+            coverage * 100.0,
+            truth_words.len()
+        );
+        if let Some(min) = min_coverage {
+            if coverage < min {
+                println!(
+                    "COVERAGE FAIL: {:.1}% < required {:.1}%",
+                    coverage * 100.0,
+                    min * 100.0
+                );
+                coverage_failed = true;
+            }
+        }
+    }
+
     if repetition_found {
         println!("\nRESULT: FAIL — repetition detected (issue #55 reproduced)");
+        Ok(ExitCode::from(1))
+    } else if coverage_failed {
+        println!("\nRESULT: FAIL — transcript does not cover the full utterance");
         Ok(ExitCode::from(1))
     } else {
         println!("\nRESULT: OK — transcript is repetition-free");

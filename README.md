@@ -157,10 +157,12 @@ bindsym $mod+w exec whisrs toggle
 | **OpenAI Realtime** | Cloud (WebSocket) | True streaming | Paid | Best UX, text as you speak |
 | **OpenAI REST** | Cloud | Batch | Paid | Simple fallback |
 | **OpenAI-compatible Realtime** | External WebSocket | Completed-utterance realtime | Free / self-hosted | Lemonade and similar OpenAI-style ASR servers |
-| **Local whisper.cpp** | Local (CPU/GPU) | Sliding window | Free | Privacy, offline use |
+| **Local whisper.cpp** | Local (CPU/GPU) | Silence-split phrases | Free | Privacy, offline use |
 | **ASR sidecar** | Local sidecar | Batch | Free | Bring-your-own local ASR (Moonshine, Parakeet, VibeVoice-ASR, …) |
 
 Groq is the default. For fully offline use, run `whisrs setup` and select **Local > whisper.cpp** — `base.en` (142 MB, ~388 MB RAM) is recommended; `tiny.en` (75 MB) for low-end hardware, `small.en` (466 MB) for higher accuracy.
+
+Local whisper.cpp streams by splitting dictation into phrases at natural pauses and decoding each phrase exactly once (the `[local-whisper]` defaults `segmentation = "silence"`, `phrase_silence_ms = 400`); set `segmentation = "window"` for the legacy overlapping sliding window. See [docs/configuration.md](docs/configuration.md).
 
 For local ASR models without a Rust runtime (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR), use the generic ASR sidecar backend — it talks to a small local HTTP service that hosts the model. See [`contrib/asr-sidecars/`](contrib/asr-sidecars/) for ready-to-run sidecars.
 
