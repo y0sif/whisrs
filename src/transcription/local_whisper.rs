@@ -38,9 +38,6 @@ const INITIAL_WINDOW_SAMPLES: usize = INITIAL_WINDOW_SECS * SAMPLE_RATE;
 /// (0.003) so we never skip audio that auto-stop considers speech.
 const SILENCE_THRESHOLD: f64 = 0.003;
 
-/// Default silence duration (ms) that ends a phrase in "silence" mode.
-pub const DEFAULT_PHRASE_SILENCE_MS: u64 = 400;
-
 /// whisper.cpp produces no output for buffers shorter than ~1 s of audio;
 /// short phrases are zero-padded up to this length before decoding.
 const MIN_DECODE_SAMPLES: usize = SAMPLE_RATE + SAMPLE_RATE / 10; // 1.1 s
@@ -97,7 +94,9 @@ impl LocalWhisperBackend {
             ctx,
             model_path,
             segmentation: SegmentationMode::default(),
-            phrase_silence_ms: DEFAULT_PHRASE_SILENCE_MS,
+            // Same default as `crate::LocalWhisperConfig` — lib.rs is the
+            // single source of truth for segmentation defaults.
+            phrase_silence_ms: crate::default_phrase_silence_ms(),
         }
     }
 

@@ -5,7 +5,9 @@
 # through LocalWhisperBackend the same way the daemon does:
 #
 #   1. issue55.wav          pause-heavy dictation — must transcribe with no
-#                           repeated n-grams (the original issue #55 repro).
+#                           repeated n-grams (the original issue #55 repro)
+#                           and >= 80% ground-truth word coverage, so silently
+#                           dropped words fail too.
 #   2. issue55_nopause.wav  ~28 s of continuous pause-free speech — must be
 #                           transcribed in full (>= 80% ground-truth word
 #                           coverage), proving the 20 s max-segment cap emits
@@ -41,9 +43,10 @@ cargo build --release --example issue55_stream_check --features local-whisper
 BIN="$REPO_ROOT/target/release/examples/issue55_stream_check"
 
 echo
-echo "=== 1/2 pause fixture (repetition gate) ==="
+echo "=== 1/2 pause fixture (repetition + coverage gate) ==="
 pause_status=0
-"$BIN" "$WAV" "$MODEL" "$TRUTH" || pause_status=$?
+WHISRS_ISSUE55_MIN_COVERAGE=0.8 "$BIN" "$WAV" "$MODEL" "$TRUTH" \
+    || pause_status=$?
 
 echo
 echo "=== 2/2 no-pause fixture (coverage gate, 20s cap) ==="

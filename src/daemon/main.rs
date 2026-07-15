@@ -27,7 +27,8 @@ use whisrs::transcription::openai_rest::OpenAIRestBackend;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::{self, WindowTracker};
 use whisrs::{
-    encode_message, read_message, socket_path, Command, Config, InjectorBackend, Response, State,
+    encode_message, read_message, socket_path, Command, Config, InjectorBackend,
+    LocalWhisperConfig, Response, State,
 };
 
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
@@ -482,29 +483,28 @@ fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
             Arc::new(OpenAIRestBackend::new(api_key))
         }
         "local-whisper" | "local" => {
-            let local_whisper = config.local_whisper.as_ref();
-            let model_path = local_whisper
-                .map(|l| l.model_path.clone())
-                .unwrap_or_else(|| {
+            // Serde defaults only apply when the [local-whisper] section
+            // exists; `LocalWhisperConfig::new` supplies the same defaults
+            // for a fully absent section.
+            let local_whisper = config.local_whisper.clone().unwrap_or_else(|| {
+                LocalWhisperConfig::new(
                     dirs::data_dir()
                         .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
                         .join("whisrs/models/ggml-base.en.bin")
                         .to_string_lossy()
-                        .to_string()
-                });
-            // Serde defaults only apply when the [local-whisper] section
-            // exists; mirror them here for a fully absent section.
-            let segmentation = local_whisper
-                .map(|l| l.segmentation.clone())
-                .unwrap_or_else(|| "silence".to_string());
-            let phrase_silence_ms = local_whisper.map(|l| l.phrase_silence_ms).unwrap_or(400);
+                        .to_string(),
+                )
+            });
             info!(
                 "using local whisper transcription backend \
-                 (model: {model_path}, segmentation: {segmentation})"
+                 (model: {}, segmentation: {})",
+                local_whisper.model_path, local_whisper.segmentation
             );
             Arc::new(
-                LocalWhisperBackend::new(model_path)
-                    .with_segmentation(&segmentation, phrase_silence_ms),
+                LocalWhisperBackend::new(local_whisper.model_path).with_segmentation(
+                    &local_whisper.segmentation,
+                    local_whisper.phrase_silence_ms,
+                ),
             )
         }
         "local-vosk" => {
