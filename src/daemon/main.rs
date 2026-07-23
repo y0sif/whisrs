@@ -63,6 +63,11 @@ struct DaemonState {
     streaming_cancel: Option<Arc<AtomicBool>>,
     /// When recording started (for duration tracking).
     recording_started_at: Option<std::time::Instant>,
+    /// The language for the active dictation session, resolved at the
+    /// Idle→Recording transition (per-toggle override or config default).
+    /// Consumed when the session ends so an override never leaks into a
+    /// later recording.
+    session_language: Option<String>,
     /// Active command mode context (set when command mode is recording).
     command_mode: Option<CommandModeContext>,
     /// Stop flag for in-progress TTS playback (read-selection-aloud).
@@ -83,9 +88,19 @@ impl DaemonState {
             streaming_task: None,
             streaming_cancel: None,
             recording_started_at: None,
+            session_language: None,
             command_mode: None,
             tts_stop: None,
         }
+    }
+
+    /// Consume the active session's language, falling back to the config
+    /// default. Taking (not reading) the value is what ends the language
+    /// session — a per-toggle override applies to exactly one recording.
+    fn take_session_language(&mut self, default_lang: &str) -> String {
+        self.session_language
+            .take()
+            .unwrap_or_else(|| default_lang.to_string())
     }
 }
 
@@ -866,12 +881,14 @@ async fn handle_toggle(
 ) -> Response {
     let mut ds = daemon_state.lock().await;
     let current_state = ds.state_machine.state();
-    // Resolve the session language once: per-toggle override, else config default.
-    // Only consulted on the Idle->Recording start branch below.
-    let language = resolve_language(language, &context.config.general.language);
 
     match current_state {
         State::Idle => {
+            // Resolve the session language once: per-toggle override, else
+            // config default. Persisted in `DaemonState` below so the
+            // stop-toggle can apply it to the batch path and history too.
+            let session_language = resolve_language(language, &context.config.general.language);
+
             // Capture focused window before recording.
             let window_id = match context.window_tracker.get_focused_window() {
                 Ok(id) => {
@@ -912,7 +929,7 @@ async fn handle_toggle(
                     }
                 };
 
-                let config = build_transcription_config(&context.config, &language);
+                let config = build_transcription_config(&context.config, &session_language);
 
                 let backend = Arc::clone(&context.transcription_backend);
                 let wid = window_id.clone();
@@ -934,7 +951,7 @@ async fn handle_toggle(
                 let pipeline_audio_volume = context.config.general.audio_feedback_volume;
 
                 let pipeline_backend_name = context.config.general.backend.clone();
-                let pipeline_language = language.clone();
+                let pipeline_language = session_language.clone();
                 let pipeline_state_tx = context.state_tx.clone();
                 let pipeline_key_delay =
                     std::time::Duration::from_millis(context.config.input.key_delay_ms);
@@ -985,6 +1002,7 @@ async fn handle_toggle(
             ds.audio_capture = Some(capture);
             ds.recording_window_id = window_id;
             ds.recording_started_at = Some(std::time::Instant::now());
+            ds.session_language = Some(session_language);
 
             match ds.state_machine.transition(Action::Toggle) {
                 Ok(new_state) => {
@@ -1004,6 +1022,7 @@ async fn handle_toggle(
                     ds.recording_window_id = None;
                     ds.streaming_task = None;
                     ds.streaming_cancel = None;
+                    ds.session_language = None;
                     Response::Error {
                         message: e.to_string(),
                     }
@@ -1034,6 +1053,22 @@ async fn handle_toggle(
                     // pipeline drains and types the remaining text.
                     ds.streaming_cancel = None;
                     let recording_started_at = ds.recording_started_at.take();
+                    // The language this session was started with. Consuming it
+                    // here ends the language session.
+                    let session_language =
+                        ds.take_session_language(&context.config.general.language);
+
+                    // A `-l` on the stop-press comes too late to change the
+                    // session — tell the user instead of silently dropping it.
+                    if let Some(requested) = &language {
+                        if *requested != session_language {
+                            warn!(
+                                "language override '{requested}' ignored — this session was \
+                                 started with '{session_language}'; pass -l on the toggle that \
+                                 starts recording"
+                            );
+                        }
+                    }
 
                     // Release lock before slow operations.
                     drop(ds);
@@ -1051,8 +1086,15 @@ async fn handle_toggle(
                             Err(e) => Err(anyhow::anyhow!("streaming task panicked: {e}")),
                         }
                     } else {
-                        // Batch path: collect all audio, then transcribe.
-                        process_recording_batch(capture, window_id.as_deref(), &context).await
+                        // Batch path: collect all audio, then transcribe with
+                        // the session language (not the config default).
+                        process_recording_batch(
+                            capture,
+                            window_id.as_deref(),
+                            &context,
+                            &session_language,
+                        )
+                        .await
                     };
 
                     // Transition back to Idle.
@@ -1074,7 +1116,7 @@ async fn handle_toggle(
                                         save_history_entry(
                                             &text,
                                             &context.config.general.backend,
-                                            &context.config.general.language,
+                                            &session_language,
                                             duration_secs,
                                         );
                                     }
@@ -1133,9 +1175,17 @@ async fn handle_toggle(
                 },
             }
         }
-        State::Transcribing => Response::Error {
-            message: "cannot toggle while transcribing".to_string(),
-        },
+        State::Transcribing => {
+            if let Some(requested) = &language {
+                warn!(
+                    "language override '{requested}' ignored — daemon is still transcribing \
+                     the previous session"
+                );
+            }
+            Response::Error {
+                message: "cannot toggle while transcribing".to_string(),
+            }
+        }
         // Recording is refused while read-aloud is active.
         State::Synthesizing | State::Speaking => Response::Error {
             message: "cannot toggle while reading aloud — cancel read-aloud first".to_string(),
@@ -1355,6 +1405,9 @@ async fn run_streaming_pipeline(
     if ds.state_machine.state() == State::Transcribing {
         debug!("streaming pipeline transitioning daemon state back to idle");
         ds.state_machine.transition(Action::TranscriptionDone).ok();
+        // Auto-stop ends the session without a stop-toggle — clear the
+        // session language so it can't leak into the next recording.
+        ds.session_language = None;
         let _ = state_tx.send(ds.state_machine.state());
         if audio_feedback {
             feedback::play_done(audio_feedback_volume);
@@ -1458,10 +1511,13 @@ where
 }
 
 /// Batch mode: collect all audio, transcribe in one shot, type result.
+/// `language` is the resolved session language (per-toggle override or
+/// config default) captured when recording started.
 async fn process_recording_batch(
     capture: Option<AudioCaptureHandle>,
     window_id: Option<&str>,
     context: &DaemonContext,
+    language: &str,
 ) -> Result<String> {
     use whisrs::audio::capture::encode_wav;
 
@@ -1503,7 +1559,7 @@ async fn process_recording_batch(
     let wav_data = encode_wav(&samples)?;
     info!("encoded WAV: {} bytes", wav_data.len());
 
-    let config = build_transcription_config(&context.config, &context.config.general.language);
+    let config = build_transcription_config(&context.config, language);
 
     let text = match context
         .transcription_backend
@@ -2691,6 +2747,7 @@ async fn handle_cancel(
                 task.abort();
             }
             ds.recording_window_id = None;
+            ds.session_language = None;
             if let Some(level_tx) = &context.overlay_level_tx {
                 let _ = level_tx.send(0.0);
             }
@@ -2724,6 +2781,74 @@ mod tests {
     #[test]
     fn resolve_language_falls_back_to_default() {
         assert_eq!(resolve_language(None, "en"), "en");
+    }
+
+    /// Minimal config with a batch (non-streaming) backend and an `en` default
+    /// language, mirroring the setup where issue reviews caught the batch path
+    /// ignoring `-l`.
+    fn batch_config() -> Config {
+        toml::from_str(
+            r#"
+            [general]
+            backend = "groq"
+            language = "en"
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// The batch path must transcribe with the language the session was
+    /// started with (`toggle -l pl`), not the config default. Mirrors the
+    /// handle_toggle flow: the start-press persists the resolved language in
+    /// `DaemonState`; the stop-press consumes it and builds the batch
+    /// `TranscriptionConfig` from it.
+    #[test]
+    fn batch_stop_uses_session_language_override() {
+        let config = batch_config();
+        let mut ds = DaemonState::new();
+
+        // Start press with `-l pl`: resolve and persist the session language.
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        ds.session_language = Some(resolve_language(
+            Some("pl".to_string()),
+            &config.general.language,
+        ));
+
+        // Stop press: the batch path consumes the stored session language.
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        let session_language = ds.take_session_language(&config.general.language);
+        assert_eq!(session_language, "pl");
+
+        // This is the config `process_recording_batch` sends to the backend
+        // (and the language `save_history_entry` records).
+        let tc = build_transcription_config(&config, &session_language);
+        assert_eq!(tc.language, "pl");
+    }
+
+    /// Consuming the session language ends the language session: the next
+    /// recording must fall back to the config default, not inherit `pl`.
+    #[test]
+    fn session_language_does_not_leak_into_next_session() {
+        let config = batch_config();
+        let mut ds = DaemonState::new();
+
+        ds.session_language = Some("pl".to_string());
+        assert_eq!(ds.take_session_language(&config.general.language), "pl");
+
+        // Session over — a plain toggle now uses the default again.
+        assert_eq!(ds.take_session_language(&config.general.language), "en");
+    }
+
+    /// Without an override the batch path keeps using the config default.
+    #[test]
+    fn batch_stop_defaults_to_config_language() {
+        let config = batch_config();
+        let mut ds = DaemonState::new();
+
+        ds.session_language = Some(resolve_language(None, &config.general.language));
+        let session_language = ds.take_session_language(&config.general.language);
+        let tc = build_transcription_config(&config, &session_language);
+        assert_eq!(tc.language, "en");
     }
 
     #[test]
