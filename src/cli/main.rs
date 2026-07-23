@@ -50,8 +50,9 @@ enum SubCmd {
     Config,
     /// Toggle recording on/off (start dictation or stop and transcribe)
     Toggle {
-        /// Override the transcription language for this session (e.g. `en`, `pl`)
-        #[arg(short, long)]
+        /// Override the transcription language for this session: an ISO 639-1
+        /// code (e.g. `en`, `pl`), optionally with a region (`en-US`), or `auto`
+        #[arg(short, long, value_parser = whisrs::validate_language_override)]
         language: Option<String>,
     },
     /// Cancel the current recording and discard audio

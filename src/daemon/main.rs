@@ -28,8 +28,8 @@ use whisrs::transcription::openai_rest::OpenAIRestBackend;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::{self, WindowTracker};
 use whisrs::{
-    encode_message, read_message, socket_path, Command, Config, InjectorBackend,
-    LocalWhisperConfig, Response, State,
+    encode_message, read_message, socket_path, validate_language_override, Command, Config,
+    InjectorBackend, LocalWhisperConfig, Response, State,
 };
 
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
@@ -884,6 +884,14 @@ async fn handle_toggle(
 
     match current_state {
         State::Idle => {
+            // Fail fast on a bad `-l` override before any capture or state
+            // transition — otherwise the user records a whole session and
+            // only finds out when the backend rejects the language.
+            let language = match validate_toggle_language(language) {
+                Ok(lang) => lang,
+                Err(response) => return response,
+            };
+
             // Resolve the session language once: per-toggle override, else
             // config default. Persisted in `DaemonState` below so the
             // stop-toggle can apply it to the batch path and history too.
@@ -1838,6 +1846,26 @@ fn resolve_language(override_lang: Option<String>, default_lang: &str) -> String
     override_lang.unwrap_or_else(|| default_lang.to_string())
 }
 
+/// Validate a per-toggle language override before recording starts.
+///
+/// Returns the normalized override on success, or the error `Response` to
+/// send back to the CLI. Called on the start-press before any capture or
+/// state transition so a bad `-l` value (e.g. `english`) is rejected up
+/// front instead of failing a whole session at transcription time. The
+/// config default (`general.language`) is deliberately not validated.
+fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, Response> {
+    match language {
+        None => Ok(None),
+        Some(lang) => match validate_language_override(&lang) {
+            Ok(normalized) => Ok(Some(normalized)),
+            Err(message) => {
+                warn!("rejected language override: {message}");
+                Err(Response::Error { message })
+            }
+        },
+    }
+}
+
 fn build_transcription_config(config: &Config, language: &str) -> TranscriptionConfig {
     TranscriptionConfig {
         language: language.to_string(),
@@ -2781,6 +2809,32 @@ mod tests {
     #[test]
     fn resolve_language_falls_back_to_default() {
         assert_eq!(resolve_language(None, "en"), "en");
+    }
+
+    /// Mirrors handle_toggle's start-press: validation runs first and its
+    /// error response is returned before the Idle→Recording transition, so
+    /// a bad `-l` override never starts a recording.
+    #[test]
+    fn start_press_rejects_invalid_language_override_before_recording() {
+        let ds = DaemonState::new();
+
+        let response = validate_toggle_language(Some("english".to_string())).unwrap_err();
+        assert!(matches!(response, Response::Error { .. }));
+
+        // handle_toggle returns that response without touching the state
+        // machine — the daemon stays idle and no capture is started.
+        assert_eq!(ds.state_machine.state(), State::Idle);
+    }
+
+    /// Valid overrides are normalized (whisper.cpp needs lowercase codes);
+    /// a plain toggle passes through untouched.
+    #[test]
+    fn start_press_normalizes_valid_language_override() {
+        assert_eq!(
+            validate_toggle_language(Some("PL".to_string())).unwrap(),
+            Some("pl".to_string())
+        );
+        assert_eq!(validate_toggle_language(None).unwrap(), None);
     }
 
     /// Minimal config with a batch (non-streaming) backend and an `en` default

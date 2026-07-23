@@ -34,6 +34,28 @@ this does not touch udev rules, the systemd unit, or compositor keybindings.
 Start or stop recording. If idle, begins audio capture. If recording,
 stops capture and sends audio for transcription. Text is typed at the
 cursor in the previously focused window.
+.RS
+.TP
+\fB\-l\fR, \fB\-\-language\fR \fICODE\fR
+Override the transcription language for this session only \(em no config
+edit or daemon restart.
+.I CODE
+is an ISO 639\-1 code (e.g.
+.BR en ,
+.BR pl ),
+optionally with a region (e.g.
+.BR en\-US ),
+or
+.B auto
+for automatic detection. Applies to the
+.B toggle
+that starts recording; the override ends with the session. A plain
+.B toggle
+keeps using the configured
+.IR general.language ,
+so an existing hotkey is unaffected. Bind a separate key per language to
+dictate in each without switching settings.
+.RE
 .TP
 .B cancel
 Cancel the current recording and discard captured audio. Returns the
@@ -115,6 +137,12 @@ Start dictation (bind this to a hotkey):
 .PP
 .RS
 .B whisrs toggle
+.RE
+.PP
+Start dictation in Polish for this session only:
+.PP
+.RS
+.B whisrs toggle \-l pl
 .RE
 .PP
 Cancel recording:

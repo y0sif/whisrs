@@ -633,6 +633,62 @@ pub fn config_path() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Language override validation
+// ---------------------------------------------------------------------------
+
+/// Validate and normalize a per-session language override (`toggle -l`).
+///
+/// Accepts, case-insensitively:
+/// - `auto` — let the backend detect the language
+/// - `multi` — Deepgram's multilingual mode (what `auto` maps to there)
+/// - BCP-47-style tags whose primary subtag is a 2–3 letter ISO 639 code,
+///   with optional region/script subtags: `en`, `en-US`, `pt-BR`, `zh-Hans`
+///
+/// The rule is deliberately structural rather than a whitelist: backends
+/// accept different sets (Deepgram takes region tags and `multi`;
+/// whisper.cpp takes ISO 639-1 plus a few three-letter codes like `yue`),
+/// so only clearly-invalid input (empty, `english`, `123`) is rejected and
+/// the backend interprets the rest. This validates the `-l` override only
+/// — `general.language` from the config file is not validated here.
+///
+/// Returns the normalized tag: primary subtag lowercased (whisper.cpp
+/// requires lowercase codes), two-letter region subtags uppercased,
+/// `_` separators replaced with `-`.
+pub fn validate_language_override(lang: &str) -> Result<String, String> {
+    let trimmed = lang.trim();
+    let invalid = || {
+        format!(
+            "invalid language '{trimmed}': use an ISO 639 code like 'en', \
+             optionally with a region ('en-US'), or 'auto'"
+        )
+    };
+
+    if trimmed.eq_ignore_ascii_case("auto") || trimmed.eq_ignore_ascii_case("multi") {
+        return Ok(trimmed.to_ascii_lowercase());
+    }
+
+    let mut subtags = trimmed.split(['-', '_']);
+    let primary = subtags.next().unwrap_or("");
+    if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(invalid());
+    }
+
+    let mut normalized = primary.to_ascii_lowercase();
+    for subtag in subtags {
+        if !(2..=8).contains(&subtag.len()) || !subtag.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(invalid());
+        }
+        normalized.push('-');
+        if subtag.len() == 2 {
+            normalized.push_str(&subtag.to_ascii_uppercase());
+        } else {
+            normalized.push_str(subtag);
+        }
+    }
+    Ok(normalized)
+}
+
+// ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
 
@@ -975,6 +1031,38 @@ mod tests {
         assert_eq!(json, r#"{"cmd":"toggle","language":"pl"}"#);
         let parsed: Command = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Command::Toggle { language: Some(l) } if l == "pl"));
+    }
+
+    #[test]
+    fn language_override_accepts_iso_codes() {
+        assert_eq!(validate_language_override("en").unwrap(), "en");
+        assert_eq!(validate_language_override("PL").unwrap(), "pl");
+        assert_eq!(validate_language_override("auto").unwrap(), "auto");
+    }
+
+    #[test]
+    fn language_override_accepts_region_tags() {
+        assert_eq!(validate_language_override("en-US").unwrap(), "en-US");
+        assert_eq!(validate_language_override("pt-br").unwrap(), "pt-BR");
+        assert_eq!(validate_language_override("en_US").unwrap(), "en-US");
+    }
+
+    #[test]
+    fn language_override_accepts_backend_specific_codes() {
+        // Deepgram's multilingual mode, whisper.cpp's three-letter codes,
+        // and script subtags pass through structurally.
+        assert_eq!(validate_language_override("multi").unwrap(), "multi");
+        assert_eq!(validate_language_override("yue").unwrap(), "yue");
+        assert_eq!(validate_language_override("zh-Hans").unwrap(), "zh-Hans");
+    }
+
+    #[test]
+    fn language_override_rejects_clearly_invalid() {
+        assert!(validate_language_override("").is_err());
+        assert!(validate_language_override("english").is_err());
+        assert!(validate_language_override("123").is_err());
+        assert!(validate_language_override("e").is_err());
+        assert!(validate_language_override("en-").is_err());
     }
 
     #[test]
