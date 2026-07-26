@@ -1,10 +1,15 @@
-# Allow members of the "input" group to access /dev/uinput
-# Install: sudo cp 99-whisrs.rules /etc/udev/rules.d/
-# Reload: sudo udevadm control --reload-rules && sudo udevadm trigger
+# Grant members of the "input" group access to /dev/uinput, which whisrs needs
+# in order to synthesize keystrokes.
 #
-# Note: MODE/GROUP alone are not enough if another udev rule (e.g. brltty)
-# sets an ACL on /dev/uinput, because ACLs override traditional Unix group
-# permissions. The setfacl call below ensures the input group always has
-# read-write access regardless of ACL state.
+# MODE/GROUP alone are not enough if another udev rule (e.g. brltty) sets an
+# ACL on /dev/uinput, because ACLs override traditional Unix group permissions.
+# The setfacl call below ensures the input group always has read-write access
+# regardless of ACL state.
+#
+# Packagers: /usr/bin/setfacl is the FHS location. On distributions that put it
+# elsewhere (NixOS, Guix), rewrite both occurrences below at build time — the
+# TEST== guard makes this rule a silent no-op when the path does not exist.
+#
+# Installation instructions live in README.md and docs/troubleshooting.md.
 KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", TAG+="uaccess"
 KERNEL=="uinput", SUBSYSTEM=="misc", TEST=="/usr/bin/setfacl", RUN+="/usr/bin/setfacl -m g:input:rw /dev/$name"
