@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -684,8 +685,17 @@ fn send_notification(summary: &str, body: &str) {
     });
 }
 
+/// The daemon takes no options of its own, but declaring the interface means
+/// `--version` and `--help` are answered and exit, instead of being ignored and
+/// starting a daemon.
+#[derive(Parser)]
+#[command(name = "whisrsd", about = "whisrs dictation daemon", version)]
+struct Args {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    Args::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
