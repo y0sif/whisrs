@@ -13,6 +13,7 @@ use evdev::{Device, EventType, InputEventKind, Key};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::llm::LlmCommandConfig;
 use crate::{Command, HotkeyConfig};
 pub use parse::{parse_hotkey, HotkeyBinding};
 
@@ -34,7 +35,11 @@ struct HotkeyAction {
 /// matching commands through the provided channel. Retries with exponential
 /// backoff if no keyboards are found yet (common on boot when the daemon
 /// starts before input devices are fully initialized). Runs until dropped.
-pub async fn start_hotkey_listener(config: &HotkeyConfig, cmd_tx: mpsc::Sender<Command>) {
+pub async fn start_hotkey_listener(
+    config: &HotkeyConfig,
+    llm_commands: &[LlmCommandConfig],
+    cmd_tx: mpsc::Sender<Command>,
+) {
     let mut actions = Vec::new();
 
     if let Some(ref s) = config.toggle {
@@ -86,6 +91,45 @@ pub async fn start_hotkey_listener(config: &HotkeyConfig, cmd_tx: mpsc::Sender<C
                 });
             }
             Err(e) => warn!("invalid speak hotkey '{s}': {e}"),
+        }
+    }
+
+    for entry in llm_commands {
+        match parse_hotkey(&entry.hotkey) {
+            Ok(binding) => {
+                info!("hotkey: llm-command '{}' = {}", entry.name, entry.hotkey);
+                actions.push(HotkeyAction {
+                    binding,
+                    command: Command::LlmCommand {
+                        name: entry.name.clone(),
+                    },
+                });
+            }
+            Err(e) => warn!(
+                "invalid hotkey '{}' for llm-command '{}': {e}",
+                entry.hotkey, entry.name
+            ),
+        }
+
+        if let Some(set_hotkey) = &entry.set_hotkey {
+            match parse_hotkey(set_hotkey) {
+                Ok(binding) => {
+                    info!(
+                        "hotkey: llm-command '{}' set-instruction = {}",
+                        entry.name, set_hotkey
+                    );
+                    actions.push(HotkeyAction {
+                        binding,
+                        command: Command::SetLlmInstruction {
+                            name: entry.name.clone(),
+                        },
+                    });
+                }
+                Err(e) => warn!(
+                    "invalid set_hotkey '{}' for llm-command '{}': {e}",
+                    set_hotkey, entry.name
+                ),
+            }
         }
     }
 

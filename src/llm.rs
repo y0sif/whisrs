@@ -1,7 +1,12 @@
 //! LLM integration for command mode.
 //!
 //! Sends selected text + a voice instruction to an LLM chat API and returns
-//! the rewritten text. Supports OpenAI-compatible endpoints (OpenAI, Groq).
+//! the rewritten text. Supports any OpenAI-compatible `/chat/completions`
+//! endpoint — OpenAI, Groq, or a local server (LM Studio, Ollama, llama.cpp
+//! server, ...). Point `[llm] api_url` at the local server (e.g.
+//! `http://localhost:1234/v1/chat/completions` for LM Studio) and set
+//! `model` to whatever the server has loaded; local servers don't validate
+//! `api_key`, so any placeholder string works.
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -37,6 +42,37 @@ fn default_llm_model() -> String {
 
 fn default_llm_url() -> String {
     "https://api.openai.com/v1/chat/completions".to_string()
+}
+
+/// A named custom LLM command: dictate → the configured instruction is
+/// applied to the transcribed text by the LLM → the result is typed at the
+/// cursor. Unlike command mode (`[hotkeys] command`), this doesn't touch the
+/// selection or clipboard — it's a toggle-recording flavor of plain
+/// dictation, just with an LLM post-processing step and a fixed instruction
+/// instead of a spoken one.
+///
+/// Each entry gets its own global hotkey, registered the same way as the
+/// built-in `[hotkeys]` entries. Uses the shared `[llm]` config — there's no
+/// per-command model/key override (keep the config surface small; add one
+/// only if real usage shows it's needed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmCommandConfig {
+    /// Unique identifier — used in logs and by `whisrs llm-command <name>`
+    /// for compositor keybind integration (same pattern as `whisrs toggle`).
+    pub name: String,
+    /// Key combo string (e.g. "Super+Shift+T"), same format as `[hotkeys]`.
+    /// Runs the command: dictate → LLM applies `instruction` → type at cursor.
+    pub hotkey: String,
+    /// Optional second key combo that *reprograms* this command: press it with
+    /// text selected and the highlighted text becomes the new `instruction`
+    /// (saved to config, applied live). Same format as `hotkey`. Absent = the
+    /// instruction can only be changed by editing the config.
+    #[serde(default)]
+    pub set_hotkey: Option<String>,
+    /// Instruction applied to the dictated text (e.g. "Translate the following
+    /// text into German. Return only the translated text."). Can be replaced at
+    /// runtime via `set_hotkey`.
+    pub instruction: String,
 }
 
 #[derive(Serialize)]

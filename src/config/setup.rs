@@ -171,6 +171,7 @@ pub fn run_setup() -> Result<()> {
         tts: None,
         hotkeys: None,
         overlay: if overlay { overlay_config } else { None },
+        llm_commands: Vec::new(),
     };
 
     let config_path = write_config(&config)?;
@@ -773,7 +774,7 @@ fn test_microphone() {
 }
 
 /// Write the config to `~/.config/whisrs/config.toml` with `chmod 0600`.
-pub(crate) fn write_config(config: &Config) -> Result<PathBuf> {
+pub fn write_config(config: &Config) -> Result<PathBuf> {
     let config_path = crate::config_path();
     let config_dir = config_path
         .parent()

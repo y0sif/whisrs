@@ -128,11 +128,42 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 url = "http://127.0.0.1:8765/transcribe"
 model = "microsoft/VibeVoice-ASR-HF"
 
-# Command mode: LLM for voice-driven text rewriting
+# Command mode: LLM for voice-driven text rewriting.
+# Also used by [[llm_commands]] (see below). Any OpenAI-compatible
+# /chat/completions endpoint works here, including a local server:
+#   [llm]
+#   api_key = "not-needed"   # local servers don't validate this
+#   model = "<model loaded in LM Studio / Ollama / llama.cpp server>"
+#   api_url = "http://localhost:1234/v1/chat/completions"  # LM Studio default
 [llm]
 api_key = "sk-..."
 model = "gpt-4o-mini"
 api_url = "https://api.openai.com/v1/chat/completions"
+
+# Named custom LLM commands: each gets its own hotkey. Dictate, the LLM
+# applies the instruction to the transcribed text, result is typed at the
+# cursor. A toggle-recording flavor of plain dictation — unlike command mode,
+# there's no text selection involved. Uses the [llm] config above.
+# Optional; can also be triggered via `whisrs llm-command <name>` for
+# compositor keybind integration (same pattern as `whisrs toggle`).
+#
+# set_hotkey (optional): reprogram this command by selection. Highlight the new
+# instruction text anywhere, press set_hotkey, and it becomes the command's
+# instruction — saved back to this file and applied immediately (no restart).
+# Lets you repurpose a command (translate -> summarize -> ...) without editing
+# config. Also available as `whisrs llm-command-set <name>` for compositor
+# binds. Selection-based on purpose: the instruction is exact, no dictation
+# glitches.
+#
+# Tip: write the instruction so it clearly refers to the dictated text (e.g.
+# "the following text") and pins the output ("Return only ..., no explanations,
+# no quotes"). Small local models otherwise sometimes echo the instruction or
+# add commentary.
+[[llm_commands]]
+name = "translate-de"
+hotkey = "Super+Shift+T"           # run: dictate -> LLM -> type
+set_hotkey = "Super+Shift+Alt+T"   # reprogram: select new instruction, press
+instruction = "Translate the following text into German, using the friendly informal 'du' form and a warm, casual tone. Return only the translated text — no explanations, no quotes."
 
 # Text-to-speech: read the current selection aloud (`whisrs speak`).
 # Opt-in. model/voice are optional; each backend has its own default,

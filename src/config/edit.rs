@@ -55,6 +55,7 @@ pub fn run_config_menu() -> Result<()> {
             "Hotkeys",
             "Tray & overlay",
             "Command mode (LLM)",
+            "Custom LLM commands",
             "Show full config (masked)",
             "Open in $EDITOR",
             "─────────",
@@ -80,8 +81,9 @@ pub fn run_config_menu() -> Result<()> {
             7 => edit_hotkeys(&mut config)?,
             8 => edit_tray_overlay(&mut config)?,
             9 => edit_llm(&mut config)?,
-            10 => show_config(&config),
-            11 => {
+            10 => edit_llm_commands(&mut config)?,
+            11 => show_config(&config),
+            12 => {
                 if open_in_editor(&mut config)? {
                     // External edit already wrote the file; reload and skip the
                     // normal save path so we don't clobber formatting/comments
@@ -89,17 +91,17 @@ pub fn run_config_menu() -> Result<()> {
                     println!("  {GREEN}Applied edits from $EDITOR.{RESET}");
                 }
             }
-            12 => {
+            13 => {
                 // separator — no-op
             }
-            13 => {
+            14 => {
                 if save_and_restart(&config, fresh)? {
                     return Ok(());
                 }
                 // Validation failed — fall through to next loop iteration,
                 // preserving the in-memory `config` so the user can fix it.
             }
-            14 => {
+            15 => {
                 println!("\n  {DIM}Discarded changes.{RESET}");
                 return Ok(());
             }
@@ -126,6 +128,7 @@ fn default_config() -> Config {
         tts: None,
         hotkeys: None,
         overlay: None,
+        llm_commands: Vec::new(),
     }
 }
 
@@ -499,6 +502,175 @@ fn edit_llm(config: &mut Config) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn edit_llm_commands(config: &mut Config) -> Result<()> {
+    println!("\n  {BOLD}Custom LLM commands{RESET}");
+    println!(
+        "  {DIM}Each entry gets its own hotkey: dictate, the LLM applies a fixed\n   \
+         instruction to what you said, and the result is typed at the cursor —\n   \
+         a toggle-recording flavor of plain dictation, not command mode (no\n   \
+         selection needed). Uses the same [llm] configuration as command mode.{RESET}"
+    );
+
+    loop {
+        if config.llm_commands.is_empty() {
+            println!("  {DIM}(none configured){RESET}");
+        } else {
+            println!();
+            for (i, entry) in config.llm_commands.iter().enumerate() {
+                println!(
+                    "    {}. {BOLD}{}{RESET}  [{}]  {}",
+                    i + 1,
+                    entry.name,
+                    entry.hotkey,
+                    truncate_for_menu(&entry.instruction)
+                );
+            }
+        }
+
+        let mut choices = vec!["Add new".to_string()];
+        if !config.llm_commands.is_empty() {
+            choices.push("Edit an entry".to_string());
+            choices.push("Remove an entry".to_string());
+        }
+        choices.push("Done".to_string());
+        let done_index = choices.len() - 1;
+
+        let selection = Select::new()
+            .with_prompt("Custom LLM commands")
+            .items(&choices)
+            .default(done_index)
+            .interact()
+            .context("failed to read menu selection")?;
+
+        match choices[selection].as_str() {
+            "Add new" => add_llm_command(config)?,
+            "Edit an entry" => edit_one_llm_command(config)?,
+            "Remove an entry" => remove_llm_command(config)?,
+            _ => return Ok(()), // "Done"
+        }
+    }
+}
+
+fn add_llm_command(config: &mut Config) -> Result<()> {
+    let name: String = Input::new()
+        .with_prompt("Name (identifier, e.g. \"translate-de\")")
+        .interact_text()
+        .context("failed to read name")?;
+    if config.llm_commands.iter().any(|e| e.name == name) {
+        println!("  {YELLOW}An entry named '{name}' already exists — edit it instead.{RESET}");
+        return Ok(());
+    }
+    let hotkey: String = Input::new()
+        .with_prompt("Hotkey (e.g. \"Super+Shift+T\")")
+        .interact_text()
+        .context("failed to read hotkey")?;
+    let set_hotkey_raw: String = Input::new()
+        .with_prompt(
+            "Set-hotkey — reprogram this command from selected text (optional, blank to skip)",
+        )
+        .allow_empty(true)
+        .interact_text()
+        .context("failed to read set_hotkey")?;
+    let set_hotkey = Some(set_hotkey_raw.trim().to_string()).filter(|s| !s.is_empty());
+    let instruction: String = Input::new()
+        .with_prompt("Instruction applied to the dictated text")
+        .interact_text()
+        .context("failed to read instruction")?;
+
+    config.llm_commands.push(crate::llm::LlmCommandConfig {
+        name,
+        hotkey,
+        set_hotkey,
+        instruction,
+    });
+    println!("  {GREEN}Added.{RESET}");
+    Ok(())
+}
+
+fn edit_one_llm_command(config: &mut Config) -> Result<()> {
+    let Some(idx) = select_llm_command(config, "Edit which entry?")? else {
+        return Ok(());
+    };
+
+    let entry = config.llm_commands[idx].clone();
+    let name: String = Input::new()
+        .with_prompt("Name")
+        .default(entry.name)
+        .interact_text()
+        .context("failed to read name")?;
+    let hotkey: String = Input::new()
+        .with_prompt("Hotkey")
+        .default(entry.hotkey)
+        .interact_text()
+        .context("failed to read hotkey")?;
+    let set_hotkey_raw: String = Input::new()
+        .with_prompt("Set-hotkey (reprogram from selection; blank for none)")
+        .default(entry.set_hotkey.clone().unwrap_or_default())
+        .allow_empty(true)
+        .interact_text()
+        .context("failed to read set_hotkey")?;
+    let set_hotkey = Some(set_hotkey_raw.trim().to_string()).filter(|s| !s.is_empty());
+    let instruction: String = Input::new()
+        .with_prompt("Instruction")
+        .default(entry.instruction)
+        .interact_text()
+        .context("failed to read instruction")?;
+
+    config.llm_commands[idx] = crate::llm::LlmCommandConfig {
+        name,
+        hotkey,
+        set_hotkey,
+        instruction,
+    };
+    println!("  {GREEN}Updated.{RESET}");
+    Ok(())
+}
+
+fn remove_llm_command(config: &mut Config) -> Result<()> {
+    let Some(idx) = select_llm_command(config, "Remove which entry?")? else {
+        return Ok(());
+    };
+    let removed = config.llm_commands.remove(idx);
+    println!("  {GREEN}Removed '{}'.{RESET}", removed.name);
+    Ok(())
+}
+
+/// Show a picker over current entries plus a trailing "Cancel". Returns
+/// `None` when the user cancels.
+fn select_llm_command(config: &Config, prompt: &str) -> Result<Option<usize>> {
+    let mut items: Vec<String> = config
+        .llm_commands
+        .iter()
+        .map(|e| format!("{} ({})", e.name, e.hotkey))
+        .collect();
+    items.push("Cancel".to_string());
+    let cancel_index = items.len() - 1;
+
+    let selection = Select::new()
+        .with_prompt(prompt)
+        .items(&items)
+        .default(0)
+        .interact()
+        .context("failed to read selection")?;
+
+    Ok(if selection == cancel_index {
+        None
+    } else {
+        Some(selection)
+    })
+}
+
+/// Truncate an instruction string for the summary menu line.
+fn truncate_for_menu(s: &str) -> String {
+    const MAX: usize = 50;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(MAX).collect();
+        format!("{truncated}…")
+    }
 }
 
 // ---------------------------------------------------------------------------

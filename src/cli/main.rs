@@ -70,6 +70,22 @@ enum SubCmd {
     },
     /// Command mode: select text, speak an instruction, LLM rewrites it in place
     Command,
+    /// Toggle a named custom LLM command (see [[llm_commands]] in config.toml):
+    /// dictate, the LLM applies the configured instruction, result is typed
+    /// at the cursor. Press again to stop recording, same as `toggle`.
+    #[command(name = "llm-command")]
+    LlmCommand {
+        /// Name of the [[llm_commands]] entry to run.
+        name: String,
+    },
+    /// Reprogram a named LLM command from the current selection: highlight the
+    /// new instruction text, then run this — it's saved to config and applied
+    /// live. Pairs with an entry's `set_hotkey`.
+    #[command(name = "llm-command-set")]
+    LlmCommandSet {
+        /// Name of the [[llm_commands]] entry to reprogram.
+        name: String,
+    },
     /// Read the selected text aloud via TTS (press again to stop playback)
     #[command(alias = "read")]
     Speak,
@@ -141,6 +157,12 @@ async fn main() -> anyhow::Result<()> {
         }
         SubCmd::Command => {
             send_command(Command::CommandMode).await?;
+        }
+        SubCmd::LlmCommand { name } => {
+            send_command(Command::LlmCommand { name }).await?;
+        }
+        SubCmd::LlmCommandSet { name } => {
+            send_command(Command::SetLlmInstruction { name }).await?;
         }
         SubCmd::Speak => {
             send_command(Command::Speak).await?;

@@ -44,6 +44,21 @@ pub enum Command {
     /// Start command mode: copy selection → record voice instruction → LLM rewrite → paste.
     #[serde(rename = "command")]
     CommandMode,
+    /// Toggle a named custom LLM command (see `[[llm_commands]]`): dictate →
+    /// LLM applies the configured instruction to the transcribed text →
+    /// types the result at the cursor. A second press on the same command
+    /// (or any other) stops recording, same as `toggle`.
+    #[serde(rename = "llm-command")]
+    LlmCommand {
+        name: String,
+    },
+    /// Reprogram a named LLM command (see `[[llm_commands]]` `set_hotkey`):
+    /// the currently selected text becomes the command's new instruction,
+    /// saved to config and applied live. No recording, LLM call, or typing.
+    #[serde(rename = "set-llm-instruction")]
+    SetLlmInstruction {
+        name: String,
+    },
     /// Read the selected text aloud via TTS. A repeat `Speak` (or `Cancel`)
     /// stops any in-progress playback.
     #[serde(alias = "read")]
@@ -129,6 +144,10 @@ pub struct Config {
     /// Overlay appearance config (theme, dimensions, optional custom colors).
     #[serde(default)]
     pub overlay: Option<OverlayConfig>,
+    /// Named custom LLM commands, each with its own hotkey (see
+    /// [`llm::LlmCommandConfig`]). Empty by default.
+    #[serde(default)]
+    pub llm_commands: Vec<llm::LlmCommandConfig>,
 }
 
 /// Global hotkey configuration — key combos that trigger actions.
@@ -947,6 +966,65 @@ impl Config {
             });
         }
 
+        if !self.llm_commands.is_empty() {
+            if self.llm.is_none() {
+                warnings.push(ConfigWarning {
+                    message: "llm_commands configured but no [llm] section — add [llm] api_key \
+                              (or set WHISRS_OPENAI_API_KEY / WHISRS_GROQ_API_KEY) or these \
+                              hotkeys will fail at runtime"
+                        .to_string(),
+                });
+            }
+
+            let mut seen_names = std::collections::HashSet::new();
+            for entry in &self.llm_commands {
+                if entry.name.trim().is_empty() {
+                    warnings.push(ConfigWarning {
+                        message: "llm_commands entry has an empty name".to_string(),
+                    });
+                } else if !seen_names.insert(entry.name.clone()) {
+                    warnings.push(ConfigWarning {
+                        message: format!("llm_commands has a duplicate name: '{}'", entry.name),
+                    });
+                }
+                if entry.hotkey.trim().is_empty() {
+                    warnings.push(ConfigWarning {
+                        message: format!("llm_commands '{}' has an empty hotkey", entry.name),
+                    });
+                } else if let Err(e) = hotkey::parse_hotkey(&entry.hotkey) {
+                    warnings.push(ConfigWarning {
+                        message: format!(
+                            "llm_commands '{}' has an invalid hotkey '{}': {e}",
+                            entry.name, entry.hotkey
+                        ),
+                    });
+                }
+                if let Some(set_hotkey) = &entry.set_hotkey {
+                    if let Err(e) = hotkey::parse_hotkey(set_hotkey) {
+                        warnings.push(ConfigWarning {
+                            message: format!(
+                                "llm_commands '{}' has an invalid set_hotkey '{}': {e}",
+                                entry.name, set_hotkey
+                            ),
+                        });
+                    } else if *set_hotkey == entry.hotkey {
+                        warnings.push(ConfigWarning {
+                            message: format!(
+                                "llm_commands '{}' has set_hotkey equal to hotkey '{}' — one \
+                                 press can't both run and reprogram",
+                                entry.name, entry.hotkey
+                            ),
+                        });
+                    }
+                }
+                if entry.instruction.trim().is_empty() {
+                    warnings.push(ConfigWarning {
+                        message: format!("llm_commands '{}' has an empty instruction", entry.name),
+                    });
+                }
+            }
+        }
+
         Ok(warnings)
     }
 
@@ -1492,6 +1570,7 @@ mod tests {
             llm: None,
             tts: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -1537,6 +1616,7 @@ mod tests {
             llm: None,
             tts: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -1566,6 +1646,7 @@ mod tests {
             llm: None,
             tts: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
         };
         let result = config.validate();
@@ -1598,6 +1679,7 @@ mod tests {
             llm: None,
             tts: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -1637,6 +1719,7 @@ mod tests {
                 llm: None,
                 tts: None,
                 hotkeys: None,
+                llm_commands: Vec::new(),
                 overlay: None,
             };
             let warnings = config.validate().unwrap();
@@ -1687,6 +1770,7 @@ mod tests {
             llm: None,
             tts: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
         };
 
@@ -1735,6 +1819,7 @@ mod tests {
             llm: None,
             tts: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -1789,6 +1874,7 @@ mod tests {
             }),
             llm: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
             tts: None,
         };
@@ -1821,6 +1907,7 @@ mod tests {
             }),
             llm: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
             tts: None,
         };
@@ -1854,6 +1941,7 @@ mod tests {
             }),
             llm: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
             tts: None,
         };
@@ -1887,6 +1975,7 @@ mod tests {
             }),
             llm: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
             tts: None,
         };
@@ -1920,6 +2009,7 @@ mod tests {
             }),
             llm: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
             tts: None,
         };
@@ -1950,6 +2040,7 @@ mod tests {
             }),
             llm: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
             tts: None,
         };
@@ -2000,5 +2091,258 @@ mod tests {
 
         let _ = std::fs::remove_file(&sock_path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn llm_command_serialization_roundtrip() {
+        let cmd = Command::LlmCommand {
+            name: "translate-de".to_string(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"cmd":"llm-command","name":"translate-de"}"#);
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Command::LlmCommand { name } if name == "translate-de"));
+    }
+
+    #[test]
+    fn config_parses_llm_commands_array() {
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            backend = "groq"
+
+            [[llm_commands]]
+            name = "translate-de"
+            hotkey = "Super+Shift+T"
+            instruction = "Translate the following into German, informal tone."
+
+            [[llm_commands]]
+            name = "summarize"
+            hotkey = "Super+Shift+S"
+            instruction = "Summarize the following in one sentence."
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.llm_commands.len(), 2);
+        assert_eq!(config.llm_commands[0].name, "translate-de");
+        assert_eq!(config.llm_commands[0].hotkey, "Super+Shift+T");
+        assert_eq!(config.llm_commands[1].name, "summarize");
+
+        // Round-trips back out and parses again identically.
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.llm_commands.len(), 2);
+    }
+
+    #[test]
+    fn config_without_llm_commands_defaults_empty() {
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            backend = "groq"
+            "#,
+        )
+        .unwrap();
+        assert!(config.llm_commands.is_empty());
+    }
+
+    #[test]
+    fn config_validate_warns_llm_commands_without_llm_section() {
+        let mut config = Config {
+            general: GeneralConfig {
+                backend: "groq".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: Some(GroqConfig {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            }),
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: None,
+            llm: None,
+            hotkeys: None,
+            llm_commands: Vec::new(),
+            overlay: None,
+            tts: None,
+        };
+        config.llm_commands.push(llm::LlmCommandConfig {
+            name: "translate-de".to_string(),
+            hotkey: "Super+Shift+T".to_string(),
+            set_hotkey: None,
+            instruction: "Translate to German.".to_string(),
+        });
+
+        let warnings = config.validate().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.message.contains("no [llm] section")));
+    }
+
+    #[test]
+    fn config_validate_rejects_duplicate_llm_command_names() {
+        let mut config = Config {
+            general: GeneralConfig {
+                backend: "groq".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: Some(GroqConfig {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            }),
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: None,
+            llm: Some(llm::LlmConfig::default()),
+            hotkeys: None,
+            llm_commands: Vec::new(),
+            overlay: None,
+            tts: None,
+        };
+        for _ in 0..2 {
+            config.llm_commands.push(llm::LlmCommandConfig {
+                name: "dup".to_string(),
+                hotkey: "Super+Shift+T".to_string(),
+                set_hotkey: None,
+                instruction: "Translate to German.".to_string(),
+            });
+        }
+
+        let warnings = config.validate().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.message.contains("duplicate name")));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_llm_command_hotkey() {
+        let mut config = Config {
+            general: GeneralConfig {
+                backend: "groq".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: Some(GroqConfig {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            }),
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: None,
+            llm: Some(llm::LlmConfig::default()),
+            hotkeys: None,
+            llm_commands: Vec::new(),
+            overlay: None,
+            tts: None,
+        };
+        config.llm_commands.push(llm::LlmCommandConfig {
+            name: "translate-de".to_string(),
+            hotkey: "NotAKey".to_string(),
+            set_hotkey: None,
+            instruction: "Translate to German.".to_string(),
+        });
+
+        let warnings = config.validate().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.message.contains("invalid hotkey")));
+    }
+
+    #[test]
+    fn llm_command_set_hotkey_defaults_none_and_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [general]
+            backend = "groq"
+
+            [[llm_commands]]
+            name = "no-set"
+            hotkey = "Super+Shift+T"
+            instruction = "Translate to German."
+
+            [[llm_commands]]
+            name = "with-set"
+            hotkey = "Super+Shift+U"
+            set_hotkey = "Super+Shift+Alt+U"
+            instruction = "Summarize."
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.llm_commands[0].set_hotkey, None);
+        assert_eq!(
+            cfg.llm_commands[1].set_hotkey.as_deref(),
+            Some("Super+Shift+Alt+U")
+        );
+    }
+
+    #[test]
+    fn set_llm_instruction_serialization_roundtrip() {
+        let cmd = Command::SetLlmInstruction {
+            name: "translate-de".to_string(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"set-llm-instruction","name":"translate-de"}"#
+        );
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Command::SetLlmInstruction { name } if name == "translate-de"));
+    }
+
+    #[test]
+    fn config_validate_warns_set_hotkey_equal_to_hotkey() {
+        let mut config = Config {
+            general: GeneralConfig {
+                backend: "groq".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: None,
+            groq: Some(GroqConfig {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            }),
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: None,
+            llm: Some(llm::LlmConfig::default()),
+            hotkeys: None,
+            llm_commands: Vec::new(),
+            overlay: None,
+            tts: None,
+        };
+        config.llm_commands.push(llm::LlmCommandConfig {
+            name: "translate-de".to_string(),
+            hotkey: "Super+Shift+T".to_string(),
+            set_hotkey: Some("Super+Shift+T".to_string()),
+            instruction: "Translate to German.".to_string(),
+        });
+
+        let warnings = config.validate().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.message.contains("set_hotkey equal to hotkey")));
     }
 }

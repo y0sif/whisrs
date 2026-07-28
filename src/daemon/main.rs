@@ -45,6 +45,17 @@ struct CommandModeContext {
     is_terminal: bool,
 }
 
+/// Context saved when a named LLM command (`[[llm_commands]]`) starts recording.
+///
+/// Simpler than [`CommandModeContext`]: there's no selection or clipboard
+/// involved — this is a toggle-recording flavor of plain dictation where the
+/// transcribed text is run through a fixed instruction before typing.
+struct LlmCommandContext {
+    name: String,
+    instruction: String,
+    llm_config: llm::LlmConfig,
+}
+
 /// Shared daemon state protected by a mutex.
 struct DaemonState {
     state_machine: StateMachine,
@@ -71,6 +82,15 @@ struct DaemonState {
     session_language: Option<String>,
     /// Active command mode context (set when command mode is recording).
     command_mode: Option<CommandModeContext>,
+    /// Active named LLM command context (set when an `[[llm_commands]]`
+    /// hotkey is recording).
+    llm_command: Option<LlmCommandContext>,
+    /// Runtime instruction overrides for `[[llm_commands]]`, keyed by command
+    /// name. Written by the `set_hotkey` path (`SetLlmInstruction`) so a
+    /// reprogrammed instruction takes effect immediately — the loaded
+    /// `Config` is an immutable `Arc`, so this map is the live source of truth
+    /// (and the change is also persisted to disk for the next start).
+    llm_instruction_overrides: std::collections::HashMap<String, String>,
     /// Stop flag for in-progress TTS playback (read-selection-aloud).
     ///
     /// Set when a `Speak` synthesis succeeds and playback begins; cleared when
@@ -91,6 +111,8 @@ impl DaemonState {
             recording_started_at: None,
             session_language: None,
             command_mode: None,
+            llm_command: None,
+            llm_instruction_overrides: std::collections::HashMap::new(),
             tts_stop: None,
         }
     }
@@ -189,6 +211,7 @@ fn load_config() -> (Config, Option<String>) {
                             llm: None,
                             tts: None,
                             hotkeys: None,
+                            llm_commands: Vec::new(),
                             overlay: None,
                         },
                         Some(msg),
@@ -217,6 +240,7 @@ fn load_config() -> (Config, Option<String>) {
                         llm: None,
                         tts: None,
                         hotkeys: None,
+                        llm_commands: Vec::new(),
                         overlay: None,
                     },
                     Some(msg),
@@ -245,6 +269,7 @@ fn load_config() -> (Config, Option<String>) {
             llm: None,
             tts: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
         },
         None,
@@ -798,15 +823,18 @@ async fn main() -> Result<()> {
         std::process::exit(0);
     });
 
-    // Start global hotkey listener if configured.
+    // Start global hotkey listener if configured — either the fixed
+    // [hotkeys] section, or any [[llm_commands]] entry (each carries its own
+    // hotkey independent of [hotkeys]).
     // Spawned as a background task so retries don't block the IPC server.
-    if let Some(ref hk_config) = context.config.hotkeys {
-        let hk_config = hk_config.clone();
+    if context.config.hotkeys.is_some() || !context.config.llm_commands.is_empty() {
+        let hk_config = context.config.hotkeys.clone().unwrap_or_default();
+        let llm_commands = context.config.llm_commands.clone();
         let hk_state = Arc::clone(&daemon_state);
         let hk_ctx = Arc::clone(&context);
         tokio::spawn(async move {
             let (hotkey_tx, mut hotkey_rx) = tokio::sync::mpsc::channel::<Command>(16);
-            whisrs::hotkey::start_hotkey_listener(&hk_config, hotkey_tx).await;
+            whisrs::hotkey::start_hotkey_listener(&hk_config, &llm_commands, hotkey_tx).await;
 
             // Process hotkey commands.
             while let Some(cmd) = hotkey_rx.recv().await {
@@ -885,6 +913,10 @@ async fn handle_command(
             },
         },
         Command::CommandMode => handle_command_mode(daemon_state, context).await,
+        Command::LlmCommand { name } => handle_llm_command(daemon_state, context, name).await,
+        Command::SetLlmInstruction { name } => {
+            handle_set_llm_instruction(daemon_state, context, name).await
+        }
         Command::Speak => handle_speak(daemon_state, context).await,
     }
 }
@@ -2425,6 +2457,479 @@ async fn command_mode_background(
     }
 }
 
+/// Handle a named `[[llm_commands]]` hotkey. A toggle-recording flavor of
+/// plain dictation: first press starts recording, second press stops it and
+/// runs the transcribed text through the command's fixed instruction via the
+/// LLM before typing the result at the cursor. Unlike command mode, there's
+/// no selection or clipboard involved.
+async fn handle_llm_command(
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+    name: String,
+) -> Response {
+    let current_state = {
+        let ds = daemon_state.lock().await;
+        ds.state_machine.state()
+    };
+
+    match current_state {
+        State::Recording => {
+            // Second press: only stop if an llm-command session is active —
+            // mirrors handle_command_mode's own-flag check.
+            let is_llm_command = {
+                let ds = daemon_state.lock().await;
+                ds.llm_command.is_some()
+            };
+            if !is_llm_command {
+                return Response::Error {
+                    message: "recording is active but not for an llm-command — use toggle, \
+                              command, or cancel"
+                        .to_string(),
+                };
+            }
+            let mut ds = daemon_state.lock().await;
+            if let Some(mut capture) = ds.audio_capture.take() {
+                capture.stop();
+                tokio::task::spawn_blocking(move || drop(capture));
+            }
+            info!("llm-command '{name}': manual stop");
+            Response::Ok {
+                state: State::Recording,
+            }
+        }
+        State::Idle => {
+            let entry = context
+                .config
+                .llm_commands
+                .iter()
+                .find(|e| e.name == name)
+                .cloned();
+            match entry {
+                Some(entry) => llm_command_start(daemon_state, context, entry).await,
+                None => Response::Error {
+                    message: format!("no llm_commands entry named '{name}' — check config.toml"),
+                },
+            }
+        }
+        State::Transcribing => Response::Error {
+            message: "cannot start llm-command while transcribing".to_string(),
+        },
+        State::Synthesizing | State::Speaking => Response::Error {
+            message: "cannot start llm-command while reading aloud — cancel read-aloud first"
+                .to_string(),
+        },
+    }
+}
+
+/// Reprogram a named LLM command from the current selection (its `set_hotkey`).
+///
+/// Synchronous: no recording, no LLM, no typing. Captures the highlighted text
+/// and stores it as the command's new instruction — applied live via the
+/// daemon override map and persisted to `config.toml` for the next start.
+async fn handle_set_llm_instruction(
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+    name: String,
+) -> Response {
+    // Only when idle — don't interfere with an active recording / read-aloud.
+    let state = {
+        let ds = daemon_state.lock().await;
+        ds.state_machine.state()
+    };
+    if state != State::Idle {
+        return Response::Error {
+            message: format!("cannot set an instruction while {state:?} — finish or cancel first"),
+        };
+    }
+
+    // The command must exist (its hotkey was registered from config).
+    if !context.config.llm_commands.iter().any(|e| e.name == name) {
+        return Response::Error {
+            message: format!("no llm_commands entry named '{name}' — check config.toml"),
+        };
+    }
+
+    let Some(instruction) = acquire_selected_text(&context).await else {
+        if context.notify_state() {
+            send_notification(
+                "whisrs",
+                &format!("'{name}': select the instruction text first"),
+            );
+        }
+        return Response::Ok { state: State::Idle };
+    };
+
+    {
+        let mut ds = daemon_state.lock().await;
+        ds.llm_instruction_overrides
+            .insert(name.clone(), instruction.clone());
+    }
+
+    if let Err(e) = persist_llm_instruction(&name, &instruction) {
+        warn!("llm-command '{name}': failed to persist new instruction to config: {e:#}");
+    }
+
+    info!(
+        "llm-command '{name}': instruction reprogrammed ({} chars)",
+        instruction.len()
+    );
+    if context.notify_state() {
+        let preview = truncate_preview(&instruction, 77);
+        send_notification("whisrs", &format!("'{name}' set to: {preview}"));
+    }
+
+    Response::Ok { state: State::Idle }
+}
+
+/// Capture the currently selected text: primary selection first, else a
+/// simulated copy (Ctrl+C, or Ctrl+Shift+C in terminals). Restores the
+/// clipboard afterwards (this path never pastes). Returns `None` when nothing
+/// usable is selected. Mirrors command mode's acquisition, minus the recording.
+async fn acquire_selected_text(context: &DaemonContext) -> Option<String> {
+    let clipboard = xkb_type::default_clipboard();
+    let saved = clipboard.get_text().unwrap_or_default();
+
+    let is_terminal = context
+        .window_tracker
+        .get_focused_window_class()
+        .map(|c| is_terminal_class(&c))
+        .unwrap_or(false);
+
+    let mut text = clipboard.get_primary_selection().unwrap_or_default();
+
+    if text.trim().is_empty() || text == saved {
+        let copy_fn = if is_terminal {
+            simulate_terminal_copy
+        } else {
+            simulate_copy
+        };
+        let _ = tokio::task::spawn_blocking(copy_fn).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        text = clipboard.get_text().unwrap_or_default();
+    }
+
+    // Restore the user's clipboard — the set path never pastes.
+    let _ = clipboard.set_text(&saved);
+
+    let text = text.trim().to_string();
+    if text.is_empty() || text == saved.trim() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Persist a reprogrammed instruction to `config.toml`: re-read the on-disk
+/// config, update the matching entry, write it back. Best-effort — the
+/// in-memory override already applies to the running daemon.
+fn persist_llm_instruction(name: &str, instruction: &str) -> anyhow::Result<()> {
+    let path = whisrs::config_path();
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read config at {}", path.display()))?;
+    let mut config: Config =
+        toml::from_str(&contents).context("failed to parse config for instruction update")?;
+    let entry = config
+        .llm_commands
+        .iter_mut()
+        .find(|e| e.name == name)
+        .ok_or_else(|| anyhow::anyhow!("entry '{name}' not present in config file"))?;
+    entry.instruction = instruction.to_string();
+    whisrs::config::setup::write_config(&config)?;
+    Ok(())
+}
+
+/// Named LLM command, first press: capture the focused window, start
+/// recording, spawn the background processor. Mirrors `handle_toggle`'s Idle
+/// branch (batch path only — this feature doesn't support streaming
+/// backends, same as command mode).
+async fn llm_command_start(
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+    entry: llm::LlmCommandConfig,
+) -> Response {
+    let llm_config = context.config.llm.clone().unwrap_or_default();
+
+    // Capture focused window before recording, like plain dictation — the
+    // result is typed at the cursor, not pasted over a selection.
+    let window_id = match context.window_tracker.get_focused_window() {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!("failed to capture focused window: {e}");
+            None
+        }
+    };
+
+    if context.config.general.audio_feedback {
+        feedback::play_start(context.config.general.audio_feedback_volume);
+    }
+
+    let mut capture =
+        match AudioCaptureHandle::start_with_level_tx(context.overlay_level_tx.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("{e}");
+                let friendly = if msg.contains("no default audio input device") {
+                    format_no_microphone_error()
+                } else {
+                    format!("Failed to start audio capture: {e}")
+                };
+                error!("{friendly}");
+                return Response::Error { message: friendly };
+            }
+        };
+
+    let audio_rx = capture.take_receiver();
+
+    {
+        let mut ds = daemon_state.lock().await;
+        if let Err(e) = ds.state_machine.transition(Action::Toggle) {
+            return Response::Error {
+                message: format!("state transition failed: {e}"),
+            };
+        }
+        ds.audio_capture = Some(capture);
+        ds.recording_window_id = window_id;
+        ds.recording_started_at = Some(std::time::Instant::now());
+        // Prefer a runtime override set via `set_hotkey`; else the configured
+        // instruction.
+        let instruction = ds
+            .llm_instruction_overrides
+            .get(&entry.name)
+            .cloned()
+            .unwrap_or_else(|| entry.instruction.clone());
+        ds.llm_command = Some(LlmCommandContext {
+            name: entry.name.clone(),
+            instruction,
+            llm_config,
+        });
+    }
+
+    if context.notify_state() {
+        send_notification(
+            "whisrs",
+            &format!("Recording for '{}'... (press again to stop)", entry.name),
+        );
+    }
+
+    let ds_ref = Arc::clone(&daemon_state);
+    let ctx = Arc::clone(&context);
+    tokio::spawn(async move {
+        llm_command_background(audio_rx, ds_ref, ctx).await;
+    });
+
+    Response::Ok {
+        state: State::Recording,
+    }
+}
+
+/// Background task: collects audio until channel closes (manual stop or
+/// auto-stop), transcribes it, applies the command's fixed instruction via
+/// the LLM (reusing the same `llm::rewrite_text` call as command mode, just
+/// with the roles swapped — the dictated text is the "selected text" and the
+/// preset instruction is the "voice instruction"), and types the result at
+/// the cursor.
+async fn llm_command_background(
+    audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+) {
+    let silence_timeout = context.config.general.silence_timeout_ms;
+    let mut auto_stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout, SAMPLE_RATE);
+    let mut all_samples: Vec<i16> = Vec::new();
+
+    if let Some(mut rx) = audio_rx {
+        while let Some(chunk) = rx.recv().await {
+            all_samples.extend_from_slice(&chunk);
+            if auto_stop.feed(&chunk) {
+                info!("llm-command: silence auto-stop");
+                let mut ds = daemon_state.lock().await;
+                if let Some(mut capture) = ds.audio_capture.take() {
+                    capture.stop();
+                    tokio::task::spawn_blocking(move || drop(capture));
+                }
+                break;
+            }
+        }
+    }
+
+    let (cmd_ctx, window_id, recording_started_at) = {
+        let mut ds = daemon_state.lock().await;
+        ds.audio_capture.take();
+        (
+            ds.llm_command.take(),
+            ds.recording_window_id.take(),
+            ds.recording_started_at.take(),
+        )
+    };
+
+    let Some(cmd_ctx) = cmd_ctx else {
+        warn!("llm-command: context missing, aborting");
+        let mut ds = daemon_state.lock().await;
+        let _ = ds.state_machine.transition(Action::Toggle);
+        let _ = ds.state_machine.transition(Action::TranscriptionDone);
+        return;
+    };
+
+    {
+        let mut ds = daemon_state.lock().await;
+        let _ = ds.state_machine.transition(Action::Toggle);
+    }
+
+    if context.config.general.audio_feedback {
+        feedback::play_stop(context.config.general.audio_feedback_volume);
+    }
+
+    if let Some(reason) = audio_gate_reason(
+        &all_samples,
+        SAMPLE_RATE,
+        AUDIO_GATE_MIN_MS,
+        SILENCE_RMS_THRESHOLD,
+    ) {
+        let label = reason.as_str();
+        info!(
+            "llm-command '{}': skipping (recording was {label}, {} samples)",
+            cmd_ctx.name,
+            all_samples.len()
+        );
+        if context.notify_state() {
+            send_notification("whisrs", &format!("Skipped: recording was {label}"));
+        }
+        let mut ds = daemon_state.lock().await;
+        let _ = ds.state_machine.transition(Action::TranscriptionDone);
+        return;
+    }
+
+    if context.notify_state() {
+        send_notification("whisrs", &format!("Processing '{}'...", cmd_ctx.name));
+    }
+
+    let wav_data = match whisrs::audio::capture::encode_wav(&all_samples) {
+        Ok(d) => d,
+        Err(e) => {
+            error!(
+                "llm-command '{}': failed to encode audio: {e}",
+                cmd_ctx.name
+            );
+            let mut ds = daemon_state.lock().await;
+            let _ = ds.state_machine.transition(Action::TranscriptionDone);
+            return;
+        }
+    };
+
+    let config = build_transcription_config(&context.config, &context.config.general.language);
+
+    let text = match context
+        .transcription_backend
+        .transcribe(&wav_data, &config)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            let friendly = format_api_error(&e);
+            error!(
+                "llm-command '{}': transcription failed: {friendly}",
+                cmd_ctx.name
+            );
+            if context.notify_error() {
+                send_notification("whisrs", &format!("'{}' failed: {friendly}", cmd_ctx.name));
+            }
+            let mut ds = daemon_state.lock().await;
+            let _ = ds.state_machine.transition(Action::TranscriptionDone);
+            return;
+        }
+    };
+
+    if text.is_empty() {
+        if context.notify_error() {
+            send_notification("whisrs", "Could not understand speech — try again");
+        }
+        let mut ds = daemon_state.lock().await;
+        let _ = ds.state_machine.transition(Action::TranscriptionDone);
+        return;
+    }
+
+    info!(
+        "llm-command '{}': transcribed {} chars",
+        cmd_ctx.name,
+        text.len()
+    );
+
+    let result = match llm::rewrite_text(&cmd_ctx.llm_config, &text, &cmd_ctx.instruction).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("llm-command '{}': LLM failed: {e}", cmd_ctx.name);
+            if context.notify_error() {
+                send_notification("whisrs", &format!("'{}' failed: {e}", cmd_ctx.name));
+            }
+            let mut ds = daemon_state.lock().await;
+            let _ = ds.state_machine.transition(Action::TranscriptionDone);
+            return;
+        }
+    };
+
+    if result.is_empty() {
+        if context.notify_error() {
+            send_notification(
+                "whisrs",
+                &format!("'{}': LLM returned empty text", cmd_ctx.name),
+            );
+        }
+        let mut ds = daemon_state.lock().await;
+        let _ = ds.state_machine.transition(Action::TranscriptionDone);
+        return;
+    }
+
+    // Restore window focus, then type the result at the cursor.
+    if let Some(wid) = &window_id {
+        if let Err(e) = context.window_tracker.focus_window(wid) {
+            warn!("failed to restore window focus: {e}");
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    let result_clone = result.clone();
+    let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
+    let injector_backend = context.config.input.backend;
+    match tokio::task::spawn_blocking(move || {
+        type_text_at_cursor(&result_clone, key_delay, injector_backend)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("llm-command '{}': failed to type text: {e:#}", cmd_ctx.name),
+        Err(e) => warn!(
+            "llm-command '{}': failed to join typing task: {e}",
+            cmd_ctx.name
+        ),
+    }
+
+    let duration_secs = recording_started_at
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    save_history_entry(
+        &result,
+        &format!("llm:{}", cmd_ctx.name),
+        &context.config.general.language,
+        duration_secs,
+    );
+
+    if context.config.general.audio_feedback {
+        feedback::play_done(context.config.general.audio_feedback_volume);
+    }
+    if context.notify_state() {
+        let preview = truncate_preview(&result, 77);
+        send_notification("whisrs", &format!("'{}' done: {preview}", cmd_ctx.name));
+    }
+
+    let mut ds = daemon_state.lock().await;
+    let _ = ds.state_machine.transition(Action::TranscriptionDone);
+    let _ = context.state_tx.send(ds.state_machine.state());
+    if let Some(level_tx) = &context.overlay_level_tx {
+        let _ = level_tx.send(0.0);
+    }
+}
+
 /// Simulate a key combo (e.g. Ctrl+C, Ctrl+V) via a temporary uinput device.
 fn simulate_key_combo(modifier: evdev::Key, key: evdev::Key) -> anyhow::Result<()> {
     use evdev::{AttributeSet, EventType, InputEvent, Key};
@@ -3326,6 +3831,7 @@ mod tests {
             }),
             llm: None,
             hotkeys: None,
+            llm_commands: Vec::new(),
             overlay: None,
             tts: None,
         };
