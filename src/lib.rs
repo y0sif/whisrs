@@ -343,6 +343,22 @@ pub struct InputConfig {
     /// backend can only emit characters present in the active XKB layout.
     #[serde(default)]
     pub backend: InjectorBackend,
+    /// Inject text by clipboard paste (Ctrl+V) instead of typing keystrokes.
+    ///
+    /// The uinput backend emits raw keycodes that the compositor decodes
+    /// through the target window's *active* XKB layout. On compositors without
+    /// the Wayland virtual-keyboard protocol (e.g. KWin), when that active
+    /// layout isn't the one whisrs detected — most commonly with per-window
+    /// layouts (KDE `SwitchMode=WinClass`) or a non-US keymap — the output is
+    /// garbled (`z`↔`y`, mangled punctuation, dropped accents). Pasting sends
+    /// the text through the clipboard, which is layout-independent and
+    /// Unicode-complete, so it comes out verbatim.
+    ///
+    /// Trade-offs: briefly replaces the clipboard (restored right after), the
+    /// target app must support Ctrl+V, and it applies to batch (non-streaming)
+    /// dictation only — streaming backends type incrementally and ignore it.
+    #[serde(default)]
+    pub paste: bool,
 }
 
 impl Default for InputConfig {
@@ -350,6 +366,7 @@ impl Default for InputConfig {
         Self {
             key_delay_ms: default_key_delay_ms(),
             backend: InjectorBackend::default(),
+            paste: false,
         }
     }
 }
@@ -1376,6 +1393,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(input.backend, InjectorBackend::WaylandVk);
+    }
+
+    #[test]
+    fn input_config_paste_defaults_false_and_parses() {
+        // Omitted → false (back-compat for configs written before the field).
+        let input: InputConfig = toml::from_str("key_delay_ms = 5").unwrap();
+        assert!(!input.paste);
+
+        // Explicit value honoured.
+        let input: InputConfig = toml::from_str("paste = true").unwrap();
+        assert!(input.paste);
     }
 
     #[test]

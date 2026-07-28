@@ -1657,18 +1657,29 @@ async fn process_recording_batch(
         }
     }
 
-    // Type the text at the cursor.
+    // Inject the text at the cursor — type keystrokes, or paste via the
+    // clipboard when `[input] paste = true` (layout-independent).
     let text_clone = text.clone();
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
     let injector_backend = context.config.input.backend;
+    let paste = context.config.input.paste;
+    let is_terminal = if paste {
+        context
+            .window_tracker
+            .get_focused_window_class()
+            .map(|c| is_terminal_class(&c))
+            .unwrap_or(false)
+    } else {
+        false
+    };
     match tokio::task::spawn_blocking(move || {
-        type_text_at_cursor(&text_clone, key_delay, injector_backend)
+        inject_text(&text_clone, is_terminal, key_delay, injector_backend, paste)
     })
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!("failed to type text: {e:#}"),
-        Err(e) => warn!("failed to join typing task: {e}"),
+        Ok(Err(e)) => warn!("failed to inject text: {e:#}"),
+        Err(e) => warn!("failed to join injection task: {e}"),
     }
 
     Ok(text)
@@ -1750,6 +1761,95 @@ fn type_text_at_cursor(
     }
     result?;
     Ok(())
+}
+
+/// Send a paste keystroke — Ctrl+V, or Ctrl+Shift+V in terminals — via the
+/// **persistent** virtual keyboard (the same device `type_text_at_cursor`
+/// uses).
+///
+/// Must NOT use a fresh per-call uinput device: on some compositors (e.g.
+/// KWin) keystrokes from a device the compositor hasn't finished enumerating
+/// are dropped, so the paste silently no-ops. The persistent device is already
+/// recognized, so its keystrokes land. The combo is raw keycodes (`KEY_V` is
+/// `v` in every common layout), so it stays layout-independent.
+fn paste_via_keyboard(
+    is_terminal: bool,
+    key_delay: std::time::Duration,
+    backend: InjectorBackend,
+) -> Result<()> {
+    use evdev::Key;
+
+    let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
+    let mut keyboard_guard = keyboard_slot
+        .lock()
+        .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
+
+    if keyboard_guard.is_none() {
+        *keyboard_guard = Some(new_keyboard(
+            key_delay, /* prewarm = */ false, backend,
+        )?);
+    }
+
+    let keyboard = keyboard_guard
+        .as_mut()
+        .expect("keyboard exists after initialization");
+    keyboard.set_key_delay(key_delay);
+
+    let combo: &[Key] = if is_terminal {
+        &[Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT, Key::KEY_V]
+    } else {
+        &[Key::KEY_LEFTCTRL, Key::KEY_V]
+    };
+
+    let result = keyboard
+        .send_combo(combo)
+        .context("failed to send paste combo");
+    if result.is_err() {
+        *keyboard_guard = None;
+    }
+    result
+}
+
+/// Inject `text` at the cursor, choosing keystrokes or clipboard paste.
+///
+/// With `paste = false` (default) this types via the virtual keyboard. With
+/// `paste = true` it sets the clipboard, sends Ctrl+V (Ctrl+Shift+V for
+/// terminals), then restores the previous clipboard — layout-independent
+/// injection for compositors that lack the Wayland virtual-keyboard protocol
+/// (see [`whisrs::InputConfig::paste`]). Runs in a blocking context (callers
+/// wrap it in `spawn_blocking`), so the sleeps/restore use std threads.
+fn inject_text(
+    text: &str,
+    is_terminal: bool,
+    key_delay: std::time::Duration,
+    backend: InjectorBackend,
+    paste: bool,
+) -> Result<()> {
+    if !paste {
+        return type_text_at_cursor(text, key_delay, backend);
+    }
+
+    let clipboard = xkb_type::default_clipboard();
+    let saved = clipboard.get_text().unwrap_or_default();
+    clipboard
+        .set_text(text)
+        .context("failed to set clipboard for paste injection")?;
+
+    // Let the clipboard settle before the paste keystroke.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let paste_result = paste_via_keyboard(is_terminal, key_delay, backend);
+
+    // Restore the user's clipboard after the paste has landed, regardless of
+    // whether the keystroke succeeded.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Err(e) = xkb_type::default_clipboard().set_text(&saved) {
+            warn!("failed to restore clipboard: {e}");
+        }
+    });
+
+    paste_result
 }
 
 fn warm_keyboard(key_delay: std::time::Duration, backend: InjectorBackend) {

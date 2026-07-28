@@ -53,6 +53,22 @@ device = "default"
 # drops characters while whisrs is typing — e.g. Node/Ink-based apps like
 # Claude Code in raw mode. Default: 2.
 key_delay_ms = 2
+# Inject text by clipboard paste (Ctrl+V) instead of typing keystrokes.
+# Default: false.
+#
+# The uinput backend emits raw keycodes that the compositor decodes through
+# the target window's ACTIVE XKB layout. On compositors without the Wayland
+# virtual-keyboard protocol (e.g. KWin), when that active layout differs from
+# the one whisrs detected — typically with per-window layouts (KDE
+# SwitchMode=WinClass) or a non-US keymap — output is garbled (z<->y, mangled
+# punctuation, dropped accents/umlauts). Pasting goes through the clipboard,
+# which is layout-independent and Unicode-complete, so text comes out verbatim.
+#
+# Trade-offs: briefly replaces the clipboard (restored right after), the
+# target app must support Ctrl+V (terminals get Ctrl+Shift+V), and it applies
+# to batch (non-streaming) dictation only — streaming backends type
+# incrementally and ignore it.
+paste = false
 
 [groq]
 api_key = "gsk_..."
