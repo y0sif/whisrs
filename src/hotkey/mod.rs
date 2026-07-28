@@ -247,24 +247,77 @@ async fn listen_device(
     }
 }
 
-/// Check if all required modifier keys (or their left/right variants) are held.
+/// True iff *exactly* the required modifiers are held — no more, no fewer —
+/// with left/right variants treated as equivalent.
+///
+/// Requiring an exact set (not just a subset) means a less-specific binding
+/// (e.g. `Ctrl+Alt+X`) does NOT also match when a more-specific one
+/// (`Ctrl+Alt+Shift+X`) is pressed, so both can be bound to the same trigger
+/// key with different modifier sets without shadowing each other.
 fn modifiers_held(held: &HashSet<Key>, required: &[Key]) -> bool {
-    required.iter().all(|m| {
-        // Accept either left or right variant.
-        match *m {
-            Key::KEY_LEFTMETA => {
-                held.contains(&Key::KEY_LEFTMETA) || held.contains(&Key::KEY_RIGHTMETA)
-            }
-            Key::KEY_LEFTALT => {
-                held.contains(&Key::KEY_LEFTALT) || held.contains(&Key::KEY_RIGHTALT)
-            }
-            Key::KEY_LEFTCTRL => {
-                held.contains(&Key::KEY_LEFTCTRL) || held.contains(&Key::KEY_RIGHTCTRL)
-            }
-            Key::KEY_LEFTSHIFT => {
-                held.contains(&Key::KEY_LEFTSHIFT) || held.contains(&Key::KEY_RIGHTSHIFT)
-            }
-            other => held.contains(&other),
+    /// Collapse right-hand modifier variants onto their left counterpart;
+    /// non-modifier keys map to themselves.
+    fn canon(k: Key) -> Key {
+        match k {
+            Key::KEY_RIGHTMETA => Key::KEY_LEFTMETA,
+            Key::KEY_RIGHTALT => Key::KEY_LEFTALT,
+            Key::KEY_RIGHTCTRL => Key::KEY_LEFTCTRL,
+            Key::KEY_RIGHTSHIFT => Key::KEY_LEFTSHIFT,
+            other => other,
         }
-    })
+    }
+    fn is_modifier(k: Key) -> bool {
+        matches!(
+            canon(k),
+            Key::KEY_LEFTMETA | Key::KEY_LEFTALT | Key::KEY_LEFTCTRL | Key::KEY_LEFTSHIFT
+        )
+    }
+
+    let required_canon: HashSet<Key> = required.iter().map(|k| canon(*k)).collect();
+
+    // Every required modifier must be held...
+    if !required_canon
+        .iter()
+        .all(|m| held.iter().any(|h| canon(*h) == *m))
+    {
+        return false;
+    }
+    // ...and no modifier outside the required set may be held.
+    !held
+        .iter()
+        .any(|h| is_modifier(*h) && !required_canon.contains(&canon(*h)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_modifier_match() {
+        let ctrl_alt = [Key::KEY_LEFTCTRL, Key::KEY_LEFTALT];
+        let ctrl_alt_shift = [Key::KEY_LEFTCTRL, Key::KEY_LEFTALT, Key::KEY_LEFTSHIFT];
+
+        // Ctrl+Alt held → matches Ctrl+Alt, not Ctrl+Alt+Shift.
+        let held: HashSet<Key> =
+            HashSet::from([Key::KEY_LEFTCTRL, Key::KEY_LEFTALT, Key::KEY_PAGEUP]);
+        assert!(modifiers_held(&held, &ctrl_alt));
+        assert!(!modifiers_held(&held, &ctrl_alt_shift));
+
+        // Ctrl+Alt+Shift held → matches Ctrl+Alt+Shift, NOT the Ctrl+Alt
+        // subset (the extra Shift must disqualify it — the shadowing bug).
+        let held: HashSet<Key> = HashSet::from([
+            Key::KEY_LEFTCTRL,
+            Key::KEY_LEFTALT,
+            Key::KEY_LEFTSHIFT,
+            Key::KEY_PAGEUP,
+        ]);
+        assert!(modifiers_held(&held, &ctrl_alt_shift));
+        assert!(!modifiers_held(&held, &ctrl_alt));
+    }
+
+    #[test]
+    fn right_hand_modifiers_are_equivalent() {
+        let held: HashSet<Key> = HashSet::from([Key::KEY_RIGHTCTRL, Key::KEY_PAGEUP]);
+        assert!(modifiers_held(&held, &[Key::KEY_LEFTCTRL]));
+    }
 }
