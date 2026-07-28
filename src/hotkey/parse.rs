@@ -117,6 +117,20 @@ fn parse_key(s: &str) -> Option<Key> {
         "f10" => Some(Key::KEY_F10),
         "f11" => Some(Key::KEY_F11),
         "f12" => Some(Key::KEY_F12),
+        // F13–F24: no default binding in graphical Linux sessions, so ideal
+        // for macro-key hotkeys. (VT switching is Ctrl+Alt+F1–F12 only.)
+        "f13" => Some(Key::KEY_F13),
+        "f14" => Some(Key::KEY_F14),
+        "f15" => Some(Key::KEY_F15),
+        "f16" => Some(Key::KEY_F16),
+        "f17" => Some(Key::KEY_F17),
+        "f18" => Some(Key::KEY_F18),
+        "f19" => Some(Key::KEY_F19),
+        "f20" => Some(Key::KEY_F20),
+        "f21" => Some(Key::KEY_F21),
+        "f22" => Some(Key::KEY_F22),
+        "f23" => Some(Key::KEY_F23),
+        "f24" => Some(Key::KEY_F24),
         "0" => Some(Key::KEY_0),
         "1" => Some(Key::KEY_1),
         "2" => Some(Key::KEY_2),
@@ -160,6 +174,15 @@ mod tests {
     fn parse_case_insensitive() {
         let binding = parse_hotkey("super+shift+d").unwrap();
         assert_eq!(binding.trigger, Key::KEY_D);
+    }
+
+    #[test]
+    fn parse_high_function_keys() {
+        assert_eq!(parse_hotkey("Shift+F13").unwrap().trigger, Key::KEY_F13);
+        let b = parse_hotkey("Shift+Ctrl+F14").unwrap();
+        assert_eq!(b.trigger, Key::KEY_F14);
+        assert_eq!(b.modifiers.len(), 2);
+        assert_eq!(parse_hotkey("Alt+F24").unwrap().trigger, Key::KEY_F24);
     }
 
     #[test]
