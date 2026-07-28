@@ -2550,7 +2550,10 @@ async fn handle_set_llm_instruction(
     }
 
     let Some(instruction) = acquire_selected_text(&context).await else {
-        if context.notify_state() {
+        // Not gated by `notify_state()`: this path never records, so the
+        // overlay (which would otherwise justify suppressing toasts) never
+        // shows — without a toast there'd be no feedback at all.
+        if context.notify {
             send_notification(
                 "whisrs",
                 &format!("'{name}': select the instruction text first"),
@@ -2573,7 +2576,12 @@ async fn handle_set_llm_instruction(
         "llm-command '{name}': instruction reprogrammed ({} chars)",
         instruction.len()
     );
-    if context.notify_state() {
+    // Audible + toast confirmation. Not gated by `notify_state()` (see above):
+    // the set path shows no overlay, so this is the only feedback the user gets.
+    if context.config.general.audio_feedback {
+        feedback::play_done(context.config.general.audio_feedback_volume);
+    }
+    if context.notify {
         let preview = truncate_preview(&instruction, 77);
         send_notification("whisrs", &format!("'{name}' set to: {preview}"));
     }
