@@ -1818,6 +1818,14 @@ fn paste_via_keyboard(
 /// injection for compositors that lack the Wayland virtual-keyboard protocol
 /// (see [`whisrs::InputConfig::paste`]). Runs in a blocking context (callers
 /// wrap it in `spawn_blocking`), so the sleeps/restore use std threads.
+///
+/// The restore is skipped, rather than clobbering the clipboard, when:
+/// - the original clipboard couldn't be read as text (e.g. it held an image
+///   or a file list) — there is nothing valid to restore to, so the pasted
+///   text is left in place instead of wiping it with `""`;
+/// - the clipboard no longer holds the text we set — something else (the
+///   user, another app) copied over it during the paste, and restoring would
+///   race that copy and discard it.
 fn inject_text(
     text: &str,
     is_terminal: bool,
@@ -1830,7 +1838,7 @@ fn inject_text(
     }
 
     let clipboard = xkb_type::default_clipboard();
-    let saved = clipboard.get_text().unwrap_or_default();
+    let saved = clipboard.get_text().ok();
     clipboard
         .set_text(text)
         .context("failed to set clipboard for paste injection")?;
@@ -1841,11 +1849,28 @@ fn inject_text(
     let paste_result = paste_via_keyboard(is_terminal, key_delay, backend);
 
     // Restore the user's clipboard after the paste has landed, regardless of
-    // whether the keystroke succeeded.
+    // whether the keystroke succeeded — but only if it's safe to (see doc
+    // comment above).
+    let pasted_text = text.to_string();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        if let Err(e) = xkb_type::default_clipboard().set_text(&saved) {
-            warn!("failed to restore clipboard: {e}");
+        let Some(saved) = saved else {
+            // Original clipboard wasn't text; nothing we can restore to.
+            return;
+        };
+        let clipboard = xkb_type::default_clipboard();
+        match clipboard.get_text() {
+            Ok(current) if current == pasted_text => {
+                if let Err(e) = clipboard.set_text(&saved) {
+                    warn!("failed to restore clipboard: {e}");
+                }
+            }
+            Ok(_) => {
+                debug!("clipboard changed during paste injection; skipping restore");
+            }
+            Err(e) => {
+                warn!("failed to read clipboard before restore, skipping restore: {e}");
+            }
         }
     });
 

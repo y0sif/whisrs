@@ -66,8 +66,10 @@ key_delay_ms = 2
 #
 # Trade-offs: briefly replaces the clipboard (restored right after), the
 # target app must support Ctrl+V (terminals get Ctrl+Shift+V), and it applies
-# to batch (non-streaming) dictation only — streaming backends type
-# incrementally and ignore it.
+# to batch (non-streaming) dictation only — streaming backends (including
+# local-whisper, which always streams regardless of its `segmentation` mode)
+# type incrementally and silently ignore it. `whisrsd` warns at startup if
+# paste is set with one of those backends.
 paste = false
 
 [groq]

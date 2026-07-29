@@ -356,7 +356,10 @@ pub struct InputConfig {
     ///
     /// Trade-offs: briefly replaces the clipboard (restored right after), the
     /// target app must support Ctrl+V, and it applies to batch (non-streaming)
-    /// dictation only — streaming backends type incrementally and ignore it.
+    /// dictation only — streaming backends (including `local-whisper`, which
+    /// always streams regardless of its `segmentation` mode) type incrementally
+    /// and silently ignore it. [`Config::validate`] warns when this is set
+    /// alongside one of those backends.
     #[serde(default)]
     pub paste: bool,
 }
@@ -916,6 +919,31 @@ impl Config {
         if self.general.silence_timeout_ms == 0 {
             warnings.push(ConfigWarning {
                 message: "silence_timeout_ms is 0 — auto-stop is effectively disabled".to_string(),
+            });
+        }
+
+        // Streaming backends (including local-whisper, which always streams
+        // regardless of its `segmentation` mode) type text incrementally as
+        // it arrives and never go through the paste-injection path, so
+        // `[input] paste` is a silent no-op for them.
+        if self.input.paste
+            && matches!(
+                backend,
+                "deepgram-streaming"
+                    | "openai-realtime"
+                    | "openai-compatible-realtime"
+                    | "local-whisper"
+                    | "local"
+            )
+        {
+            warnings.push(ConfigWarning {
+                message: format!(
+                    "[input] paste = true has no effect with backend = \"{backend}\": streaming \
+                     backends (deepgram-streaming, openai-realtime, openai-compatible-realtime, \
+                     local-whisper) type text incrementally as it arrives and never use the paste \
+                     path. Switch to a non-streaming backend (deepgram, groq, openai, local-vosk, \
+                     local-parakeet, asr-sidecar) to use paste injection."
+                ),
             });
         }
 
@@ -1524,6 +1552,81 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_validate_paste_with_non_streaming_backend_no_warning() {
+        let config = Config {
+            general: GeneralConfig {
+                backend: "groq".to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: InputConfig {
+                paste: true,
+                ..Default::default()
+            },
+            deepgram: None,
+            groq: Some(GroqConfig {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            }),
+            openai: None,
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: None,
+            llm: None,
+            tts: None,
+            hotkeys: None,
+            overlay: None,
+        };
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings.iter().all(|w| !w.message.contains("paste")),
+            "groq is not a streaming backend; paste should not warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_paste_with_streaming_backend_warns() {
+        for backend in ["deepgram-streaming", "openai-realtime", "local-whisper"] {
+            let config = Config {
+                general: GeneralConfig {
+                    backend: backend.to_string(),
+                    ..Default::default()
+                },
+                audio: Default::default(),
+                input: InputConfig {
+                    paste: true,
+                    ..Default::default()
+                },
+                deepgram: Some(DeepgramConfig {
+                    api_key: "test-key".to_string(),
+                    model: default_deepgram_model(),
+                }),
+                groq: None,
+                openai: Some(OpenAiConfig {
+                    api_key: "test-key".to_string(),
+                    model: default_openai_model(),
+                }),
+                local_whisper: None,
+                local_vosk: None,
+                local_parakeet: None,
+                asr_sidecar: None,
+                openai_compatible_realtime: None,
+                llm: None,
+                tts: None,
+                hotkeys: None,
+                overlay: None,
+            };
+            let warnings = config.validate().unwrap();
+            assert!(
+                warnings.iter().any(|w| w.message.contains("paste")),
+                "backend {backend} streams and ignores paste; expected a warning, got: {warnings:?}"
+            );
+        }
     }
 
     #[test]

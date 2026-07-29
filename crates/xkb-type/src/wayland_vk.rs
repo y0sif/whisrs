@@ -190,6 +190,26 @@ const SHIFT_MOD_MASK: u32 = 1 << 0;
 /// 7 — mask bit `1 << 7`. Asserted in `modifier_masks_select_levels`.
 const ALTGR_MOD_MASK: u32 = 1 << 7;
 
+/// XKB keycode of the Control key, present in every keymap and bound via
+/// `modifier_map Control`. `KEY_LEFTCTRL` (evdev 29) + 8.
+const CTRL_XKB_KEYCODE: u32 = 37;
+
+/// Modifier **mask** that declares Control depressed, for combos like
+/// Ctrl+V sent via [`WaylandVkKeyboard::send_combo`].
+///
+/// Our keymap binds `modifier_map Control { <K37> }`, so Control is the real
+/// modifier at its standard index 2 — mask bit `1 << 2`. Asserted in
+/// `modifier_masks_select_levels`.
+///
+/// `send_combo` declares this mask via `zwp_virtual_keyboard_v1.modifiers`
+/// rather than pressing the Ctrl keycode directly, for the same reason
+/// [`WaylandVkKeyboard::tap_char_key`] declares Shift/AltGr that way: without
+/// `modifier_map Control` binding a keycode to the real Control modifier, and
+/// without explicitly asserting the mask, the compositor has nothing telling
+/// it that a pressed Ctrl keycode means "Control is down" — the receiving
+/// client would see a bare key press instead of a Ctrl-chord.
+const CTRL_MOD_MASK: u32 = 1 << 2;
+
 /// The XKB level reached by a per-character key tap, encoding which modifier
 /// (if any) must be held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -479,8 +499,10 @@ fn base_keys() -> Vec<BaseKey> {
 ///   skipped (warned once). At most [`dynamic_capacity`] are placed; any beyond
 ///   that are ignored here (callers batch).
 /// * Base/modifier keys (BackSpace, Ctrl, Shift, Alt, AltGr, Return, Tab) are
-///   pinned at their real `evdev + 8` positions, with `modifier_map` entries so
-///   pressing Shift reaches level 1 and pressing AltGr reaches level 2.
+///   pinned at their real `evdev + 8` positions. Shift, AltGr, and Control
+///   each have a `modifier_map` entry making them *real* modifiers — Shift and
+///   AltGr so declaring their mask reaches level 1/2, Control so `send_combo`
+///   can declare it depressed for chords like Ctrl+V.
 ///
 /// This is factored out as a pure function so it can be unit-tested without a
 /// Wayland connection (see the roundtrip tests).
@@ -572,6 +594,11 @@ pub(crate) fn build_keymap_string(chars: &[char]) -> (String, HashMap<char, Char
     ));
     keymap.push_str(&format!(
         "modifier_map Mod5 {{ <K{ALTGR_XKB_KEYCODE}> }};\n"
+    ));
+    // Bind Control so combos (Ctrl+V, Ctrl+Shift+V, ...) sent via
+    // `send_combo` register as real Control-held state, not a bare keycode.
+    keymap.push_str(&format!(
+        "modifier_map Control {{ <K{CTRL_XKB_KEYCODE}> }};\n"
     ));
     // Permanent ASCII keys, each FOUR_LEVEL with an optional dynamic level-2.
     for &(kc, l0, l1) in PERMANENT_ASCII_KEYS {
@@ -1080,19 +1107,53 @@ impl KeyInjector for WaylandVkKeyboard {
         Ok(())
     }
 
+    /// Send a key combo (e.g. Ctrl+V, Ctrl+Shift+V).
+    ///
+    /// Recognized modifier keys (Ctrl, Shift) are declared via
+    /// `zwp_virtual_keyboard_v1.modifiers` — the same "wtype model" atomic
+    /// mask declaration [`Self::tap_char_key`] uses — rather than pressed as
+    /// keycodes. Pressing a modifier keycode directly is not sufficient here:
+    /// our uploaded keymap only makes a key a *real* modifier via
+    /// `modifier_map`, and even then, propagating "held" state from a raw key
+    /// press to the level/combo interpretation the focused client uses can
+    /// lag the press (see [`Self::tap_char_key`]'s doc comment). Declaring the
+    /// mask directly is atomic and reliable. Any other keys in `keys` (e.g.
+    /// `KEY_V`) are tapped while the mask is held, in the order given.
     fn send_combo(&mut self, keys: &[evdev::Key]) -> anyhow::Result<()> {
         if !self.keymap_uploaded {
             self.upload_keymap(&[])?;
         }
-        // Press each key (evdev code + 8) in order, release in reverse.
-        for key in keys {
+
+        use evdev::Key;
+        let mut mask = 0u32;
+        let mut real_keys = Vec::with_capacity(keys.len());
+        for &key in keys {
+            match key {
+                Key::KEY_LEFTCTRL | Key::KEY_RIGHTCTRL => mask |= CTRL_MOD_MASK,
+                Key::KEY_LEFTSHIFT | Key::KEY_RIGHTSHIFT => mask |= SHIFT_MOD_MASK,
+                other => real_keys.push(other),
+            }
+        }
+
+        if mask != 0 {
+            self.set_modifiers(mask)?;
+        }
+
+        // Press the non-modifier keys (evdev code + 8) in order, release in
+        // reverse.
+        for key in &real_keys {
             let keycode = u32::from(key.code()) + 8;
             self.emit_key(keycode, KEY_STATE_PRESSED)?;
         }
-        for key in keys.iter().rev() {
+        for key in real_keys.iter().rev() {
             let keycode = u32::from(key.code()) + 8;
             self.emit_key(keycode, KEY_STATE_RELEASED)?;
         }
+
+        if mask != 0 {
+            self.set_modifiers(0)?;
+        }
+
         Ok(())
     }
 
@@ -1743,6 +1804,11 @@ mod tests {
             ALTGR_MOD_MASK.trailing_zeros(),
             "Mod5/AltGr modifier index mismatch with ALTGR_MOD_MASK"
         );
+        assert_eq!(
+            keymap.mod_get_index(xkb::MOD_NAME_CTRL),
+            CTRL_MOD_MASK.trailing_zeros(),
+            "Control modifier index mismatch with CTRL_MOD_MASK"
+        );
 
         // Drive a single keycode through all three masks and confirm the level.
         let a = map[&'a'];
@@ -1770,7 +1836,8 @@ mod tests {
             "ALTGR_MOD_MASK must select the AltGr (dynamic) level"
         );
         eprintln!(
-            "modifier-mask OK: Shift={SHIFT_MOD_MASK} Mod5={ALTGR_MOD_MASK} select levels 1/2"
+            "modifier-mask OK: Shift={SHIFT_MOD_MASK} Mod5={ALTGR_MOD_MASK} select levels 1/2, \
+             Control={CTRL_MOD_MASK} is a real modifier"
         );
     }
 }
