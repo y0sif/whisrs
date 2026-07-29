@@ -1,16 +1,9 @@
-.TH WHISRSD 1 "2026-03-14" "whisrs 0.1.0" "User Commands"
+.TH WHISRSD 1 "2026-07-29" "whisrs 0.1.20" "User Commands"
 .SH NAME
 whisrsd \- whisrs dictation daemon
 .SH SYNOPSIS
 .B whisrsd
 .RI [ OPTIONS ]
-.SH OPTIONS
-.TP
-.BR \-h ", " \-\-help
-Print a short help message and exit.
-.TP
-.BR \-V ", " \-\-version
-Print version information and exit.
 .SH DESCRIPTION
 .B whisrsd
 is the background daemon for the whisrs dictation system. It manages audio
@@ -36,6 +29,13 @@ Auto-detects the active window manager/compositor
 Initializes the selected transcription backend
 .IP \(bu 2
 Binds the Unix domain socket and begins accepting commands
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print a short help message and exit.
+.TP
+.BR \-V ", " \-\-version
+Print version information and exit.
 .SH STATE MACHINE
 The daemon maintains one of five states:
 .TP
