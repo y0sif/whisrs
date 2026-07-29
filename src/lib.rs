@@ -1014,6 +1014,24 @@ pub async fn read_message<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
 
+    /// The man pages carry the version by hand and drifted for 20 releases, so
+    /// assert it rather than trusting the release checklist. The revision date
+    /// in the same `.TH` line stays manual — nothing in the build knows it.
+    #[test]
+    fn man_pages_declare_current_version() {
+        let expected = format!("\"whisrs {}\"", env!("CARGO_PKG_VERSION"));
+        for (name, page) in [
+            ("contrib/whisrs.1", include_str!("../contrib/whisrs.1")),
+            ("contrib/whisrsd.1", include_str!("../contrib/whisrsd.1")),
+        ] {
+            let th = page.lines().next().unwrap_or_default();
+            assert!(
+                th.starts_with(".TH ") && th.contains(&expected),
+                "{name}: .TH should carry {expected}, got: {th}"
+            );
+        }
+    }
+
     #[test]
     fn command_serialization_roundtrip() {
         let cmd = Command::Toggle { language: None };

@@ -164,7 +164,7 @@ If any check fails, fix the issue before pushing. Do not push with the intent to
 
 When a feature or set of changes warrants a version bump:
 
-1. **Bump version** in `Cargo.toml` and `flake.nix` (semver: `MAJOR.MINOR.PATCH`)
+1. **Bump version** in `Cargo.toml`, `flake.nix`, and the `.TH` lines of `contrib/whisrs.1` and `contrib/whisrsd.1` (semver: `MAJOR.MINOR.PATCH`). `cargo test` fails if the man page versions are stale, but the revision date in the same `.TH` line is only checked by eye — bump it too.
 2. **Always include `Cargo.lock`** in the version bump commit
 3. **Run all CI checks** locally (see above)
 4. **Commit** and **push**
