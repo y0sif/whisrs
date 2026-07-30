@@ -358,7 +358,11 @@ fn check_uinput_access() {
                      Fix: sudo usermod -aG input $USER\n\
                           # Then log out and log back in\n\
                      Or install the udev rule:\n\
-                          sudo cp contrib/99-whisrs.rules /etc/udev/rules.d/\n\
+                          sudo install -m644 contrib/99-whisrs.rules /etc/udev/rules.d/\n\
+                          # On NixOS/Guix, point the rule at your setfacl:\n\
+                          command -v setfacl >/dev/null && sudo sed -i \\\n\
+                              \"s|/usr/bin/setfacl|$(command -v setfacl)|g\" \\\n\
+                              /etc/udev/rules.d/99-whisrs.rules\n\
                           sudo udevadm control --reload-rules\n\
                           sudo udevadm trigger"
                 );

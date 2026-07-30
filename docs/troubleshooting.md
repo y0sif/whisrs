@@ -19,11 +19,14 @@ path does not exist, so on distributions that put `setfacl` elsewhere (NixOS,
 Guix) rewrite it after copying:
 
 ```bash
-sudo sed -i "s|/usr/bin/setfacl|$(command -v setfacl)|g" /etc/udev/rules.d/99-whisrs.rules
+command -v setfacl >/dev/null && sudo sed -i "s|/usr/bin/setfacl|$(command -v setfacl)|g" /etc/udev/rules.d/99-whisrs.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-`whisrs setup` and the Nix package do this substitution for you.
+The `command -v` guard matters: with `setfacl` not installed the substitution would
+rewrite the rule to `TEST==""`, which stays dead even after you install `acl`.
+
+The Nix package does this substitution at build time.
 
 ## No microphone detected
 
