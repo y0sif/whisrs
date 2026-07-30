@@ -61,6 +61,8 @@ curl -sSL -o whisrs.tar.gz https://github.com/y0sif/whisrs/releases/latest/downl
 tar xzf whisrs.tar.gz
 sudo install -m755 whisrs whisrsd /usr/local/bin/
 sudo install -m644 contrib/99-whisrs.rules /etc/udev/rules.d/
+# On NixOS/Guix, point the rule's ACL fallback at your setfacl:
+# sudo sed -i "s|/usr/bin/setfacl|$(command -v setfacl)|g" /etc/udev/rules.d/99-whisrs.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo usermod -aG input $USER   # log out / back in for the group change
 whisrs setup

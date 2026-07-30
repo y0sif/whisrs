@@ -33,6 +33,11 @@
           inherit nativeBuildInputs buildInputs;
 
           postInstall = ''
+            # The shipped rule is written against the FHS setfacl path, which does
+            # not exist here — without this the ACL fallback is a silent no-op.
+            substituteInPlace contrib/99-whisrs.rules \
+              --replace-fail /usr/bin/setfacl ${pkgs.acl}/bin/setfacl
+
             install -Dm644 contrib/whisrs.1 $out/share/man/man1/whisrs.1
             install -Dm644 contrib/whisrsd.1 $out/share/man/man1/whisrsd.1
             install -Dm644 contrib/99-whisrs.rules $out/lib/udev/rules.d/99-whisrs.rules

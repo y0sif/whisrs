@@ -5,12 +5,25 @@
 Copy the udev rule and add yourself to the `input` group:
 
 ```bash
-sudo cp contrib/99-whisrs.rules /etc/udev/rules.d/
+sudo install -m644 contrib/99-whisrs.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo usermod -aG input $USER
 ```
 
 Log out and back in for the group change to take effect.
+
+The rule also grants the `input` group an ACL on `/dev/uinput`, which matters when
+another rule (e.g. brltty) sets one — ACLs override plain group permissions. That
+line is written against the FHS path `/usr/bin/setfacl` and is skipped when the
+path does not exist, so on distributions that put `setfacl` elsewhere (NixOS,
+Guix) rewrite it after copying:
+
+```bash
+sudo sed -i "s|/usr/bin/setfacl|$(command -v setfacl)|g" /etc/udev/rules.d/99-whisrs.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+`whisrs setup` and the Nix package do this substitution for you.
 
 ## No microphone detected
 
