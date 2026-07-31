@@ -1834,13 +1834,18 @@ fn paste_via_keyboard(
 /// (see [`whisrs::InputConfig::paste`]). Runs in a blocking context (callers
 /// wrap it in `spawn_blocking`), so the sleeps/restore use std threads.
 ///
-/// The restore is skipped, rather than clobbering the clipboard, when:
-/// - the original clipboard couldn't be read as text (e.g. it held an image
-///   or a file list) — there is nothing valid to restore to, so the pasted
-///   text is left in place instead of wiping it with `""`;
-/// - the clipboard no longer holds the text we set — something else (the
-///   user, another app) copied over it during the paste, and restoring would
-///   race that copy and discard it.
+/// `ClipboardBackend` is text-only, so a clipboard holding non-text content
+/// (an image, a file list, ...) can't be captured and round-tripped at all.
+/// If the pre-paste read fails, this falls back to typing instead of pasting
+/// — overwriting the clipboard via `set_text` first and only then discovering
+/// there's nothing valid to restore would destroy that content permanently
+/// (see #69), which skipping the *restore* alone can't undo since the damage
+/// already happened at `set_text`.
+///
+/// The restore is otherwise skipped, rather than clobbering the clipboard,
+/// when the clipboard no longer holds the text we set — something else (the
+/// user, another app) copied over it during the paste, and restoring would
+/// race that copy and discard it.
 fn inject_text(
     text: &str,
     is_terminal: bool,
@@ -1853,7 +1858,13 @@ fn inject_text(
     }
 
     let clipboard = xkb_type::default_clipboard();
-    let saved = clipboard.get_text().ok();
+    let saved = match clipboard.get_text() {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("clipboard unreadable as text, typing instead of pasting: {e:#}");
+            return type_text_at_cursor(text, key_delay, backend);
+        }
+    };
     clipboard
         .set_text(text)
         .context("failed to set clipboard for paste injection")?;
@@ -1869,10 +1880,6 @@ fn inject_text(
     let pasted_text = text.to_string();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let Some(saved) = saved else {
-            // Original clipboard wasn't text; nothing we can restore to.
-            return;
-        };
         let clipboard = xkb_type::default_clipboard();
         match clipboard.get_text() {
             Ok(current) if current == pasted_text => {
