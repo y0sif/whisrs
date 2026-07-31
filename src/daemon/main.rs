@@ -2908,7 +2908,8 @@ async fn llm_command_background(
         return;
     }
 
-    // Restore window focus, then type the result at the cursor.
+    // Restore window focus, then inject the result at the cursor — keystrokes,
+    // or clipboard paste when `[input] paste = true` (layout-independent).
     if let Some(wid) = &window_id {
         if let Err(e) = context.window_tracker.focus_window(wid) {
             warn!("failed to restore window focus: {e}");
@@ -2920,15 +2921,34 @@ async fn llm_command_background(
     let result_clone = result.clone();
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
     let injector_backend = context.config.input.backend;
+    let paste = context.config.input.paste;
+    let is_terminal = if paste {
+        context
+            .window_tracker
+            .get_focused_window_class()
+            .map(|c| is_terminal_class(&c))
+            .unwrap_or(false)
+    } else {
+        false
+    };
     match tokio::task::spawn_blocking(move || {
-        type_text_at_cursor(&result_clone, key_delay, injector_backend)
+        inject_text(
+            &result_clone,
+            is_terminal,
+            key_delay,
+            injector_backend,
+            paste,
+        )
     })
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!("llm-command '{}': failed to type text: {e:#}", cmd_ctx.name),
+        Ok(Err(e)) => warn!(
+            "llm-command '{}': failed to inject text: {e:#}",
+            cmd_ctx.name
+        ),
         Err(e) => warn!(
-            "llm-command '{}': failed to join typing task: {e}",
+            "llm-command '{}': failed to join injection task: {e}",
             cmd_ctx.name
         ),
     }
