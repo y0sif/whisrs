@@ -8,43 +8,90 @@ use std::process::Command;
 // Wayland: shell out to wl-paste / wl-copy
 // ---------------------------------------------------------------------------
 
+/// MIME types treated as "this clipboard offer is text" — the standard
+/// `text/plain` variants plus the legacy X11-selection type names wl-paste
+/// also reports under Xwayland interop.
+const TEXT_MIME_TYPES: &[&str] = &[
+    "text/plain",
+    "text/plain;charset=utf-8",
+    "TEXT",
+    "STRING",
+    "UTF8_STRING",
+];
+
 /// Run `wl-paste` with the given extra args (e.g. `--primary`) and return its
 /// text, distinguishing a genuinely empty clipboard from one holding
 /// non-text content (image, files, ...).
 ///
-/// wl-clipboard reports these as two different messages: an empty clipboard
-/// (no selection owner at all) says "Nothing is copied"; a selection that
-/// exists but doesn't offer a text MIME type says "Clipboard content is not
-/// available as \[inferred output|requested\] type ...". Only the former is a
-/// legitimate empty string — the latter must surface as an error, or a
-/// caller restoring a saved clipboard value (see `whisrs`'s paste-injection
-/// path) would overwrite non-text content with `""`.
+/// Does **not** rely on `wl-paste`'s own "inferred type" content negotiation
+/// (a bare `wl-paste --no-newline` with no explicit `--type`): that path was
+/// observed, live, to sometimes return a non-text selection's raw bytes as
+/// if they were text — even immediately after copying an image, with
+/// `wl-paste --list-types` correctly reporting only `image/png` on offer.
+/// The negotiation wl-paste performs when no type is given is apparently not
+/// reliable across all wl-clipboard/compositor/clipboard-manager
+/// combinations (reproduced under KDE Plasma 6 / KWin with Klipper active).
 ///
-/// Matched case-insensitively since wl-clipboard's exact capitalization has
-/// varied across versions; verified against wl-clipboard 2.2.1's actual
-/// wording (embedded strings), which no longer matches the older "no
-/// suitable type" phrasing this used to check for.
+/// Instead, this always queries `--list-types` first (a plain listing, no
+/// negotiation involved) and only issues a real read with an explicit
+/// `--type text/plain` if a text MIME type is actually listed. If the list is
+/// empty, the clipboard genuinely has no selection — a legitimate empty
+/// string. If it's non-empty but contains no text type, the selection holds
+/// non-text content and this errors, so a caller restoring a saved clipboard
+/// value (see `whisrs`'s paste-injection path) doesn't mistake "can't read
+/// this" for "empty" and overwrite it with `""`.
 fn run_wl_paste(extra_args: &[&str], command_desc: &str) -> anyhow::Result<String> {
+    let list_output = Command::new("wl-paste")
+        .arg("--list-types")
+        .args(extra_args)
+        .output()
+        .context("failed to run wl-paste --list-types — is wl-clipboard installed?")?;
+
+    if !list_output.status.success() {
+        let stderr = String::from_utf8_lossy(&list_output.stderr);
+        if is_empty_clipboard_message(&stderr) {
+            return Ok(String::new());
+        }
+        anyhow::bail!("{command_desc} --list-types failed: {stderr}");
+    }
+
+    let types = String::from_utf8_lossy(&list_output.stdout);
+    let offered: Vec<&str> = types.lines().map(str::trim).collect();
+
+    if offered.is_empty() {
+        // No selection owner at all — genuinely empty clipboard.
+        return Ok(String::new());
+    }
+
+    if !offers_text(&offered) {
+        anyhow::bail!(
+            "{command_desc}: clipboard holds non-text content (offered types: {offered:?})"
+        );
+    }
+
     let output = Command::new("wl-paste")
-        .arg("--no-newline")
+        .args(["--no-newline", "--type", "text/plain"])
         .args(extra_args)
         .output()
         .context("failed to run wl-paste — is wl-clipboard installed?")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if is_empty_clipboard_message(&stderr) {
-            return Ok(String::new());
-        }
         anyhow::bail!("{command_desc} failed: {stderr}");
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Whether any of `offered` (as reported by `wl-paste --list-types`) is a
+/// text MIME type.
+fn offers_text(offered: &[&str]) -> bool {
+    offered.iter().any(|t| TEXT_MIME_TYPES.contains(t))
+}
+
 /// Whether a `wl-paste` stderr message means "the clipboard has no selection
-/// at all" (a legitimate empty string), as opposed to "a selection exists but
-/// isn't text" (which must propagate as an error — see [`run_wl_paste`]).
+/// at all" (a legitimate empty string). Kept as a defensive fallback in case
+/// `--list-types` itself ever errors instead of returning an empty listing.
 fn is_empty_clipboard_message(stderr: &str) -> bool {
     stderr.to_lowercase().contains("nothing is copied")
 }
@@ -212,5 +259,38 @@ mod tests {
         assert!(!is_empty_clipboard_message(
             "no suitable type of content copied"
         ));
+    }
+
+    /// `offers_text` is what `get_text`/`get_primary_selection` now gate on
+    /// (via `wl-paste --list-types`) instead of trusting wl-paste's own
+    /// "inferred type" negotiation — that negotiation was observed, live, to
+    /// sometimes return an image selection's raw bytes as if they were text,
+    /// even when `--list-types` correctly listed only `image/png`. Listing
+    /// types first and only reading with an explicit `--type text/plain`
+    /// when a text type is actually present avoids depending on that
+    /// negotiation at all.
+    #[test]
+    fn offers_text_true_for_plain_text_types() {
+        assert!(offers_text(&["text/plain"]));
+        assert!(offers_text(&["text/plain;charset=utf-8"]));
+        assert!(offers_text(&["TEXT"]));
+        assert!(offers_text(&["STRING"]));
+        assert!(offers_text(&["UTF8_STRING"]));
+        assert!(offers_text(&["image/png", "text/plain"]));
+    }
+
+    #[test]
+    fn offers_text_false_for_image_only() {
+        assert!(!offers_text(&["image/png"]));
+        assert!(!offers_text(&[
+            "image/png",
+            "application/x-qt-image",
+            "image/bmp"
+        ]));
+    }
+
+    #[test]
+    fn offers_text_false_for_empty_list() {
+        assert!(!offers_text(&[]));
     }
 }
