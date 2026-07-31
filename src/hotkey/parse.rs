@@ -186,6 +186,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_every_high_function_key() {
+        // Pin all twelve arms: a copy-paste mis-map inside the f13-f24 block
+        // is otherwise silent, and picks the wrong physical key at runtime.
+        let expected = [
+            ("F13", Key::KEY_F13),
+            ("F14", Key::KEY_F14),
+            ("F15", Key::KEY_F15),
+            ("F16", Key::KEY_F16),
+            ("F17", Key::KEY_F17),
+            ("F18", Key::KEY_F18),
+            ("F19", Key::KEY_F19),
+            ("F20", Key::KEY_F20),
+            ("F21", Key::KEY_F21),
+            ("F22", Key::KEY_F22),
+            ("F23", Key::KEY_F23),
+            ("F24", Key::KEY_F24),
+        ];
+        for (name, key) in expected {
+            let binding = parse_hotkey(&format!("Super+{name}")).unwrap();
+            assert_eq!(binding.trigger, key, "{name} mapped to the wrong keycode");
+        }
+    }
+
+    #[test]
     fn parse_no_modifier_fails() {
         assert!(parse_hotkey("D").is_err());
     }

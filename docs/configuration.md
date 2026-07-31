@@ -152,6 +152,11 @@ response_format = "wav"     # audio format requested from the API
 #                           #   OpenAI-compatible server (Kokoro, Supertonic, ...)
 
 # Built-in global hotkeys (optional, works without WM keybinds)
+# Triggers: A-Z, 0-9, F1-F24, space, enter, escape, tab, backspace, delete,
+#   insert, home, end, pageup, pagedown, up, down, left, right.
+# Modifiers: Super, Alt, Ctrl, Shift. At least one is required, so a bare
+#   "F13" is rejected; write "Shift+F13". The modifier set must match exactly,
+#   so "Ctrl+Alt+Ins" does not fire while Shift is also held.
 [hotkeys]
 toggle = "Super+Shift+W"
 cancel = "Super+Shift+D"
