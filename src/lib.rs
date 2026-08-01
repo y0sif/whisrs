@@ -41,7 +41,7 @@ pub enum Command {
     /// Clear all transcription history.
     #[serde(rename = "clear-history")]
     ClearHistory,
-    /// Start command mode: copy selection → record voice instruction → LLM rewrite → paste.
+    /// Start command mode: copy selection → record voice instruction → LLM rewrite → inject.
     #[serde(rename = "command")]
     CommandMode,
     /// Read the selected text aloud via TTS. A repeat `Speak` (or `Cancel`)
@@ -354,12 +354,15 @@ pub struct InputConfig {
     /// the text through the clipboard, which is layout-independent and
     /// Unicode-complete, so it comes out verbatim.
     ///
-    /// Trade-offs: briefly replaces the clipboard (restored right after), the
-    /// target app must support Ctrl+V, and it applies to batch (non-streaming)
-    /// dictation only — streaming backends (including `local-whisper`, which
-    /// always streams regardless of its `segmentation` mode) type incrementally
-    /// and silently ignore it. [`Config::validate`] warns when this is set
-    /// alongside one of those backends.
+    /// Trade-offs: briefly replaces the clipboard (restored right after) and
+    /// the target app must support Ctrl+V. It covers batch (non-streaming)
+    /// dictation and command-mode output (`whisrs command` injects its LLM
+    /// result with a single injection call, so it honors this regardless of
+    /// the configured backend). The streaming *dictation* path is the
+    /// exception: streaming backends (including `local-whisper`, which always
+    /// streams regardless of its `segmentation` mode) type incrementally as
+    /// text arrives and ignore this setting. [`Config::validate`] warns when
+    /// this is set alongside one of those backends.
     #[serde(default)]
     pub paste: bool,
 }
@@ -923,9 +926,13 @@ impl Config {
         }
 
         // Streaming backends (including local-whisper, which always streams
-        // regardless of its `segmentation` mode) type text incrementally as
-        // it arrives and never go through the paste-injection path, so
-        // `[input] paste` is a silent no-op for them.
+        // regardless of its `segmentation` mode) type dictated text
+        // incrementally as it arrives and never go through the
+        // paste-injection path, so `[input] paste` does not apply to
+        // dictation with them. Command mode is unaffected whatever backend
+        // transcribed the instruction: the instruction is never injected, and
+        // the LLM result goes out in a single injection call through the same
+        // wrapper the batch dictation path uses.
         if self.input.paste
             && matches!(
                 backend,
@@ -938,11 +945,13 @@ impl Config {
         {
             warnings.push(ConfigWarning {
                 message: format!(
-                    "[input] paste = true has no effect with backend = \"{backend}\": streaming \
-                     backends (deepgram-streaming, openai-realtime, openai-compatible-realtime, \
-                     local-whisper) type text incrementally as it arrives and never use the paste \
-                     path. Switch to a non-streaming backend (deepgram, groq, openai, local-vosk, \
-                     local-parakeet, asr-sidecar) to use paste injection."
+                    "[input] paste = true does not apply to dictation with backend = \
+                     \"{backend}\": streaming backends (deepgram-streaming, openai-realtime, \
+                     openai-compatible-realtime, local-whisper) type text incrementally as it \
+                     arrives and never use the paste path. Command mode output is injected in \
+                     one shot, so it still uses paste where that mode is configured. Switch to \
+                     a non-streaming backend (deepgram, groq, openai, local-vosk, \
+                     local-parakeet, asr-sidecar) to use paste injection for dictation too."
                 ),
             });
         }
@@ -1640,9 +1649,25 @@ mod tests {
                 overlay: None,
             };
             let warnings = config.validate().unwrap();
+            let warning = warnings
+                .iter()
+                .find(|w| w.message.contains("[input] paste = true"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "backend {backend} streams and ignores paste for dictation; \
+                         expected a warning, got: {warnings:?}"
+                    )
+                });
             assert!(
-                warnings.iter().any(|w| w.message.contains("paste")),
-                "backend {backend} streams and ignores paste; expected a warning, got: {warnings:?}"
+                warning.message.contains("does not apply to dictation"),
+                "the warning must scope itself to dictation, not claim paste is a global \
+                 no-op: {}",
+                warning.message
+            );
+            assert!(
+                warning.message.contains("Command mode"),
+                "the warning must say command mode still pastes: {}",
+                warning.message
             );
         }
     }

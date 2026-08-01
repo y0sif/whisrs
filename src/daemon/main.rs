@@ -39,10 +39,7 @@ const TYPING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Context saved when command mode starts recording.
 struct CommandModeContext {
     selected_text: String,
-    saved_clipboard: String,
     llm_config: llm::LlmConfig,
-    /// Whether the focused window is a terminal (use Ctrl+Shift+V to paste).
-    is_terminal: bool,
 }
 
 /// Shared daemon state protected by a mutex.
@@ -1825,6 +1822,56 @@ fn paste_via_keyboard(
     result
 }
 
+/// Clear the current shell prompt line by sending Ctrl+A ("move to start of
+/// line") then Ctrl+K ("kill to end of line") via the **persistent** virtual
+/// keyboard (the same device `type_text_at_cursor` and `paste_via_keyboard`
+/// use). That readline / zle / fish editing pair empties the line in bash, zsh
+/// and fish alike.
+///
+/// Only ever called for terminals. A terminal's mouse highlight is a visual
+/// overlay, not an editable selection, so injecting at the cursor would append
+/// to the existing line rather than replace it. Clearing the line first makes
+/// the injected text the whole line, which is what a "rewrite my selection"
+/// command means at a prompt. In GUI text widgets no clear is needed (or
+/// wanted): typing/pasting over a real selection replaces it natively.
+///
+/// Must NOT use a fresh per-call uinput device: on some compositors (e.g.
+/// KWin) keystrokes from a device the compositor hasn't finished enumerating
+/// are dropped, so the clear silently no-ops. The persistent device is already
+/// recognized, so its keystrokes land.
+fn clear_line_via_keyboard(key_delay: std::time::Duration, backend: InjectorBackend) -> Result<()> {
+    use evdev::Key;
+
+    let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
+    let mut keyboard_guard = keyboard_slot
+        .lock()
+        .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
+
+    if keyboard_guard.is_none() {
+        *keyboard_guard = Some(new_keyboard(
+            key_delay, /* prewarm = */ false, backend,
+        )?);
+    }
+
+    let keyboard = keyboard_guard
+        .as_mut()
+        .expect("keyboard exists after initialization");
+    keyboard.set_key_delay(key_delay);
+
+    let result = keyboard
+        .send_combo(&[Key::KEY_LEFTCTRL, Key::KEY_A])
+        .context("failed to send Ctrl+A (move to start of line)")
+        .and_then(|()| {
+            keyboard
+                .send_combo(&[Key::KEY_LEFTCTRL, Key::KEY_K])
+                .context("failed to send Ctrl+K (kill to end of line)")
+        });
+    if result.is_err() {
+        *keyboard_guard = None;
+    }
+    result
+}
+
 /// Inject `text` at the cursor, choosing keystrokes or clipboard paste.
 ///
 /// With `paste = false` (default) this types via the virtual keyboard. With
@@ -2047,7 +2094,7 @@ fn save_history_entry(text: &str, backend: &str, language: &str, duration_secs: 
 }
 
 /// Command mode toggle: first call copies selection and starts recording,
-/// second call stops recording and kicks off transcription → LLM → paste.
+/// second call stops recording and kicks off transcription → LLM → inject.
 /// Also auto-stops on silence.
 async fn handle_command_mode(
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -2105,74 +2152,20 @@ async fn command_mode_start(
     // Get LLM config.
     let llm_config = context.config.llm.clone().unwrap_or_default();
 
-    // Step 1: Get the selected text.
-    // Try primary selection first (works everywhere, no key simulation needed),
-    // then fall back to clipboard copy (Ctrl+C or Ctrl+Shift+C for terminals).
+    // Step 1: Capture the selected text. Command mode prefers the primary
+    // selection (the X highlight, distinct from the Ctrl+C clipboard), which
+    // needs no key simulation and leaves the clipboard untouched. When the
+    // primary selection is empty it falls back to a simulated Ctrl+C, sharing
+    // the same capture path as read-aloud, so command mode still works on apps
+    // and compositors that don't populate the primary selection. The LLM result
+    // is later injected through the same wrapper dictation uses: typed by
+    // default, pasted when `[input] paste` is set. Either way it replaces the
+    // active selection in GUI apps and lands at the prompt cursor in terminals.
     info!("command mode: getting selected text");
-    let clipboard = xkb_type::default_clipboard();
-
-    // Save current clipboard content so we can restore it later.
-    let saved_clipboard = clipboard.get_text().unwrap_or_default();
-
-    // Detect if the focused window is a terminal (for Ctrl+Shift+C/V fallback).
-    let is_terminal = context
-        .window_tracker
-        .get_focused_window_class()
-        .map(|c| is_terminal_class(&c))
-        .unwrap_or(false);
-
-    // Get selected text via primary selection (highlighted text, no key simulation).
-    // Then simulate copy (Ctrl+C or Ctrl+Shift+C for terminals) to keep the
-    // selection active so that paste will replace it rather than append.
-    let selected_text = clipboard.get_primary_selection().unwrap_or_default();
-
-    let copy_fn = if is_terminal {
-        simulate_terminal_copy
-    } else {
-        simulate_copy
+    let selected_text = match capture_selection(&context).await {
+        Ok(text) => text,
+        Err(message) => return Response::Error { message },
     };
-
-    match tokio::task::spawn_blocking(copy_fn).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            if selected_text.is_empty() {
-                return Response::Error {
-                    message: format!("failed to copy selection: {e}"),
-                };
-            }
-            // Copy failed but we have text from primary selection, continue.
-            warn!("copy simulation failed ({e}), using primary selection text");
-        }
-        Err(e) => {
-            if selected_text.is_empty() {
-                return Response::Error {
-                    message: format!("copy task panicked: {e}"),
-                };
-            }
-            warn!("copy task panicked ({e}), using primary selection text");
-        }
-    }
-
-    // If primary selection was empty, try the clipboard (copy may have worked).
-    let selected_text = if selected_text.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        match clipboard.get_text() {
-            Ok(text) => text,
-            Err(e) => {
-                return Response::Error {
-                    message: format!("failed to read clipboard: {e}"),
-                };
-            }
-        }
-    } else {
-        selected_text
-    };
-
-    if selected_text.is_empty() || selected_text == saved_clipboard {
-        return Response::Error {
-            message: "no text selected — select some text before using command mode".to_string(),
-        };
-    }
 
     info!(
         "command mode: got {} chars of selected text",
@@ -2208,9 +2201,7 @@ async fn command_mode_start(
         ds.recording_started_at = Some(std::time::Instant::now());
         ds.command_mode = Some(CommandModeContext {
             selected_text,
-            saved_clipboard,
             llm_config,
-            is_terminal,
         });
     }
 
@@ -2234,7 +2225,7 @@ async fn command_mode_start(
 }
 
 /// Background task: collects audio until channel closes (manual stop or auto-stop),
-/// then transcribes the instruction, sends to LLM, and pastes the result.
+/// then transcribes the instruction, sends to LLM, and injects the result.
 async fn command_mode_background(
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -2369,45 +2360,68 @@ async fn command_mode_background(
             }
         };
 
-    // Paste the result, replacing the original selection.
-    info!("command mode: pasting {} chars", result.len());
-    let clipboard = xkb_type::default_clipboard();
-
-    if let Err(e) = clipboard.set_text(&result) {
-        error!("command mode: failed to set clipboard: {e}");
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        return;
+    // Inject the result at the cursor through the same policy wrapper the
+    // dictation path uses. By default that means typing keystrokes through
+    // the evdev / Wayland virtual-keyboard pipeline: the AltGr / dead-key
+    // work in xkb-type covers accented and non-ASCII output end-to-end,
+    // including in terminals where Ctrl+V is interpreted as a control
+    // character rather than paste, so the result never touches the clipboard.
+    // (The capture side may still fall back to a simulated Ctrl+C when the
+    // primary selection is empty; see `capture_selection`.)
+    //
+    // `[input] paste = true` switches command mode to clipboard paste for the
+    // same reason it does for dictation: on compositors without the Wayland
+    // virtual-keyboard protocol (e.g. KWin) uinput keycodes are decoded
+    // through the target window's active XKB layout and can come out garbled,
+    // and the clipboard is layout-independent. `is_terminal` only picks
+    // Ctrl+Shift+V over Ctrl+V there; nothing else keys off it. It can only
+    // ever be true under Hyprland and Niri: `get_focused_window_class()`
+    // defaults to `None` for every other tracker (KWin, GNOME, Sway, X11),
+    // so terminals get plain Ctrl+V there. Same gap as the dictation path
+    // above; tracked in issues #70 and #71.
+    //
+    // GUI apps: typing (or pasting) while text is selected replaces the
+    // selection. That is text-widget behavior in GTK, Qt and Electron, and it
+    // holds on Wayland as well, so nothing extra is needed there.
+    //
+    // Terminals: a mouse highlight is a visual overlay, not an editable
+    // selection, so injecting at the cursor would *append* to the line that is
+    // already at the prompt. We clear it first with Ctrl+A / Ctrl+K, then
+    // inject, so the result replaces the highlighted command instead of being
+    // tacked onto it. The clear is best-effort: if it fails we still inject,
+    // because appending the LLM result beats losing it.
+    //
+    // `is_terminal` can only ever be true where
+    // `WindowTracker::get_focused_window_class()` is actually implemented,
+    // which is Hyprland (`src/window/hyprland.rs:59`) and Niri
+    // (`src/window/niri.rs:79`). `src/window/mod.rs:23` defaults it to `None`,
+    // so on KWin, GNOME, Sway and X11 it stays false and terminals there fall
+    // back to plain injection at the cursor (and to plain Ctrl+V on the paste
+    // branch). Tracked in issues #70 and #71; not fixed here.
+    info!("command mode: injecting {} chars", result.len());
+    let text_clone = result.clone();
+    let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
+    let injector_backend = context.config.input.backend;
+    let paste = context.config.input.paste;
+    let is_terminal = context
+        .window_tracker
+        .get_focused_window_class()
+        .map(|c| is_terminal_class(&c))
+        .unwrap_or(false);
+    match tokio::task::spawn_blocking(move || {
+        if is_terminal {
+            if let Err(e) = clear_line_via_keyboard(key_delay, injector_backend) {
+                warn!("command mode: failed to clear terminal line, injecting anyway: {e:#}");
+            }
+        }
+        inject_text(&text_clone, is_terminal, key_delay, injector_backend, paste)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("command mode: failed to inject text: {e:#}"),
+        Err(e) => warn!("command mode: injection task panicked: {e}"),
     }
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    if cmd_ctx.is_terminal {
-        // In terminals, selections are a visual overlay — paste never replaces them.
-        // Clear the command line first (Ctrl+A → beginning, Ctrl+K → kill to end),
-        // then paste. Works across bash, zsh, and fish.
-        match tokio::task::spawn_blocking(simulate_terminal_clear_and_paste).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("failed to clear+paste in terminal: {e}"),
-            Err(e) => warn!("terminal clear+paste task panicked: {e}"),
-        }
-    } else {
-        match tokio::task::spawn_blocking(simulate_paste).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("failed to paste: {e}"),
-            Err(e) => warn!("paste task panicked: {e}"),
-        }
-    }
-
-    // Restore original clipboard after a delay.
-    let saved = cmd_ctx.saved_clipboard.clone();
-    let clipboard_restore = xkb_type::default_clipboard();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Err(e) = clipboard_restore.set_text(&saved) {
-            warn!("failed to restore clipboard: {e}");
-        }
-    });
 
     if context.config.general.audio_feedback {
         feedback::play_done(context.config.general.audio_feedback_volume);
@@ -2516,81 +2530,6 @@ fn simulate_terminal_copy() -> anyhow::Result<()> {
     )
 }
 
-/// Simulate Ctrl+V (paste) via uinput.
-fn simulate_paste() -> anyhow::Result<()> {
-    simulate_key_combo(evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_V)
-}
-
-/// Clear the terminal command line (Ctrl+A → Ctrl+K) then paste (Ctrl+Shift+V).
-///
-/// In terminals, selections are visual overlays — paste inserts at cursor, never
-/// replaces the selection. So we clear the line first then paste the new content.
-/// Ctrl+A (beginning of line) + Ctrl+K (kill to end) works in bash, zsh, and fish.
-fn simulate_terminal_clear_and_paste() -> anyhow::Result<()> {
-    use evdev::{AttributeSet, EventType, InputEvent, Key};
-    use std::thread;
-    use std::time::Duration;
-
-    let mut keys = AttributeSet::<Key>::new();
-    keys.insert(Key::KEY_LEFTCTRL);
-    keys.insert(Key::KEY_LEFTSHIFT);
-    keys.insert(Key::KEY_A);
-    keys.insert(Key::KEY_K);
-    keys.insert(Key::KEY_V);
-
-    let mut device = evdev::uinput::VirtualDeviceBuilder::new()
-        .context("failed to create VirtualDeviceBuilder")?
-        .name("whisrs command")
-        .with_keys(&keys)
-        .context("failed to register key events")?
-        .build()
-        .context("failed to build uinput device")?;
-
-    thread::sleep(Duration::from_millis(200));
-
-    // Ctrl+A — move to beginning of line.
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 1)])?;
-    thread::sleep(Duration::from_millis(2));
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_A.code(), 1)])?;
-    thread::sleep(Duration::from_millis(2));
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_A.code(), 0)])?;
-    thread::sleep(Duration::from_millis(2));
-
-    // Ctrl+K — kill to end of line (Ctrl is still held).
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_K.code(), 1)])?;
-    thread::sleep(Duration::from_millis(2));
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_K.code(), 0)])?;
-    thread::sleep(Duration::from_millis(2));
-
-    // Release Ctrl.
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 0)])?;
-    thread::sleep(Duration::from_millis(10));
-
-    // Ctrl+Shift+V — paste.
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 1)])?;
-    thread::sleep(Duration::from_millis(2));
-    device.emit(&[InputEvent::new(
-        EventType::KEY,
-        Key::KEY_LEFTSHIFT.code(),
-        1,
-    )])?;
-    thread::sleep(Duration::from_millis(2));
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 1)])?;
-    thread::sleep(Duration::from_millis(2));
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 0)])?;
-    thread::sleep(Duration::from_millis(2));
-    device.emit(&[InputEvent::new(
-        EventType::KEY,
-        Key::KEY_LEFTSHIFT.code(),
-        0,
-    )])?;
-    thread::sleep(Duration::from_millis(2));
-    device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTCTRL.code(), 0)])?;
-    thread::sleep(Duration::from_millis(2));
-
-    Ok(())
-}
-
 /// Known terminal emulator window classes (lowercase for matching).
 const TERMINAL_CLASSES: &[&str] = &[
     "alacritty",
@@ -2636,7 +2575,7 @@ fn leads_with_punct(text: &str) -> bool {
     ])
 }
 
-/// Capture the currently-selected text for read-aloud.
+/// Capture the currently-selected text for read-aloud and command mode.
 ///
 /// The primary selection (highlighted text) is authoritative when present: it
 /// needs no key simulation, so a non-empty primary selection is returned
@@ -2646,24 +2585,37 @@ fn leads_with_punct(text: &str) -> bool {
 ///
 /// When the primary selection is empty, fall back to a simulated Ctrl+C
 /// (Ctrl+Shift+C in terminals) and read the clipboard. A short settle delay
-/// precedes the simulated copy: the read-aloud hotkey is typically a modifier
+/// precedes the simulated copy: the triggering hotkey is typically a modifier
 /// combo (e.g. Alt+Shift+A), and if the user is still physically holding those
 /// modifiers when Ctrl+C fires, the app receives a garbled combo and the copy
 /// silently fails. The delay lets a briefly-held hotkey clear first.
 ///
+/// That fallback overwrites the user's clipboard, so it is restored as soon as
+/// the copied text has been read — synchronously, because nothing downstream
+/// needs the clipboard to keep holding the capture (command mode injects the
+/// LLM result, read-aloud speaks the text). The restore is skipped, rather
+/// than clobbering the clipboard, under the same two conditions as
+/// [`inject_text`]: the original clipboard wasn't readable as text (an image
+/// or a file list), or something else copied over our simulated Ctrl+C in the
+/// meantime. It is also skipped when the copy captured nothing and left the
+/// clipboard unchanged, so nothing is written when there was no selection to
+/// copy. A failed restore is logged, never fatal.
+///
 /// Returns `Ok(text)` on success, or `Err(message)` describing why nothing was
 /// captured (caller surfaces this as a `Response::Error` + notification).
-async fn capture_selection_for_speak(context: &DaemonContext) -> Result<String, String> {
+async fn capture_selection(context: &DaemonContext) -> Result<String, String> {
     let clipboard = xkb_type::default_clipboard();
 
-    // Trust a non-empty primary selection directly — no copy, no equality check.
+    // Trust a non-empty primary selection directly — no copy, no equality
+    // check, and no clipboard write of any kind.
     let primary = clipboard.get_primary_selection().unwrap_or_default();
     if !primary.is_empty() {
         return Ok(primary);
     }
 
     // No primary selection: fall back to a simulated copy + clipboard read.
-    let saved_clipboard = clipboard.get_text().unwrap_or_default();
+    // `None` means the clipboard held something that isn't text.
+    let saved_clipboard = clipboard.get_text().ok();
 
     let is_terminal = context
         .window_tracker
@@ -2691,10 +2643,37 @@ async fn capture_selection_for_speak(context: &DaemonContext) -> Result<String, 
         .get_text()
         .map_err(|e| format!("failed to read clipboard: {e}"))?;
 
+    // The copy clobbered the user's clipboard with the selection; put the
+    // original back now that we've read it (see doc comment above). Skipped
+    // when the original wasn't text, when the clipboard no longer holds what
+    // our Ctrl+C put there, and when the copy left the clipboard exactly as it
+    // was (nothing was selected, so there is nothing to undo). Writing an
+    // identical value back is not free: on Wayland it takes selection
+    // ownership and re-offers plain text only, downgrading a clipboard that
+    // held text/html and giving an empty one an empty-string owner.
+    let saved_to_restore = saved_clipboard
+        .as_deref()
+        .filter(|saved| *saved != copied.as_str());
+    if let Some(saved) = saved_to_restore {
+        match clipboard.get_text() {
+            Ok(current) if current == copied => {
+                if let Err(e) = clipboard.set_text(saved) {
+                    warn!("failed to restore clipboard after selection capture: {e}");
+                }
+            }
+            Ok(_) => {
+                debug!("clipboard changed during selection capture; skipping restore");
+            }
+            Err(e) => {
+                warn!("failed to read clipboard before restore, skipping restore: {e}");
+            }
+        }
+    }
+
     // With no primary selection, an unchanged clipboard means the copy captured
     // nothing (nothing selected, or the held hotkey garbled Ctrl+C).
-    if copied.is_empty() || copied == saved_clipboard {
-        return Err("no text selected — select text before using read-aloud".to_string());
+    if copied.is_empty() || saved_clipboard.as_deref() == Some(copied.as_str()) {
+        return Err("no text selected — select some text first".to_string());
     }
 
     Ok(copied)
@@ -2773,7 +2752,7 @@ async fn handle_speak(
     // (c) Capture the selection. On failure (incl. empty), surface an error
     // and — since this is hotkey-triggered — notify so the user sees why.
     info!("speak: getting selected text");
-    let selected_text = match capture_selection_for_speak(&context).await {
+    let selected_text = match capture_selection(&context).await {
         Ok(text) => text,
         Err(message) => {
             if context.notify_error() {

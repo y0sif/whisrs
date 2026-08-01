@@ -64,12 +64,15 @@ key_delay_ms = 2
 # punctuation, dropped accents/umlauts). Pasting goes through the clipboard,
 # which is layout-independent and Unicode-complete, so text comes out verbatim.
 #
-# Trade-offs: briefly replaces the clipboard (restored right after), the
-# target app must support Ctrl+V (terminals get Ctrl+Shift+V), and it applies
-# to batch (non-streaming) dictation only — streaming backends (including
+# Trade-offs: briefly replaces the clipboard (restored right after) and the
+# target app must support Ctrl+V (terminals get Ctrl+Shift+V). It covers batch
+# (non-streaming) dictation and command-mode output (`whisrs command` injects its
+# LLM result with a single injection call, so it honors this whatever the
+# backend).
+# The streaming dictation path is the exception: streaming backends (including
 # local-whisper, which always streams regardless of its `segmentation` mode)
-# type incrementally and silently ignore it. `whisrsd` warns at startup if
-# paste is set with one of those backends.
+# type incrementally and ignore it. `whisrsd` warns at startup if paste is set
+# with one of those backends.
 paste = false
 
 [groq]

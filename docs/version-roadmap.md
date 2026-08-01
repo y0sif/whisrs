@@ -16,7 +16,7 @@ historical record; current development happens against the v0.1.x patch line.
 
 ## v0.1.3 — Command Mode & Custom Vocabulary ✓
 
-- [x] **Command mode** (`whisrs command`): Select text + hotkey → record voice instruction → LLM rewrites selected text in place. Toggleable (press again to stop early). Simulates Ctrl+C/Ctrl+V via uinput.
+- [x] **Command mode** (`whisrs command`): Select text + hotkey → record voice instruction → LLM rewrites the selection. Toggleable (press again to stop early). (Originally pasted the result via simulated Ctrl+C/Ctrl+V; later releases inject it through the dictation pipeline instead: typed at the cursor by default, pasted when `[input] paste` is set, with terminals clearing the prompt line first.)
 - [x] **Custom vocabulary**: `vocabulary = ["term1", "term2"]` in config — passed as prompt hint to Groq, OpenAI REST, and local whisper backends
 - [x] **LLM integration**: `[llm]` config section with provider selection (OpenAI, Groq, OpenRouter, Google Gemini) and model menus with latest models. "Other" option for custom model names.
 
@@ -32,7 +32,7 @@ historical record; current development happens against the v0.1.x patch line.
 
 ## v0.1.5 — Terminal-Aware Command Mode & Polish ✓
 
-- [x] **Terminal-aware command mode**: Fixed LLM command mode in terminal emulators. Uses primary selection (`wl-paste --primary` / arboard) to read highlighted text without Ctrl+C (which sends SIGINT in terminals). Detects terminal windows via `WindowTracker::get_focused_window_class()` and uses Ctrl+Shift+C/V. Clears command line (Ctrl+A → Ctrl+K) before pasting so the result replaces the original text.
+- [x] **Terminal-aware command mode**: Fixed LLM command mode in terminal emulators. Uses primary selection (`wl-paste --primary` / arboard) to read highlighted text without Ctrl+C (which sends SIGINT in terminals). Detects terminal windows via `WindowTracker::get_focused_window_class()`. (This release pasted the result via Ctrl+Shift+V after clearing the line with Ctrl+A → Ctrl+K; later releases route it through the dictation injection pipeline instead (typed by default, pasted with Ctrl+Shift+V when `[input] paste` is set) and still clear the prompt line first so the result replaces the original command.)
 - [x] **Window class detection**: Added `get_focused_window_class()` to `WindowTracker` trait, implemented for Hyprland via `hyprctl activewindow -j` class field. Recognizes 18+ terminal emulators (Alacritty, Kitty, Foot, WezTerm, Ghostty, etc.).
 - [x] **Primary selection support**: Added `get_primary_selection()` to `ClipboardHandler` trait — Wayland (`wl-paste --primary`) and X11 (arboard `LinuxClipboardKind::Primary`).
 - [x] **Notification panic fix**: Resolved D-Bus `block_on` conflict with ksni tray runtime.
