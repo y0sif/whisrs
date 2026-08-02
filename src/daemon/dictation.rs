@@ -13,7 +13,7 @@ use crate::context::{DaemonContext, DaemonState};
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     build_transcription_config, format_no_microphone_error, process_recording_batch,
-    run_streaming_pipeline, save_history_entry,
+    run_streaming_pipeline, save_history_entry, StreamingPipelineParams,
 };
 
 pub(crate) async fn handle_toggle(
@@ -81,62 +81,41 @@ pub(crate) async fn handle_toggle(
 
                 let config = build_transcription_config(&context.config, &session_language);
 
-                let backend = Arc::clone(&context.transcription_backend);
-                let wid = window_id.clone();
-                let ctx_notify = context.notify;
-                let ctx_overlay = context.overlay_enabled;
-                let window_tracker_for_pipeline = Arc::clone(&context.window_tracker);
                 // Restore focus before starting the pipeline.
-                let wid_for_focus = wid.clone();
-
-                // Spawn a task to:
-                // 1. Run auto-stop detection + forward audio to transcription
-                // 2. Run transcription backend
-                // 3. Type text as it arrives
-                let silence_timeout = context.config.general.silence_timeout_ms;
-                let ds_ref = Arc::clone(&daemon_state);
-                let filler_enabled = context.config.general.remove_filler_words;
-                let filler_words = context.config.general.filler_words.clone();
-                let pipeline_audio_feedback = context.config.general.audio_feedback;
-                let pipeline_audio_volume = context.config.general.audio_feedback_volume;
-
-                let pipeline_backend_name = context.config.general.backend.clone();
-                let pipeline_language = session_language.clone();
-                let pipeline_state_tx = context.state_tx.clone();
-                let pipeline_key_delay =
-                    std::time::Duration::from_millis(context.config.input.key_delay_ms);
-                let pipeline_injector_backend = context.config.input.backend;
+                let wid_for_focus = window_id.clone();
 
                 // Per-recording cancel flag: lets `handle_cancel` stop the
                 // typing loop, which keeps running detached when the outer
                 // pipeline future is aborted.
                 let cancel_flag = Arc::new(AtomicBool::new(false));
-                let pipeline_cancel = Arc::clone(&cancel_flag);
 
-                let task = tokio::spawn(async move {
-                    run_streaming_pipeline(
-                        audio_rx,
-                        backend,
-                        config,
-                        wid,
-                        ctx_notify,
-                        ctx_overlay,
-                        silence_timeout,
-                        ds_ref,
-                        window_tracker_for_pipeline,
-                        filler_enabled,
-                        filler_words,
-                        pipeline_audio_feedback,
-                        pipeline_audio_volume,
-                        pipeline_backend_name,
-                        pipeline_language,
-                        pipeline_state_tx,
-                        pipeline_key_delay,
-                        pipeline_injector_backend,
-                        pipeline_cancel,
-                    )
-                    .await
-                });
+                // Spawn a task to:
+                // 1. Run auto-stop detection + forward audio to transcription
+                // 2. Run transcription backend
+                // 3. Type text as it arrives
+                let params = StreamingPipelineParams {
+                    audio_rx,
+                    backend: Arc::clone(&context.transcription_backend),
+                    daemon_state: Arc::clone(&daemon_state),
+                    window_tracker: Arc::clone(&context.window_tracker),
+                    state_tx: context.state_tx.clone(),
+                    cancel_flag: Arc::clone(&cancel_flag),
+                    config,
+                    window_id: window_id.clone(),
+                    language: session_language.clone(),
+                    notify: context.notify,
+                    overlay_enabled: context.overlay_enabled,
+                    silence_timeout_ms: context.config.general.silence_timeout_ms,
+                    filler_enabled: context.config.general.remove_filler_words,
+                    filler_words: context.config.general.filler_words.clone(),
+                    audio_feedback: context.config.general.audio_feedback,
+                    audio_feedback_volume: context.config.general.audio_feedback_volume,
+                    backend_name: context.config.general.backend.clone(),
+                    key_delay: std::time::Duration::from_millis(context.config.input.key_delay_ms),
+                    injector_backend: context.config.input.backend,
+                };
+
+                let task = tokio::spawn(run_streaming_pipeline(params));
 
                 ds.streaming_task = Some(task);
                 ds.streaming_cancel = Some(cancel_flag);

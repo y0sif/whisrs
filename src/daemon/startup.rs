@@ -40,27 +40,7 @@ pub(crate) fn load_config() -> (Config, Option<String>) {
                         config_path.display()
                     );
                     error!("{msg}");
-                    return (
-                        Config {
-                            general: Default::default(),
-                            audio: Default::default(),
-                            input: Default::default(),
-                            deepgram: None,
-                            groq: None,
-                            openai: None,
-                            local_whisper: None,
-                            local_vosk: None,
-                            local_parakeet: None,
-                            asr_sidecar: None,
-                            openai_compatible_realtime: None,
-                            llm: None,
-                            tts: None,
-                            hotkeys: None,
-                            llm_commands: Vec::new(),
-                            overlay: None,
-                        },
-                        Some(msg),
-                    );
+                    return (default_config(), Some(msg));
                 }
             },
             Err(e) => {
@@ -69,27 +49,7 @@ pub(crate) fn load_config() -> (Config, Option<String>) {
                     config_path.display()
                 );
                 error!("{msg}");
-                return (
-                    Config {
-                        general: Default::default(),
-                        audio: Default::default(),
-                        input: Default::default(),
-                        deepgram: None,
-                        groq: None,
-                        openai: None,
-                        local_whisper: None,
-                        local_vosk: None,
-                        local_parakeet: None,
-                        asr_sidecar: None,
-                        openai_compatible_realtime: None,
-                        llm: None,
-                        tts: None,
-                        hotkeys: None,
-                        llm_commands: Vec::new(),
-                        overlay: None,
-                    },
-                    Some(msg),
-                );
+                return (default_config(), Some(msg));
             }
         }
     } else {
@@ -98,27 +58,31 @@ pub(crate) fn load_config() -> (Config, Option<String>) {
             config_path.display()
         );
     }
-    (
-        Config {
-            general: Default::default(),
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: None,
-            tts: None,
-            hotkeys: None,
-            llm_commands: Vec::new(),
-            overlay: None,
-        },
-        None,
-    )
+    (default_config(), None)
+}
+
+/// The built-in default configuration, used by every `load_config` fallback
+/// (missing file, unreadable file, parse error). `Config` doesn't implement
+/// `Default`, so the field-by-field construction lives here, once.
+fn default_config() -> Config {
+    Config {
+        general: Default::default(),
+        audio: Default::default(),
+        input: Default::default(),
+        deepgram: None,
+        groq: None,
+        openai: None,
+        local_whisper: None,
+        local_vosk: None,
+        local_parakeet: None,
+        asr_sidecar: None,
+        openai_compatible_realtime: None,
+        llm: None,
+        tts: None,
+        hotkeys: None,
+        llm_commands: Vec::new(),
+        overlay: None,
+    }
 }
 
 /// Maximum number of attempts to detect compositor environment.

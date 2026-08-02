@@ -28,30 +28,60 @@ const TYPING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// certainly an accidental hotkey tap.
 const AUDIO_GATE_MIN_MS: u64 = 300;
 
+/// Everything [`run_streaming_pipeline`] needs, bundled so the single call
+/// site (`handle_toggle`'s Idle branch in `dictation.rs`) builds one value
+/// instead of threading ~19 positional arguments.
+pub(crate) struct StreamingPipelineParams {
+    // Channels and shared handles.
+    pub(crate) audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
+    pub(crate) backend: Arc<dyn TranscriptionBackend>,
+    pub(crate) daemon_state: Arc<Mutex<DaemonState>>,
+    pub(crate) window_tracker: Arc<dyn WindowTracker>,
+    pub(crate) state_tx: tokio::sync::watch::Sender<State>,
+    pub(crate) cancel_flag: Arc<AtomicBool>,
+
+    // Per-session values captured when recording started.
+    pub(crate) config: TranscriptionConfig,
+    pub(crate) window_id: Option<String>,
+    pub(crate) language: String,
+
+    // Config snapshot taken at spawn time.
+    pub(crate) notify: bool,
+    pub(crate) overlay_enabled: bool,
+    pub(crate) silence_timeout_ms: u64,
+    pub(crate) filler_enabled: bool,
+    pub(crate) filler_words: Vec<String>,
+    pub(crate) audio_feedback: bool,
+    pub(crate) audio_feedback_volume: f32,
+    pub(crate) backend_name: String,
+    pub(crate) key_delay: Duration,
+    pub(crate) injector_backend: InjectorBackend,
+}
+
 /// The streaming pipeline: reads audio in real-time, sends to API, types text.
 /// Also monitors for silence auto-stop.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_streaming_pipeline(
-    mut audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
-    backend: Arc<dyn TranscriptionBackend>,
-    config: TranscriptionConfig,
-    window_id: Option<String>,
-    notify: bool,
-    overlay_enabled: bool,
-    silence_timeout_ms: u64,
-    daemon_state: Arc<Mutex<DaemonState>>,
-    window_tracker: Arc<dyn WindowTracker>,
-    filler_enabled: bool,
-    filler_words: Vec<String>,
-    audio_feedback: bool,
-    audio_feedback_volume: f32,
-    backend_name: String,
-    language: String,
-    state_tx: tokio::sync::watch::Sender<State>,
-    key_delay: std::time::Duration,
-    injector_backend: InjectorBackend,
-    cancel_flag: Arc<AtomicBool>,
-) -> Result<String> {
+pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> Result<String> {
+    let StreamingPipelineParams {
+        mut audio_rx,
+        backend,
+        daemon_state,
+        window_tracker,
+        state_tx,
+        cancel_flag,
+        config,
+        window_id,
+        language,
+        notify,
+        overlay_enabled,
+        silence_timeout_ms,
+        filler_enabled,
+        filler_words,
+        audio_feedback,
+        audio_feedback_volume,
+        backend_name,
+        key_delay,
+        injector_backend,
+    } = params;
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
     let notify_error = notify;
