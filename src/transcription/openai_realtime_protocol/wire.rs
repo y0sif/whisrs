@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{clamp_prompt, TurnDetectionMode};
+use super::profile::{clamp_prompt, TurnDetectionMode};
 
 /// Client message: input_audio_buffer.append
 #[derive(Debug, Serialize)]

@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
@@ -6,11 +5,12 @@ use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioChunk;
-use crate::transcription::{TranscriptionBackend, TranscriptionConfig};
+use crate::transcription::TranscriptionConfig;
 
-use super::profile::{DeltaMode, OpenAiRealtimeProfile, TurnDetectionMode};
+use super::profile::{
+    encode_pcm_base64, resample_16k_to_24k, DeltaMode, OpenAiRealtimeProfile, TurnDetectionMode,
+};
 use super::wire::{AudioBufferAppend, AudioBufferCommit, ServerMessage};
-use super::{encode_pcm_base64, resample_16k_to_24k};
 
 const FINAL_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -719,35 +719,6 @@ fn prepare_audio_chunk_for_profile(
         16_000 => Ok(chunk.to_vec()),
         24_000 => Ok(resample_16k_to_24k(chunk)),
         rate => anyhow::bail!("unsupported realtime input sample rate: {rate}"),
-    }
-}
-
-// This trait impl keeps the provider wrappers thin today, but the engine is
-// still an internal protocol component rather than a user-facing backend.
-// If TranscriptionBackend grows more wrapper-level surface area in the future,
-// consider removing this impl and keeping the trait boundary only on the
-// concrete wrapper structs.
-#[async_trait]
-impl TranscriptionBackend for OpenAiRealtimeProtocolEngine {
-    async fn transcribe(
-        &self,
-        audio: &[u8],
-        config: &TranscriptionConfig,
-    ) -> anyhow::Result<String> {
-        OpenAiRealtimeProtocolEngine::transcribe(self, audio, config).await
-    }
-
-    async fn transcribe_stream(
-        &self,
-        audio_rx: mpsc::Receiver<AudioChunk>,
-        text_tx: mpsc::Sender<String>,
-        config: &TranscriptionConfig,
-    ) -> anyhow::Result<()> {
-        OpenAiRealtimeProtocolEngine::transcribe_stream(self, audio_rx, text_tx, config).await
-    }
-
-    fn supports_streaming(&self) -> bool {
-        true
     }
 }
 
