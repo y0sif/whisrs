@@ -53,7 +53,9 @@ Cargo workspace: the root package builds two binaries, plus five extracted crate
 
 ```
 src/
-├── lib.rs                  # Shared types: Config, IPC protocol, errors, helpers
+├── lib.rs                  # Crate root: WhisrsError + re-exports (config types, IPC, service ctl)
+├── ipc.rs                  # IPC protocol: commands, responses, socket path, wire framing
+├── service_ctl.rs          # Daemon restart via systemd (shared by CLI and config editor)
 ├── state.rs                # State machine (Idle → Recording → Transcribing → Idle;
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
@@ -61,7 +63,8 @@ src/
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
 ├── audio/
-│   ├── capture.rs          # cpal audio capture + WAV encoding
+│   ├── capture.rs          # cpal audio capture
+│   ├── wav.rs              # PCM-to-WAV encoding
 │   ├── playback.rs         # TTS audio playback
 │   ├── feedback.rs         # Audio cues
 │   └── recovery.rs         # Save/load audio on transcription failure
@@ -93,18 +96,24 @@ src/
 ├── hotkey/                 # Hotkey listener (raw evdev) + spec parsing
 ├── tray/                   # Tray icon (ksni, feature-gated)
 ├── overlay/                # Recording overlay (feature-gated)
+│   ├── service.rs          #   Overlay service: picks and drives a backend
+│   ├── render.rs           #   Shared rendering: theme, animation state, frame drawing
+│   ├── wayland.rs          #   Wayland layer-shell backend
+│   ├── x11.rs              #   X11 override-redirect backend
+│   └── gnome.rs            #   GNOME overlay D-Bus broadcaster
 └── config/
+    ├── types.rs            # Config structs, defaults, validation (config.toml)
     ├── setup.rs            # Interactive onboarding (whisrs setup)
     └── edit.rs             # whisrs config interactive editor
 ```
 
 Injection **policy** lives in the daemon: `type_text_at_cursor`, `paste_via_keyboard`
-and `inject_text` (`src/daemon/main.rs:1744`, `:1786`, `:1840`) decide what gets sent.
+and `inject_text` (all in `src/daemon/main.rs`) decide what gets sent.
 The **primitives** they call live in the `xkb-type` workspace crate, not in `src/`:
 
 ```
 crates/
-├── xkb-type/src/           # 0.1.2 — key injection
+├── xkb-type/src/           # 0.1.4 — key injection
 │   ├── lib.rs              #   KeyInjector + ClipboardBackend traits
 │   ├── keyboard.rs         #   uinput virtual keyboard (evdev)
 │   ├── keymap.rs           #   XKB reverse lookup (char → keycode+modifiers)
