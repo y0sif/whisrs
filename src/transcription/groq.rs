@@ -13,7 +13,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::audio::capture::encode_wav;
+use crate::audio::wav::encode_wav;
 use crate::audio::AudioChunk;
 
 use super::{TranscriptionBackend, TranscriptionConfig};

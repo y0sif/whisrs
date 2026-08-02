@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use tracing::{info, warn};
 
-use super::capture::encode_wav;
+use super::wav::encode_wav;
 
 /// Return the recovery directory path (`~/.cache/whisrs/recovery/`).
 pub fn recovery_dir() -> PathBuf {

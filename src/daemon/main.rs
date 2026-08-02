@@ -1571,7 +1571,7 @@ async fn process_recording_batch(
     context: &DaemonContext,
     language: &str,
 ) -> Result<String> {
-    use whisrs::audio::capture::encode_wav;
+    use whisrs::audio::wav::encode_wav;
 
     let samples = match capture {
         Some(cap) => cap.stop_and_collect().await?,
@@ -2340,7 +2340,7 @@ async fn command_mode_background(
     }
 
     // Encode and transcribe.
-    let wav_data = match whisrs::audio::capture::encode_wav(&all_samples) {
+    let wav_data = match whisrs::audio::wav::encode_wav(&all_samples) {
         Ok(d) => d,
         Err(e) => {
             error!("command mode: failed to encode audio: {e}");
@@ -2832,7 +2832,7 @@ async fn llm_command_background(
         send_notification("whisrs", &format!("Processing '{}'...", cmd_ctx.name));
     }
 
-    let wav_data = match whisrs::audio::capture::encode_wav(&all_samples) {
+    let wav_data = match whisrs::audio::wav::encode_wav(&all_samples) {
         Ok(d) => d,
         Err(e) => {
             error!(

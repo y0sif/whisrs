@@ -75,7 +75,7 @@ pub trait TranscriptionBackend: Send + Sync {
         text_tx: mpsc::Sender<String>,
         config: &TranscriptionConfig,
     ) -> anyhow::Result<()> {
-        use crate::audio::capture::encode_wav;
+        use crate::audio::wav::encode_wav;
 
         // Collect all audio chunks.
         let mut all_samples: Vec<i16> = Vec::new();
