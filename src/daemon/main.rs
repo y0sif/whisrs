@@ -1322,6 +1322,9 @@ async fn run_streaming_pipeline(
                 }
 
                 info!("typing: {:?}", text_to_type);
+                // Streaming deliberately bypasses `inject_text` / `[input]
+                // paste`: partial deltas are typed as they arrive, and a
+                // paste per delta would thrash the clipboard.
                 match tokio::task::spawn_blocking(move || {
                     type_text_at_cursor(&text_to_type, key_delay, injector_backend)
                 })
@@ -1562,27 +1565,55 @@ where
     full_text
 }
 
-/// Batch mode: collect all audio, transcribe in one shot, type result.
-/// `language` is the resolved session language (per-toggle override or
-/// config default) captured when recording started.
-async fn process_recording_batch(
-    capture: Option<AudioCaptureHandle>,
-    window_id: Option<&str>,
+/// Where a batch transcription request originated. Selects the per-path
+/// notification/log wording inside [`transcribe_batch_audio`]; the behavior
+/// toggles live in [`BatchOptions`].
+enum BatchOrigin<'a> {
+    /// Plain dictation (`whisrs toggle` with a batch backend).
+    Dictation,
+    /// Command mode (`whisrs command`): selection + voice instruction.
+    CommandMode,
+    /// A named `[[llm_commands]]` hotkey. Carries the command name for
+    /// toasts/logs — runtime config data, hence not a `&'static str` label.
+    LlmCommand { name: &'a str },
+}
+
+/// Per-path switches for [`transcribe_batch_audio`].
+///
+/// File-local for now; the daemon module split moves this out later.
+struct BatchOptions<'a> {
+    /// Send the configured prompt/vocabulary hint via
+    /// `build_transcription_config` instead of a bare config.
+    use_prompt: bool,
+    /// Save the recording for `whisrs transcribe-recovery` when the backend
+    /// errors. Dictation only: command-path audio is an instruction, not
+    /// content worth replaying later.
+    save_recovery: bool,
+    /// Drop transcripts that look like the model echoing the prompt back.
+    /// Should be `true` whenever `use_prompt` is `true` — an echoed prompt is
+    /// garbage whether it would be typed or fed to the LLM.
+    check_prompt_echo: bool,
+    /// Apply the configured filler-word filter. Dictation only for now.
+    apply_filler: bool,
+    /// Which flow is asking; picks the notification/log wording.
+    origin: BatchOrigin<'a>,
+}
+
+/// Shared batch transcription flow: audio gate → WAV encode → backend
+/// transcribe → prompt-echo check → filler removal.
+///
+/// `Ok(String::new())` means "nothing to act on" — the recording was gated,
+/// the transcript was dropped as a prompt echo, or it came back empty — and
+/// the relevant user-facing toast has already been sent with the calling
+/// path's own wording (selected via `opts.origin`). `Err` is a real failure
+/// (encode or backend); the caller formats and reports it, then unwinds.
+async fn transcribe_batch_audio(
+    samples: &[i16],
     context: &DaemonContext,
     language: &str,
+    opts: &BatchOptions<'_>,
 ) -> Result<String> {
     use whisrs::audio::wav::encode_wav;
-
-    let samples = match capture {
-        Some(cap) => cap.stop_and_collect().await?,
-        None => anyhow::bail!("no audio capture to collect"),
-    };
-
-    if samples.is_empty() {
-        anyhow::bail!("no audio samples captured");
-    }
-
-    info!("collected {} audio samples", samples.len());
 
     // Skip the API call entirely when the recording is empty, too short, or
     // pure silence. Cloud Whisper variants (whisper-1, gpt-4o-*-transcribe)
@@ -1592,26 +1623,72 @@ async fn process_recording_batch(
     // typing on every accidental hotkey tap. Filtering here also saves the
     // round-trip cost.
     if let Some(reason) = audio_gate_reason(
-        &samples,
+        samples,
         SAMPLE_RATE,
         AUDIO_GATE_MIN_MS,
         SILENCE_RMS_THRESHOLD,
     ) {
         let label = reason.as_str();
-        info!(
-            "skipping transcription: recording was {label} ({} samples)",
-            samples.len()
-        );
-        if context.notify_state() {
-            send_notification("whisrs", &format!("Skipped: recording was {label}"));
+        match &opts.origin {
+            BatchOrigin::Dictation => {
+                info!(
+                    "skipping transcription: recording was {label} ({} samples)",
+                    samples.len()
+                );
+                if context.notify_state() {
+                    send_notification("whisrs", &format!("Skipped: recording was {label}"));
+                }
+            }
+            BatchOrigin::CommandMode => {
+                info!(
+                    "command mode: skipping (recording was {label}, {} samples)",
+                    samples.len()
+                );
+                if context.notify_error() {
+                    send_notification("whisrs", &format!("Command mode: recording was {label}"));
+                }
+            }
+            BatchOrigin::LlmCommand { name } => {
+                info!(
+                    "llm-command '{name}': skipping (recording was {label}, {} samples)",
+                    samples.len()
+                );
+                if context.notify_state() {
+                    send_notification("whisrs", &format!("Skipped: recording was {label}"));
+                }
+            }
         }
         return Ok(String::new());
     }
 
-    let wav_data = encode_wav(&samples)?;
+    // Progress toast for the command flows — after the gate, so a silent
+    // recording only surfaces the skip toast above.
+    match &opts.origin {
+        BatchOrigin::Dictation => {}
+        BatchOrigin::CommandMode => {
+            if context.notify_state() {
+                send_notification("whisrs", "Processing command...");
+            }
+        }
+        BatchOrigin::LlmCommand { name } => {
+            if context.notify_state() {
+                send_notification("whisrs", &format!("Processing '{name}'..."));
+            }
+        }
+    }
+
+    let wav_data = encode_wav(samples)?;
     info!("encoded WAV: {} bytes", wav_data.len());
 
-    let config = build_transcription_config(&context.config, language);
+    let config = if opts.use_prompt {
+        build_transcription_config(&context.config, language)
+    } else {
+        TranscriptionConfig {
+            language: language.to_string(),
+            model: get_model_for_backend(&context.config),
+            prompt: None,
+        }
+    };
 
     let text = match context
         .transcription_backend
@@ -1620,28 +1697,30 @@ async fn process_recording_batch(
     {
         Ok(t) => t,
         Err(e) => {
-            let friendly = format_api_error(&e);
-            error!("transcription failed: {friendly}");
-            // Save audio for recovery.
-            use whisrs::audio::recovery;
-            match recovery::save_recovery_audio(&samples) {
-                Ok(path) => {
-                    info!(
-                        "audio saved for recovery: {} — retry with: whisrs transcribe-recovery",
-                        path.display()
-                    );
-                    if context.notify_error() {
-                        send_notification(
-                            "whisrs",
-                            &format!(
-                                "Transcription failed: {friendly}\nAudio saved to {}\nRetry with: whisrs transcribe-recovery",
-                                path.display()
-                            ),
+            if opts.save_recovery {
+                let friendly = format_api_error(&e);
+                error!("transcription failed: {friendly}");
+                // Save audio for recovery.
+                use whisrs::audio::recovery;
+                match recovery::save_recovery_audio(samples) {
+                    Ok(path) => {
+                        info!(
+                            "audio saved for recovery: {} — retry with: whisrs transcribe-recovery",
+                            path.display()
                         );
+                        if context.notify_error() {
+                            send_notification(
+                                "whisrs",
+                                &format!(
+                                    "Transcription failed: {friendly}\nAudio saved to {}\nRetry with: whisrs transcribe-recovery",
+                                    path.display()
+                                ),
+                            );
+                        }
                     }
-                }
-                Err(re) => {
-                    warn!("failed to save recovery audio: {re}");
+                    Err(re) => {
+                        warn!("failed to save recovery audio: {re}");
+                    }
                 }
             }
             return Err(e);
@@ -1651,11 +1730,13 @@ async fn process_recording_batch(
     // Defence in depth against prompt-echo hallucinations: even with the
     // upstream gate, low-SNR recordings (tap microphones, very brief speech
     // followed by silence) sometimes squeak through and trigger the model to
-    // regurgitate the prompt. Drop those before they reach the keyboard.
-    if config
-        .prompt
-        .as_deref()
-        .is_some_and(|prompt| is_prompt_echo(&text, prompt))
+    // regurgitate the prompt. Drop those before they reach the keyboard (or,
+    // for llm-commands, the LLM).
+    if opts.check_prompt_echo
+        && config
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| is_prompt_echo(&text, prompt))
     {
         warn!(
             "discarding likely prompt-echo response ({} chars) — see prompt_echo crate",
@@ -1671,7 +1752,7 @@ async fn process_recording_batch(
     }
 
     // Apply filler word removal if enabled.
-    let text = if context.config.general.remove_filler_words {
+    let text = if opts.apply_filler && context.config.general.remove_filler_words {
         let filter = FillerFilter::new(&context.config.general.filler_words)
             .context("invalid custom filler word in configuration")?;
         let cleaned = filter.apply(&text);
@@ -1688,7 +1769,62 @@ async fn process_recording_batch(
     };
 
     if text.is_empty() {
-        info!("transcription returned empty text — nothing to type");
+        match &opts.origin {
+            BatchOrigin::Dictation => {
+                info!("transcription returned empty text — nothing to type");
+            }
+            BatchOrigin::CommandMode => {
+                if context.notify_error() {
+                    send_notification("whisrs", "Could not understand instruction — try again");
+                }
+            }
+            BatchOrigin::LlmCommand { .. } => {
+                if context.notify_error() {
+                    send_notification("whisrs", "Could not understand speech — try again");
+                }
+            }
+        }
+    }
+
+    Ok(text)
+}
+
+/// Batch mode: collect all audio, transcribe in one shot, type result.
+/// `language` is the resolved session language (per-toggle override or
+/// config default) captured when recording started.
+async fn process_recording_batch(
+    capture: Option<AudioCaptureHandle>,
+    window_id: Option<&str>,
+    context: &DaemonContext,
+    language: &str,
+) -> Result<String> {
+    let samples = match capture {
+        Some(cap) => cap.stop_and_collect().await?,
+        None => anyhow::bail!("no audio capture to collect"),
+    };
+
+    if samples.is_empty() {
+        anyhow::bail!("no audio samples captured");
+    }
+
+    info!("collected {} audio samples", samples.len());
+
+    let text = transcribe_batch_audio(
+        &samples,
+        context,
+        language,
+        &BatchOptions {
+            use_prompt: true,
+            save_recovery: true,
+            check_prompt_echo: true,
+            apply_filler: true,
+            origin: BatchOrigin::Dictation,
+        },
+    )
+    .await?;
+
+    if text.is_empty() {
+        // Gated, echo-dropped, or empty — the helper already said so.
         return Ok(text);
     }
 
@@ -2265,6 +2401,10 @@ async fn command_mode_start(
 
 /// Background task: collects audio until channel closes (manual stop or auto-stop),
 /// then transcribes the instruction, sends to LLM, and injects the result.
+///
+/// Thin wrapper: collects the recording and takes the session context, runs
+/// the fallible pipeline in [`command_mode_background_inner`], then funnels
+/// every outcome through one finalize block.
 async fn command_mode_background(
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -2291,113 +2431,79 @@ async fn command_mode_background(
         }
     }
 
-    // Take command mode context.
+    // Take the command mode context and transition to transcribing. The lock
+    // is released before the slow transcribe/LLM awaits in the inner fn.
     let cmd_ctx = {
         let mut ds = daemon_state.lock().await;
         ds.audio_capture.take(); // ensure capture is dropped
+        let _ = ds.state_machine.transition(Action::Toggle);
         ds.command_mode.take()
     };
 
-    let Some(cmd_ctx) = cmd_ctx else {
+    if let Some(cmd_ctx) = cmd_ctx {
+        if let Err(e) = command_mode_background_inner(&all_samples, cmd_ctx, &context).await {
+            let friendly = format_api_error(&e);
+            error!("command mode: {e:#}");
+            if context.notify_error() {
+                send_notification("whisrs", &format!("Command failed: {friendly}"));
+            }
+        }
+    } else {
         warn!("command mode: context missing, aborting");
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::Toggle);
-        let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        return;
-    };
-
-    // Transition to transcribing.
-    {
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::Toggle);
     }
 
+    // Single finalize path — success, benign skip, and error all land here.
+    // Deliberate improvement over the old per-site unwinds: the state
+    // broadcast + overlay reset now run on error paths too, so the tray can
+    // no longer be left showing a stale state after a failure.
+    let mut ds = daemon_state.lock().await;
+    let _ = ds.state_machine.transition(Action::TranscriptionDone);
+    let _ = context.state_tx.send(ds.state_machine.state());
+    if let Some(level_tx) = &context.overlay_level_tx {
+        let _ = level_tx.send(0.0);
+    }
+}
+
+/// Fallible body of [`command_mode_background`]: stop-feedback, gate +
+/// transcribe (via [`transcribe_batch_audio`]), LLM rewrite, inject.
+///
+/// Early `Ok(())` returns are benign skips whose toast the helper already
+/// sent; `Err` is a real failure the outer wrapper formats
+/// (`format_api_error`) and reports. Takes no daemon-state lock, so nothing
+/// is held across the transcribe/LLM awaits.
+async fn command_mode_background_inner(
+    all_samples: &[i16],
+    cmd_ctx: CommandModeContext,
+    context: &DaemonContext,
+) -> Result<()> {
     if context.config.general.audio_feedback {
         feedback::play_stop(context.config.general.audio_feedback_volume);
     }
 
-    if let Some(reason) = audio_gate_reason(
-        &all_samples,
-        SAMPLE_RATE,
-        AUDIO_GATE_MIN_MS,
-        SILENCE_RMS_THRESHOLD,
-    ) {
-        let label = reason.as_str();
-        info!(
-            "command mode: skipping (recording was {label}, {} samples)",
-            all_samples.len()
-        );
-        if context.notify_error() {
-            send_notification("whisrs", &format!("Command mode: recording was {label}"));
-        }
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        return;
-    }
-
-    if context.notify_state() {
-        send_notification("whisrs", "Processing command...");
-    }
-
-    // Encode and transcribe.
-    let wav_data = match whisrs::audio::wav::encode_wav(&all_samples) {
-        Ok(d) => d,
-        Err(e) => {
-            error!("command mode: failed to encode audio: {e}");
-            let mut ds = daemon_state.lock().await;
-            let _ = ds.state_machine.transition(Action::TranscriptionDone);
-            return;
-        }
-    };
-
-    let config = TranscriptionConfig {
-        language: context.config.general.language.clone(),
-        model: get_model_for_backend(&context.config),
-        prompt: None,
-    };
-
-    let instruction = match context
-        .transcription_backend
-        .transcribe(&wav_data, &config)
-        .await
-    {
-        Ok(text) => text,
-        Err(e) => {
-            error!("command mode: transcription failed: {e}");
-            if context.notify_error() {
-                send_notification("whisrs", &format!("Command failed: {e}"));
-            }
-            let mut ds = daemon_state.lock().await;
-            let _ = ds.state_machine.transition(Action::TranscriptionDone);
-            return;
-        }
-    };
+    let instruction = transcribe_batch_audio(
+        all_samples,
+        context,
+        &context.config.general.language,
+        &BatchOptions {
+            use_prompt: false,
+            save_recovery: false,
+            check_prompt_echo: false,
+            apply_filler: false,
+            origin: BatchOrigin::CommandMode,
+        },
+    )
+    .await?;
 
     if instruction.is_empty() {
-        if context.notify_error() {
-            send_notification("whisrs", "Could not understand instruction — try again");
-        }
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        return;
+        // Gated or unintelligible — the helper already toasted.
+        return Ok(());
     }
 
     info!("command mode: instruction = {:?}", instruction);
 
     // Send to LLM.
     let result =
-        match llm::rewrite_text(&cmd_ctx.llm_config, &cmd_ctx.selected_text, &instruction).await {
-            Ok(text) => text,
-            Err(e) => {
-                error!("command mode: LLM failed: {e}");
-                if context.notify_error() {
-                    send_notification("whisrs", &format!("Command failed: {e}"));
-                }
-                let mut ds = daemon_state.lock().await;
-                let _ = ds.state_machine.transition(Action::TranscriptionDone);
-                return;
-            }
-        };
+        llm::rewrite_text(&cmd_ctx.llm_config, &cmd_ctx.selected_text, &instruction).await?;
 
     // Inject the result at the cursor through the same policy wrapper the
     // dictation path uses. By default that means typing keystrokes through
@@ -2469,13 +2575,7 @@ async fn command_mode_background(
         send_notification("whisrs", &format!("Command applied: {instruction}"));
     }
 
-    // Transition back to idle.
-    let mut ds = daemon_state.lock().await;
-    let _ = ds.state_machine.transition(Action::TranscriptionDone);
-    let _ = context.state_tx.send(ds.state_machine.state());
-    if let Some(level_tx) = &context.overlay_level_tx {
-        let _ = level_tx.send(0.0);
-    }
+    Ok(())
 }
 
 /// Handle a named `[[llm_commands]]` hotkey. A toggle-recording flavor of
@@ -2757,6 +2857,10 @@ async fn llm_command_start(
 /// with the roles swapped — the dictated text is the "selected text" and the
 /// preset instruction is the "voice instruction"), and types the result at
 /// the cursor.
+///
+/// Thin wrapper: collects the recording and takes the session context, runs
+/// the fallible pipeline in [`llm_command_background_inner`], then funnels
+/// every outcome through one finalize block.
 async fn llm_command_background(
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -2781,9 +2885,12 @@ async fn llm_command_background(
         }
     }
 
+    // Take the session context and transition to transcribing. The lock is
+    // released before the slow transcribe/LLM awaits in the inner fn.
     let (cmd_ctx, window_id, recording_started_at) = {
         let mut ds = daemon_state.lock().await;
         ds.audio_capture.take();
+        let _ = ds.state_machine.transition(Action::Toggle);
         (
             ds.llm_command.take(),
             ds.recording_window_id.take(),
@@ -2791,90 +2898,79 @@ async fn llm_command_background(
         )
     };
 
-    let Some(cmd_ctx) = cmd_ctx else {
+    if let Some(cmd_ctx) = cmd_ctx {
+        let name = cmd_ctx.name.clone();
+        if let Err(e) = llm_command_background_inner(
+            &all_samples,
+            cmd_ctx,
+            window_id,
+            recording_started_at,
+            &context,
+        )
+        .await
+        {
+            let friendly = format_api_error(&e);
+            error!("llm-command '{name}': {e:#}");
+            if context.notify_error() {
+                send_notification("whisrs", &format!("'{name}' failed: {friendly}"));
+            }
+        }
+    } else {
         warn!("llm-command: context missing, aborting");
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::Toggle);
-        let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        return;
-    };
-
-    {
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::Toggle);
     }
 
+    // Single finalize path — success, benign skip, and error all land here.
+    // As in `command_mode_background`, the state broadcast + overlay reset
+    // now deliberately run on error paths too (they used to be success-only),
+    // so the tray can no longer be left showing a stale state after a failure.
+    let mut ds = daemon_state.lock().await;
+    let _ = ds.state_machine.transition(Action::TranscriptionDone);
+    let _ = context.state_tx.send(ds.state_machine.state());
+    if let Some(level_tx) = &context.overlay_level_tx {
+        let _ = level_tx.send(0.0);
+    }
+}
+
+/// Fallible body of [`llm_command_background`]: stop-feedback, gate +
+/// transcribe (via [`transcribe_batch_audio`]), LLM rewrite, inject, history.
+///
+/// Early `Ok(())` returns are benign skips that already surfaced their own
+/// toast; `Err` is a real failure the outer wrapper formats
+/// (`format_api_error`) and reports. Takes no daemon-state lock, so nothing
+/// is held across the transcribe/LLM awaits.
+async fn llm_command_background_inner(
+    all_samples: &[i16],
+    cmd_ctx: LlmCommandContext,
+    window_id: Option<String>,
+    recording_started_at: Option<std::time::Instant>,
+    context: &DaemonContext,
+) -> Result<()> {
     if context.config.general.audio_feedback {
         feedback::play_stop(context.config.general.audio_feedback_volume);
     }
 
-    if let Some(reason) = audio_gate_reason(
-        &all_samples,
-        SAMPLE_RATE,
-        AUDIO_GATE_MIN_MS,
-        SILENCE_RMS_THRESHOLD,
-    ) {
-        let label = reason.as_str();
-        info!(
-            "llm-command '{}': skipping (recording was {label}, {} samples)",
-            cmd_ctx.name,
-            all_samples.len()
-        );
-        if context.notify_state() {
-            send_notification("whisrs", &format!("Skipped: recording was {label}"));
-        }
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        return;
-    }
-
-    if context.notify_state() {
-        send_notification("whisrs", &format!("Processing '{}'...", cmd_ctx.name));
-    }
-
-    let wav_data = match whisrs::audio::wav::encode_wav(&all_samples) {
-        Ok(d) => d,
-        Err(e) => {
-            error!(
-                "llm-command '{}': failed to encode audio: {e}",
-                cmd_ctx.name
-            );
-            let mut ds = daemon_state.lock().await;
-            let _ = ds.state_machine.transition(Action::TranscriptionDone);
-            return;
-        }
-    };
-
-    let config = build_transcription_config(&context.config, &context.config.general.language);
-
-    let text = match context
-        .transcription_backend
-        .transcribe(&wav_data, &config)
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            let friendly = format_api_error(&e);
-            error!(
-                "llm-command '{}': transcription failed: {friendly}",
-                cmd_ctx.name
-            );
-            if context.notify_error() {
-                send_notification("whisrs", &format!("'{}' failed: {friendly}", cmd_ctx.name));
-            }
-            let mut ds = daemon_state.lock().await;
-            let _ = ds.state_machine.transition(Action::TranscriptionDone);
-            return;
-        }
-    };
+    let text = transcribe_batch_audio(
+        all_samples,
+        context,
+        &context.config.general.language,
+        &BatchOptions {
+            use_prompt: true,
+            save_recovery: false,
+            // The transcript is LLM input here: an echoed prompt would be
+            // silently rewritten into plausible garbage, so the echo check
+            // matters just as much as on the dictation path.
+            check_prompt_echo: true,
+            apply_filler: false,
+            origin: BatchOrigin::LlmCommand {
+                name: &cmd_ctx.name,
+            },
+        },
+    )
+    .await?;
 
     if text.is_empty() {
-        if context.notify_error() {
-            send_notification("whisrs", "Could not understand speech — try again");
-        }
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        return;
+        // Gated, echo-dropped, or unintelligible — the helper already toasted.
+        return Ok(());
     }
 
     info!(
@@ -2883,18 +2979,7 @@ async fn llm_command_background(
         text.len()
     );
 
-    let result = match llm::rewrite_text(&cmd_ctx.llm_config, &text, &cmd_ctx.instruction).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("llm-command '{}': LLM failed: {e}", cmd_ctx.name);
-            if context.notify_error() {
-                send_notification("whisrs", &format!("'{}' failed: {e}", cmd_ctx.name));
-            }
-            let mut ds = daemon_state.lock().await;
-            let _ = ds.state_machine.transition(Action::TranscriptionDone);
-            return;
-        }
-    };
+    let result = llm::rewrite_text(&cmd_ctx.llm_config, &text, &cmd_ctx.instruction).await?;
 
     if result.is_empty() {
         if context.notify_error() {
@@ -2903,9 +2988,7 @@ async fn llm_command_background(
                 &format!("'{}': LLM returned empty text", cmd_ctx.name),
             );
         }
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        return;
+        return Ok(());
     }
 
     // Restore window focus, then inject the result at the cursor — keystrokes,
@@ -2971,12 +3054,7 @@ async fn llm_command_background(
         send_notification("whisrs", &format!("'{}' done: {preview}", cmd_ctx.name));
     }
 
-    let mut ds = daemon_state.lock().await;
-    let _ = ds.state_machine.transition(Action::TranscriptionDone);
-    let _ = context.state_tx.send(ds.state_machine.state());
-    if let Some(level_tx) = &context.overlay_level_tx {
-        let _ = level_tx.send(0.0);
-    }
+    Ok(())
 }
 
 /// Simulate a key combo (e.g. Ctrl+C, Ctrl+V) via a temporary uinput device.
