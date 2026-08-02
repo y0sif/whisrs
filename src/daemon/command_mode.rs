@@ -16,7 +16,7 @@ use crate::injection::{clear_line_via_keyboard, inject_text, is_terminal_class};
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     format_api_error, format_no_microphone_error, save_history_entry, transcribe_batch_audio,
-    BatchOptions, BatchOrigin,
+    BatchOptions,
 };
 use crate::selection::{acquire_selected_text, capture_selection};
 
@@ -236,13 +236,7 @@ async fn command_mode_background_inner(
         all_samples,
         context,
         &context.config.general.language,
-        &BatchOptions {
-            use_prompt: false,
-            save_recovery: false,
-            check_prompt_echo: false,
-            apply_filler: false,
-            origin: BatchOrigin::CommandMode,
-        },
+        &BatchOptions::command_mode(),
     )
     .await?;
 
@@ -667,18 +661,7 @@ async fn llm_command_background_inner(
         all_samples,
         context,
         &context.config.general.language,
-        &BatchOptions {
-            use_prompt: true,
-            save_recovery: false,
-            // The transcript is LLM input here: an echoed prompt would be
-            // silently rewritten into plausible garbage, so the echo check
-            // matters just as much as on the dictation path.
-            check_prompt_echo: true,
-            apply_filler: false,
-            origin: BatchOrigin::LlmCommand {
-                name: &cmd_ctx.name,
-            },
-        },
+        &BatchOptions::llm_command(&cmd_ctx.name),
     )
     .await?;
 

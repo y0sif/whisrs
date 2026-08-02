@@ -384,6 +384,7 @@ where
 /// Where a batch transcription request originated. Selects the per-path
 /// notification/log wording inside [`transcribe_batch_audio`]; the behavior
 /// toggles live in [`BatchOptions`].
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BatchOrigin<'a> {
     /// Plain dictation (`whisrs toggle` with a batch backend).
     Dictation,
@@ -394,9 +395,46 @@ pub(crate) enum BatchOrigin<'a> {
     LlmCommand { name: &'a str },
 }
 
+impl BatchOrigin<'_> {
+    /// Toast text when the audio gate rejects the recording (`label` is the
+    /// gate's reason, e.g. "too short" or "silent").
+    fn gate_skip_message(&self, label: &str) -> String {
+        match self {
+            BatchOrigin::Dictation | BatchOrigin::LlmCommand { .. } => {
+                format!("Skipped: recording was {label}")
+            }
+            BatchOrigin::CommandMode => format!("Command mode: recording was {label}"),
+        }
+    }
+
+    /// Progress toast shown once the gate passes. `None` for dictation, which
+    /// stays quiet until text lands.
+    fn processing_message(&self) -> Option<String> {
+        match self {
+            BatchOrigin::Dictation => None,
+            BatchOrigin::CommandMode => Some("Processing command...".to_string()),
+            BatchOrigin::LlmCommand { name } => Some(format!("Processing '{name}'...")),
+        }
+    }
+
+    /// Error toast when the backend returns an empty transcript. `None` for
+    /// dictation, which only logs.
+    fn empty_result_message(&self) -> Option<&'static str> {
+        match self {
+            BatchOrigin::Dictation => None,
+            BatchOrigin::CommandMode => Some("Could not understand instruction — try again"),
+            BatchOrigin::LlmCommand { .. } => Some("Could not understand speech — try again"),
+        }
+    }
+}
+
+/// Toast text when a transcript is dropped as a prompt echo. Origin-independent:
+/// the same wording is used by every batch path.
+const PROMPT_ECHO_SKIP_TOAST: &str =
+    "Skipped: response looked like a prompt echo (no speech detected)";
+
 /// Per-path switches for [`transcribe_batch_audio`].
-///
-/// File-local for now; the daemon module split moves this out later.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BatchOptions<'a> {
     /// Send the configured prompt/vocabulary hint via
     /// `build_transcription_config` instead of a bare config.
@@ -413,6 +451,55 @@ pub(crate) struct BatchOptions<'a> {
     pub(crate) apply_filler: bool,
     /// Which flow is asking; picks the notification/log wording.
     pub(crate) origin: BatchOrigin<'a>,
+}
+
+impl<'a> BatchOptions<'a> {
+    /// Plain dictation: everything on — prompt, recovery save, echo check,
+    /// filler removal.
+    pub(crate) fn dictation() -> BatchOptions<'static> {
+        BatchOptions {
+            use_prompt: true,
+            save_recovery: true,
+            check_prompt_echo: true,
+            apply_filler: true,
+            origin: BatchOrigin::Dictation,
+        }
+    }
+
+    /// Command mode (`whisrs command`): the recording is a spoken instruction,
+    /// not content — no prompt (so no echo check), no recovery save, no filler
+    /// removal.
+    pub(crate) fn command_mode() -> BatchOptions<'static> {
+        BatchOptions {
+            use_prompt: false,
+            save_recovery: false,
+            check_prompt_echo: false,
+            apply_filler: false,
+            origin: BatchOrigin::CommandMode,
+        }
+    }
+
+    /// A named `[[llm_commands]]` hotkey. Prompted like dictation — and the
+    /// transcript is LLM input here: an echoed prompt would be silently
+    /// rewritten into plausible garbage, so the echo check matters just as
+    /// much as on the dictation path. Still no recovery save or filler
+    /// removal: the audio is an instruction, not content.
+    pub(crate) fn llm_command(name: &'a str) -> BatchOptions<'a> {
+        BatchOptions {
+            use_prompt: true,
+            save_recovery: false,
+            check_prompt_echo: true,
+            apply_filler: false,
+            origin: BatchOrigin::LlmCommand { name },
+        }
+    }
+
+    /// Whether `text` must be discarded as the model echoing the prompt back.
+    /// Only fires when the echo check is enabled for this path *and* a prompt
+    /// was actually sent — with no prompt there is nothing to echo.
+    fn should_drop_as_echo(&self, prompt: Option<&str>, text: &str) -> bool {
+        self.check_prompt_echo && prompt.is_some_and(|prompt| is_prompt_echo(text, prompt))
+    }
 }
 
 /// Shared batch transcription flow: audio gate → WAV encode → backend
@@ -452,7 +539,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_state() {
-                    send_notification("whisrs", &format!("Skipped: recording was {label}"));
+                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
                 }
             }
             BatchOrigin::CommandMode => {
@@ -461,7 +548,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_error() {
-                    send_notification("whisrs", &format!("Command mode: recording was {label}"));
+                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
                 }
             }
             BatchOrigin::LlmCommand { name } => {
@@ -470,7 +557,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_state() {
-                    send_notification("whisrs", &format!("Skipped: recording was {label}"));
+                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
                 }
             }
         }
@@ -479,17 +566,9 @@ pub(crate) async fn transcribe_batch_audio(
 
     // Progress toast for the command flows — after the gate, so a silent
     // recording only surfaces the skip toast above.
-    match &opts.origin {
-        BatchOrigin::Dictation => {}
-        BatchOrigin::CommandMode => {
-            if context.notify_state() {
-                send_notification("whisrs", "Processing command...");
-            }
-        }
-        BatchOrigin::LlmCommand { name } => {
-            if context.notify_state() {
-                send_notification("whisrs", &format!("Processing '{name}'..."));
-            }
+    if let Some(msg) = opts.origin.processing_message() {
+        if context.notify_state() {
+            send_notification("whisrs", &msg);
         }
     }
 
@@ -548,21 +627,13 @@ pub(crate) async fn transcribe_batch_audio(
     // followed by silence) sometimes squeak through and trigger the model to
     // regurgitate the prompt. Drop those before they reach the keyboard (or,
     // for llm-commands, the LLM).
-    if opts.check_prompt_echo
-        && config
-            .prompt
-            .as_deref()
-            .is_some_and(|prompt| is_prompt_echo(&text, prompt))
-    {
+    if opts.should_drop_as_echo(config.prompt.as_deref(), &text) {
         warn!(
             "discarding likely prompt-echo response ({} chars) — see prompt_echo crate",
             text.len()
         );
         if context.notify_state() {
-            send_notification(
-                "whisrs",
-                "Skipped: response looked like a prompt echo (no speech detected)",
-            );
+            send_notification("whisrs", PROMPT_ECHO_SKIP_TOAST);
         }
         return Ok(String::new());
     }
@@ -585,18 +656,12 @@ pub(crate) async fn transcribe_batch_audio(
     };
 
     if text.is_empty() {
-        match &opts.origin {
-            BatchOrigin::Dictation => {
-                info!("transcription returned empty text — nothing to type");
-            }
-            BatchOrigin::CommandMode => {
+        match opts.origin.empty_result_message() {
+            // Dictation: nothing to toast, just log.
+            None => info!("transcription returned empty text — nothing to type"),
+            Some(msg) => {
                 if context.notify_error() {
-                    send_notification("whisrs", "Could not understand instruction — try again");
-                }
-            }
-            BatchOrigin::LlmCommand { .. } => {
-                if context.notify_error() {
-                    send_notification("whisrs", "Could not understand speech — try again");
+                    send_notification("whisrs", msg);
                 }
             }
         }
@@ -625,19 +690,8 @@ pub(crate) async fn process_recording_batch(
 
     info!("collected {} audio samples", samples.len());
 
-    let text = transcribe_batch_audio(
-        &samples,
-        context,
-        language,
-        &BatchOptions {
-            use_prompt: true,
-            save_recovery: true,
-            check_prompt_echo: true,
-            apply_filler: true,
-            origin: BatchOrigin::Dictation,
-        },
-    )
-    .await?;
+    let text =
+        transcribe_batch_audio(&samples, context, language, &BatchOptions::dictation()).await?;
 
     if text.is_empty() {
         // Gated, echo-dropped, or empty — the helper already said so.
@@ -999,5 +1053,182 @@ mod tests {
         let full_text = batcher.await.unwrap();
         assert_eq!(full_text, "");
         assert!(typed.lock().unwrap().is_empty());
+    }
+
+    // ── BatchOptions / BatchOrigin decision logic ───────────────────────
+
+    /// Pins the exact option set each production caller uses (dictation in
+    /// `process_recording_batch`, the two command flows in `command_mode.rs`).
+    /// A flipped flag here is a behavior change on a real path — in
+    /// particular, recovery-save and filler removal are dictation-only.
+    #[test]
+    fn batch_options_canonical_sets() {
+        let cases = [
+            (
+                "dictation",
+                BatchOptions::dictation(),
+                BatchOptions {
+                    use_prompt: true,
+                    save_recovery: true,
+                    check_prompt_echo: true,
+                    apply_filler: true,
+                    origin: BatchOrigin::Dictation,
+                },
+            ),
+            (
+                "command_mode",
+                BatchOptions::command_mode(),
+                BatchOptions {
+                    use_prompt: false,
+                    save_recovery: false,
+                    check_prompt_echo: false,
+                    apply_filler: false,
+                    origin: BatchOrigin::CommandMode,
+                },
+            ),
+            (
+                "llm_command",
+                BatchOptions::llm_command("proofread"),
+                BatchOptions {
+                    use_prompt: true,
+                    save_recovery: false,
+                    check_prompt_echo: true,
+                    apply_filler: false,
+                    origin: BatchOrigin::LlmCommand { name: "proofread" },
+                },
+            ),
+        ];
+        for (name, actual, expected) in cases {
+            assert_eq!(actual, expected, "option set for {name}");
+        }
+    }
+
+    /// Per-origin gate-skip toast wording: command mode announces itself,
+    /// dictation and llm-commands share the plain skip message.
+    #[test]
+    fn gate_skip_message_per_origin() {
+        let cases = [
+            (BatchOrigin::Dictation, "Skipped: recording was silent"),
+            (
+                BatchOrigin::CommandMode,
+                "Command mode: recording was silent",
+            ),
+            (
+                BatchOrigin::LlmCommand { name: "proofread" },
+                "Skipped: recording was silent",
+            ),
+        ];
+        for (origin, expected) in cases {
+            assert_eq!(origin.gate_skip_message("silent"), expected, "{origin:?}");
+        }
+    }
+
+    /// Progress toast after the gate: dictation stays quiet; the command
+    /// flows announce what they are doing, llm-commands by name.
+    #[test]
+    fn processing_message_per_origin() {
+        let cases = [
+            (BatchOrigin::Dictation, None),
+            (
+                BatchOrigin::CommandMode,
+                Some("Processing command...".to_string()),
+            ),
+            (
+                BatchOrigin::LlmCommand { name: "proofread" },
+                Some("Processing 'proofread'...".to_string()),
+            ),
+        ];
+        for (origin, expected) in cases {
+            assert_eq!(origin.processing_message(), expected, "{origin:?}");
+        }
+    }
+
+    /// Empty-transcript wording: dictation only logs; command mode blames the
+    /// instruction, llm-commands the speech.
+    #[test]
+    fn empty_result_message_per_origin() {
+        let cases = [
+            (BatchOrigin::Dictation, None),
+            (
+                BatchOrigin::CommandMode,
+                Some("Could not understand instruction — try again"),
+            ),
+            (
+                BatchOrigin::LlmCommand { name: "proofread" },
+                Some("Could not understand speech — try again"),
+            ),
+        ];
+        for (origin, expected) in cases {
+            assert_eq!(origin.empty_result_message(), expected, "{origin:?}");
+        }
+    }
+
+    /// The echo-skip toast wording is origin-independent — every batch path
+    /// sends the same message.
+    #[test]
+    fn prompt_echo_skip_toast_wording() {
+        assert_eq!(
+            PROMPT_ECHO_SKIP_TOAST,
+            "Skipped: response looked like a prompt echo (no speech detected)"
+        );
+    }
+
+    /// The prompt-echo guard fires only when the path enables the check AND a
+    /// prompt was actually sent — with no prompt there is nothing the model
+    /// could have echoed. In particular the llm-command path (whose
+    /// transcript is LLM input) checks, while command mode (which sends no
+    /// prompt) never does.
+    #[test]
+    fn prompt_echo_guard_conditions() {
+        let prompt = "Embedded Linux dictation about Hyprland and whisrs";
+        // Contained verbatim in the prompt → `is_prompt_echo` fires.
+        let echoed = "Embedded Linux dictation";
+        // Unrelated short utterance → never an echo.
+        let genuine = "hello world";
+
+        let cases = [
+            (
+                "dictation: echo with prompt drops",
+                BatchOptions::dictation(),
+                Some(prompt),
+                echoed,
+                true,
+            ),
+            (
+                "dictation: no prompt sent, nothing to echo",
+                BatchOptions::dictation(),
+                None,
+                echoed,
+                false,
+            ),
+            (
+                "dictation: genuine speech passes",
+                BatchOptions::dictation(),
+                Some(prompt),
+                genuine,
+                false,
+            ),
+            (
+                "llm_command: echo with prompt drops",
+                BatchOptions::llm_command("proofread"),
+                Some(prompt),
+                echoed,
+                true,
+            ),
+            (
+                "command_mode: check disabled, echo-shaped text passes",
+                BatchOptions::command_mode(),
+                Some(prompt),
+                echoed,
+                false,
+            ),
+        ];
+        for (name, opts, prompt, text, expect_drop) in cases {
+            assert_eq!(
+                opts.should_drop_as_echo(prompt, text),
+                expect_drop,
+                "{name}"
+            );
+        }
     }
 }
