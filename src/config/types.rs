@@ -757,6 +757,29 @@ impl Config {
                 });
             }
 
+            // The llm-command path always transcribes the recorded instruction
+            // with a single batch `transcribe()` call, even when the dictation
+            // backend streams: deepgram-streaming and both realtime backends
+            // push the whole WAV through their websocket in one shot. Not a
+            // failure — the transcript still comes back — but none of the
+            // streaming behavior the user configured applies. (local-whisper
+            // is excluded: its `transcribe()` is a real batch path.)
+            if matches!(
+                backend,
+                "deepgram-streaming" | "openai-realtime" | "openai-compatible-realtime"
+            ) {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "llm_commands run one-shot with backend = \"{backend}\": the \
+                         llm-command path pushes the whole recording through a single batch \
+                         transcription call, so the streaming behavior this backend is \
+                         configured for does not apply to these hotkeys. They still work — \
+                         the transcript just arrives in one round trip after recording \
+                         stops. Dictation (toggle) streams as configured."
+                    ),
+                });
+            }
+
             let mut seen_names = std::collections::HashSet::new();
             for entry in &self.llm_commands {
                 if entry.name.trim().is_empty() {
@@ -803,6 +826,73 @@ impl Config {
                         message: format!("llm_commands '{}' has an empty instruction", entry.name),
                     });
                 }
+            }
+        }
+
+        // Duplicate-binding detection across [hotkeys] and llm_commands. The
+        // listener dispatches every action whose binding matches, with no
+        // early exit, so a shared combo silently fires multiple commands and
+        // the loser's error is never seen. Compare parsed bindings (sorted
+        // modifier set + trigger key) rather than raw strings, so
+        // "shift+super+t" collides with "Super+Shift+T".
+        let mut binding_sources: Vec<(String, &str)> = Vec::new();
+        if let Some(hotkeys) = &self.hotkeys {
+            for (label, value) in [
+                ("[hotkeys] toggle", &hotkeys.toggle),
+                ("[hotkeys] cancel", &hotkeys.cancel),
+                ("[hotkeys] command", &hotkeys.command),
+                ("[hotkeys] speak", &hotkeys.speak),
+            ] {
+                if let Some(spec) = value {
+                    binding_sources.push((label.to_string(), spec.as_str()));
+                }
+            }
+        }
+        for entry in &self.llm_commands {
+            binding_sources.push((
+                format!("llm_commands '{}' hotkey", entry.name),
+                entry.hotkey.as_str(),
+            ));
+            if let Some(set_hotkey) = &entry.set_hotkey {
+                // A set_hotkey textually equal to its own hotkey already got
+                // the dedicated warning above; skip it here so the same
+                // mistake is not reported twice. A collision with any third
+                // binding is still reported through the hotkey itself.
+                if *set_hotkey != entry.hotkey {
+                    binding_sources.push((
+                        format!("llm_commands '{}' set_hotkey", entry.name),
+                        set_hotkey.as_str(),
+                    ));
+                }
+            }
+        }
+        let mut seen_bindings: std::collections::HashMap<(Vec<u16>, u16), (String, String)> =
+            std::collections::HashMap::new();
+        for (source, spec) in binding_sources {
+            // Unset or empty bindings never fire, so they must not collide
+            // with each other; empty llm_commands hotkeys warn above.
+            if spec.trim().is_empty() {
+                continue;
+            }
+            // Invalid specs warn above (llm_commands) or are rejected by the
+            // listener at startup; either way they never fire.
+            let Ok(parsed) = hotkey::parse_hotkey(spec) else {
+                continue;
+            };
+            let mut modifiers: Vec<u16> = parsed.modifiers.iter().map(|k| k.code()).collect();
+            modifiers.sort_unstable();
+            modifiers.dedup();
+            let canonical = (modifiers, parsed.trigger.code());
+            if let Some((first_source, first_spec)) = seen_bindings.get(&canonical) {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "duplicate hotkey binding: {first_source} ('{first_spec}') and \
+                         {source} ('{spec}') use the same combo — one press fires both \
+                         actions; rebind one of them"
+                    ),
+                });
+            } else {
+                seen_bindings.insert(canonical, (source, spec.to_string()));
             }
         }
 
@@ -1799,5 +1889,281 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|w| w.message.contains("set_hotkey equal to hotkey")));
+    }
+
+    /// Minimal valid config for the given backend, with every backend
+    /// section populated so validate()'s hard checks pass. Tests mutate the
+    /// fields they exercise.
+    fn validatable_config(backend: &str) -> Config {
+        Config {
+            general: GeneralConfig {
+                backend: backend.to_string(),
+                ..Default::default()
+            },
+            audio: Default::default(),
+            input: Default::default(),
+            deepgram: Some(DeepgramConfig {
+                api_key: "test-key".to_string(),
+                model: default_deepgram_model(),
+            }),
+            groq: Some(GroqConfig {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            }),
+            openai: Some(OpenAiConfig {
+                api_key: "test-key".to_string(),
+                model: default_openai_model(),
+            }),
+            local_whisper: None,
+            local_vosk: None,
+            local_parakeet: None,
+            asr_sidecar: None,
+            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
+                url: "ws://localhost:1234/realtime".to_string(),
+                model: "Whisper-Tiny".to_string(),
+                profile: "lemonade".to_string(),
+                turn_detection: "server-vad".to_string(),
+                api_key: None,
+            }),
+            llm: Some(llm::LlmConfig::default()),
+            hotkeys: None,
+            llm_commands: Vec::new(),
+            overlay: None,
+            tts: None,
+        }
+    }
+
+    fn llm_command(name: &str, hotkey: &str) -> llm::LlmCommandConfig {
+        llm::LlmCommandConfig {
+            name: name.to_string(),
+            hotkey: hotkey.to_string(),
+            set_hotkey: None,
+            instruction: "Translate to German.".to_string(),
+        }
+    }
+
+    #[test]
+    fn config_validate_warns_hotkey_collision_across_sections() {
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            toggle: Some("Super+Shift+T".to_string()),
+            cancel: None,
+            command: None,
+            speak: None,
+        });
+        config
+            .llm_commands
+            .push(llm_command("german", "Super+Shift+T"));
+
+        let warnings = config.validate().unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| w.message.contains("duplicate hotkey binding"))
+            .unwrap_or_else(|| {
+                panic!("hotkeys.toggle and llm_commands share a combo; expected a warning, got: {warnings:?}")
+            });
+        assert!(
+            warning.message.contains("[hotkeys] toggle"),
+            "the warning must name the [hotkeys] side: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("llm_commands 'german' hotkey"),
+            "the warning must name the llm_commands side: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn config_validate_warns_hotkey_collision_between_llm_commands_normalized() {
+        // Different spelling (case + modifier order) of the same combo must
+        // still collide: the listener matches parsed bindings, not strings.
+        let mut config = validatable_config("groq");
+        config
+            .llm_commands
+            .push(llm_command("german", "Super+Shift+T"));
+        config
+            .llm_commands
+            .push(llm_command("summarize", "shift+super+t"));
+
+        let warnings = config.validate().unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| w.message.contains("duplicate hotkey binding"))
+            .unwrap_or_else(|| {
+                panic!("both entries bind the same combo; expected a warning, got: {warnings:?}")
+            });
+        assert!(
+            warning.message.contains("llm_commands 'german' hotkey")
+                && warning.message.contains("llm_commands 'summarize' hotkey"),
+            "the warning must name both entries: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn config_validate_warns_duplicate_bindings_within_hotkeys_section() {
+        // "Meta" is an alias for "Super", so these are the same binding.
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            toggle: Some("Super+D".to_string()),
+            cancel: None,
+            command: None,
+            speak: Some("Meta+D".to_string()),
+        });
+
+        let warnings = config.validate().unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| w.message.contains("duplicate hotkey binding"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "toggle and speak bind the same combo; expected a warning, got: {warnings:?}"
+                )
+            });
+        assert!(
+            warning.message.contains("[hotkeys] toggle")
+                && warning.message.contains("[hotkeys] speak"),
+            "the warning must name both fields: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn config_validate_no_collision_warning_for_distinct_bindings() {
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            toggle: Some("Super+Shift+D".to_string()),
+            cancel: Some("Super+Shift+Escape".to_string()),
+            command: Some("Super+Shift+C".to_string()),
+            speak: Some("Super+Shift+R".to_string()),
+        });
+        config
+            .llm_commands
+            .push(llm_command("german", "Super+Shift+T"));
+        config
+            .llm_commands
+            .push(llm_command("summarize", "Super+Shift+S"));
+
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.message.contains("duplicate hotkey binding")),
+            "all bindings are distinct; no collision warning expected: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_no_collision_warning_for_entry_own_set_hotkey() {
+        let mut config = validatable_config("groq");
+        let mut entry = llm_command("german", "Super+Shift+U");
+        entry.set_hotkey = Some("Super+Shift+Alt+U".to_string());
+        config.llm_commands.push(entry);
+
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.message.contains("duplicate hotkey binding")),
+            "an entry's own distinct hotkey/set_hotkey pair is not a collision: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_set_hotkey_equal_to_hotkey_not_double_reported() {
+        // Textually equal set_hotkey already has a dedicated warning; the
+        // generic collision pass must not report the same mistake twice.
+        let mut config = validatable_config("groq");
+        let mut entry = llm_command("german", "Super+Shift+T");
+        entry.set_hotkey = Some("Super+Shift+T".to_string());
+        config.llm_commands.push(entry);
+
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.contains("set_hotkey equal to hotkey")),
+            "the dedicated warning must still fire: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.message.contains("duplicate hotkey binding")),
+            "the generic collision warning would be redundant here: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_empty_llm_command_hotkeys_do_not_collide() {
+        let mut config = validatable_config("groq");
+        config.llm_commands.push(llm_command("german", ""));
+        config.llm_commands.push(llm_command("summarize", ""));
+
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.message.contains("duplicate hotkey binding")),
+            "empty hotkeys never fire and must not collide with each other: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_warns_llm_commands_with_streaming_backend() {
+        for backend in [
+            "deepgram-streaming",
+            "openai-realtime",
+            "openai-compatible-realtime",
+        ] {
+            let mut config = validatable_config(backend);
+            config
+                .llm_commands
+                .push(llm_command("german", "Super+Shift+T"));
+
+            let warnings = config.validate().unwrap();
+            let warning = warnings
+                .iter()
+                .find(|w| w.message.contains("llm_commands run one-shot"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "backend {backend} streams but llm_commands transcribe in one batch \
+                         call; expected a warning, got: {warnings:?}"
+                    )
+                });
+            assert!(
+                warning
+                    .message
+                    .contains(&format!("backend = \"{backend}\"")),
+                "the warning must name the backend: {}",
+                warning.message
+            );
+            assert!(
+                warning.message.contains("still work"),
+                "the warning must say llm_commands degrade, not fail: {}",
+                warning.message
+            );
+        }
+    }
+
+    #[test]
+    fn config_validate_no_streaming_warning_for_batch_backend_llm_commands() {
+        // local-whisper is deliberately absent from the streaming list here
+        // (unlike the paste warning): its transcribe() is a real batch path.
+        for backend in ["groq", "local-whisper"] {
+            let mut config = validatable_config(backend);
+            config
+                .llm_commands
+                .push(llm_command("german", "Super+Shift+T"));
+
+            let warnings = config.validate().unwrap();
+            assert!(
+                warnings
+                    .iter()
+                    .all(|w| !w.message.contains("llm_commands run one-shot")),
+                "backend {backend} has a real batch path; no streaming warning expected: \
+                 {warnings:?}"
+            );
+        }
     }
 }
