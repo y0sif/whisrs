@@ -6,10 +6,11 @@
 //! and configuring keybindings.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, Password, Select};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 
 use crate::llm::LlmConfig;
 use crate::{
@@ -774,8 +775,22 @@ fn test_microphone() {
 }
 
 /// Write the config to `~/.config/whisrs/config.toml` with `chmod 0600`.
+///
+/// Format-preserving (issue #82): when a config file already exists on disk it
+/// is parsed with `toml_edit` and updated in place, so the user's comments,
+/// section order, and formatting of unchanged values all survive. The daemon
+/// calls this on every `set_hotkey` press, which must not shred a hand-tuned
+/// file. The write itself is atomic (0600 temp file in the same directory +
+/// rename), so a crash or full disk mid-write can never leave a truncated
+/// config and the API keys inside are never world-readable, even transiently.
 pub fn write_config(config: &Config) -> Result<PathBuf> {
     let config_path = crate::config_path();
+    write_config_to(config, &config_path)?;
+    Ok(config_path)
+}
+
+/// Implementation of [`write_config`] against an explicit path (testable).
+fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
     let config_dir = config_path
         .parent()
         .expect("config path should have a parent directory");
@@ -784,23 +799,271 @@ pub fn write_config(config: &Config) -> Result<PathBuf> {
     fs::create_dir_all(config_dir)
         .with_context(|| format!("failed to create config directory {}", config_dir.display()))?;
 
-    // Serialize config to TOML.
-    let toml_str = toml::to_string_pretty(config).context("failed to serialize config to TOML")?;
+    // Serialize the struct, then parse that back into a TOML document. This
+    // "fresh" document is the source of truth for *which* keys exist and what
+    // their values are; the on-disk document is the source of truth for
+    // comments, ordering, and formatting.
+    let fresh_str = toml::to_string_pretty(config).context("failed to serialize config to TOML")?;
+    let output = match fs::read_to_string(config_path) {
+        Ok(existing_str) => match existing_str.parse::<DocumentMut>() {
+            Ok(mut existing) => {
+                let fresh: DocumentMut = fresh_str
+                    .parse()
+                    .context("failed to reparse serialized config")?;
+                merge_table(existing.as_table_mut(), fresh.as_table());
+                existing.to_string()
+            }
+            Err(e) => {
+                // Unparseable on-disk file: there is no layout to preserve, so
+                // fall back to regenerating it from the struct (pre-#82
+                // behavior). The broken file is the only copy of the user's
+                // hand-edits, so save it as a private backup first (it may
+                // hold API keys, hence 0600) and refuse to proceed if that
+                // backup cannot be written.
+                let file_name = config_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("config.toml");
+                let backup_path = config_path.with_file_name(format!("{file_name}.bak"));
+                write_private_file(&backup_path, &existing_str).with_context(|| {
+                    format!(
+                        "existing config {} is not valid TOML ({e}), and backing it up to {} \
+                         failed; refusing to overwrite the only copy",
+                        config_path.display(),
+                        backup_path.display()
+                    )
+                })?;
+                // `tracing` alone is invisible in the CLI flows (`whisrs
+                // setup` / `whisrs config` install no subscriber that prints
+                // warnings), so tell the user on stderr as well.
+                tracing::warn!(
+                    "existing config at {} is not valid TOML ({e}); rewriting it from scratch \
+                     (backup saved to {})",
+                    config_path.display(),
+                    backup_path.display()
+                );
+                eprintln!(
+                    "warning: existing config at {} is not valid TOML ({e}); rewriting it from \
+                     scratch (backup saved to {})",
+                    config_path.display(),
+                    backup_path.display()
+                );
+                fresh_str
+            }
+        },
+        // First-time setup: nothing on disk yet, plain serialization is fine.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fresh_str,
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("failed to read existing config {}", config_path.display())
+            });
+        }
+    };
 
-    // Write the file.
-    fs::write(&config_path, &toml_str)
-        .with_context(|| format!("failed to write config to {}", config_path.display()))?;
+    atomic_write(config_path, &output)
+        .with_context(|| format!("failed to write config to {}", config_path.display()))
+}
 
-    // Set permissions to 0600 (owner read/write only) since it may contain API keys.
+/// Sync `existing` (the user's on-disk TOML, decor intact) to hold exactly the
+/// keys and values of `fresh` (the reserialized struct). Matching keys keep
+/// their comments and formatting, recursing into sub-tables; keys missing from
+/// `fresh` are removed; new keys are appended.
+fn merge_table(existing: &mut Table, fresh: &Table) {
+    // Drop keys the struct no longer carries. This intentionally also drops
+    // keys `Config` never knew about (it has no catch-all field), matching the
+    // previous full-rewrite behavior: the file always mirrors the struct.
+    let stale: Vec<String> = existing
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .filter(|key| !fresh.contains_key(key))
+        .collect();
+    for key in stale {
+        existing.remove(&key);
+    }
+
+    for (key, fresh_item) in fresh.iter() {
+        match existing.get_mut(key) {
+            Some(existing_item) => merge_item(existing_item, fresh_item),
+            None => {
+                // A header-less parent (e.g. `[overlay.colors]` without an
+                // explicit `[overlay]`) must gain its header once it holds a
+                // plain value.
+                if fresh_item.is_value() && existing.is_implicit() {
+                    existing.set_implicit(false);
+                }
+                existing.insert(key, fresh_item.clone());
+            }
+        }
+    }
+}
+
+/// Merge one item of a table, dispatching on its structure.
+fn merge_item(existing: &mut Item, fresh: &Item) {
+    match (existing, fresh) {
+        (Item::Table(existing), Item::Table(fresh)) => merge_table(existing, fresh),
+        (Item::ArrayOfTables(existing), Item::ArrayOfTables(fresh)) => {
+            merge_array_of_tables(existing, fresh)
+        }
+        // The user wrote a section as an inline table (`colors = { ... }`);
+        // the serializer always produces a header table. Keep their spelling.
+        (Item::Value(Value::InlineTable(existing)), Item::Table(fresh)) if is_flat(fresh) => {
+            merge_inline_table(existing, fresh)
+        }
+        (Item::Value(existing), Item::Value(fresh)) => merge_value(existing, fresh),
+        // Structural change (e.g. `llm_commands = []` becoming a populated
+        // `[[llm_commands]]` array, or vice versa): take the fresh item as-is.
+        (existing, fresh) => *existing = fresh.clone(),
+    }
+}
+
+/// Replace a scalar/array value only when it actually changed, carrying the
+/// old decor (surrounding whitespace + trailing inline comment) over to the
+/// new value. Untouched values keep their exact user spelling (quoting style,
+/// number format, array layout).
+fn merge_value(existing: &mut Value, fresh: &Value) {
+    if values_equal(existing, fresh) {
+        return;
+    }
+    let decor = existing.decor().clone();
+    let mut new_value = fresh.clone();
+    *new_value.decor_mut() = decor;
+    *existing = new_value;
+}
+
+/// Structural equality of two TOML values, ignoring formatting/decor.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(a), Value::String(b)) => a.value() == b.value(),
+        (Value::Integer(a), Value::Integer(b)) => a.value() == b.value(),
+        (Value::Float(a), Value::Float(b)) => a.value() == b.value(),
+        (Value::Boolean(a), Value::Boolean(b)) => a.value() == b.value(),
+        (Value::Datetime(a), Value::Datetime(b)) => a.value() == b.value(),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        (Value::InlineTable(a), Value::InlineTable(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, av)| b.get(key).is_some_and(|bv| values_equal(av, bv)))
+        }
+        _ => false,
+    }
+}
+
+/// Sync an array-of-tables (e.g. `[[llm_commands]]`). Fresh entries are
+/// matched to their on-disk counterpart by `name` first (so deleting or
+/// reordering entries keeps each survivor's comments), falling back to
+/// position for tables without a usable `name`. Fresh entries with no match
+/// are appended; on-disk entries with no match are dropped.
+fn merge_array_of_tables(existing: &mut ArrayOfTables, fresh: &ArrayOfTables) {
+    let mut consumed = vec![false; existing.len()];
+    let mut merged: Vec<Table> = Vec::with_capacity(fresh.len());
+
+    for (fresh_idx, fresh_table) in fresh.iter().enumerate() {
+        let by_name = entry_name(fresh_table).and_then(|name| {
+            (0..existing.len()).find(|&i| {
+                !consumed[i] && existing.get(i).is_some_and(|t| entry_name(t) == Some(name))
+            })
+        });
+        let matched = by_name
+            .or_else(|| (fresh_idx < existing.len() && !consumed[fresh_idx]).then_some(fresh_idx));
+        match matched.and_then(|i| existing.get(i).cloned().map(|t| (i, t))) {
+            Some((i, mut table)) => {
+                consumed[i] = true;
+                merge_table(&mut table, fresh_table);
+                merged.push(table);
+            }
+            None => merged.push(fresh_table.clone()),
+        }
+    }
+
+    existing.clear();
+    for table in merged {
+        existing.push(table);
+    }
+}
+
+/// The `name` key of an array-of-tables entry, if it is a string.
+fn entry_name(table: &Table) -> Option<&str> {
+    table.get("name").and_then(Item::as_str)
+}
+
+/// True when every entry of `table` is a plain value (no sub-tables).
+fn is_flat(table: &Table) -> bool {
+    table.iter().all(|(_, item)| item.is_value())
+}
+
+/// Sync a user-written inline table against the flat header table the
+/// serializer produced for the same section.
+fn merge_inline_table(existing: &mut toml_edit::InlineTable, fresh: &Table) {
+    let stale: Vec<String> = existing
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .filter(|key| !fresh.contains_key(key))
+        .collect();
+    for key in stale {
+        existing.remove(&key);
+    }
+    for (key, fresh_item) in fresh.iter() {
+        // `is_flat` guarantees every fresh item is a value.
+        let Some(fresh_value) = fresh_item.as_value() else {
+            continue;
+        };
+        match existing.get_mut(key) {
+            Some(existing_value) => merge_value(existing_value, fresh_value),
+            None => {
+                existing.insert(key, fresh_value.clone());
+            }
+        }
+    }
+}
+
+/// Write `contents` to `path` atomically: create a 0600 temp file in the same
+/// directory, fsync it, then rename it over `path`. Interrupted writes can
+/// only ever leave the temp file behind, never a truncated config, and the
+/// mode is set at creation so the file is private for its entire lifetime.
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .expect("config path should have a parent directory");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    // Per-process temp name so a concurrent `whisrs config` save and a daemon
+    // persist do not scribble on the same temp file.
+    let tmp_path = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+
+    let result = write_private_file(&tmp_path, contents).and_then(|()| fs::rename(&tmp_path, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+/// Create (or truncate) `path` with mode 0600 and write `contents`, fsyncing
+/// before returning.
+fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    // `mode(0o600)` only applies at creation; enforce it again in case a
+    // stale temp file from an interrupted run survived with laxer permissions.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&config_path, perms)
-            .with_context(|| format!("failed to set permissions on {}", config_path.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-
-    Ok(config_path)
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Check if /dev/uinput is accessible. If not, offer to fix it automatically.
@@ -1622,4 +1885,225 @@ fn print_done() {
         "  timeout, etc.) by editing the config file or re-running {BOLD}whisrs setup{RESET}."
     );
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config the way a user actually writes it: header comments, inline
+    /// comments, custom section order ([audio] before [general]), and
+    /// commented [[llm_commands]] entries pasted from the docs.
+    const COMMENTED_CONFIG: &str = r#"# whisrs config - hand-tuned, do not regenerate
+# see docs/configuration.md before touching anything below
+
+[audio]
+device = "default" # usb mic drops out, stick to default
+
+[general]
+backend = "groq" # fastest cloud option
+language = "en"
+
+[hotkeys]
+toggle = "Super+D"
+
+# translate the selection into german
+[[llm_commands]]
+name = "german"
+hotkey = "Super+Shift+G"
+set_hotkey = "Super+Shift+S"
+instruction = "Translate to German."
+
+# tidy up prose without changing meaning
+[[llm_commands]]
+name = "polish"
+hotkey = "Super+Shift+P"
+instruction = "Polish the text."
+"#;
+
+    fn parse_config(toml_str: &str) -> Config {
+        toml::from_str(toml_str).expect("fixture should deserialize")
+    }
+
+    fn write_fixture(dir: &tempfile::TempDir) -> PathBuf {
+        let path = dir.path().join("config.toml");
+        fs::write(&path, COMMENTED_CONFIG).expect("write fixture");
+        path
+    }
+
+    #[test]
+    fn value_change_keeps_comments_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(&dir);
+
+        // The #82 scenario: a set_hotkey press persists a new instruction.
+        let mut config = parse_config(COMMENTED_CONFIG);
+        config.llm_commands[0].instruction = "Translate to French.".to_string();
+        // Plus a changed scalar that carries an inline comment.
+        config.general.backend = "openai".to_string();
+        write_config_to(&config, &path).unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(out.contains("# whisrs config - hand-tuned, do not regenerate"));
+        assert!(out.contains("# see docs/configuration.md before touching anything below"));
+        assert!(out.contains("# usb mic drops out, stick to default"));
+        assert!(out.contains("# translate the selection into german"));
+        assert!(out.contains("# tidy up prose without changing meaning"));
+        // The changed value keeps its trailing comment.
+        assert!(out.contains(r#"backend = "openai" # fastest cloud option"#));
+        assert!(out.contains("Translate to French."));
+        assert!(!out.contains("Translate to German."));
+        // The user's section order survives ([audio] written above [general]).
+        assert!(out.find("[audio]").unwrap() < out.find("[general]").unwrap());
+        // And the result still round-trips into the struct.
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(reparsed.general.backend, "openai");
+        assert_eq!(reparsed.llm_commands[0].instruction, "Translate to French.");
+    }
+
+    #[test]
+    fn added_keys_appear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(&dir);
+
+        let mut config = parse_config(COMMENTED_CONFIG);
+        config.general.prompt = Some("Vocabulary: whisrs, Hyprland".to_string());
+        config.hotkeys.as_mut().unwrap().speak = Some("Super+R".to_string());
+        write_config_to(&config, &path).unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        // New key in an existing section.
+        assert!(out.contains(r#"prompt = "Vocabulary: whisrs, Hyprland""#));
+        assert!(out.contains(r#"speak = "Super+R""#));
+        // A whole section the file never had (serialized from defaults).
+        assert!(out.contains("[input]"));
+        // Comments still intact.
+        assert!(out.contains("# whisrs config - hand-tuned, do not regenerate"));
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            reparsed.general.prompt.as_deref(),
+            Some("Vocabulary: whisrs, Hyprland")
+        );
+        assert_eq!(reparsed.hotkeys.unwrap().speak.as_deref(), Some("Super+R"));
+    }
+
+    #[test]
+    fn removed_llm_command_disappears_and_survivor_keeps_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(&dir);
+
+        // Remove the *first* entry, so the survivor only keeps its comment if
+        // entries are matched by name rather than by position.
+        let mut config = parse_config(COMMENTED_CONFIG);
+        config.llm_commands.retain(|c| c.name != "german");
+        write_config_to(&config, &path).unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("Translate to German."));
+        assert!(!out.contains(r#"name = "german""#));
+        // The removed entry's comment goes with it.
+        assert!(!out.contains("# translate the selection into german"));
+        // The survivor keeps its own comment and content.
+        assert!(out.contains("# tidy up prose without changing meaning"));
+        assert!(out.contains(r#"name = "polish""#));
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(reparsed.llm_commands.len(), 1);
+        assert_eq!(reparsed.llm_commands[0].name, "polish");
+    }
+
+    #[test]
+    fn clearing_llm_commands_removes_all_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(&dir);
+
+        let mut config = parse_config(COMMENTED_CONFIG);
+        config.llm_commands.clear();
+        write_config_to(&config, &path).unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("[[llm_commands]]"));
+        // Comments elsewhere survive the structural change.
+        assert!(out.contains("# whisrs config - hand-tuned, do not regenerate"));
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert!(reparsed.llm_commands.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_mode_is_0600_on_create_and_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = parse_config(COMMENTED_CONFIG);
+
+        // Fresh create (no file on disk yet).
+        write_config_to(&config, &path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // Rewrite over a file that drifted to laxer permissions.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_config_to(&config, &path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn first_time_write_creates_parseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parent directory does not exist yet: exercised create_dir_all.
+        let path = dir.path().join("whisrs").join("config.toml");
+
+        let config = parse_config(COMMENTED_CONFIG);
+        write_config_to(&config, &path).unwrap();
+
+        let reparsed: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reparsed.general.backend, "groq");
+        assert_eq!(reparsed.llm_commands.len(), 2);
+    }
+
+    #[test]
+    fn unparseable_existing_file_is_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "this is [ not toml").unwrap();
+
+        let config = parse_config(COMMENTED_CONFIG);
+        write_config_to(&config, &path).unwrap();
+
+        let reparsed: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reparsed.general.backend, "groq");
+
+        // The broken file was the only copy of the user's hand-edits: it must
+        // survive, byte for byte, as a private backup next to the config.
+        let backup = dir.path().join("config.toml.bak");
+        assert_eq!(fs::read(&backup).unwrap(), b"this is [ not toml");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "backup may hold API keys, must be 0600");
+        }
+    }
+
+    #[test]
+    fn rewriting_identical_config_is_byte_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(&dir);
+
+        // First write merges the struct into the commented fixture.
+        let config = parse_config(COMMENTED_CONFIG);
+        write_config_to(&config, &path).unwrap();
+        let first = fs::read(&path).unwrap();
+
+        // Writing the identical Config again (e.g. a set_hotkey press that
+        // changes nothing) must not perturb a single byte.
+        write_config_to(&config, &path).unwrap();
+        let second = fs::read(&path).unwrap();
+        assert_eq!(
+            first, second,
+            "second write of an identical Config must be byte-identical"
+        );
+    }
 }

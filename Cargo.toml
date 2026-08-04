@@ -71,6 +71,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
+# Format-preserving config rewrites (issue #82). Kept on 0.22 so it shares the
+# exact toml_edit build that `toml 0.8` already pulls in — no new dependency tree.
+toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x11rb = { version = "0.13", features = ["randr", "shape"] }
