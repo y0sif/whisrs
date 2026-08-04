@@ -203,6 +203,8 @@ whisrs cancel    # Cancel recording, discard audio
 whisrs status    # Query daemon state
 whisrs restart   # Restart the daemon (uses the systemd user service when present)
 whisrs command   # Command mode: select text + speak instruction → LLM rewrite
+whisrs llm-command <name>      # Toggle a named [[llm_commands]] entry (see config.toml)
+whisrs llm-command-set <name>  # Reprogram a named LLM command from the current selection
 whisrs speak     # Read the selected text aloud (alias: whisrs read; press again to stop)
 whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries

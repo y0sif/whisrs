@@ -326,3 +326,93 @@ fn print_history(entries: &[HistoryEntry], use_color: bool) {
         println!();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    /// Issue #84: `llm-command` and `llm-command-set` existed in the clap CLI
+    /// (`SubCmd` above) but were never added to the man page's SUBCOMMANDS
+    /// section, and nothing caught it. Rather than hand-maintain a mirror
+    /// list of subcommand names (which is exactly what went stale), this
+    /// walks the real `Cli` derive so a future subcommand that isn't
+    /// documented fails automatically.
+    #[test]
+    fn man_page_documents_all_cli_subcommands() {
+        let page_path = format!("{}/contrib/whisrs.1", env!("CARGO_MANIFEST_DIR"));
+        let page = std::fs::read_to_string(&page_path)
+            .unwrap_or_else(|e| panic!("failed to read {page_path}: {e}"));
+
+        let section = subcommands_section(&page);
+        let headers = entry_headers(section);
+
+        let cli = Cli::command();
+        for sub in cli.get_subcommands() {
+            let name = sub.get_name();
+            assert!(
+                headers.iter().any(|h| h == name),
+                "contrib/whisrs.1: SUBCOMMANDS section is missing an entry header for \
+                 `{name}` (expected a `.TP` block headed by `.B {name}` or `\\fB{name}\\fR`); \
+                 found headers: {headers:?}"
+            );
+        }
+    }
+
+    /// Slice out the `.SH SUBCOMMANDS` section body, up to (but not
+    /// including) the next `.SH `. Man pages repeat subcommand names as
+    /// prose elsewhere (DESCRIPTION references `.B setup`, the `speak` entry
+    /// mentions `.B cancel`, EXAMPLES shows `whisrs setup`, ...), so a
+    /// whole-page search can't tell a real entry from a passing mention.
+    /// Scoping to this section is necessary but not sufficient on its own —
+    /// see `entry_headers` for the rest.
+    fn subcommands_section(page: &str) -> &str {
+        const HEADER: &str = ".SH SUBCOMMANDS";
+        let start = page
+            .find(HEADER)
+            .expect("contrib/whisrs.1: missing .SH SUBCOMMANDS section");
+        let rest = &page[start + HEADER.len()..];
+        let end = rest.find("\n.SH ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Collect the subcommand names introduced by real `.TP` entry headers
+    /// in `section` — i.e. the line immediately following a `.TP` macro,
+    /// when that line is itself a `.B`/`.BR` macro or an inline `\fB...\fR`
+    /// bold run. This deliberately ignores `.B name` / `\fBname\fR` used in
+    /// body text (not directly under `.TP`), which is what let `.B setup`
+    /// (referenced from the `config` entry) and `.B cancel` (referenced from
+    /// the `speak` entry) mask a deleted header in a plain substring search.
+    ///
+    /// Escaped groff hyphens (`\-`) are normalized to plain `-` first so
+    /// hyphenated subcommand names (`llm-command`, `llm-command-set`) match
+    /// regardless of whether the man page escapes them.
+    fn entry_headers(section: &str) -> Vec<String> {
+        let normalized = section.replace("\\-", "-");
+        let lines: Vec<&str> = normalized.lines().collect();
+
+        let mut headers = Vec::new();
+        for i in 0..lines.len() {
+            if lines[i].trim() != ".TP" {
+                continue;
+            }
+            let Some(header) = lines.get(i + 1).map(|l| l.trim()) else {
+                continue;
+            };
+
+            if let Some(rest) = header.strip_prefix(".BR ") {
+                if let Some(name) = rest.split_whitespace().next() {
+                    headers.push(name.to_string());
+                }
+            } else if let Some(rest) = header.strip_prefix(".B ") {
+                headers.push(rest.trim().to_string());
+            } else if let Some(rest) = header.strip_prefix("\\fB") {
+                if let Some(end) = rest.find("\\fR") {
+                    headers.push(rest[..end].to_string());
+                }
+            }
+        }
+        headers
+    }
+}

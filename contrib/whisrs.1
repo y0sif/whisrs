@@ -61,6 +61,38 @@ dictate in each without switching settings.
 Cancel the current recording and discard captured audio. Returns the
 daemon to the idle state. Has no effect if the daemon is not recording.
 .TP
+.B log
+Show recent transcription history.
+.RS
+.TP
+\fB\-n\fR, \fB\-\-limit\fR \fIN\fR
+Number of entries to show. Defaults to
+.BR 20 .
+.TP
+\fB\-\-clear\fR
+Clear all history instead of showing it.
+.RE
+.TP
+.B command
+Command mode: select text, speak an instruction, and the LLM rewrites it
+in place.
+.TP
+\fBllm\-command\fR \fINAME\fR
+Toggle a named custom LLM command (see
+.B [[llm_commands]]
+in
+.IR config.toml ):
+dictate, the LLM applies the configured instruction, and the result is
+typed at the cursor. Press again to stop recording, same as
+.BR toggle .
+.TP
+\fBllm\-command\-set\fR \fINAME\fR
+Reprogram a named LLM command from the current selection: highlight the
+new instruction text, then run this \(em it is saved to
+.I config.toml
+and applied live. Pairs with an entry's
+.BR set_hotkey .
+.TP
 .B speak
 Read the current text selection aloud via text-to-speech. A second
 .B speak
