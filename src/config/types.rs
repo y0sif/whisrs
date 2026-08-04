@@ -518,6 +518,99 @@ impl std::fmt::Display for ConfigWarning {
     }
 }
 
+/// Keys in a parsed `config.toml` document that the configuration schema
+/// does not know.
+///
+/// The known set is derived from serde itself: the parsed [`Config`] is
+/// serialized back into a `toml::Table`, and the two tables are diffed
+/// recursively. A key present in the document but absent from the
+/// reserialization is a key the running binary silently dropped. This avoids
+/// a hand-maintained field-name list, which would go stale, and avoids a new
+/// dependency.
+///
+/// Returns `[]` when the document is not valid TOML or does not deserialize,
+/// because those cases already produce their own error in [`crate::daemon::startup::load_config`].
+pub fn unknown_config_keys(contents: &str) -> Vec<String> {
+    let Ok(document) = contents.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Ok(config) = toml::from_str::<Config>(contents) else {
+        return Vec::new();
+    };
+    let Ok(known) = toml::Value::try_from(&config) else {
+        return Vec::new();
+    };
+    let mut unknown = Vec::new();
+    diff_config_tables(
+        &document,
+        known.as_table().expect("Config serializes to a table"),
+        "",
+        &mut unknown,
+    );
+    unknown.sort();
+    unknown.dedup();
+    unknown
+}
+
+/// Collect every leaf key of `table` (with `prefix`) into `out`.
+fn collect_unknown_leaves(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
+    for (key, value) in table {
+        let path = format!("{prefix}{key}");
+        match value {
+            toml::Value::Table(inner) => collect_unknown_leaves(inner, &format!("{path}."), out),
+            _ => out.push(path),
+        }
+    }
+}
+
+/// Recursively compare a parsed document table against the reserialized
+/// (schema-known) table, appending dotted paths of unknown keys to `out`.
+fn diff_config_tables(
+    document: &toml::Table,
+    known: &toml::Table,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    for (key, value) in document {
+        let path = format!("{prefix}{key}");
+        match known.get(key) {
+            None => match value {
+                // A whole section the schema dropped (e.g. an Option section
+                // whose only keys are unknown): report each leaf, so the user
+                // learns which key inside it is the typo.
+                toml::Value::Table(inner) => {
+                    collect_unknown_leaves(inner, &format!("{path}."), out)
+                }
+                _ => out.push(path),
+            },
+            Some(toml::Value::Table(known_table)) => {
+                if let toml::Value::Table(document_table) = value {
+                    diff_config_tables(document_table, known_table, &format!("{path}."), out);
+                }
+            }
+            Some(toml::Value::Array(known_array)) => {
+                if let toml::Value::Array(document_array) = value {
+                    for (index, item) in document_array.iter().enumerate() {
+                        if let (
+                            toml::Value::Table(document_table),
+                            Some(toml::Value::Table(known_table)),
+                        ) = (item, known_array.get(index))
+                        {
+                            diff_config_tables(
+                                document_table,
+                                known_table,
+                                &format!("{path}[{index}]."),
+                                out,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Config {
     /// Validate the configuration and return a list of warnings.
     ///
@@ -956,6 +1049,51 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_top_level_key_is_reported() {
+        let unknown = unknown_config_keys("bogus = 1\n[general]\nbackend = \"groq\"\n");
+        assert_eq!(unknown, vec!["bogus"]);
+    }
+
+    #[test]
+    fn unknown_nested_key_reports_full_path() {
+        // The live case from #99: `past` is a typo for `paste`.
+        let unknown = unknown_config_keys("[input]\npast = true\n");
+        assert_eq!(unknown, vec!["input.past"]);
+    }
+
+    #[test]
+    fn unknown_key_in_option_section_is_reported() {
+        let unknown = unknown_config_keys("[deepgram]\napi_key = \"k\"\nbogus = 2\n");
+        assert_eq!(unknown, vec!["deepgram.bogus"]);
+    }
+
+    #[test]
+    fn section_with_only_unknown_keys_reports_leaves() {
+        let unknown = unknown_config_keys("[deepgram]\nbogus = 1\n");
+        assert_eq!(unknown, vec!["deepgram.bogus"]);
+    }
+
+    #[test]
+    fn unknown_key_in_llm_command_array_element_is_reported() {
+        let unknown = unknown_config_keys(
+            "[[llm_commands]]\nname = \"x\"\nhotkey = \"Super+T\"\ninstruction = \"y\"\nbogus = 1\n",
+        );
+        assert_eq!(unknown, vec!["llm_commands[0].bogus"]);
+    }
+
+    #[test]
+    fn valid_config_reports_nothing() {
+        let unknown = unknown_config_keys("[general]\nbackend = \"groq\"\n[input]\npaste = true\n");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn invalid_toml_reports_nothing() {
+        let unknown = unknown_config_keys("not [valid toml");
+        assert!(unknown.is_empty());
+    }
 
     #[test]
     fn config_tts_section_roundtrip() {

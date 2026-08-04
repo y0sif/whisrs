@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
+use whisrs::config::types::unknown_config_keys;
 use whisrs::Config;
 
 /// Try to connect to an existing socket.
@@ -32,7 +33,17 @@ pub(crate) fn load_config() -> (Config, Option<String>) {
             Ok(contents) => match toml::from_str::<Config>(&contents) {
                 Ok(config) => {
                     info!("loaded config from {}", config_path.display());
-                    return (config, None);
+                    let unknown = unknown_config_keys(&contents);
+                    if unknown.is_empty() {
+                        return (config, None);
+                    }
+                    let msg = format!(
+                        "Unknown keys in config at {} ignored: {}",
+                        config_path.display(),
+                        unknown.join(", ")
+                    );
+                    warn!("{msg}");
+                    return (config, Some(msg));
                 }
                 Err(e) => {
                     let msg = format!(
