@@ -182,6 +182,18 @@ pub(crate) async fn handle_toggle(
                     // pipeline drains and types the remaining text.
                     ds.streaming_cancel = None;
                     let recording_started_at = ds.recording_started_at.take();
+                    // A plain toggle-stop on a command-mode / llm-command
+                    // recording takes the session over as plain dictation: the
+                    // audio is transcribed below, and the command context is
+                    // discarded here, under the lock this arm already holds.
+                    // The clear must happen on this press — the command
+                    // background task's claim bails on state != Recording
+                    // WITHOUT consuming its slot (`claim_session`'s bail is
+                    // deliberately mutation-free), so a slot left `Some` here
+                    // would satisfy the second-press command gates in
+                    // command_mode.rs during a later unrelated dictation and
+                    // silently steal its capture.
+                    discard_command_sessions(&mut ds, "toggle-stop");
                     // The language this session was started with. Consuming it
                     // here ends the language session.
                     let session_language =
@@ -339,23 +351,7 @@ pub(crate) async fn handle_cancel(
 
     match ds.state_machine.transition(Action::Cancel) {
         Ok(new_state) => {
-            if let Some(mut capture) = ds.audio_capture.take() {
-                capture.stop();
-                tokio::task::spawn_blocking(move || drop(capture));
-            }
-            // Stop the typing loop BEFORE aborting the pipeline. Aborting
-            // only drops the outer pipeline future; the detached backend and
-            // typing tasks keep running, the backend treats the dropped audio
-            // channel as a normal end-of-stream and flushes the trailing
-            // phrase — without this flag the typing task would type it.
-            if let Some(cancel) = ds.streaming_cancel.take() {
-                cancel.store(true, Ordering::SeqCst);
-            }
-            if let Some(task) = ds.streaming_task.take() {
-                task.abort();
-            }
-            ds.recording_window_id = None;
-            ds.session_language = None;
+            discard_recording_session(&mut ds);
             if let Some(level_tx) = &context.overlay_level_tx {
                 let _ = level_tx.send(0.0);
             }
@@ -374,6 +370,60 @@ pub(crate) async fn handle_cancel(
         Err(e) => Response::Error {
             message: e.to_string(),
         },
+    }
+}
+
+/// Tear down every per-session resource a cancelled recording leaves behind.
+/// Called by `handle_cancel` under the daemon-state lock, after the
+/// Recording→Idle transition succeeded.
+///
+/// Streaming: stop the typing loop BEFORE aborting the pipeline. Aborting
+/// only drops the outer pipeline future; the detached backend and typing
+/// tasks keep running, the backend treats the dropped audio channel as a
+/// normal end-of-stream and flushes the trailing phrase — without the flag
+/// the typing task would type it.
+///
+/// Command mode / llm-command: taking the session context is what cancels
+/// the background task. It wakes on the closed audio channel and re-checks
+/// under this same lock (`claim_session` in command_mode.rs) — context gone
+/// means cancelled, so it discards the recording instead of transcribing,
+/// calling the LLM, and injecting text the user threw away (issues #81/#90).
+/// No other cleanup is owed for command mode: `capture_selection` restores
+/// the clipboard before recording ever starts, so the context holds only
+/// owned strings.
+fn discard_recording_session(ds: &mut DaemonState) {
+    if let Some(mut capture) = ds.audio_capture.take() {
+        capture.stop();
+        tokio::task::spawn_blocking(move || drop(capture));
+    }
+    if let Some(cancel) = ds.streaming_cancel.take() {
+        cancel.store(true, Ordering::SeqCst);
+    }
+    if let Some(task) = ds.streaming_task.take() {
+        task.abort();
+    }
+    discard_command_sessions(ds, "cancel");
+    ds.recording_window_id = None;
+    ds.recording_started_at = None;
+    ds.session_language = None;
+}
+
+/// Take both command-session context slots (command mode and llm-command),
+/// logging any session actually discarded. `reason` names the trigger in the
+/// log line ("cancel", "toggle-stop").
+///
+/// Shared by `discard_recording_session` and `handle_toggle`'s stop arm:
+/// both are exits from `Recording` after which the command background task's
+/// claim bails without consuming its slot (`claim_session`'s bail is
+/// mutation-free by design), so the exit itself must clear the slots — a
+/// stale `Some` would satisfy the second-press command gates in
+/// command_mode.rs during a later unrelated dictation and steal its capture.
+pub(crate) fn discard_command_sessions(ds: &mut DaemonState, reason: &str) {
+    if ds.command_mode.take().is_some() {
+        info!("{reason}: discarded command mode session");
+    }
+    if let Some(cmd) = ds.llm_command.take() {
+        info!("{reason}: discarded llm-command '{}' session", cmd.name);
     }
 }
 
@@ -510,5 +560,53 @@ mod tests {
         let session_language = ds.take_session_language(&config.general.language);
         let tc = build_transcription_config(&config, &session_language);
         assert_eq!(tc.language, "en");
+    }
+
+    /// Mirrors `handle_cancel` on an active command-mode / llm-command
+    /// recording: after Cancel the session teardown must take BOTH command
+    /// contexts (that is the signal the background tasks bail on — issues
+    /// #81/#90), flip the streaming cancel flag, and clear every per-session
+    /// field, leaving the machine in Idle.
+    #[test]
+    fn cancel_discards_command_and_llm_command_sessions() {
+        use crate::context::{CommandModeContext, LlmCommandContext};
+
+        let mut ds = DaemonState::new();
+        ds.state_machine.transition(Action::Toggle).unwrap(); // → Recording
+        ds.command_mode = Some(CommandModeContext {
+            selected_text: "selected".to_string(),
+            llm_config: Default::default(),
+        });
+        ds.llm_command = Some(LlmCommandContext {
+            name: "german".to_string(),
+            instruction: "translate to German".to_string(),
+            llm_config: Default::default(),
+        });
+        ds.recording_window_id = Some("0xdead".to_string());
+        ds.recording_started_at = Some(std::time::Instant::now());
+        ds.session_language = Some("pl".to_string());
+        let streaming_flag = Arc::new(AtomicBool::new(false));
+        ds.streaming_cancel = Some(Arc::clone(&streaming_flag));
+
+        ds.state_machine.transition(Action::Cancel).unwrap(); // → Idle
+        discard_recording_session(&mut ds);
+
+        assert!(
+            ds.command_mode.is_none(),
+            "command_mode context must be taken"
+        );
+        assert!(
+            ds.llm_command.is_none(),
+            "llm_command context must be taken"
+        );
+        assert!(ds.recording_window_id.is_none());
+        assert!(ds.recording_started_at.is_none());
+        assert!(ds.session_language.is_none());
+        assert!(ds.streaming_cancel.is_none());
+        assert!(
+            streaming_flag.load(Ordering::SeqCst),
+            "streaming typing loop must be told to discard its tail"
+        );
+        assert_eq!(ds.state_machine.state(), State::Idle);
     }
 }

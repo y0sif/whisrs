@@ -221,6 +221,55 @@ mod tests {
         assert_eq!(sm.state(), State::Recording);
     }
 
+    /// A background task finishing after `cancel` must not move the machine:
+    /// its late TranscriptionDone is invalid from Idle and leaves Idle
+    /// untouched (issues #81/#90).
+    #[test]
+    fn late_transcription_done_after_cancel_stays_idle() {
+        let mut sm = StateMachine::new();
+        sm.transition(Action::Toggle).unwrap(); // → Recording
+        sm.transition(Action::Cancel).unwrap(); // → Idle
+        assert!(sm.transition(Action::TranscriptionDone).is_err());
+        assert_eq!(sm.state(), State::Idle);
+    }
+
+    /// Documents the #81/#90 trap: from a post-cancel Idle, Toggle is a
+    /// valid user action that starts a NEW recording, so the machine cannot
+    /// reject a background task that fires Toggle blindly — the task must
+    /// check its session context first (`claim_session` in
+    /// src/daemon/command_mode.rs). A blind Toggle re-enters Recording and
+    /// the finalizer's TranscriptionDone then wedges there.
+    #[test]
+    fn blind_toggle_after_cancel_reenters_recording_and_wedges() {
+        let mut sm = StateMachine::new();
+        sm.transition(Action::Toggle).unwrap(); // → Recording
+        sm.transition(Action::Cancel).unwrap(); // → Idle
+                                                // The old buggy background: Toggle from Idle is valid...
+        assert_eq!(sm.transition(Action::Toggle).unwrap(), State::Recording);
+        // ...and its finalizer's TranscriptionDone is then swallowed,
+        // leaving the machine stuck in Recording. This is the wedge the
+        // daemon-side context check prevents from ever being reachable.
+        assert!(sm.transition(Action::TranscriptionDone).is_err());
+        assert_eq!(sm.state(), State::Recording);
+    }
+
+    /// Once a claimed session is Transcribing, cancel cannot yank the state
+    /// out from under the pipeline — its finalizer's TranscriptionDone is
+    /// the only way back to Idle. (This is why the post-claim half of the
+    /// cancel race is safe: cancel returns an error instead.)
+    #[test]
+    fn cancel_cannot_interrupt_transcribing_before_finalize() {
+        let mut sm = StateMachine::new();
+        sm.transition(Action::Toggle).unwrap(); // → Recording
+        sm.transition(Action::Toggle).unwrap(); // claimed → Transcribing
+        assert!(sm.transition(Action::Cancel).is_err());
+        assert_eq!(sm.state(), State::Transcribing);
+        assert_eq!(
+            sm.transition(Action::TranscriptionDone).unwrap(),
+            State::Idle
+        );
+    }
+
     // --- Read-aloud flow ---
 
     #[test]

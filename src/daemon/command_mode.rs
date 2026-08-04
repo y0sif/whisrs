@@ -8,7 +8,7 @@ use audio_silence_gate::{AutoStopDetector, SILENCE_RMS_THRESHOLD};
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
 use whisrs::audio::feedback;
 use whisrs::llm;
-use whisrs::state::Action;
+use whisrs::state::{Action, StateMachine};
 use whisrs::{Config, Response, State};
 
 use crate::context::{CommandModeContext, DaemonContext, DaemonState, LlmCommandContext};
@@ -19,6 +19,78 @@ use crate::pipeline::{
     BatchOptions,
 };
 use crate::selection::{acquire_selected_text, capture_selection};
+
+/// Claim a command-session context (command mode or llm-command) when audio
+/// collection ends, moving the state machine Recording → Transcribing.
+///
+/// Returns `None` — leaving the state machine *and* the context slot
+/// untouched — when the session no longer exists: `handle_cancel` takes the
+/// context and moves the machine to Idle under the same daemon-state lock
+/// the caller holds here, so a missing context (or a machine that is not in
+/// `Recording`) means the user threw this recording away. The caller must
+/// then bail without transcribing, calling the LLM, injecting, or
+/// transitioning — and without touching any other `DaemonState` field: by
+/// the time a stale task gets the lock, those fields may already belong to
+/// a session that started after the cancel. That is why this borrows the
+/// slot instead of consuming a pre-taken value, and why
+/// [`claim_command_mode_session`] / [`claim_llm_command_session`] gate every
+/// neighbor take on a successful claim.
+///
+/// Ordering matters: transitioning *before* checking the context was issues
+/// #81/#90 — from a post-cancel Idle, `Toggle` is a valid transition back
+/// into Recording, so the dead session ran to completion and its final
+/// `TranscriptionDone` (invalid from Recording) was swallowed, wedging the
+/// daemon in Recording until restart. Claiming first closes the race: both
+/// sides serialize on the daemon-state lock, so either cancel wins (context
+/// gone → bail, machine stays Idle) or the background wins (machine moves to
+/// Transcribing, from which `Cancel` is an invalid transition, so the
+/// pipeline owns the state until its finalizer's `TranscriptionDone`).
+fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Option<T>) -> Option<T> {
+    if ctx.is_none() || state_machine.state() != State::Recording {
+        return None;
+    }
+    // From Recording, Toggle → Transcribing cannot fail.
+    let _ = state_machine.transition(Action::Toggle);
+    ctx.take()
+}
+
+/// The claim block of [`command_mode_background`]: claim the session via
+/// [`claim_session`], then — only after the claim succeeded — take the
+/// neighbor state that belongs to this recording (the capture handle, in
+/// case a stop path didn't already drop it, e.g. the input device vanished
+/// and the channel closed on its own).
+///
+/// The gating is the point: a stale background task can reach this after
+/// `handle_cancel` discarded its session AND a new session has already
+/// started. Taking `audio_capture` before knowing the claim succeeded would
+/// strip the new session's live capture. On bail this mutates nothing.
+fn claim_command_mode_session(ds: &mut DaemonState) -> Option<CommandModeContext> {
+    let ctx = claim_session(&mut ds.state_machine, &mut ds.command_mode)?;
+    ds.audio_capture.take(); // ensure capture is dropped
+    Some(ctx)
+}
+
+/// The claim block of [`llm_command_background`]: claim the session via
+/// [`claim_session`], then — only after the claim succeeded — take the
+/// neighbor state that belongs to this recording (capture handle, source
+/// window, start time).
+///
+/// Same gating as [`claim_command_mode_session`]: a stale background that
+/// bails must not strip `audio_capture` / `recording_window_id` /
+/// `recording_started_at` from a just-started new session.
+fn claim_llm_command_session(
+    ds: &mut DaemonState,
+) -> Option<(
+    LlmCommandContext,
+    Option<String>,
+    Option<std::time::Instant>,
+)> {
+    let ctx = claim_session(&mut ds.state_machine, &mut ds.llm_command)?;
+    ds.audio_capture.take(); // ensure capture is dropped
+    let window_id = ds.recording_window_id.take();
+    let started_at = ds.recording_started_at.take();
+    Some((ctx, window_id, started_at))
+}
 
 /// Command mode toggle: first call copies selection and starts recording,
 /// second call stops recording and kicks off transcription → LLM → inject.
@@ -154,9 +226,10 @@ async fn command_mode_start(
 /// Background task: collects audio until channel closes (manual stop or auto-stop),
 /// then transcribes the instruction, sends to LLM, and injects the result.
 ///
-/// Thin wrapper: collects the recording and takes the session context, runs
-/// the fallible pipeline in [`command_mode_background_inner`], then funnels
-/// every outcome through one finalize block.
+/// Thin wrapper: collects the recording, claims the session context via
+/// [`claim_session`] (bailing out if `whisrs cancel` already discarded the
+/// session), runs the fallible pipeline in [`command_mode_background_inner`],
+/// then funnels every surviving outcome through one finalize block.
 async fn command_mode_background(
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -183,31 +256,42 @@ async fn command_mode_background(
         }
     }
 
-    // Take the command mode context and transition to transcribing. The lock
-    // is released before the slow transcribe/LLM awaits in the inner fn.
+    // Claim the session context and enter Transcribing. `handle_cancel`
+    // takes the context under this same lock, so whoever locks first wins:
+    // if cancel got there first the context is gone and the machine is
+    // already Idle — bail below without transcribing, calling the LLM,
+    // injecting, or transitioning (issues #81/#90). Every neighbor take
+    // (the capture handle) happens inside the helper, gated on a successful
+    // claim, so a bail cannot strip state from a session that started after
+    // the cancel. The lock is released before the slow transcribe/LLM
+    // awaits in the inner fn.
     let cmd_ctx = {
         let mut ds = daemon_state.lock().await;
-        ds.audio_capture.take(); // ensure capture is dropped
-        let _ = ds.state_machine.transition(Action::Toggle);
-        ds.command_mode.take()
+        claim_command_mode_session(&mut ds)
     };
 
-    if let Some(cmd_ctx) = cmd_ctx {
-        if let Err(e) = command_mode_background_inner(&all_samples, cmd_ctx, &context).await {
-            let friendly = format_api_error(&e);
-            error!("command mode: {e:#}");
-            if context.notify_error() {
-                send_notification("whisrs", &format!("Command failed: {friendly}"));
-            }
+    let Some(cmd_ctx) = cmd_ctx else {
+        // Cancelled: `handle_cancel` already moved the machine to Idle (its
+        // dispatcher broadcasts the state and it resets the overlay level),
+        // so there is nothing to finalize — the recording is discarded.
+        info!("command mode: session cancelled — discarding recording");
+        return;
+    };
+
+    if let Err(e) = command_mode_background_inner(&all_samples, cmd_ctx, &context).await {
+        let friendly = format_api_error(&e);
+        error!("command mode: {e:#}");
+        if context.notify_error() {
+            send_notification("whisrs", &format!("Command failed: {friendly}"));
         }
-    } else {
-        warn!("command mode: context missing, aborting");
     }
 
     // Single finalize path — success, benign skip, and error all land here.
     // Deliberate improvement over the old per-site unwinds: the state
     // broadcast + overlay reset now run on error paths too, so the tray can
     // no longer be left showing a stale state after a failure.
+    // `claim_session` put the machine in Transcribing and no other action is
+    // valid from there, so this TranscriptionDone cannot fail.
     let mut ds = daemon_state.lock().await;
     let _ = ds.state_machine.transition(Action::TranscriptionDone);
     let _ = context.state_tx.send(ds.state_machine.state());
@@ -566,9 +650,10 @@ async fn llm_command_start(
 /// preset instruction is the "voice instruction"), and types the result at
 /// the cursor.
 ///
-/// Thin wrapper: collects the recording and takes the session context, runs
-/// the fallible pipeline in [`llm_command_background_inner`], then funnels
-/// every outcome through one finalize block.
+/// Thin wrapper: collects the recording, claims the session context via
+/// [`claim_session`] (bailing out if `whisrs cancel` already discarded the
+/// session), runs the fallible pipeline in [`llm_command_background_inner`],
+/// then funnels every surviving outcome through one finalize block.
 async fn llm_command_background(
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -593,44 +678,51 @@ async fn llm_command_background(
         }
     }
 
-    // Take the session context and transition to transcribing. The lock is
-    // released before the slow transcribe/LLM awaits in the inner fn.
-    let (cmd_ctx, window_id, recording_started_at) = {
+    // Claim the session context and enter Transcribing. `handle_cancel`
+    // takes the context under this same lock, so whoever locks first wins:
+    // if cancel got there first the context is gone and the machine is
+    // already Idle — bail below without transcribing, calling the LLM,
+    // injecting, or transitioning (issues #81/#90). Every neighbor take
+    // (capture handle, source window, start time) happens inside the
+    // helper, gated on a successful claim, so a bail cannot strip state
+    // from a session that started after the cancel. The lock is released
+    // before the slow transcribe/LLM awaits in the inner fn.
+    let claimed = {
         let mut ds = daemon_state.lock().await;
-        ds.audio_capture.take();
-        let _ = ds.state_machine.transition(Action::Toggle);
-        (
-            ds.llm_command.take(),
-            ds.recording_window_id.take(),
-            ds.recording_started_at.take(),
-        )
+        claim_llm_command_session(&mut ds)
     };
 
-    if let Some(cmd_ctx) = cmd_ctx {
-        let name = cmd_ctx.name.clone();
-        if let Err(e) = llm_command_background_inner(
-            &all_samples,
-            cmd_ctx,
-            window_id,
-            recording_started_at,
-            &context,
-        )
-        .await
-        {
-            let friendly = format_api_error(&e);
-            error!("llm-command '{name}': {e:#}");
-            if context.notify_error() {
-                send_notification("whisrs", &format!("'{name}' failed: {friendly}"));
-            }
+    let Some((cmd_ctx, window_id, recording_started_at)) = claimed else {
+        // Cancelled: `handle_cancel` already moved the machine to Idle (its
+        // dispatcher broadcasts the state and it resets the overlay level),
+        // so there is nothing to finalize — the recording is discarded.
+        info!("llm-command: session cancelled — discarding recording");
+        return;
+    };
+
+    let name = cmd_ctx.name.clone();
+    if let Err(e) = llm_command_background_inner(
+        &all_samples,
+        cmd_ctx,
+        window_id,
+        recording_started_at,
+        &context,
+    )
+    .await
+    {
+        let friendly = format_api_error(&e);
+        error!("llm-command '{name}': {e:#}");
+        if context.notify_error() {
+            send_notification("whisrs", &format!("'{name}' failed: {friendly}"));
         }
-    } else {
-        warn!("llm-command: context missing, aborting");
     }
 
     // Single finalize path — success, benign skip, and error all land here.
     // As in `command_mode_background`, the state broadcast + overlay reset
     // now deliberately run on error paths too (they used to be success-only),
     // so the tray can no longer be left showing a stale state after a failure.
+    // `claim_session` put the machine in Transcribing and no other action is
+    // valid from there, so this TranscriptionDone cannot fail.
     let mut ds = daemon_state.lock().await;
     let _ = ds.state_machine.transition(Action::TranscriptionDone);
     let _ = context.state_tx.send(ds.state_machine.state());
@@ -752,4 +844,223 @@ async fn llm_command_background_inner(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recording_machine() -> StateMachine {
+        let mut sm = StateMachine::new();
+        sm.transition(Action::Toggle).unwrap(); // → Recording
+        sm
+    }
+
+    /// Normal stop: the context survived, so the session is claimed (the
+    /// slot is consumed) and the machine moves to Transcribing — from which
+    /// the finalizer's TranscriptionDone must succeed.
+    #[test]
+    fn claim_session_moves_recording_to_transcribing() {
+        let mut sm = recording_machine();
+        let mut ctx = Some("ctx");
+        assert_eq!(claim_session(&mut sm, &mut ctx), Some("ctx"));
+        assert_eq!(ctx, None, "a successful claim consumes the context slot");
+        assert_eq!(sm.state(), State::Transcribing);
+        assert_eq!(
+            sm.transition(Action::TranscriptionDone).unwrap(),
+            State::Idle
+        );
+    }
+
+    /// Cancel won the race: `handle_cancel` took the context and moved the
+    /// machine to Idle before the background task got the lock. The claim
+    /// must bail and leave Idle untouched — the old blind Toggle re-entered
+    /// Recording here and wedged the daemon (issues #81/#90).
+    #[test]
+    fn claim_session_bails_after_cancel_without_touching_idle() {
+        let mut sm = StateMachine::new(); // post-cancel: Idle
+        let mut ctx: Option<&str> = None;
+        assert_eq!(claim_session(&mut sm, &mut ctx), None);
+        assert_eq!(sm.state(), State::Idle);
+    }
+
+    /// Defence in depth: even if a context somehow survived, a machine that
+    /// is not in Recording is never transitioned — the pipeline bails rather
+    /// than wedging, and the bail leaves the context slot in place (a bail
+    /// must not mutate anything).
+    #[test]
+    fn claim_session_bails_when_not_recording_even_with_context() {
+        let mut sm = StateMachine::new(); // Idle
+        let mut ctx = Some("ctx");
+        assert_eq!(claim_session(&mut sm, &mut ctx), None);
+        assert_eq!(sm.state(), State::Idle);
+        assert_eq!(ctx, Some("ctx"), "a bail must not consume the context slot");
+    }
+
+    /// The full cancelled-session sequence at the state-machine level:
+    /// cancel puts the machine in Idle, the woken background task claims
+    /// nothing, and a hypothetical late TranscriptionDone is rejected
+    /// without leaving Idle. This is the exact sequence from issue #81's
+    /// repro (`llm-command german` → `cancel`).
+    #[test]
+    fn cancelled_session_cannot_wedge_the_machine() {
+        let mut sm = recording_machine();
+        sm.transition(Action::Cancel).unwrap(); // handle_cancel → Idle
+        let mut ctx: Option<()> = None;
+        assert_eq!(claim_session(&mut sm, &mut ctx), None);
+        assert!(sm.transition(Action::TranscriptionDone).is_err());
+        assert_eq!(sm.state(), State::Idle);
+    }
+
+    /// User cancels a command session, then starts a new plain dictation
+    /// before the stale background task wakes. The stale task finds its
+    /// context gone and must not disturb the new session's Recording state.
+    #[test]
+    fn stale_background_does_not_disturb_a_new_dictation() {
+        let mut sm = recording_machine();
+        sm.transition(Action::Cancel).unwrap(); // → Idle
+        sm.transition(Action::Toggle).unwrap(); // new dictation → Recording
+        let mut ctx: Option<()> = None;
+        assert_eq!(claim_session(&mut sm, &mut ctx), None);
+        assert_eq!(sm.state(), State::Recording);
+    }
+
+    /// Build a `DaemonState` in the residual-steal-window scenario: an
+    /// llm-command session was cancelled (`handle_cancel` took the context
+    /// and capture, machine → Idle), then a NEW plain dictation started and
+    /// repopulated the per-session fields before the stale background task
+    /// got the lock.
+    fn state_with_new_dictation_after_cancel() -> DaemonState {
+        let mut ds = DaemonState::new();
+
+        // Old session: recording, then `whisrs cancel` discards it.
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        ds.state_machine.transition(Action::Cancel).unwrap();
+        // (`discard_recording_session` left command_mode / llm_command /
+        // recording_* all None — DaemonState::new() starts that way.)
+
+        // New dictation starts before the stale task wakes.
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        ds.recording_window_id = Some("0xnew".to_string());
+        ds.recording_started_at = Some(std::time::Instant::now());
+        ds.session_language = Some("pl".to_string());
+        // In real life `audio_capture` now holds the new session's live
+        // handle; it needs a real input device, so it stays `None` here.
+        // The claim helpers gate its take behind the same success check as
+        // the fields asserted below.
+        ds
+    }
+
+    /// The residual steal window from the #81/#90 review: a stale
+    /// llm-command background bails (its context is gone) while a new
+    /// session's `recording_window_id` / `recording_started_at` are already
+    /// populated. The old claim block took those fields BEFORE checking the
+    /// claim, stripping them from the new session. The bail must leave
+    /// every field untouched and the machine in Recording.
+    #[test]
+    fn stale_llm_command_bail_leaves_new_session_state_untouched() {
+        let mut ds = state_with_new_dictation_after_cancel();
+        let started_at = ds.recording_started_at;
+
+        assert!(claim_llm_command_session(&mut ds).is_none());
+
+        assert_eq!(ds.state_machine.state(), State::Recording);
+        assert_eq!(ds.recording_window_id.as_deref(), Some("0xnew"));
+        assert_eq!(ds.recording_started_at, started_at);
+        assert_eq!(ds.session_language.as_deref(), Some("pl"));
+        assert!(ds.audio_capture.is_none());
+    }
+
+    /// Same steal-window scenario for the command-mode claim block: the
+    /// stale bail must not touch the new session's fields (its old take of
+    /// `audio_capture` before the claim check would have dropped the new
+    /// session's live capture).
+    #[test]
+    fn stale_command_mode_bail_leaves_new_session_state_untouched() {
+        let mut ds = state_with_new_dictation_after_cancel();
+        let started_at = ds.recording_started_at;
+
+        assert!(claim_command_mode_session(&mut ds).is_none());
+
+        assert_eq!(ds.state_machine.state(), State::Recording);
+        assert_eq!(ds.recording_window_id.as_deref(), Some("0xnew"));
+        assert_eq!(ds.recording_started_at, started_at);
+        assert_eq!(ds.session_language.as_deref(), Some("pl"));
+        assert!(ds.audio_capture.is_none());
+    }
+
+    /// The success half of the llm-command claim helper: an uncancelled
+    /// stop claims the context, hands back this session's window id and
+    /// start time, clears those fields, and enters Transcribing.
+    #[test]
+    fn llm_command_claim_takes_own_session_state_on_success() {
+        let mut ds = DaemonState::new();
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        ds.llm_command = Some(LlmCommandContext {
+            name: "german".to_string(),
+            instruction: "translate to German".to_string(),
+            llm_config: Default::default(),
+        });
+        ds.recording_window_id = Some("0xmine".to_string());
+        ds.recording_started_at = Some(std::time::Instant::now());
+
+        let (ctx, window_id, started_at) =
+            claim_llm_command_session(&mut ds).expect("live session must be claimed");
+
+        assert_eq!(ctx.name, "german");
+        assert_eq!(window_id.as_deref(), Some("0xmine"));
+        assert!(started_at.is_some());
+        assert_eq!(ds.state_machine.state(), State::Transcribing);
+        assert!(ds.llm_command.is_none());
+        assert!(ds.recording_window_id.is_none());
+        assert!(ds.recording_started_at.is_none());
+    }
+
+    /// A plain `whisrs toggle` on a command-mode / llm-command recording:
+    /// handle_toggle's stop arm takes the session over as plain dictation
+    /// and must clear BOTH command slots under its lock (via
+    /// `discard_command_sessions`). The background task's claim then bails
+    /// without consuming anything — its bail is mutation-free by design —
+    /// so without the stop-arm clear the stale `Some` slot would satisfy
+    /// the second-press gates above during a later unrelated dictation and
+    /// silently steal its capture.
+    #[test]
+    fn toggle_stop_clears_command_slots_so_stale_claim_bails() {
+        let mut ds = DaemonState::new();
+
+        // Command session recording. Both slots filled to pin that the
+        // stop arm clears both (in real life only one is ever Some).
+        ds.state_machine.transition(Action::Toggle).unwrap(); // → Recording
+        ds.command_mode = Some(CommandModeContext {
+            selected_text: "selected".to_string(),
+            llm_config: Default::default(),
+        });
+        ds.llm_command = Some(LlmCommandContext {
+            name: "german".to_string(),
+            instruction: "translate to German".to_string(),
+            llm_config: Default::default(),
+        });
+
+        // Plain toggle-stop: Recording → Transcribing plus the takeover
+        // clear — the two steps handle_toggle's stop arm runs under one
+        // lock.
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        crate::dictation::discard_command_sessions(&mut ds, "toggle-stop");
+
+        assert!(
+            ds.command_mode.is_none(),
+            "toggle-stop must clear command_mode"
+        );
+        assert!(
+            ds.llm_command.is_none(),
+            "toggle-stop must clear llm_command"
+        );
+
+        // The command background wakes later (its audio channel closed on
+        // the toggle-stop's capture take) and must bail cleanly: slot gone,
+        // machine no longer in Recording, nothing mutated.
+        assert!(claim_command_mode_session(&mut ds).is_none());
+        assert!(claim_llm_command_session(&mut ds).is_none());
+        assert_eq!(ds.state_machine.state(), State::Transcribing);
+    }
 }
