@@ -1,0 +1,82 @@
+name: Nix
+
+# Guards the substitution contract flake.nix's postInstall relies on: it rewrites
+# the FHS /usr/bin/setfacl path in contrib/99-whisrs.rules to the Nix-built
+# setfacl, and --replace-fail means an edit that drops the literal breaks the
+# build loudly — but only on a machine that runs `nix build`. Scoped to the
+# paths that can break that contract, since the build itself (whisper.cpp,
+# cmake, libclang) is not cheap.
+on:
+  push:
+    branches: [main]
+    paths:
+      - flake.nix
+      - flake.lock
+      - Cargo.toml
+      - Cargo.lock
+      - contrib/**
+      - .github/workflows/nix.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - flake.nix
+      - flake.lock
+      - Cargo.toml
+      - Cargo.lock
+      - contrib/**
+      - .github/workflows/nix.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Flake build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 3G
+
+      - name: Flake check
+        run: nix flake check --no-build
+
+      - name: Build
+        run: nix build .#default -L
+
+      - name: Assert setfacl path was substituted
+        run: |
+          set -euo pipefail
+          RULE=result/lib/udev/rules.d/99-whisrs.rules
+          cat "$RULE"
+
+          if grep -q '/usr/bin/setfacl' "$RULE"; then
+            echo "::error::${RULE} still contains the literal /usr/bin/setfacl — the substituteInPlace in flake.nix's postInstall did not run, or its --replace-fail pattern no longer matches contrib/99-whisrs.rules."
+            exit 1
+          fi
+
+          MATCH=$(grep -oE 'TEST=="/nix/store/[^"]+/bin/setfacl"' "$RULE" | head -n1 || true)
+          if [ -z "$MATCH" ]; then
+            echo "::error::${RULE} does not reference a /nix/store/.../bin/setfacl path — the TEST== guard was not substituted to the Nix-built setfacl."
+            exit 1
+          fi
+
+          SETFACL_PATH=$(echo "$MATCH" | sed -E 's/TEST=="(.*)"/\1/')
+
+          if [ ! -x "$SETFACL_PATH" ]; then
+            echo "::error::${SETFACL_PATH} extracted from ${RULE} is not an executable binary on this runner — the substituted setfacl path no longer points at a real setfacl, even though it has the expected /nix/store/.../bin/setfacl shape."
+            exit 1
+          fi
+
+          echo "OK: udev rule references a real Nix store setfacl binary (${SETFACL_PATH}), not /usr/bin/setfacl."
