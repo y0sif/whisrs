@@ -717,7 +717,7 @@ pub(crate) async fn process_recording_batch(
         context
             .window_tracker
             .get_focused_window_class()
-            .map(|c| is_terminal_class(&c))
+            .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
             .unwrap_or(false)
     } else {
         false

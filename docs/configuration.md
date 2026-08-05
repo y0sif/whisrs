@@ -74,6 +74,43 @@ key_delay_ms = 2
 # type incrementally and ignore it. `whisrsd` warns at startup if paste is set
 # with one of those backends.
 paste = false
+# Extra window classes to treat as terminal emulators, checked alongside the
+# built-in list. Default: [] (built-in list only).
+#
+# WARNING: terminal detection is what makes command mode clear the prompt line
+# with Ctrl+A then Ctrl+K before injecting its result. If you list a class that
+# is not a terminal, that Ctrl+A / Ctrl+K goes into an ordinary text field and
+# empties it. Terminal detection also swaps Ctrl+C for Ctrl+Shift+C in the
+# selection path, so a mis-listed class can instead open DevTools in browsers
+# and Electron apps. Only add classes you have confirmed belong to a terminal.
+#
+# The config is read once at daemon startup, so run `whisrs restart` after
+# changing this key or the new value has no effect.
+#
+# To debug a class that will not match, run `RUST_LOG=debug whisrsd` and look
+# for the `is_terminal_class(...)` line for that window. It names the class
+# under test, the verdict, and (on a match) which stage matched: built-in
+# whole identifier, your terminal_classes entry, or a built-in leaf name.
+#
+# Use this for the two cases the built-in list cannot cover:
+#   * an st build with a custom `termname` in config.h, which reports that name
+#     as its class instead of st-256color
+#   * scratchpad / dropdown windows launched under a renamed class, such as
+#     Alacritty-float, kitty-dropdown or wezterm-quake
+#
+# Entries are compared case-insensitively against the WHOLE window class, never
+# as substrings, so "st" matches a window whose class is exactly "st" and not
+# "steam". Unlike the built-in list, they are not matched by their last
+# dot-segment either: listing "warp" matches the class "warp" and leaves
+# "app.drey.Warp" (GNOME's Magic Wormhole client, not a terminal) alone. To
+# match a reverse-DNS app_id, write it out in full.
+#
+# Read the class off your compositor:
+#   hyprctl activewindow | grep class
+#   niri msg focused-window
+# Hyprland and Niri are also the only window trackers that report a class
+# today, so this key has no effect on KDE, GNOME, Sway or X11 (issue #71).
+terminal_classes = []
 
 [groq]
 api_key = "gsk_..."

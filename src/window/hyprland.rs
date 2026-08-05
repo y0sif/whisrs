@@ -63,15 +63,24 @@ impl WindowTracker for HyprlandTracker {
             .ok()?;
 
         if !output.status.success() {
+            debug!("hyprland focused window class: hyprctl activewindow failed");
             return None;
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: HyprctlActiveWindow = serde_json::from_str(&stdout).ok()?;
+        let parsed: HyprctlActiveWindow = match serde_json::from_str(&stdout) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                debug!("hyprland focused window class: failed to parse hyprctl JSON: {err}");
+                return None;
+            }
+        };
 
         if parsed.class.is_empty() {
+            debug!("hyprland focused window class: empty (no class reported)");
             None
         } else {
+            debug!("hyprland focused window class: {}", parsed.class);
             Some(parsed.class)
         }
     }

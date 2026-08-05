@@ -381,7 +381,7 @@ async fn command_mode_background_inner(
     let is_terminal = context
         .window_tracker
         .get_focused_window_class()
-        .map(|c| is_terminal_class(&c))
+        .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
         .unwrap_or(false);
     match tokio::task::spawn_blocking(move || {
         if is_terminal {
@@ -798,7 +798,7 @@ async fn llm_command_background_inner(
         context
             .window_tracker
             .get_focused_window_class()
-            .map(|c| is_terminal_class(&c))
+            .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
             .unwrap_or(false)
     } else {
         false

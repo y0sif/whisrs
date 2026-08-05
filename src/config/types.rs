@@ -289,6 +289,27 @@ pub struct InputConfig {
     /// this is set alongside one of those backends.
     #[serde(default)]
     pub paste: bool,
+    /// Extra window classes to treat as terminal emulators, checked alongside
+    /// the built-in list. Empty by default.
+    ///
+    /// Terminal detection picks Ctrl+Shift+C / Ctrl+Shift+V over Ctrl+C /
+    /// Ctrl+V and, in command mode, sends Ctrl+A then Ctrl+K to clear the
+    /// prompt line before injecting. That last one *empties the field* if it
+    /// fires in a GUI text input (#70), so the built-in list stays
+    /// conservative and this is the explicit, opt-in escape hatch for the two
+    /// cases it cannot know about: an `st` build with a custom `termname` in
+    /// `config.h`, and scratchpad/dropdown classes such as `Alacritty-float`,
+    /// `kitty-dropdown` or `wezterm-quake` (#92).
+    ///
+    /// Entries are compared case-insensitively against the *whole* focused
+    /// window class. They are never substring-matched, and they never go
+    /// through the reverse-DNS leaf stage the built-in list uses — so listing
+    /// a generic name like `warp` matches a window whose class is exactly
+    /// `warp`, and leaves `app.drey.Warp` (GNOME's Magic Wormhole client)
+    /// alone. Write the class exactly as the compositor reports it
+    /// (`hyprctl activewindow`, `niri msg focused-window`).
+    #[serde(default)]
+    pub terminal_classes: Vec<String>,
 }
 
 impl Default for InputConfig {
@@ -297,6 +318,7 @@ impl Default for InputConfig {
             key_delay_ms: default_key_delay_ms(),
             backend: InjectorBackend::default(),
             paste: false,
+            terminal_classes: Vec::new(),
         }
     }
 }

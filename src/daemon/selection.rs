@@ -173,10 +173,11 @@ pub(crate) async fn capture_selection(context: &DaemonContext) -> Result<String,
     // The terminal check is resolved lazily, inside the copy closure, so the
     // primary-selection fast path never queries the window tracker.
     let tracker = context.window_tracker.clone();
+    let user_terminal_classes = context.config.input.terminal_classes.clone();
     let copy = move || {
         let is_terminal = tracker
             .get_focused_window_class()
-            .map(|c| is_terminal_class(&c))
+            .map(|c| is_terminal_class(&c, &user_terminal_classes))
             .unwrap_or(false);
         if is_terminal {
             simulate_terminal_copy()

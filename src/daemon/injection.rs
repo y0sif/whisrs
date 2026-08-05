@@ -419,31 +419,73 @@ const TERMINAL_LEAF_CLASSES: &[&str] = &[
 /// Check if a window class corresponds to a terminal emulator.
 ///
 /// A false positive here is destructive (command mode clears the line), while a
-/// false negative merely degrades to plain injection — so both stages match on
-/// whole identifiers or whole dot-segments, never on substrings.
-pub(crate) fn is_terminal_class(class: &str) -> bool {
+/// false negative merely degrades to plain injection — so every stage matches
+/// on whole identifiers or whole dot-segments, never on substrings.
+///
+/// `user_classes` is `[input] terminal_classes`: the opt-in escape hatch for
+/// the classes the built-in list cannot know about — an `st` build with a
+/// custom `termname`, and scratchpad/dropdown classes like `Alacritty-float`
+/// (#92). It is checked *alongside* the built-in list, and only as a whole
+/// identifier:
+///
+/// - Case-insensitive, like the built-in path, because compositors disagree on
+///   casing (`Alacritty` on X11, `alacritty` elsewhere) and a config entry
+///   should not have to guess.
+/// - **Not** run through the leaf stage below. The leaf stage exists to rescue
+///   app_ids the user never had to think about; a user entry is already the
+///   exact string they read off `hyprctl activewindow`. Leaf-matching it would
+///   turn a one-word entry into a whole-namespace wildcard — listing `warp`
+///   would then also match `app.drey.Warp`, GNOME's Magic Wormhole client,
+///   which is the destructive direction. An entry that *is* a dotted app_id
+///   still matches that app_id exactly, so nothing is out of reach: it just
+///   has to be named.
+/// - Free to name a class the leaf set deliberately excludes (`warp`, `st`,
+///   `terminal`, ...). Whole-identifier matching keeps that scoped to the one
+///   window class the user actually opted into, so honoring it costs nothing
+///   the exclusions were protecting.
+pub(crate) fn is_terminal_class(class: &str, user_classes: &[String]) -> bool {
     let lower = class.trim().to_ascii_lowercase();
     if lower.is_empty() {
+        debug!("is_terminal_class({class:?}): false (empty class)");
         return false;
     }
-    // Stage 1: whole-identifier exact match.
+    // Stage 1: whole-identifier exact match against the built-in list.
     if TERMINAL_CLASSES.contains(&lower.as_str()) {
+        debug!("is_terminal_class({class:?}): true (built-in whole identifier)");
         return true;
     }
-    // Stage 2: exact match on the last dot-segment, so repackaged reverse-DNS
+    // Stage 2: whole-identifier exact match against the user's list. Entries
+    // are trimmed for the same reason the class is; a blank entry can never
+    // match, because an empty class returned above.
+    if user_classes
+        .iter()
+        .any(|entry| entry.trim().eq_ignore_ascii_case(&lower))
+    {
+        debug!("is_terminal_class({class:?}): true (user terminal_classes entry)");
+        return true;
+    }
+    // Stage 3: exact match on the last dot-segment, so repackaged reverse-DNS
     // app_ids still resolve. Only applies to dotted identifiers; a bare class
-    // must appear in TERMINAL_CLASSES verbatim.
+    // must appear in TERMINAL_CLASSES verbatim. Built-in leaves only — see the
+    // doc comment for why user entries stop at stage 2.
     if let Some((_, leaf)) = lower.rsplit_once('.') {
         if TERMINAL_LEAF_CLASSES.contains(&leaf) {
+            debug!("is_terminal_class({class:?}): true (built-in leaf {leaf:?})");
             return true;
         }
     }
+    debug!("is_terminal_class({class:?}): false (no match in built-in list, user list, or built-in leaves)");
     false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[input] terminal_classes` as the daemon hands it over.
+    fn user(classes: &[&str]) -> Vec<String> {
+        classes.iter().map(|c| c.to_string()).collect()
+    }
 
     /// Real-world strings, in the casing a compositor hands them to us: bare
     /// X11 WM_CLASS classes and reverse-DNS Wayland app_ids.
@@ -512,7 +554,7 @@ mod tests {
             "hyper",
         ] {
             assert!(
-                is_terminal_class(class),
+                is_terminal_class(class, &[]),
                 "{class} is a terminal but is_terminal_class says it is not"
             );
         }
@@ -524,7 +566,7 @@ mod tests {
     fn every_terminal_class_entry_matches() {
         for class in TERMINAL_CLASSES {
             assert!(
-                is_terminal_class(class),
+                is_terminal_class(class, &[]),
                 "{class} is in TERMINAL_CLASSES but is_terminal_class says it is not a terminal"
             );
         }
@@ -536,7 +578,7 @@ mod tests {
         for leaf in TERMINAL_LEAF_CLASSES {
             let class = format!("io.example.{leaf}");
             assert!(
-                is_terminal_class(&class),
+                is_terminal_class(&class, &[]),
                 "{class} should match via TERMINAL_LEAF_CLASSES but does not"
             );
             // Stage 2 only fires on dotted identifiers, so the bare class form
@@ -567,7 +609,7 @@ mod tests {
             "com.example.Wave",
         ] {
             assert!(
-                !is_terminal_class(class),
+                !is_terminal_class(class, &[]),
                 "{class} is not a terminal but is_terminal_class says it is"
             );
         }
@@ -586,7 +628,7 @@ mod tests {
             "ghostty-foo",
         ] {
             assert!(
-                !is_terminal_class(class),
+                !is_terminal_class(class, &[]),
                 "{class} is not a known terminal class but is_terminal_class says it is"
             );
         }
@@ -599,7 +641,7 @@ mod tests {
             "com.mitchellh.ghostty-debug",
         ] {
             assert!(
-                is_terminal_class(class),
+                is_terminal_class(class, &[]),
                 "{class} is a terminal but is_terminal_class says it is not"
             );
         }
@@ -609,9 +651,9 @@ mod tests {
     /// list: only `blackbox-terminal` is a real class, plain `blackbox` is not.
     #[test]
     fn leaf_set_requires_a_dot() {
-        assert!(!is_terminal_class("blackbox"));
-        assert!(is_terminal_class("blackbox-terminal"));
-        assert!(is_terminal_class("io.example.Ghostty"));
+        assert!(!is_terminal_class("blackbox", &[]));
+        assert!(is_terminal_class("blackbox-terminal", &[]));
+        assert!(is_terminal_class("io.example.Ghostty", &[]));
     }
 
     /// The destructive direction: anything matched here gets Ctrl+A/Ctrl+K sent
@@ -645,7 +687,7 @@ mod tests {
             "   ",
         ] {
             assert!(
-                !is_terminal_class(class),
+                !is_terminal_class(class, &[]),
                 "{class:?} is not a terminal but is_terminal_class says it is"
             );
         }
@@ -662,7 +704,7 @@ mod tests {
             "libreoffice-startcenter",
         ] {
             assert!(
-                !is_terminal_class(class),
+                !is_terminal_class(class, &[]),
                 "{class} is not a terminal but is_terminal_class says it is"
             );
         }
@@ -680,9 +722,197 @@ mod tests {
             "qterminal",
         ] {
             assert!(
-                is_terminal_class(class),
+                is_terminal_class(class, &[]),
                 "{class} is a terminal but is_terminal_class says it is not"
             );
         }
+    }
+
+    /// `[input] terminal_classes` entries match the whole class, in either
+    /// casing: the compositor's (X11 hands us `Alacritty-float`) and the
+    /// user's (they may have typed it lowercase, or with stray spaces).
+    #[test]
+    fn user_terminal_classes_match_whole_identifiers_case_insensitively() {
+        let extra = user(&["st-mytermname", "  Alacritty-float  ", "kitty-dropdown"]);
+        for class in [
+            "st-mytermname",
+            "ST-MYTERMNAME",
+            "Alacritty-float",
+            "alacritty-float",
+            "ALACRITTY-FLOAT",
+            "  alacritty-float  ",
+            "kitty-dropdown",
+            "Kitty-Dropdown",
+        ] {
+            assert!(
+                is_terminal_class(class, &extra),
+                "{class:?} is listed in terminal_classes but is_terminal_class says it is not a terminal"
+            );
+        }
+    }
+
+    /// Issue #92, first case: st takes its class from `termname` in
+    /// `config.h`, so a renamed build matches nothing built in.
+    #[test]
+    fn repro_renamed_st_needs_a_user_entry_issue92() {
+        for class in ["st-mytermname", "st-solarized", "mysuckless-term"] {
+            assert!(
+                !is_terminal_class(class, &[]),
+                "{class} is not a built-in class; the built-in list must stay conservative"
+            );
+            assert!(
+                is_terminal_class(class, &user(&[class])),
+                "{class} is listed in terminal_classes but is_terminal_class says it is not a terminal"
+            );
+        }
+    }
+
+    /// Issue #92, second case: scratchpad and dropdown setups rename the
+    /// class. The pre-#70 substring match caught these incidentally; exact
+    /// matching does not, so they need an explicit entry.
+    #[test]
+    fn repro_scratchpad_classes_need_a_user_entry_issue92() {
+        for class in ["Alacritty-float", "kitty-dropdown", "wezterm-quake"] {
+            assert!(
+                !is_terminal_class(class, &[]),
+                "{class} must not match on its own — exact matching is the #70 fix"
+            );
+            assert!(
+                is_terminal_class(class, &user(&[class])),
+                "{class} is listed in terminal_classes but is_terminal_class says it is not a terminal"
+            );
+        }
+    }
+
+    /// A user entry must not reintroduce the #70 substring bug. Someone who
+    /// lists a short generic name gets exactly that window class, nothing
+    /// that merely contains it.
+    #[test]
+    fn user_entries_are_never_substring_matched() {
+        let extra = user(&["st", "float", "term"]);
+        for class in [
+            "steam",
+            "Postman",
+            "systemsettings",
+            "com.obsproject.Studio",
+            "libreoffice-startcenter",
+            "floating-window",
+            "Alacritty-float",
+            "terminal-preferences",
+        ] {
+            assert!(
+                !is_terminal_class(class, &extra),
+                "{class} only contains a terminal_classes entry; it must not match"
+            );
+        }
+        // The entries themselves still match, as whole identifiers.
+        for class in ["st", "float", "term"] {
+            assert!(is_terminal_class(class, &extra));
+        }
+    }
+
+    /// User entries stop at the whole-identifier stage. They are never
+    /// leaf-matched in either direction, so a one-word entry can never turn
+    /// into a whole-namespace wildcard over the generic leaves the built-in
+    /// set deliberately excludes.
+    #[test]
+    fn user_entries_do_not_go_through_the_leaf_stage() {
+        // `warp` is an excluded leaf: `app.drey.Warp` is GNOME's Magic
+        // Wormhole client. Listing the bare word must not drag it in.
+        let bare = user(&["warp"]);
+        assert!(is_terminal_class("warp", &bare));
+        assert!(!is_terminal_class("app.drey.Warp", &bare));
+        assert!(!is_terminal_class("dev.example.warp", &bare));
+
+        // Naming the full app_id is honored: it is exact, and the user opted
+        // into that one class explicitly.
+        let dotted = user(&["dev.example.warp"]);
+        assert!(is_terminal_class("dev.example.warp", &dotted));
+        assert!(!is_terminal_class("app.drey.Warp", &dotted));
+
+        // Same in the other direction: a dotted entry does not match the bare
+        // leaf, and the other excluded generics behave identically.
+        assert!(!is_terminal_class("myterm", &user(&["com.example.myterm"])));
+        for (entry, class) in [
+            ("terminal", "com.paymentco.Terminal"),
+            ("console", "org.example.Console"),
+            ("blackbox", "com.example.BlackBox"),
+        ] {
+            assert!(
+                !is_terminal_class(class, &user(&[entry])),
+                "{class} must not match on a bare `{entry}` entry"
+            );
+        }
+    }
+
+    /// The default: an empty list is exactly today's behavior, and a list
+    /// that names something unrelated changes no built-in verdict — in
+    /// either direction.
+    #[test]
+    fn user_list_never_changes_the_builtin_verdicts() {
+        let unrelated = user(&["Alacritty-float", "st-mytermname"]);
+        for class in [
+            "alacritty",
+            "org.gnome.Terminal",
+            "st-256color",
+            "io.example.Ghostty",
+            "hyper",
+        ] {
+            assert!(is_terminal_class(class, &[]), "{class} regressed at &[]");
+            assert!(
+                is_terminal_class(class, &unrelated),
+                "{class} regressed with an unrelated terminal_classes list"
+            );
+        }
+        for class in [
+            "steam",
+            "Postman",
+            "systemsettings",
+            "com.obsproject.Studio",
+            "app.drey.Warp",
+            "st-link",
+            "",
+            "   ",
+        ] {
+            assert!(
+                !is_terminal_class(class, &[]),
+                "{class:?} must not match with no user classes"
+            );
+            assert!(
+                !is_terminal_class(class, &unrelated),
+                "{class:?} must not match because of an unrelated terminal_classes entry"
+            );
+        }
+    }
+
+    /// A blank or whitespace-only entry is inert. It must not match the empty
+    /// class, and above all it must not match everything.
+    #[test]
+    fn blank_user_entries_are_inert() {
+        let blanks = user(&["", "   ", "\t"]);
+        for class in ["", "   ", "steam", "firefox", "org.gnome.Settings"] {
+            assert!(
+                !is_terminal_class(class, &blanks),
+                "{class:?} matched a blank terminal_classes entry"
+            );
+        }
+    }
+
+    /// End to end through the config type: an `[input]` table written before
+    /// the key existed still parses, and the parsed list is what the daemon
+    /// hands to `is_terminal_class`.
+    #[test]
+    fn terminal_classes_parses_from_the_input_table() {
+        let old: whisrs::InputConfig = toml::from_str("key_delay_ms = 2\npaste = true\n").unwrap();
+        assert!(old.terminal_classes.is_empty());
+        assert!(!is_terminal_class("Alacritty-float", &old.terminal_classes));
+
+        let new: whisrs::InputConfig =
+            toml::from_str("terminal_classes = [\"Alacritty-float\", \"st-mytermname\"]\n")
+                .unwrap();
+        assert_eq!(new.terminal_classes, ["Alacritty-float", "st-mytermname"]);
+        assert!(is_terminal_class("alacritty-float", &new.terminal_classes));
+        assert!(is_terminal_class("st-mytermname", &new.terminal_classes));
+        assert!(!is_terminal_class("steam", &new.terminal_classes));
     }
 }

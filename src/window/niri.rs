@@ -77,8 +77,24 @@ impl WindowTracker for NiriTracker {
     }
 
     fn get_focused_window_class(&self) -> Option<String> {
-        let focused_window = query_focused_window().ok()?;
-        focused_window.app_id.filter(|app_id| !app_id.is_empty())
+        let focused_window = match query_focused_window() {
+            Ok(focused_window) => focused_window,
+            Err(err) => {
+                debug!("niri focused window class: query failed: {err}");
+                return None;
+            }
+        };
+
+        match focused_window.app_id.filter(|app_id| !app_id.is_empty()) {
+            Some(app_id) => {
+                debug!("niri focused window class: {app_id}");
+                Some(app_id)
+            }
+            None => {
+                debug!("niri focused window class: empty (no app_id reported)");
+                None
+            }
+        }
     }
 
     fn focus_window(&self, id: &str) -> anyhow::Result<()> {
