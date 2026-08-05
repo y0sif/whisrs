@@ -24,6 +24,33 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
 tray = true                 # system tray icon (requires SNI host like waybar)
 overlay = false             # bottom-screen recording overlay (Hyprland/Sway, GNOME extension)
 
+# Run every dictation through the [llm] backend before it is typed.
+# Default: false. This is the always-on flavor of [[llm_commands]] below:
+# same rewrite, but on the normal `whisrs toggle` key instead of a dedicated
+# hotkey per entry. Needs an [llm] section (or WHISRS_OPENAI_API_KEY /
+# WHISRS_GROQ_API_KEY).
+#
+# Batch backends only: deepgram, groq, openai, asr-sidecar. The streaming
+# backends, which are deepgram-streaming, openai-realtime,
+# openai-compatible-realtime AND local-whisper, type text as it arrives, so
+# there is never a whole transcript to post-process and the flag does nothing
+# at all. local-whisper is the one to watch: it runs offline and transcribes
+# in a single call, but dictation with it always streams, so llm_post_process
+# is a silent no-op there too. `whisrsd` warns at startup if you pair the two.
+# Use an [[llm_commands]] hotkey instead, which works whatever the backend.
+#
+# If the LLM call fails, times out (30s), or returns nothing, the raw
+# transcript is typed instead, so a dictation is never lost to post-processing.
+# A post-processed dictation is logged as <backend>+llm (e.g. "groq+llm") in
+# `whisrs log`; one that fell back to the raw transcript keeps the plain
+# backend name.
+llm_post_process = false
+# Instruction applied to the transcript when llm_post_process is on. This is
+# NOT `prompt` above: that one is a hint for the transcription backend and
+# never reaches the LLM. Defaults to the conservative cleanup pass below, so
+# `llm_post_process = true` alone already does something sensible.
+llm_instruction = "Fix punctuation, capitalization and obvious transcription errors in the following text. Keep the wording and the meaning unchanged. Return only the corrected text, with no explanations and no quotes."
+
 # Optional — controls overlay appearance when enabled.
 # Defaults to a 100×40 pill with the "carbon" theme.
 # When the overlay is on, recording/transcribing toast notifications are
@@ -169,7 +196,8 @@ url = "http://127.0.0.1:8765/transcribe"
 model = "microsoft/VibeVoice-ASR-HF"
 
 # Command mode: LLM for voice-driven text rewriting.
-# Also used by [[llm_commands]] (see below). Any OpenAI-compatible
+# Also used by [[llm_commands]] (see below) and by
+# [general] llm_post_process. Any OpenAI-compatible
 # /chat/completions endpoint works here, including a local server:
 #   [llm]
 #   api_key = "not-needed"   # local servers don't validate this
@@ -186,6 +214,8 @@ api_url = "https://api.openai.com/v1/chat/completions"
 # there's no text selection involved. Uses the [llm] config above.
 # Optional; can also be triggered via `whisrs llm-command <name>` for
 # compositor keybind integration (same pattern as `whisrs toggle`).
+# For one instruction applied to every dictation with no extra hotkey, use
+# [general] llm_post_process instead.
 #
 # set_hotkey (optional): reprogram this command by selection. Highlight the new
 # instruction text anywhere, press set_hotkey, and it becomes the command's

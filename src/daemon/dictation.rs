@@ -12,8 +12,9 @@ use whisrs::{validate_language_override, Response, State};
 use crate::context::{DaemonContext, DaemonState};
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
-    build_transcription_config, format_no_microphone_error, process_recording_batch,
-    run_streaming_pipeline, save_history_entry, StreamingPipelineParams,
+    build_transcription_config, format_no_microphone_error, history_backend_tag,
+    process_recording_batch, run_streaming_pipeline, save_history_entry, DictationOutcome,
+    StreamingPipelineParams,
 };
 
 pub(crate) async fn handle_toggle(
@@ -222,7 +223,12 @@ pub(crate) async fn handle_toggle(
                             tokio::task::spawn_blocking(move || drop(cap));
                         }
                         match task.await {
-                            Ok(Ok(text)) => Ok(text),
+                            // Never post-processed: the streaming pipeline
+                            // types partials as they arrive, so there is no
+                            // whole transcript to hand the LLM.
+                            // `Config::validate` warns when `llm_post_process`
+                            // is paired with a streaming backend.
+                            Ok(Ok(text)) => Ok(DictationOutcome::raw(text)),
                             Ok(Err(e)) => Err(e),
                             Err(e) => Err(anyhow::anyhow!("streaming task panicked: {e}")),
                         }
@@ -251,12 +257,19 @@ pub(crate) async fn handle_toggle(
                                 let _ = level_tx.send(0.0);
                             }
                             match result {
-                                Ok(text) => {
-                                    info!("transcription complete: {} chars", text.len());
-                                    if !text.is_empty() {
+                                Ok(dictation) => {
+                                    info!("transcription complete: {} chars", dictation.text.len());
+                                    if !dictation.text.is_empty() {
+                                        // The tag records whether the words
+                                        // came from the backend or from the
+                                        // LLM that rewrote them, so `whisrs
+                                        // log` can tell the two apart.
                                         save_history_entry(
-                                            &text,
-                                            &context.config.general.backend,
+                                            &dictation.text,
+                                            &history_backend_tag(
+                                                &context.config.general.backend,
+                                                dictation.post_processed,
+                                            ),
                                             &session_language,
                                             duration_secs,
                                         );
@@ -267,7 +280,7 @@ pub(crate) async fn handle_toggle(
                                         );
                                     }
                                     if context.notify_state() {
-                                        let preview = truncate_preview(&text, 77);
+                                        let preview = truncate_preview(&dictation.text, 77);
                                         send_notification("whisrs", &format!("Done: {preview}"));
                                     }
                                     Response::Ok { state: new_state }
@@ -296,10 +309,10 @@ pub(crate) async fn handle_toggle(
                                 let _ = level_tx.send(0.0);
                             }
                             match &result {
-                                Ok(text) => {
+                                Ok(dictation) => {
                                     info!(
                                         "transcription complete (pipeline-finalized): {} chars",
-                                        text.len()
+                                        dictation.text.len()
                                     )
                                 }
                                 Err(e) => error!("transcription failed: {e:#}"),

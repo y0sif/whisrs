@@ -12,6 +12,7 @@ use prompt_echo::is_prompt_echo;
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
 use whisrs::audio::feedback;
 use whisrs::history::{self, HistoryEntry};
+use whisrs::llm;
 use whisrs::state::Action;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::WindowTracker;
@@ -27,6 +28,13 @@ const TYPING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Minimum recording duration accepted by the gate. Anything shorter is almost
 /// certainly an accidental hotkey tap.
 const AUDIO_GATE_MIN_MS: u64 = 300;
+
+/// Wall-clock budget for the toggle-path LLM post-processing call
+/// (`[general] llm_post_process`). `llm::rewrite_text` sets no client-side
+/// timeout, so without this a hung endpoint would strand the daemon in
+/// `Transcribing` and the dictation would never land. On expiry the raw
+/// transcript is injected instead.
+const LLM_POST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Everything [`run_streaming_pipeline`] needs, bundled so the single call
 /// site (`handle_toggle`'s Idle branch in `dictation.rs`) builds one value
@@ -670,6 +678,162 @@ pub(crate) async fn transcribe_batch_audio(
     Ok(text)
 }
 
+/// The instruction a finished transcript should be post-processed with, or
+/// `None` when the toggle path must inject it unmodified.
+///
+/// `None` covers both "`llm_post_process` is off" (the default) and "on but
+/// the instruction is blank" — an empty instruction buys a round trip and a
+/// non-deterministic rewrite for nothing. `Config::validate` warns about the
+/// second case at startup.
+fn llm_post_process_instruction(config: &Config) -> Option<&str> {
+    if !config.general.llm_post_process {
+        return None;
+    }
+    let instruction = config.general.llm_instruction.trim();
+    (!instruction.is_empty()).then_some(instruction)
+}
+
+/// What a finished dictation produced: the text that reached the cursor, and
+/// whether `[general] llm_post_process` is what produced it.
+///
+/// The flag is carried out of the pipeline purely so `whisrs log` can tell a
+/// post-processed dictation from a raw one (see [`history_backend_tag`]). It
+/// is `true` only when the LLM actually returned the words that were typed,
+/// never for a fallback: with the flag off, a blank instruction, an API error,
+/// a timeout or an empty completion, the entry holds the raw transcript and
+/// labelling it post-processed would be a lie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DictationOutcome {
+    pub(crate) text: String,
+    pub(crate) post_processed: bool,
+}
+
+impl DictationOutcome {
+    /// Text that reached the cursor untouched by the LLM. Also what the
+    /// streaming path always produces: it types partials as they arrive and
+    /// never holds a whole transcript to post-process.
+    pub(crate) fn raw(text: String) -> Self {
+        Self {
+            text,
+            post_processed: false,
+        }
+    }
+}
+
+/// The history `backend` field for a finished dictation.
+///
+/// A raw dictation keeps the bare backend name, byte for byte what has always
+/// been recorded, so existing history semantics do not shift. A dictation the
+/// LLM rewrote gets a `+llm` suffix (`groq` becomes `groq+llm`), so `whisrs
+/// log` distinguishes the LLM's words from the microphone's.
+///
+/// The suffix mirrors the llm-command path's `llm:<name>` tag, which reads as
+/// "the LLM produced this". It is a suffix rather than that prefix for two
+/// reasons: the transcription backend still matters here (it produced the LLM's
+/// input, whereas command mode never logs it), and `llm:<backend>` would be
+/// indistinguishable from an `[[llm_commands]]` entry that happens to be named
+/// after a backend.
+pub(crate) fn history_backend_tag(backend: &str, post_processed: bool) -> String {
+    if post_processed {
+        format!("{backend}+llm")
+    } else {
+        backend.to_string()
+    }
+}
+
+/// Pick the text to inject after a post-processing attempt. `rewritten` is
+/// `None` when the call failed or timed out, and a blank completion counts the
+/// same: the original transcript wins in every one of those cases.
+///
+/// This is where the toggle path deliberately diverges from the llm-command
+/// path (`llm_command_background_inner`), which propagates the LLM error and
+/// injects nothing. There the user pressed a hotkey to run *that command*, so
+/// a failure means the command did not happen; here they pressed plain
+/// dictate, and losing a whole dictation to a flaky endpoint would be a
+/// regression against `llm_post_process = false`.
+/// The completion is trimmed before it is injected. A trailing newline typed at
+/// a shell prompt submits the line, and unlike the llm-command hotkey this runs
+/// on every dictation, so a chatty model would append one every time.
+fn post_processed_or_raw(original: String, rewritten: Option<String>) -> DictationOutcome {
+    match rewritten {
+        Some(text) if !text.trim().is_empty() => DictationOutcome {
+            text: text.trim().to_string(),
+            post_processed: true,
+        },
+        _ => DictationOutcome::raw(original),
+    }
+}
+
+/// Run a finished transcript through the shared `[llm]` backend when
+/// `[general] llm_post_process` is on, returning the text to inject.
+///
+/// Fails soft on every path — flag off, blank instruction, missing `[llm]`
+/// section, API error, timeout, empty completion — by returning `text`
+/// unchanged, so a post-processing problem never costs the user their words.
+/// Reuses `llm::rewrite_text` exactly as the llm-command path does, with the
+/// dictated text as the "selected text" and the configured instruction as the
+/// "voice instruction".
+async fn apply_llm_post_process(text: String, context: &DaemonContext) -> DictationOutcome {
+    let Some(instruction) = llm_post_process_instruction(&context.config) else {
+        return DictationOutcome::raw(text);
+    };
+
+    info!(
+        "llm post-processing: sending {} chars to the LLM",
+        text.len()
+    );
+    // Same resolution as command mode: an absent [llm] section falls back to
+    // the defaults, where an empty api_key sends `rewrite_text` to the
+    // WHISRS_OPENAI_API_KEY / WHISRS_GROQ_API_KEY env vars.
+    let llm_config = context.config.llm.clone().unwrap_or_default();
+
+    let rewritten = match tokio::time::timeout(
+        LLM_POST_PROCESS_TIMEOUT,
+        llm::rewrite_text(&llm_config, &text, instruction),
+    )
+    .await
+    {
+        Ok(Ok(rewritten)) => {
+            if rewritten.trim().is_empty() {
+                warn!("llm post-processing returned empty text — injecting the raw transcript");
+                if context.notify_error() {
+                    send_notification(
+                        "whisrs",
+                        "LLM post-processing returned nothing — typing the raw transcript",
+                    );
+                }
+            }
+            Some(rewritten)
+        }
+        Ok(Err(e)) => {
+            let friendly = format_api_error(&e);
+            error!("llm post-processing failed: {e:#}");
+            if context.notify_error() {
+                send_notification(
+                    "whisrs",
+                    &format!("LLM post-processing failed: {friendly}\nTyping the raw transcript"),
+                );
+            }
+            None
+        }
+        Err(_elapsed) => {
+            let secs = LLM_POST_PROCESS_TIMEOUT.as_secs();
+            error!("llm post-processing timed out after {secs}s");
+            if context.notify_error() {
+                send_notification(
+                    "whisrs",
+                    &format!(
+                        "LLM post-processing timed out after {secs}s\nTyping the raw transcript"
+                    ),
+                );
+            }
+            None
+        }
+    };
+
+    post_processed_or_raw(text, rewritten)
+}
+
 /// Batch mode: collect all audio, transcribe in one shot, type result.
 /// `language` is the resolved session language (per-toggle override or
 /// config default) captured when recording started.
@@ -678,7 +842,7 @@ pub(crate) async fn process_recording_batch(
     window_id: Option<&str>,
     context: &DaemonContext,
     language: &str,
-) -> Result<String> {
+) -> Result<DictationOutcome> {
     let samples = match capture {
         Some(cap) => cap.stop_and_collect().await?,
         None => anyhow::bail!("no audio capture to collect"),
@@ -695,8 +859,18 @@ pub(crate) async fn process_recording_batch(
 
     if text.is_empty() {
         // Gated, echo-dropped, or empty — the helper already said so.
-        return Ok(text);
+        return Ok(DictationOutcome::raw(text));
     }
+
+    // `[general] llm_post_process`: rewrite the finished transcript through
+    // the shared `[llm]` backend before it reaches the cursor (issue #85).
+    // Batch-only by design — the streaming pipeline types partials as they
+    // arrive and never holds a whole transcript, so this must NOT be wired
+    // into `run_streaming_pipeline`; the usual "wire it into both paths" rule
+    // is inverted here and `Config::validate` warns instead. The rewritten
+    // text is what this function returns, so history records what was actually
+    // typed, tagged by `history_backend_tag` with whether the LLM produced it.
+    let outcome = apply_llm_post_process(text, context).await;
 
     // Restore window focus.
     if let Some(wid) = window_id {
@@ -709,7 +883,7 @@ pub(crate) async fn process_recording_batch(
 
     // Inject the text at the cursor — type keystrokes, or paste via the
     // clipboard when `[input] paste = true` (layout-independent).
-    let text_clone = text.clone();
+    let text_clone = outcome.text.clone();
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
     let injector_backend = context.config.input.backend;
     let paste = context.config.input.paste;
@@ -732,7 +906,7 @@ pub(crate) async fn process_recording_batch(
         Err(e) => warn!("failed to join injection task: {e}"),
     }
 
-    Ok(text)
+    Ok(outcome)
 }
 
 pub(crate) fn format_no_microphone_error() -> String {
@@ -1230,5 +1404,151 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    // ── Toggle-path LLM post-processing (issue #85) ─────────────────────
+
+    /// Parse a config from TOML, with a `[general] backend` already set so
+    /// only the keys under test have to be spelled out.
+    fn config_from(general_extra: &str) -> Config {
+        toml::from_str(&format!("[general]\nbackend = \"groq\"\n{general_extra}\n"))
+            .expect("test config parses")
+    }
+
+    /// The flag is opt-in: an untouched config never post-processes, whatever
+    /// the (defaulted) instruction says.
+    #[test]
+    fn llm_post_process_off_by_default() {
+        let config = config_from("");
+        assert!(!config.general.llm_post_process);
+        assert!(llm_post_process_instruction(&config).is_none());
+    }
+
+    /// Flag on: the trimmed instruction is what gets sent to the LLM.
+    #[test]
+    fn llm_post_process_instruction_is_trimmed() {
+        let config =
+            config_from("llm_post_process = true\nllm_instruction = \"  Translate to German.  \"");
+        assert_eq!(
+            llm_post_process_instruction(&config),
+            Some("Translate to German.")
+        );
+    }
+
+    /// Flag on with the key omitted still has something to apply — the built
+    /// in cleanup instruction — so the flag alone is a working configuration.
+    #[test]
+    fn llm_post_process_uses_default_instruction_when_key_omitted() {
+        let config = config_from("llm_post_process = true");
+        let instruction = llm_post_process_instruction(&config).expect("default instruction");
+        assert!(
+            instruction.contains("Return only the corrected text"),
+            "unexpected default instruction: {instruction}"
+        );
+    }
+
+    /// A blank instruction disables post-processing rather than sending an
+    /// empty instruction to the LLM.
+    #[test]
+    fn llm_post_process_blank_instruction_skips() {
+        let config = config_from("llm_post_process = true\nllm_instruction = \"   \"");
+        assert!(llm_post_process_instruction(&config).is_none());
+    }
+
+    /// The failure contract: only a non-blank completion may replace the
+    /// transcript. Errors, timeouts (both `None`) and blank completions all
+    /// keep the user's words — the toggle path never loses a dictation to a
+    /// post-processing problem.
+    ///
+    /// The `post_processed` flag tracks the same split, because it is what
+    /// `whisrs log` is tagged from: a fallback holds the raw transcript, so it
+    /// must not be labelled as the LLM's work.
+    #[test]
+    fn post_processed_or_raw_falls_back_to_the_transcript() {
+        let raw = || "hello world".to_string();
+        let cases = [
+            (
+                "rewrite wins",
+                Some("Hello, world.".to_string()),
+                "Hello, world.",
+                true,
+            ),
+            ("llm error or timeout", None, "hello world", false),
+            (
+                "empty completion",
+                Some(String::new()),
+                "hello world",
+                false,
+            ),
+            (
+                "whitespace-only completion",
+                Some("  \n ".to_string()),
+                "hello world",
+                false,
+            ),
+            (
+                "trailing newline is trimmed, it would submit the line in a terminal",
+                Some("Hello, world.\n".to_string()),
+                "Hello, world.",
+                true,
+            ),
+            (
+                "surrounding whitespace is trimmed",
+                Some("\n  Hello, world.  \n\n".to_string()),
+                "Hello, world.",
+                true,
+            ),
+        ];
+        for (name, rewritten, expected, post_processed) in cases {
+            let outcome = post_processed_or_raw(raw(), rewritten);
+            assert_eq!(outcome.text, expected, "{name}");
+            assert_eq!(
+                outcome.post_processed, post_processed,
+                "{name}: post_processed must be true only when the LLM produced the text \
+                 that was typed"
+            );
+        }
+    }
+
+    /// A dictation that was not post-processed keeps the bare backend name it
+    /// has always been logged under, byte for byte. Anything else would shift
+    /// the meaning of every pre-existing history entry.
+    #[test]
+    fn history_backend_tag_is_unchanged_for_raw_dictation() {
+        for backend in ["groq", "deepgram", "openai", "local-whisper", "asr-sidecar"] {
+            assert_eq!(history_backend_tag(backend, false), backend);
+        }
+    }
+
+    /// A post-processed dictation is tagged `<backend>+llm`, so `whisrs log`
+    /// shows which entries hold the LLM's words rather than the microphone's.
+    #[test]
+    fn history_backend_tag_marks_post_processed_dictation() {
+        assert_eq!(history_backend_tag("groq", true), "groq+llm");
+        assert_eq!(history_backend_tag("deepgram", true), "deepgram+llm");
+    }
+
+    /// The tag must not collide with the llm-command path's `llm:<name>`
+    /// entries (`command_mode.rs`), which name a configured command rather
+    /// than a transcription backend. Keeping the backend in front and the
+    /// marker behind means neither form can be mistaken for the other, even
+    /// when an `[[llm_commands]]` entry is named after a backend.
+    #[test]
+    fn history_backend_tag_does_not_collide_with_llm_command_tags() {
+        let post_processed = history_backend_tag("groq", true);
+        assert!(!post_processed.starts_with("llm:"));
+        assert_ne!(post_processed, "llm:groq");
+    }
+
+    /// The streaming path can only ever produce raw dictation, so its
+    /// constructor must never claim otherwise.
+    #[test]
+    fn dictation_outcome_raw_is_not_post_processed() {
+        let outcome = DictationOutcome::raw("hello".to_string());
+        assert!(!outcome.post_processed);
+        assert_eq!(
+            history_backend_tag("openai-realtime", outcome.post_processed),
+            "openai-realtime"
+        );
     }
 }

@@ -152,6 +152,9 @@ pub fn run_setup() -> Result<()> {
             prompt: None,
             tray: true,
             overlay,
+            // Onboarding stays minimal: LLM post-processing of dictation is
+            // opt-in and edited by hand (see docs/configuration.md).
+            ..GeneralConfig::default()
         },
         audio: AudioConfig {
             device: "default".to_string(),

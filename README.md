@@ -229,6 +229,41 @@ bindsym F2 exec whisrs toggle -l pl
 Without `-l`, `whisrs toggle` keeps using `general.language`, so an existing
 plain-toggle key is unaffected.
 
+### LLM post-processing
+
+Three ways to put an LLM between your voice and the cursor, all sharing the one
+`[llm]` section:
+
+- `whisrs command`: select text, speak an instruction, the selection is rewritten in place.
+- `[[llm_commands]]`: a named instruction on its own hotkey. Dictate, the LLM applies it, the result is typed. One hotkey per entry.
+- `[general] llm_post_process`: the same rewrite on the normal toggle key, with no extra binding.
+
+```toml
+[general]
+backend = "groq"           # a batch backend
+llm_post_process = true    # off by default
+llm_instruction = "Fix punctuation and obvious transcription errors. Keep the wording unchanged. Return only the corrected text."
+```
+
+With it on, every `whisrs toggle` dictation goes through `[llm]` before it is
+typed.
+
+**Batch backends only:** `deepgram`, `groq`, `openai`, `asr-sidecar`. The
+streaming backends, which are `deepgram-streaming`, `openai-realtime`,
+`openai-compatible-realtime` **and `local-whisper`**, type text at the cursor as
+it arrives, so no whole transcript ever exists to post-process and the flag does
+nothing at all. `local-whisper` is the one to watch: it runs offline and
+transcribes in a single call, but dictation with it always streams, so
+`llm_post_process` is a silent no-op there too. `whisrsd` warns at startup if you
+pair the two. Use an `[[llm_commands]]` hotkey instead, which works whatever the
+backend.
+
+If the LLM call fails, times out, or returns nothing, the raw transcript is typed
+instead, so a dictation is never lost to post-processing. A post-processed entry
+shows up in `whisrs log` tagged `<backend>+llm` (for example `groq+llm`); a
+dictation that fell back to the raw transcript keeps the plain backend name. See
+[docs/configuration.md](docs/configuration.md).
+
 ---
 
 ## Supported Environments
