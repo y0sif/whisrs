@@ -75,7 +75,14 @@ Clear all history instead of showing it.
 .TP
 .B command
 Command mode: select text, speak an instruction, and the LLM rewrites it
-in place.
+in place. Requires a selection. To write text where there is none, configure
+an
+.B [[llm_commands]]
+entry with a generic \(lqtreat the following text as a request and output
+only what is asked\(rq instruction \(em that path never reads the selection.
+See
+.I https://github.com/y0sif/whisrs/blob/main/docs/configuration.md
+for the recipe.
 .TP
 \fBllm\-command\fR \fINAME\fR
 Toggle a named custom LLM command (see
@@ -117,6 +124,37 @@ when the systemd user unit is loaded; otherwise prints guidance for
 manual restart. Does not require the daemon to be running \(em
 .B restart
 will start a stopped service.
+.SH LLM OUTPUT
+Applies to
+.B command
+and to every
+.B [[llm_commands]]
+entry \(em both type the model's reply at the cursor.
+.PP
+A reply wrapped entirely in a Markdown code fence is unwrapped before it is
+typed; a fence is never what you wanted at the cursor. A reply that contains
+several fenced blocks is prose about code, not a wrapper, and is left alone.
+Stripping has no opt-out, so an entry whose instruction asks for a fenced
+block cannot produce one.
+.PP
+A reply spanning several lines is typed normally \(em translating a paragraph
+or drafting an email is exactly what these commands are for. The one exception
+is a terminal: there a line break is an Enter that runs a command you have not
+read, so a multi-line reply aimed at a terminal is refused rather than typed.
+It is not lost \(em it is written to the history, where
+.B whisrs log
+recovers it. Ask for a one\-liner to get an injected result. The refusal also
+applies with
+.B [input] paste
+set, since bracketed paste is the foreground program's choice and cannot be
+relied on; and its notification fires even with
+.B [general] notify
+turned off, because nothing was typed.
+.PP
+Terminal detection needs
+.BR WindowTracker::get_focused_window_class ,
+which only Hyprland and Niri implement; elsewhere a terminal is treated as an
+ordinary target and multi-line replies are typed.
 .SH ENVIRONMENT
 .TP
 .B WHISRS_GROQ_API_KEY

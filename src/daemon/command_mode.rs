@@ -12,13 +12,41 @@ use whisrs::state::{Action, StateMachine};
 use whisrs::{Config, Response, State};
 
 use crate::context::{CommandModeContext, DaemonContext, DaemonState, LlmCommandContext};
-use crate::injection::{clear_line_via_keyboard, inject_text, is_terminal_class};
+use crate::injection::{
+    clear_line_via_keyboard, inject_text, is_terminal_class, prepare_llm_injection, LlmInjection,
+};
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     format_api_error, format_no_microphone_error, save_history_entry, transcribe_batch_audio,
     BatchOptions,
 };
 use crate::selection::{acquire_selected_text, capture_selection};
+
+/// History `backend` tag for a command-mode result, alongside the `llm:<name>`
+/// tags the `[[llm_commands]]` path writes.
+///
+/// Command mode does not otherwise log — the rewritten text lands on screen,
+/// and the original is still there to compare against. It logs on exactly one
+/// path: a multi-line result refused at a terminal, where the history entry is
+/// the only surviving copy and what `whisrs log` recovers.
+const COMMAND_MODE_HISTORY_BACKEND: &str = "command";
+
+/// The toast for a multi-line reply refused at a terminal. `label` names the
+/// `[[llm_commands]]` entry; `None` is command mode, which has no name.
+///
+/// Names `whisrs log` on purpose: nothing was typed, so the history entry
+/// written alongside this toast is the only surviving copy of the text, and a
+/// message that does not say where it went is a message that loses it.
+fn refused_multi_line_message(label: Option<&str>) -> String {
+    let subject = match label {
+        Some(name) => format!("'{name}': result"),
+        None => "Result".to_string(),
+    };
+    format!(
+        "{subject} spans multiple lines and the target is a terminal — not typed. \
+         Recover it with 'whisrs log'."
+    )
+}
 
 /// Claim a command-session context (command mode or llm-command) when audio
 /// collection ends, moving the state machine Recording → Transcribing.
@@ -58,16 +86,20 @@ fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Option<T>) -> Op
 /// [`claim_session`], then — only after the claim succeeded — take the
 /// neighbor state that belongs to this recording (the capture handle, in
 /// case a stop path didn't already drop it, e.g. the input device vanished
-/// and the channel closed on its own).
+/// and the channel closed on its own; and the start time, which the history
+/// entry a refused multi-line result falls back to needs).
 ///
 /// The gating is the point: a stale background task can reach this after
 /// `handle_cancel` discarded its session AND a new session has already
 /// started. Taking `audio_capture` before knowing the claim succeeded would
 /// strip the new session's live capture. On bail this mutates nothing.
-fn claim_command_mode_session(ds: &mut DaemonState) -> Option<CommandModeContext> {
+fn claim_command_mode_session(
+    ds: &mut DaemonState,
+) -> Option<(CommandModeContext, Option<std::time::Instant>)> {
     let ctx = claim_session(&mut ds.state_machine, &mut ds.command_mode)?;
     ds.audio_capture.take(); // ensure capture is dropped
-    Some(ctx)
+    let started_at = ds.recording_started_at.take();
+    Some((ctx, started_at))
 }
 
 /// The claim block of [`llm_command_background`]: claim the session via
@@ -160,10 +192,27 @@ async fn command_mode_start(
     // is later injected through the same wrapper dictation uses: typed by
     // default, pasted when `[input] paste` is set. Either way it replaces the
     // active selection in GUI apps and lands at the prompt cursor in terminals.
+    //
+    // Command mode requires a selection: every [`CaptureError`] variant aborts
+    // here, including both "nothing came back" ones. It does not fall back to
+    // writing text from scratch when the capture comes up empty. A fallback
+    // was tried and dropped: the two empty-shaped variants are
+    // indistinguishable from the user's point of view but not to act on
+    // (`ClipboardUnchanged` also fires when the user copied their live
+    // selection by hand), so a fallback either refuses the ambiguous case —
+    // and then almost never fires, since any clipboard content makes it
+    // ambiguous — or types over text the user is still looking at. Writing
+    // text with no selection is what an `[[llm_commands]]` entry with a
+    // generic "treat this as a request" instruction does (issue #91); it never
+    // captures a selection in the first place, so the question never comes up.
     info!("command mode: getting selected text");
     let selected_text = match capture_selection(&context).await {
         Ok(text) => text,
-        Err(message) => return Response::Error { message },
+        Err(error) => {
+            return Response::Error {
+                message: error.to_string(),
+            }
+        }
     };
 
     info!(
@@ -265,12 +314,12 @@ async fn command_mode_background(
     // claim, so a bail cannot strip state from a session that started after
     // the cancel. The lock is released before the slow transcribe/LLM
     // awaits in the inner fn.
-    let cmd_ctx = {
+    let claimed = {
         let mut ds = daemon_state.lock().await;
         claim_command_mode_session(&mut ds)
     };
 
-    let Some(cmd_ctx) = cmd_ctx else {
+    let Some((cmd_ctx, recording_started_at)) = claimed else {
         // Cancelled: `handle_cancel` already moved the machine to Idle (its
         // dispatcher broadcasts the state and it resets the overlay level),
         // so there is nothing to finalize — the recording is discarded.
@@ -278,7 +327,9 @@ async fn command_mode_background(
         return;
     };
 
-    if let Err(e) = command_mode_background_inner(&all_samples, cmd_ctx, &context).await {
+    if let Err(e) =
+        command_mode_background_inner(&all_samples, cmd_ctx, recording_started_at, &context).await
+    {
         let friendly = format_api_error(&e);
         error!("command mode: {e:#}");
         if context.notify_error() {
@@ -310,6 +361,7 @@ async fn command_mode_background(
 async fn command_mode_background_inner(
     all_samples: &[i16],
     cmd_ctx: CommandModeContext,
+    recording_started_at: Option<std::time::Instant>,
     context: &DaemonContext,
 ) -> Result<()> {
     if context.config.general.audio_feedback {
@@ -332,8 +384,65 @@ async fn command_mode_background_inner(
     info!("command mode: instruction = {:?}", instruction);
 
     // Send to LLM.
-    let result =
-        llm::rewrite_text(&cmd_ctx.llm_config, &cmd_ctx.selected_text, &instruction).await?;
+    let raw = llm::rewrite_text(&cmd_ctx.llm_config, &cmd_ctx.selected_text, &instruction).await?;
+
+    // Resolve the target before deciding what to do with the reply: the
+    // multi-line refusal below is conditional on it, and so is the paste combo
+    // further down.
+    //
+    // `is_terminal` can only ever be true where
+    // `WindowTracker::get_focused_window_class()` is actually implemented,
+    // which is Hyprland (`src/window/hyprland.rs:59`) and Niri
+    // (`src/window/niri.rs:79`). `src/window/mod.rs:23` defaults it to `None`,
+    // so on KWin, GNOME, Sway and X11 it stays false and terminals there fall
+    // back to plain injection at the cursor (and to plain Ctrl+V on the paste
+    // branch). Tracked in issues #70 and #71; not fixed here. The practical
+    // consequence for the gate is that on those compositors a multi-line reply
+    // is typed into a terminal rather than refused — the same exposure the
+    // line-clear already has.
+    let is_terminal = context
+        .window_tracker
+        .get_focused_window_class()
+        .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
+        .unwrap_or(false);
+
+    // Clean the reply and decide whether it may be typed here (shared with the
+    // `[[llm_commands]]` path — see `prepare_llm_injection`).
+    let result = match prepare_llm_injection(&raw, is_terminal) {
+        LlmInjection::Inject(text) => text,
+        LlmInjection::Empty => {
+            warn!("command mode: LLM returned no usable text");
+            if context.notify_error() {
+                send_notification("whisrs", "Command mode: LLM returned empty text");
+            }
+            return Ok(());
+        }
+        LlmInjection::RefusedMultiLine(text) => {
+            warn!(
+                "command mode: refusing to inject {} chars of multi-line text into a terminal",
+                text.len()
+            );
+            save_history_entry(
+                &text,
+                COMMAND_MODE_HISTORY_BACKEND,
+                &context.config.general.language,
+                recording_started_at
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(0.0),
+            );
+            // Fired UNCONDITIONALLY — deliberately not behind
+            // `notify_error()`, unlike every other toast in this file. The
+            // others report progress or a failure; this one is different in
+            // kind, because it *withholds text the user would otherwise have
+            // received*, and the history entry just written is the only
+            // surviving copy. `notify = false` means "do not narrate normal
+            // operation", not "silently discard my work": gated, this outcome
+            // is a `warn!` in the journal that nobody reads, and from the
+            // user's chair the dictation simply vanished.
+            send_notification("whisrs", &refused_multi_line_message(None));
+            return Ok(());
+        }
+    };
 
     // Inject the result at the cursor through the same policy wrapper the
     // dictation path uses. By default that means typing keystrokes through
@@ -348,12 +457,8 @@ async fn command_mode_background_inner(
     // same reason it does for dictation: on compositors without the Wayland
     // virtual-keyboard protocol (e.g. KWin) uinput keycodes are decoded
     // through the target window's active XKB layout and can come out garbled,
-    // and the clipboard is layout-independent. `is_terminal` only picks
-    // Ctrl+Shift+V over Ctrl+V there; nothing else keys off it. It can only
-    // ever be true under Hyprland and Niri: `get_focused_window_class()`
-    // defaults to `None` for every other tracker (KWin, GNOME, Sway, X11),
-    // so terminals get plain Ctrl+V there. Same gap as the dictation path
-    // above; tracked in issues #70 and #71.
+    // and the clipboard is layout-independent. On that branch `is_terminal`
+    // only picks Ctrl+Shift+V over Ctrl+V.
     //
     // GUI apps: typing (or pasting) while text is selected replaces the
     // selection. That is text-widget behavior in GTK, Qt and Electron, and it
@@ -365,24 +470,11 @@ async fn command_mode_background_inner(
     // inject, so the result replaces the highlighted command instead of being
     // tacked onto it. The clear is best-effort: if it fails we still inject,
     // because appending the LLM result beats losing it.
-    //
-    // `is_terminal` can only ever be true where
-    // `WindowTracker::get_focused_window_class()` is actually implemented,
-    // which is Hyprland (`src/window/hyprland.rs:59`) and Niri
-    // (`src/window/niri.rs:79`). `src/window/mod.rs:23` defaults it to `None`,
-    // so on KWin, GNOME, Sway and X11 it stays false and terminals there fall
-    // back to plain injection at the cursor (and to plain Ctrl+V on the paste
-    // branch). Tracked in issues #70 and #71; not fixed here.
     info!("command mode: injecting {} chars", result.len());
     let text_clone = result.clone();
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
     let injector_backend = context.config.input.backend;
     let paste = context.config.input.paste;
-    let is_terminal = context
-        .window_tracker
-        .get_focused_window_class()
-        .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
-        .unwrap_or(false);
     match tokio::task::spawn_blocking(move || {
         if is_terminal {
             if let Err(e) = clear_line_via_keyboard(key_delay, injector_backend) {
@@ -768,20 +860,11 @@ async fn llm_command_background_inner(
         text.len()
     );
 
-    let result = llm::rewrite_text(&cmd_ctx.llm_config, &text, &cmd_ctx.instruction).await?;
+    let raw = llm::rewrite_text(&cmd_ctx.llm_config, &text, &cmd_ctx.instruction).await?;
 
-    if result.is_empty() {
-        if context.notify_error() {
-            send_notification(
-                "whisrs",
-                &format!("'{}': LLM returned empty text", cmd_ctx.name),
-            );
-        }
-        return Ok(());
-    }
-
-    // Restore window focus, then inject the result at the cursor — keystrokes,
-    // or clipboard paste when `[input] paste = true` (layout-independent).
+    // Restore window focus before anything else looks at what is focused: the
+    // gate below and the paste combo both key off the target window, and the
+    // focus may have moved during the recording.
     if let Some(wid) = &window_id {
         if let Err(e) = context.window_tracker.focus_window(wid) {
             warn!("failed to restore window focus: {e}");
@@ -790,19 +873,64 @@ async fn llm_command_background_inner(
         }
     }
 
+    // Resolved unconditionally, not just on the paste branch: the multi-line
+    // gate needs it too. Same #70/#71 caveat as command mode — only Hyprland
+    // and Niri implement `get_focused_window_class()`, so elsewhere this stays
+    // false and a terminal there is treated as an ordinary target.
+    let is_terminal = context
+        .window_tracker
+        .get_focused_window_class()
+        .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
+        .unwrap_or(false);
+
+    let duration_secs = recording_started_at
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    let history_backend = format!("llm:{}", cmd_ctx.name);
+
+    // Clean the reply and decide whether it may be typed here — the same gate
+    // command mode uses. Multi-line output is normal for these commands
+    // (translate a paragraph, draft an email) and is injected as-is; it is only
+    // refused when the target is a terminal, where a line break is an Enter.
+    let result = match prepare_llm_injection(&raw, is_terminal) {
+        LlmInjection::Inject(text) => text,
+        LlmInjection::Empty => {
+            if context.notify_error() {
+                send_notification(
+                    "whisrs",
+                    &format!("'{}': LLM returned empty text", cmd_ctx.name),
+                );
+            }
+            return Ok(());
+        }
+        LlmInjection::RefusedMultiLine(text) => {
+            warn!(
+                "llm-command '{}': refusing to inject {} chars of multi-line text into a terminal",
+                cmd_ctx.name,
+                text.len()
+            );
+            save_history_entry(
+                &text,
+                &history_backend,
+                &context.config.general.language,
+                duration_secs,
+            );
+            // Fired UNCONDITIONALLY — see the matching arm in
+            // `command_mode_background_inner` for why this one toast bypasses
+            // the notify gate: it withholds text the user would otherwise
+            // have received, and `notify = false` means "do not narrate
+            // normal operation", not "silently discard my work".
+            send_notification("whisrs", &refused_multi_line_message(Some(&cmd_ctx.name)));
+            return Ok(());
+        }
+    };
+
+    // Inject at the cursor — keystrokes, or clipboard paste when
+    // `[input] paste = true` (layout-independent).
     let result_clone = result.clone();
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
     let injector_backend = context.config.input.backend;
     let paste = context.config.input.paste;
-    let is_terminal = if paste {
-        context
-            .window_tracker
-            .get_focused_window_class()
-            .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
-            .unwrap_or(false)
-    } else {
-        false
-    };
     match tokio::task::spawn_blocking(move || {
         inject_text(
             &result_clone,
@@ -825,12 +953,9 @@ async fn llm_command_background_inner(
         ),
     }
 
-    let duration_secs = recording_started_at
-        .map(|t| t.elapsed().as_secs_f64())
-        .unwrap_or(0.0);
     save_history_entry(
         &result,
-        &format!("llm:{}", cmd_ctx.name),
+        &history_backend,
         &context.config.general.language,
         duration_secs,
     );
@@ -849,6 +974,7 @@ async fn llm_command_background_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::CaptureError;
 
     fn recording_machine() -> StateMachine {
         let mut sm = StateMachine::new();
@@ -1014,6 +1140,151 @@ mod tests {
         assert!(ds.llm_command.is_none());
         assert!(ds.recording_window_id.is_none());
         assert!(ds.recording_started_at.is_none());
+    }
+
+    /// The success half of the command-mode claim helper: an uncancelled stop
+    /// claims the context (consuming the slot), hands back this session's
+    /// start time — the history entry a terminal-refused multi-line result
+    /// falls back to needs the duration — clears that field, and enters
+    /// Transcribing.
+    #[test]
+    fn command_mode_claim_takes_own_session_state_on_success() {
+        let mut ds = DaemonState::new();
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        ds.command_mode = Some(CommandModeContext {
+            selected_text: "selected".to_string(),
+            llm_config: Default::default(),
+        });
+        ds.recording_started_at = Some(std::time::Instant::now());
+
+        let (ctx, started_at) =
+            claim_command_mode_session(&mut ds).expect("live session must be claimed");
+
+        assert_eq!(ctx.selected_text, "selected");
+        assert!(started_at.is_some());
+        assert_eq!(ds.state_machine.state(), State::Transcribing);
+        assert!(ds.command_mode.is_none());
+        assert!(ds.recording_started_at.is_none());
+    }
+
+    /// Command mode *requires* a selection: every [`CaptureError`] variant —
+    /// including the two whose wording says "no text selected" — aborts the
+    /// session. `command_mode_start` renders the variant's `Display` into
+    /// `Response::Error` with no branching, which is what this pins: no
+    /// variant may be silently reinterpreted as "proceed with an empty
+    /// selection" (issue #91's rejected fallback).
+    #[test]
+    fn every_capture_error_aborts_command_mode_with_its_own_message() {
+        let cases = [
+            (
+                CaptureError::NothingSelected,
+                "no text selected — select some text first",
+            ),
+            (
+                CaptureError::ClipboardUnchanged,
+                "no text selected — select some text first",
+            ),
+            (
+                CaptureError::CopyFailed("uinput permission denied".to_string()),
+                "failed to copy selection: uinput permission denied",
+            ),
+            (
+                CaptureError::CopyTaskPanicked("task 12 panicked".to_string()),
+                "copy task panicked: task 12 panicked",
+            ),
+            (
+                CaptureError::ClipboardReadFailed("connection refused".to_string()),
+                "failed to read clipboard: connection refused",
+            ),
+        ];
+        for (error, expected) in cases {
+            // The exact expression `command_mode_start` evaluates on the error
+            // arm, byte-for-byte what the CLI prints and the toast shows.
+            let response = Response::Error {
+                message: error.to_string(),
+            };
+            let Response::Error { message } = response else {
+                panic!("capture failures must abort command mode");
+            };
+            assert_eq!(message, expected, "{error:?}");
+        }
+    }
+
+    /// The refusal message must name `whisrs log`, in both flavors: it is the
+    /// only place the text still exists, so a message that omits it turns a
+    /// recoverable result into a lost one.
+    #[test]
+    fn the_refusal_message_names_the_recovery_path() {
+        for label in [None, Some("german")] {
+            let message = refused_multi_line_message(label);
+            assert!(
+                message.contains("whisrs log"),
+                "{message:?} does not tell the user how to recover the text"
+            );
+            assert!(
+                message.contains("not typed"),
+                "{message:?} does not say the text was withheld"
+            );
+        }
+        assert!(refused_multi_line_message(Some("german")).starts_with("'german':"));
+    }
+
+    /// The refusal toast must never sit behind the notify gate.
+    ///
+    /// There is no runtime seam for this: `send_notification` spawns a D-Bus
+    /// thread, and reaching the arm needs a `DaemonContext` with a live window
+    /// tracker, transcription backend and audio device. What *is* testable is
+    /// the shape of the two call sites — both must notify, and neither may be
+    /// wrapped in `notify_error()` / `context.notify`. Gated, this outcome is a
+    /// `warn!` in the journal and nothing on screen, so a user with
+    /// notifications off just watches their dictation disappear.
+    #[test]
+    fn the_multi_line_refusal_notifies_unconditionally() {
+        // Everything before the test module — so the string literals in this
+        // very test cannot match themselves.
+        let production = include_str!("command_mode.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production half");
+
+        let arms: Vec<String> = production
+            .split("LlmInjection::RefusedMultiLine(text) => {")
+            .skip(1)
+            .map(|rest| {
+                let arm = rest
+                    .split("return Ok(());")
+                    .next()
+                    .expect("the arm returns Ok");
+                // Comment lines are stripped: these arms explain *why* they
+                // bypass the notify gate, and naming it in prose must not read
+                // as calling it.
+                arm.lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        assert_eq!(
+            arms.len(),
+            2,
+            "command mode and llm-command each have exactly one refusal arm"
+        );
+
+        for arm in arms {
+            assert!(
+                arm.contains("send_notification("),
+                "a refusal arm that does not notify discards the result silently"
+            );
+            assert!(
+                !arm.contains("notify_error()"),
+                "the refusal toast must not be gated by notify_error() — \
+                 `notify = false` must not mean `discard my work silently`"
+            );
+            assert!(
+                !arm.contains("context.notify"),
+                "the refusal toast must not be gated by the notify flag at all"
+            );
+        }
     }
 
     /// A plain `whisrs toggle` on a command-mode / llm-command recording:

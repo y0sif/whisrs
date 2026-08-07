@@ -228,12 +228,83 @@ response_format = "wav"     # audio format requested from the API
 # Modifiers: Super, Alt, Ctrl, Shift. At least one is required, so a bare
 #   "F13" is rejected; write "Shift+F13". The modifier set must match exactly,
 #   so "Ctrl+Alt+Ins" does not fire while Shift is also held.
+# Two bindings sharing a combo both fire on one press, so whisrs warns at
+#   startup when it finds a duplicate across [hotkeys] and [[llm_commands]].
 [hotkeys]
 toggle = "Super+Shift+W"
 cancel = "Super+Shift+D"
 command = "Super+Shift+G"
 speak = "Super+Shift+R"
 ```
+
+### Generate text with no selection
+
+`whisrs command` **rewrites a selection**: highlight some text, press the key,
+say what to do with it ("make this formal", "translate to German"). It reads
+the primary selection, falling back to a simulated Ctrl+C, and refuses with
+"no text selected" when it comes up empty.
+
+To **write new text** where there is nothing to select, use an `[[llm_commands]]`
+entry with a generic instruction. That path never reads the selection or the
+clipboard, so nothing needs to be highlighted first: press the key, say what you
+want, and the result is typed at the cursor.
+
+```toml
+[[llm_commands]]
+name = "ask"
+hotkey = "Super+Shift+B"
+instruction = "Treat the following text as a request and output only what is asked. Output the requested artifact itself, with no preamble, no explanation and no code fences."
+```
+
+Then press `Super+Shift+B`, say "the command to install steam on arch linux",
+press again (or stop talking), and `sudo pacman -S steam` is typed where your
+cursor is. Say "a polite email declining the meeting on Thursday" and you get
+the email. The instruction is what makes it generic, so one entry covers every
+ad-hoc request; a second entry with a narrower instruction ("Translate the
+following text into German. Return only the translation.") stays a dedicated
+command.
+
+It also works from a compositor keybind:
+`bind = $mainMod SHIFT, B, exec, whisrs llm-command ask` on Hyprland,
+`bindsym $mod+Shift+b exec whisrs llm-command ask` on Sway.
+
+### What happens to the LLM's reply
+
+The following applies to `whisrs command` and to every `[[llm_commands]]` entry,
+since both type the model's reply at the cursor.
+
+- **A wrapping code fence is removed.** If the whole reply is one fenced block,
+  the fence goes and the body is typed. A reply containing several fenced blocks
+  is prose about code, not a wrapper, and is left as it came.
+  There is no opt-out, and that is a real limitation: an `[[llm_commands]]` entry
+  whose instruction genuinely asks for a fenced block ("wrap this in a python
+  code fence") cannot produce one — the fence is stripped on the way to the
+  cursor, and no config key turns that off. If you need the fence characters
+  themselves, type them yourself around the result.
+- **Multi-line replies are typed normally**, except into a terminal. Translating
+  a paragraph or drafting an email is exactly what these commands are for, so
+  the line breaks are kept.
+- **A multi-line reply is refused when the focused window is a terminal.** There
+  a line break is an Enter, which would run a command before you have read it.
+  The text is not lost: it goes to the history, so `whisrs log` prints it and you
+  can copy it from there. Ask for a one-liner to get an injected result.
+  You are told when this happens: the "not typed" notification fires even with
+  `[general] notify = false`, because that setting means "don't narrate normal
+  operation", not "discard my dictation quietly".
+
+The refusal also applies with `[input] paste = true`, where the risk is lower
+but not gone. Pasting into a terminal sends Ctrl+Shift+V, and a terminal with
+bracketed paste enabled inserts multi-line text literally instead of running
+each line — but bracketed paste is the foreground program's choice, not the
+terminal's, and it is off inside many TUI programs and in some readline modes.
+whisrs cannot see which is the case from the window class alone, and refusing
+wrongly costs you one `whisrs log` lookup where injecting wrongly runs commands
+you never read, so it refuses either way.
+
+Terminal detection needs the compositor to report the focused window class,
+which today means Hyprland and Niri. On KDE, GNOME, Sway and X11 a terminal is
+treated as an ordinary target, so a multi-line reply is typed there. Add any
+class the built-in list misses to `[input] terminal_classes`.
 
 ## Environment variables
 

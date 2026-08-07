@@ -3,9 +3,73 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
+use whisrs::llm;
 use whisrs::InjectorBackend;
 
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
+
+/// What may be done with an LLM reply that is headed for the cursor, decided
+/// by [`prepare_llm_injection`].
+///
+/// Three-way rather than a `String`, because two of the outcomes must not
+/// reach the injector and the caller has to tell the user which one happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LlmInjection {
+    /// Cleaned text, safe to inject at this target.
+    Inject(String),
+    /// Nothing usable came back: an empty reply, an all-whitespace one, or a
+    /// code fence with nothing in it.
+    Empty,
+    /// Multi-line text aimed at a terminal. Never injected — see
+    /// [`prepare_llm_injection`]. Carries the cleaned text so the caller can
+    /// put it in the history log instead of dropping it.
+    RefusedMultiLine(String),
+}
+
+/// Clean an LLM reply and decide whether it may be injected at the current
+/// target. Shared by `whisrs command` and `[[llm_commands]]`.
+///
+/// Two rules, and only one of them is absolute:
+///
+/// * **Cleaning is unconditional.** [`llm::clean_llm_output`] normalizes line
+///   endings and strips a code fence wrapping the whole reply, everywhere. A
+///   fenced reply is never what the user wanted typed.
+/// * **The multi-line refusal is conditional on the target.** A line break is
+///   only dangerous where it *submits*: at a shell prompt it is an Enter that
+///   runs a command the user has not read. Everywhere else a multi-line reply
+///   is the normal, wanted result — translating a paragraph, drafting an
+///   email, reformatting a list — so refusing it outright would break the
+///   feature it was meant to protect. Hence `is_terminal`, resolved by the
+///   caller from the focused window class.
+///
+/// Truncating to the first line was considered and rejected for the terminal
+/// case: `cd /tmp` out of `cd /tmp` + `rm -rf x` is a different, still
+/// destructive command. Refusing costs one retry and loses nothing — the text
+/// comes back in [`LlmInjection::RefusedMultiLine`] for the history log, where
+/// `whisrs log` recovers it.
+///
+/// **`[input] paste` is deliberately not a parameter.** The refusal fires the
+/// same way under `paste = true`, where the hazard is weaker: that path sends
+/// Ctrl+Shift+V, and a terminal with bracketed paste enabled inserts the whole
+/// multi-line text literally instead of running each line. Weaker is not
+/// absent. Bracketed paste is the *foreground program's* choice, not the
+/// terminal's — it is off inside plenty of TUI programs and in some readline
+/// modes — so from here, with only the window class to go on, we cannot know
+/// whether it is on at the moment the keystroke lands. The trade is asymmetric:
+/// refusing wrongly costs one `whisrs log` lookup, injecting wrongly runs
+/// commands the user never read. So the gate stays target-shaped, not
+/// injection-method-shaped, and this function keeps a signature that cannot
+/// express the weaker rule.
+pub(crate) fn prepare_llm_injection(raw: &str, is_terminal: bool) -> LlmInjection {
+    let cleaned = llm::clean_llm_output(raw);
+    if cleaned.is_empty() {
+        return LlmInjection::Empty;
+    }
+    if is_terminal && llm::contains_line_break(&cleaned) {
+        return LlmInjection::RefusedMultiLine(cleaned);
+    }
+    LlmInjection::Inject(cleaned)
+}
 
 /// Type text at the cursor using uinput (keyboard injection) or clipboard paste.
 pub(crate) fn type_text_at_cursor(
@@ -485,6 +549,119 @@ mod tests {
     /// `[input] terminal_classes` as the daemon hands it over.
     fn user(classes: &[&str]) -> Vec<String> {
         classes.iter().map(|c| c.to_string()).collect()
+    }
+
+    const TERMINAL: bool = true;
+    const NOT_A_TERMINAL: bool = false;
+
+    /// The reported defect, end to end: the model wraps a one-line command in
+    /// a fence, and it is unwrapped and injected at either target.
+    #[test]
+    fn a_fenced_one_liner_is_unwrapped_and_injected_anywhere() {
+        for target in [TERMINAL, NOT_A_TERMINAL] {
+            assert_eq!(
+                prepare_llm_injection("```bash\nsudo pacman -S steam\n```", target),
+                LlmInjection::Inject("sudo pacman -S steam".to_string()),
+                "is_terminal = {target}"
+            );
+        }
+    }
+
+    /// Cleaning does not depend on the target: padding and a wrapping fence go
+    /// in both directions. Only the multi-line verdict is conditional.
+    #[test]
+    fn cleaning_is_unconditional() {
+        for target in [TERMINAL, NOT_A_TERMINAL] {
+            assert_eq!(
+                prepare_llm_injection("  \n  Wo ist der Bahnhof?  \n", target),
+                LlmInjection::Inject("Wo ist der Bahnhof?".to_string())
+            );
+            assert_eq!(
+                prepare_llm_injection("```\nsudo pacman -S steam\n```\n", target),
+                LlmInjection::Inject("sudo pacman -S steam".to_string())
+            );
+        }
+    }
+
+    /// The hazard: a line break typed at a shell prompt is an Enter that runs
+    /// a command the user has not read. Refused, with the text handed back for
+    /// the history log rather than dropped.
+    #[test]
+    fn multi_line_output_is_refused_at_a_terminal() {
+        assert_eq!(
+            prepare_llm_injection("```sh\ncd /tmp\nrm -rf x\n```", TERMINAL),
+            LlmInjection::RefusedMultiLine("cd /tmp\nrm -rf x".to_string()),
+            "the refusal must carry the cleaned text, not drop it"
+        );
+    }
+
+    /// The correction that makes the gate shareable: refusing *all* multi-line
+    /// output would break the llm-command uses that produce it on purpose — a
+    /// translated paragraph, a drafted email, a reformatted list. Away from a
+    /// terminal there is nothing to submit, so it is injected normally.
+    #[test]
+    fn multi_line_output_is_injected_when_the_target_is_not_a_terminal() {
+        let email = "Hi Sam,\n\nThe kitchen tap is leaking.\n\nThanks,\nAlex";
+        assert_eq!(
+            prepare_llm_injection(email, NOT_A_TERMINAL),
+            LlmInjection::Inject(email.to_string())
+        );
+        assert_eq!(
+            prepare_llm_injection("```python\ndef f():\n    return 1\n```", NOT_A_TERMINAL),
+            LlmInjection::Inject("def f():\n    return 1".to_string()),
+            "the fence still goes; only the refusal is terminal-only"
+        );
+    }
+
+    /// CRLF and a bare CR are normalized before the verdict, so a `\r` can
+    /// never slip through to the keymap (which taps it as a real Enter). At a
+    /// terminal that means refused, not silently typed.
+    #[test]
+    fn carriage_returns_are_normalized_before_the_verdict() {
+        assert_eq!(
+            prepare_llm_injection("echo one\r\necho two", TERMINAL),
+            LlmInjection::RefusedMultiLine("echo one\necho two".to_string())
+        );
+        assert_eq!(
+            prepare_llm_injection("echo one\recho two", TERMINAL),
+            LlmInjection::RefusedMultiLine("echo one\necho two".to_string())
+        );
+        // A trailing CRLF is padding on a single-line answer, not a second line.
+        assert_eq!(
+            prepare_llm_injection("sudo pacman -S steam\r\n", TERMINAL),
+            LlmInjection::Inject("sudo pacman -S steam".to_string())
+        );
+    }
+
+    /// Content on the fence line is never dropped, so such a reply stays
+    /// multi-line and a terminal target refuses it — the user is told rather
+    /// than handed a different command from the one the model wrote.
+    #[test]
+    fn a_fence_line_carrying_content_is_refused_not_truncated() {
+        let LlmInjection::RefusedMultiLine(text) =
+            prepare_llm_injection("```bash echo hi\nrm -rf /tmp/x\n```", TERMINAL)
+        else {
+            panic!("a reply with content on the fence line is multi-line");
+        };
+        assert!(
+            text.contains("echo hi"),
+            "content on the fence line must survive, got {text:?}"
+        );
+    }
+
+    /// Nothing usable came back. Reported as its own outcome so the caller
+    /// toasts instead of injecting nothing and logging an empty entry.
+    #[test]
+    fn an_unusable_reply_is_reported_as_empty() {
+        for reply in ["", "   ", "\n\t\n", "\r\n", "```\n```", "```bash\n\n```"] {
+            for target in [TERMINAL, NOT_A_TERMINAL] {
+                assert_eq!(
+                    prepare_llm_injection(reply, target),
+                    LlmInjection::Empty,
+                    "{reply:?} at is_terminal = {target}"
+                );
+            }
+        }
     }
 
     /// Real-world strings, in the casing a compositor hands them to us: bare

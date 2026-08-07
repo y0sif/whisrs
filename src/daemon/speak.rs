@@ -81,12 +81,22 @@ pub(crate) async fn handle_speak(
         }
     };
 
-    // (c) Capture the selection. On failure (incl. empty), surface an error
-    // and — since this is hotkey-triggered — notify so the user sees why.
+    // (c) Capture the selection. On failure, surface an error and — since this
+    // is hotkey-triggered — notify so the user sees why.
+    //
+    // Every `CaptureError` variant is fatal here, deliberately: read-aloud has
+    // nothing to say without text. That includes both "nothing was selected"
+    // variants — `NothingSelected` (the clipboard came back empty) and
+    // `ClipboardUnchanged` (the capture could not tell). Only a caller that
+    // would proceed on an empty selection needs to tell them apart, and
+    // read-aloud never proceeds, so it just renders the variant's `Display`,
+    // whose wording is byte-identical across all of them and unchanged from
+    // before the error was typed.
     info!("speak: getting selected text");
     let selected_text = match capture_selection(&context).await {
         Ok(text) => text,
-        Err(message) => {
+        Err(error) => {
+            let message = error.to_string();
             if context.notify_error() {
                 send_notification("whisrs", &format!("Read-aloud: {message}"));
             }
