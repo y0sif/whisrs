@@ -40,98 +40,7 @@ pub async fn start_hotkey_listener(
     llm_commands: &[LlmCommandConfig],
     cmd_tx: mpsc::Sender<Command>,
 ) {
-    let mut actions = Vec::new();
-
-    if let Some(ref s) = config.toggle {
-        match parse_hotkey(s) {
-            Ok(binding) => {
-                info!("hotkey: toggle = {s}");
-                actions.push(HotkeyAction {
-                    binding,
-                    command: Command::Toggle { language: None },
-                });
-            }
-            Err(e) => warn!("invalid toggle hotkey '{s}': {e}"),
-        }
-    }
-
-    if let Some(ref s) = config.cancel {
-        match parse_hotkey(s) {
-            Ok(binding) => {
-                info!("hotkey: cancel = {s}");
-                actions.push(HotkeyAction {
-                    binding,
-                    command: Command::Cancel,
-                });
-            }
-            Err(e) => warn!("invalid cancel hotkey '{s}': {e}"),
-        }
-    }
-
-    if let Some(ref s) = config.command {
-        match parse_hotkey(s) {
-            Ok(binding) => {
-                info!("hotkey: command = {s}");
-                actions.push(HotkeyAction {
-                    binding,
-                    command: Command::CommandMode,
-                });
-            }
-            Err(e) => warn!("invalid command hotkey '{s}': {e}"),
-        }
-    }
-
-    if let Some(ref s) = config.speak {
-        match parse_hotkey(s) {
-            Ok(binding) => {
-                info!("hotkey: speak = {s}");
-                actions.push(HotkeyAction {
-                    binding,
-                    command: Command::Speak,
-                });
-            }
-            Err(e) => warn!("invalid speak hotkey '{s}': {e}"),
-        }
-    }
-
-    for entry in llm_commands {
-        match parse_hotkey(&entry.hotkey) {
-            Ok(binding) => {
-                info!("hotkey: llm-command '{}' = {}", entry.name, entry.hotkey);
-                actions.push(HotkeyAction {
-                    binding,
-                    command: Command::LlmCommand {
-                        name: entry.name.clone(),
-                    },
-                });
-            }
-            Err(e) => warn!(
-                "invalid hotkey '{}' for llm-command '{}': {e}",
-                entry.hotkey, entry.name
-            ),
-        }
-
-        if let Some(set_hotkey) = &entry.set_hotkey {
-            match parse_hotkey(set_hotkey) {
-                Ok(binding) => {
-                    info!(
-                        "hotkey: llm-command '{}' set-instruction = {}",
-                        entry.name, set_hotkey
-                    );
-                    actions.push(HotkeyAction {
-                        binding,
-                        command: Command::SetLlmInstruction {
-                            name: entry.name.clone(),
-                        },
-                    });
-                }
-                Err(e) => warn!(
-                    "invalid set_hotkey '{}' for llm-command '{}': {e}",
-                    set_hotkey, entry.name
-                ),
-            }
-        }
-    }
+    let actions = build_actions(config, llm_commands);
 
     if actions.is_empty() {
         debug!("no hotkeys configured");
@@ -204,6 +113,79 @@ pub async fn start_hotkey_listener(
             }
         });
     }
+}
+
+/// Build the dispatch table: every set `[hotkeys]` field, plus every
+/// `[[llm_commands]]` entry's `hotkey` and optional `set_hotkey`. Invalid
+/// specs are warned about and skipped, so one bad combo never disables the
+/// rest.
+///
+/// Split out of [`start_hotkey_listener`] — which needs real input devices and
+/// so cannot be unit-tested — because the failure this guards against is
+/// silent: a field added to [`HotkeyConfig`] but not listed here parses fine,
+/// validates fine, shows up in the config editor, and simply never fires.
+/// `every_fixed_hotkey_field_is_dispatched` below fails when that happens.
+fn build_actions(config: &HotkeyConfig, llm_commands: &[LlmCommandConfig]) -> Vec<HotkeyAction> {
+    let mut actions = Vec::new();
+
+    // Every field of `HotkeyConfig` must appear in this table.
+    let fixed = [
+        ("toggle", &config.toggle, Command::Toggle { language: None }),
+        ("cancel", &config.cancel, Command::Cancel),
+        ("command", &config.command, Command::CommandMode),
+        ("speak", &config.speak, Command::Speak),
+    ];
+    for (label, spec, command) in fixed {
+        let Some(spec) = spec else { continue };
+        match parse_hotkey(spec) {
+            Ok(binding) => {
+                info!("hotkey: {label} = {spec}");
+                actions.push(HotkeyAction { binding, command });
+            }
+            Err(e) => warn!("invalid {label} hotkey '{spec}': {e}"),
+        }
+    }
+
+    for entry in llm_commands {
+        match parse_hotkey(&entry.hotkey) {
+            Ok(binding) => {
+                info!("hotkey: llm-command '{}' = {}", entry.name, entry.hotkey);
+                actions.push(HotkeyAction {
+                    binding,
+                    command: Command::LlmCommand {
+                        name: entry.name.clone(),
+                    },
+                });
+            }
+            Err(e) => warn!(
+                "invalid hotkey '{}' for llm-command '{}': {e}",
+                entry.hotkey, entry.name
+            ),
+        }
+
+        if let Some(set_hotkey) = &entry.set_hotkey {
+            match parse_hotkey(set_hotkey) {
+                Ok(binding) => {
+                    info!(
+                        "hotkey: llm-command '{}' set-instruction = {}",
+                        entry.name, set_hotkey
+                    );
+                    actions.push(HotkeyAction {
+                        binding,
+                        command: Command::SetLlmInstruction {
+                            name: entry.name.clone(),
+                        },
+                    });
+                }
+                Err(e) => warn!(
+                    "invalid set_hotkey '{}' for llm-command '{}': {e}",
+                    set_hotkey, entry.name
+                ),
+            }
+        }
+    }
+
+    actions
 }
 
 /// Enumerate all keyboard input devices.
@@ -363,5 +345,85 @@ mod tests {
     fn right_hand_modifiers_are_equivalent() {
         let held: HashSet<Key> = HashSet::from([Key::KEY_RIGHTCTRL, Key::KEY_PAGEUP]);
         assert!(modifiers_held(&held, &[Key::KEY_LEFTCTRL]));
+    }
+
+    fn all_hotkeys_set() -> HotkeyConfig {
+        HotkeyConfig {
+            toggle: Some("Super+Shift+W".to_string()),
+            cancel: Some("Super+Shift+D".to_string()),
+            command: Some("Super+Shift+G".to_string()),
+            speak: Some("Super+Shift+R".to_string()),
+        }
+    }
+
+    /// Every field of [`HotkeyConfig`] must be wired to a command in
+    /// [`build_actions`]. Derived from serde rather than a hand-written count,
+    /// so a fifth field added to the struct fails here instead of shipping as
+    /// a binding that parses, validates, and silently never fires.
+    #[test]
+    fn every_fixed_hotkey_field_is_dispatched() {
+        let config = all_hotkeys_set();
+        let fields = toml::Value::try_from(&config)
+            .expect("HotkeyConfig serializes")
+            .as_table()
+            .expect("as a table")
+            .len();
+
+        let actions = build_actions(&config, &[]);
+        assert_eq!(
+            actions.len(),
+            fields,
+            "every set [hotkeys] field must produce a listener action — a new field \
+             needs a line in build_actions' `fixed` table"
+        );
+    }
+
+    /// Each field is wired to its own command — a mis-ordered `fixed` table
+    /// would silently send one key's press through another's handler.
+    #[test]
+    fn each_field_dispatches_its_own_command() {
+        let actions = build_actions(&all_hotkeys_set(), &[]);
+        for expected in [
+            Command::Toggle { language: None },
+            Command::Cancel,
+            Command::CommandMode,
+            Command::Speak,
+        ] {
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(
+                        |a| std::mem::discriminant(&a.command) == std::mem::discriminant(&expected)
+                    )
+                    .count(),
+                1,
+                "{expected:?} must be dispatched exactly once"
+            );
+        }
+    }
+
+    /// An unset binding registers nothing.
+    #[test]
+    fn an_unset_binding_registers_nothing() {
+        let config = HotkeyConfig {
+            command: Some("Super+Shift+G".to_string()),
+            ..Default::default()
+        };
+        let actions = build_actions(&config, &[]);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0].command, Command::CommandMode));
+    }
+
+    /// One invalid spec must not take the others down with it.
+    #[test]
+    fn an_invalid_binding_is_skipped_not_fatal() {
+        let config = HotkeyConfig {
+            toggle: Some("Super+Shift+W".to_string()),
+            speak: Some("NotAKey".to_string()),
+            ..Default::default()
+        };
+        let actions = build_actions(&config, &[]);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0].command, Command::Toggle { .. }));
     }
 }
