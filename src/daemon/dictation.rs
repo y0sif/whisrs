@@ -10,6 +10,7 @@ use whisrs::state::Action;
 use whisrs::{validate_language_override, Response, State};
 
 use crate::context::{DaemonContext, DaemonState};
+use crate::injection::{inject_text, is_terminal_class};
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     build_transcription_config, format_no_microphone_error, history_backend_tag,
@@ -384,6 +385,76 @@ pub(crate) async fn handle_cancel(
             message: e.to_string(),
         },
     }
+}
+
+/// Re-inject the most recent transcription at the cursor.
+///
+/// Recovery path for when the original injection landed in the wrong
+/// window or was dropped entirely: the last history entry is injected
+/// again, pasted or typed following `[input] paste` — no re-dictating.
+/// Explicitly a *repeat*, so it always injects: `[input] clipboard_only`
+/// is a dictation output mode and does not apply here.
+///
+/// Notifies (and returns success) when there is no previous transcription
+/// to repeat, so a hotkey binding gives feedback instead of doing nothing.
+pub(crate) async fn handle_repeat_last(
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+) -> Response {
+    let state = daemon_state.lock().await.state_machine.state();
+
+    let entries = match whisrs::history::read_entries(1) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return Response::Error {
+                message: format!("failed to read history: {e}"),
+            };
+        }
+    };
+    let Some(entry) = entries.into_iter().next() else {
+        send_notification("whisrs", "No previous dictation to repeat");
+        return Response::Ok { state };
+    };
+
+    let text = entry.text;
+    if text.trim().is_empty() {
+        send_notification("whisrs", "No previous dictation to repeat");
+        return Response::Ok { state };
+    }
+
+    let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
+    let injector_backend = context.config.input.backend;
+    let paste = context.config.input.paste;
+    let is_terminal = if paste {
+        context
+            .window_tracker
+            .get_focused_window_class()
+            .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    info!("repeat: re-injecting {} chars", text.len());
+    match tokio::task::spawn_blocking(move || {
+        inject_text(&text, is_terminal, key_delay, injector_backend, paste)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!("repeat: failed to inject text: {e:#}");
+            send_notification("whisrs", &format!("Failed to repeat last dictation: {e:#}"));
+        }
+        Err(e) => {
+            warn!("repeat: failed to join injection task: {e}");
+            send_notification(
+                "whisrs",
+                "Failed to repeat last dictation: injection task error",
+            );
+        }
+    }
+    Response::Ok { state }
 }
 
 /// Tear down every per-session resource a cancelled recording leaves behind.

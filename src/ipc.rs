@@ -51,6 +51,12 @@ pub enum Command {
     /// stops any in-progress playback.
     #[serde(alias = "read")]
     Speak,
+    /// Re-inject the most recent transcription at the cursor — pasted or
+    /// typed, following `[input] paste`. A recovery path for when the
+    /// original injection landed in the wrong window or was dropped: the
+    /// text comes back without re-dictating.
+    #[serde(rename = "repeat-last")]
+    RepeatLast,
 }
 
 fn default_log_limit() -> usize {

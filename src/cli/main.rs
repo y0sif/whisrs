@@ -89,6 +89,11 @@ enum SubCmd {
     /// Read the selected text aloud via TTS (press again to stop playback)
     #[command(alias = "read")]
     Speak,
+    /// Re-inject the most recent transcription at the cursor — pasted or
+    /// typed, following `[input] paste`. A recovery path for when the
+    /// original injection landed in the wrong window or was dropped: the
+    /// text comes back without re-dictating.
+    Repeat,
     /// Restart the whisrs daemon (uses the systemd user service when present)
     Restart,
 }
@@ -166,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
         }
         SubCmd::Speak => {
             send_command(Command::Speak).await?;
+        }
+        SubCmd::Repeat => {
+            send_command(Command::RepeatLast).await?;
         }
         SubCmd::Restart => {
             cmd_restart()?;

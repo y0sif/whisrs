@@ -108,6 +108,14 @@ or a
 stops playback. Alias:
 .BR read .
 .TP
+.B repeat
+Re-inject the most recent transcription at the cursor \\(em pasted or
+typed, following the configured
+.B paste
+input mode. A recovery path for when the original injection landed in the
+wrong window or was dropped: the text comes back without re-dictating.
+Notifies if there is no previous transcription.
+.TP
 .B status
 Query the daemon state. Prints one of:
 .BR idle ,

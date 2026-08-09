@@ -24,7 +24,7 @@ mod startup;
 
 use crate::command_mode::{handle_command_mode, handle_llm_command, handle_set_llm_instruction};
 use crate::context::{DaemonContext, DaemonState};
-use crate::dictation::{handle_cancel, handle_toggle};
+use crate::dictation::{handle_cancel, handle_repeat_last, handle_toggle};
 use crate::factory::create_backend;
 use crate::injection::warm_keyboard;
 use crate::notify::send_notification;
@@ -257,6 +257,7 @@ async fn handle_command(
             handle_set_llm_instruction(daemon_state, context, name).await
         }
         Command::Speak => handle_speak(daemon_state, context).await,
+        Command::RepeatLast => handle_repeat_last(daemon_state, context).await,
     }
 }
 

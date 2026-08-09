@@ -1,0 +1,40 @@
+name: cache
+
+on:
+  push:
+    branches: [main, "feat/*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pull-configures the cache, but does NOT auto-push (skipPush):
+      # pushing happens in the guarded step below, so this workflow is
+      # safe to run on any repo (upstream included) that lacks the
+      # CACHIX_AUTH_TOKEN secret / CACHIX_PUSH variable.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: whisrs-fork
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+          skipPush: 'true'
+
+      - name: Build
+        run: nix build .#default
+        timeout-minutes: 90
+
+      # Fork-local: only runs when the repo defines CACHIX_PUSH=true.
+      # Andrii's home-manager switches then substitute the fork build
+      # instead of compiling it locally.
+      - name: Push to cachix
+        if: vars.CACHIX_PUSH == 'true'
+        run: nix build .#default --print-out-paths | xargs cachix push whisrs-fork
+        timeout-minutes: 30
