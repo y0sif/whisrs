@@ -387,6 +387,13 @@ pub(crate) async fn handle_cancel(
     }
 }
 
+/// How long `repeat` waits before the first keystroke, to let the hotkey's
+/// physical modifiers (e.g. Shift in `$mod+SHIFT+space`) be released.
+/// Compositors like Hyprland merge the real keyboard's held modifiers into
+/// virtual-keyboard events, which would otherwise reinterpret the first
+/// injected keysyms (see the settle comment in `handle_repeat_last`).
+const REPEAT_INJECTION_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Re-inject the most recent transcription at the cursor.
 ///
 /// Recovery path for when the original injection landed in the wrong
@@ -437,6 +444,18 @@ pub(crate) async fn handle_repeat_last(
 
     info!("repeat: re-injecting {} chars", text.len());
     match tokio::task::spawn_blocking(move || {
+        // Settle delay before the first keystroke: the repeat hotkey
+        // commonly involves modifiers (e.g. `$mod+SHIFT+space`), and
+        // compositors (Hyprland) merge the *real* keyboard's held
+        // modifiers into virtual-keyboard events. A still-held Shift
+        // reinterprets the first injected keysyms against the uploaded
+        // keymap: commas come out as `<` (Shift level of the comma key)
+        // and AltGr-level Cyrillic resolves to the unbound level 3 and
+        // silently drops. Waiting out the physical key release keeps the
+        // re-injection clean. Dictation itself is unaffected: its hotkey
+        // is a level-neutral modifier (Super), so no settle is needed
+        // there.
+        std::thread::sleep(REPEAT_INJECTION_SETTLE);
         inject_text(&text, is_terminal, key_delay, injector_backend, paste)
     })
     .await

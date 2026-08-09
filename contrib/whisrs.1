@@ -114,7 +114,9 @@ typed, following the configured
 .B paste
 input mode. A recovery path for when the original injection landed in the
 wrong window or was dropped: the text comes back without re-dictating.
-Notifies if there is no previous transcription.
+The injection waits briefly before the first keystroke so a hotkey's held
+modifiers (e.g. Shift) are released first. Notifies if there is no
+previous transcription.
 .TP
 .B status
 Query the daemon state. Prints one of:
