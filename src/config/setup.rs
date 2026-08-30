@@ -1300,7 +1300,36 @@ fn write_service_file(manager: ServiceManager, dest: &Path) -> bool {
     };
 
     if let Some(src) = find_contrib_file(contrib_name) {
-        if let Err(e) = fs::copy(&src, dest) {
+        if manager == ServiceManager::Systemd {
+            // Keep the packaged unit, but write an absolute ExecStart. User
+            // services do not reliably inherit the shell's PATH, especially
+            // for cargo installs under ~/.cargo/bin.
+            let whisrsd_path = which_whisrsd();
+            let content = match fs::read_to_string(&src) {
+                Ok(contents) => {
+                    contents
+                        .lines()
+                        .map(|line| {
+                            if line.starts_with("ExecStart=") {
+                                format!("ExecStart={whisrsd_path}")
+                            } else {
+                                line.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n"
+                }
+                Err(e) => {
+                    println!("  {RED}Failed to read service file: {e}{RESET}");
+                    return false;
+                }
+            };
+            if let Err(e) = fs::write(dest, content) {
+                println!("  {RED}Failed to write service file: {e}{RESET}");
+                return false;
+            }
+        } else if let Err(e) = fs::copy(&src, dest) {
             println!("  {RED}Failed to copy service file: {e}{RESET}");
             return false;
         }
