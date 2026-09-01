@@ -1276,7 +1276,18 @@ fn setup_user_service() {
             // "Unit does not exist".
             match manager {
                 ServiceManager::Systemd => {
+                    // Not a plain `cp`: the packaged unit ships
+                    // `ExecStart=whisrsd`, and systemd resolves a bare name
+                    // against a compiled-in search path that never contains
+                    // ~/.cargo/bin. Copying it verbatim is the same broken
+                    // unit `write_service_file` exists to avoid, so name the
+                    // resolved path here too.
                     println!("    cp contrib/whisrs.service ~/.config/systemd/user/");
+                    println!(
+                        "    sed -i 's|^ExecStart=.*|ExecStart={}|' \
+                         ~/.config/systemd/user/whisrs.service",
+                        which_whisrsd()
+                    );
                 }
                 ServiceManager::OpenRc => {
                     println!(
@@ -1295,19 +1306,16 @@ fn setup_user_service() {
     }
 }
 
-/// Write the service definition for `manager` to `dest`.
+/// Repoint a systemd unit's `ExecStart=` at `whisrsd_path`, leaving the rest
+/// of the file alone.
 ///
-/// Prefers the file shipped in `contrib/`, falling back to an inline copy for
-/// installs where `contrib/` isn't on disk (e.g. `cargo install`). Returns
-/// false when it printed an error and the caller should stop.
-/// Repoint a systemd unit's `ExecStart=` at `whisrsd_path`, leaving the rest of
-/// the file alone.
-///
-/// Only the binary is replaced: everything after the first whitespace is kept,
-/// so a unit that grows a flag does not silently lose it. Replacing the whole
-/// line is the obvious spelling and the wrong one, since it fails in exactly
-/// the case nobody would re-test, and `contrib/whisrs.service` carries no
-/// arguments today to make it visible.
+/// Only the binary token is replaced. Everything after it is kept, so a unit
+/// that grows a flag does not silently lose it, and systemd's execution
+/// prefixes (`@-:+!`, which sit *before* the binary) are kept too. Both
+/// details are load-bearing in opposite directions: replacing the whole line
+/// drops arguments, and replacing from the `=` swallows the prefix and turns
+/// `@whisrsd argv0` into a stray argument. `contrib/whisrs.service` exercises
+/// neither shape today, which is exactly why they are pinned by tests.
 ///
 /// `ExecStartPre=` and `ExecStartPost=` are deliberately untouched: they are
 /// not the daemon, and rewriting them to the daemon path would be nonsense.
@@ -1316,12 +1324,21 @@ fn rewrite_exec_start(contents: &str, whisrsd_path: &str) -> String {
     for line in contents.lines() {
         match line.strip_prefix("ExecStart=") {
             Some(command) => {
+                // systemd strips whitespace around the value, so `ExecStart= x`
+                // names the binary `x`. Splitting before trimming would re-emit
+                // that name as an argument to the path we just resolved.
+                let command = command.trim_start();
+                let prefixes: &[char] = &['@', '-', ':', '+', '!'];
+                let binary = command.trim_start_matches(prefixes);
+                let prefix = &command[..command.len() - binary.len()];
+
                 out.push_str("ExecStart=");
+                out.push_str(prefix);
                 out.push_str(whisrsd_path);
                 // Everything after the binary is the caller's, keep it verbatim.
-                if let Some(args) = command.split_once(char::is_whitespace) {
+                if let Some((_, args)) = binary.split_once(char::is_whitespace) {
                     out.push(' ');
-                    out.push_str(args.1);
+                    out.push_str(args);
                 }
             }
             None => out.push_str(line),
@@ -1331,6 +1348,11 @@ fn rewrite_exec_start(contents: &str, whisrsd_path: &str) -> String {
     out
 }
 
+/// Write the service definition for `manager` to `dest`.
+///
+/// Prefers the file shipped in `contrib/`, falling back to an inline copy for
+/// installs where `contrib/` isn't on disk (e.g. `cargo install`). Returns
+/// false when it printed an error and the caller should stop.
 fn write_service_file(manager: ServiceManager, dest: &Path) -> bool {
     let contrib_name = match manager {
         ServiceManager::Systemd => "whisrs.service",
@@ -2183,15 +2205,6 @@ mod tests {
         &from_loop[..end]
     }
 
-    /// The inline OpenRC fallback is used on `cargo install`, where `contrib/`
-    /// is not on disk. It is a hand-maintained copy of
-    /// `contrib/openrc/whisrs.initd`, so it silently drifts: an earlier
-    /// revision omitted the conf.d re-export loop, which made
-    /// `XKB_DEFAULT_LAYOUT` in conf.d a no-op with no diagnostic.
-    ///
-    /// `contrib/openrc/whisrs.initd` is the copy users actually install, so it
-    /// is held to the same list: asserting the two loops are byte-equal catches
-    /// drift in either direction and covers the shipped file's own var list.
     /// `whisrs setup` rewrites the packaged unit's `ExecStart=` instead of
     /// copying it, because systemd resolves a bare `whisrsd` against a
     /// compiled-in search path that never contains `~/.cargo/bin`. Verified
@@ -2212,6 +2225,40 @@ mod tests {
     fn exec_start_rewrite_keeps_arguments() {
         let out = rewrite_exec_start("ExecStart=whisrsd --foo bar\n", "/opt/bin/whisrsd");
         assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo bar\n");
+
+        // Not `split_once(' ')`: systemd tokenises on any whitespace run, and a
+        // space-only split drops a tab-separated flag entirely.
+        let out = rewrite_exec_start("ExecStart=whisrsd\t--foo\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo\n");
+    }
+
+    /// systemd strips whitespace around a directive value, so `ExecStart= x`
+    /// names the binary `x`. Splitting on whitespace before trimming re-emits
+    /// that name as an argument to the path just resolved, producing
+    /// `ExecStart=/abs/whisrsd whisrsd`, which clap rejects with exit 2 while
+    /// `Restart=on-failure` burns its retries. The whole-line replace this
+    /// function replaced was accidentally right here, so the argument fix has
+    /// to not regress it.
+    #[test]
+    fn exec_start_rewrite_trims_before_splitting() {
+        let out = rewrite_exec_start("ExecStart= whisrsd\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=/opt/bin/whisrsd\n");
+
+        let out = rewrite_exec_start("ExecStart=  whisrsd --foo\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo\n");
+    }
+
+    /// systemd's execution prefixes sit before the binary, so a rewrite that
+    /// starts at the `=` swallows them. `@` in particular takes the next token
+    /// as argv[0], so dropping it silently promotes that token to a real
+    /// argument.
+    #[test]
+    fn exec_start_rewrite_keeps_execution_prefixes() {
+        let out = rewrite_exec_start("ExecStart=-whisrsd\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=-/opt/bin/whisrsd\n");
+
+        let out = rewrite_exec_start("ExecStart=@whisrsd argv0 --foo\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=@/opt/bin/whisrsd argv0 --foo\n");
     }
 
     /// `ExecStartPre=`/`ExecStartPost=`/`ExecStop=` are not the daemon, so
@@ -2228,9 +2275,11 @@ mod tests {
     /// actually get, so a change to the packaged unit is covered too.
     #[test]
     fn exec_start_rewrite_touches_nothing_else_in_the_shipped_unit() {
-        let Some(src) = find_contrib_file("whisrs.service") else {
-            return; // no contrib/ on disk (cargo install); the inline unit applies
-        };
+        // Not an early return: `Cargo.toml` sets no `include`/`exclude`, so
+        // `contrib/` ships with the crate and is on disk wherever this test
+        // runs. A `return` here would let the whole assertion go vacuous the
+        // day that stops being true.
+        let src = find_contrib_file("whisrs.service").expect("contrib/whisrs.service is on disk");
         let original = std::fs::read_to_string(&src).expect("contrib unit is readable");
         let rewritten = rewrite_exec_start(&original, "/opt/bin/whisrsd");
 
@@ -2251,6 +2300,15 @@ mod tests {
         );
     }
 
+    /// The inline OpenRC fallback is used on `cargo install`, where `contrib/`
+    /// is not on disk. It is a hand-maintained copy of
+    /// `contrib/openrc/whisrs.initd`, so it silently drifts: an earlier
+    /// revision omitted the conf.d re-export loop, which made
+    /// `XKB_DEFAULT_LAYOUT` in conf.d a no-op with no diagnostic.
+    ///
+    /// `contrib/openrc/whisrs.initd` is the copy users actually install, so it
+    /// is held to the same list: asserting the two loops are byte-equal catches
+    /// drift in either direction and covers the shipped file's own var list.
     #[test]
     fn openrc_scripts_reexport_confd_vars() {
         let script = openrc_initd_contents("/usr/bin/whisrsd");
