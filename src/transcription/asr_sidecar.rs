@@ -184,6 +184,12 @@ impl TranscriptionBackend for AsrSidecarBackend {
 
     // Uses the default transcribe_stream (collect + transcribe). Model-specific
     // streaming behavior belongs in the sidecar process.
+
+    // The prompt does reach the sidecar, just under a different name: it is
+    // sent as the `hotwords` multipart field.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

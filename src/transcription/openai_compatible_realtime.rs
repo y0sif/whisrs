@@ -140,6 +140,18 @@ impl TranscriptionBackend for OpenAiCompatibleRealtimeBackend {
     fn supports_streaming(&self) -> bool {
         true
     }
+
+    // Statically false, exactly like Deepgram (issue #133). `new` rejects
+    // every profile but `lemonade` and `engine` hardcodes
+    // `OpenAiRealtimeProfile::Lemonade`, whose `session_update` arm calls
+    // `LemonadeSessionUpdate::new(model, turn_detection)` — a constructor that
+    // takes no prompt argument at all. The engine passes `request.prompt`
+    // down, but the Lemonade wire format drops it on the floor, so a
+    // non-empty `[general] vocabulary` here would otherwise get real
+    // transcripts discarded as echoes of a prompt that was never sent.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +287,24 @@ mod tests {
         .unwrap();
 
         assert!(backend.supports_streaming());
+    }
+
+    /// The Lemonade wire format has no prompt field, so the echo filter must
+    /// stay off here (#133). Pinned because `engine()` hardcodes the Lemonade
+    /// profile: wiring the OpenAI profile in without revisiting this would
+    /// silently make the answer wrong again.
+    #[test]
+    fn lemonade_never_sends_the_prompt() {
+        let backend = OpenAiCompatibleRealtimeBackend::new(
+            "ws://localhost:1234/realtime".to_string(),
+            "Whisper-Tiny".to_string(),
+            "lemonade".to_string(),
+            "server-vad".to_string(),
+            None,
+        )
+        .unwrap();
+
+        assert!(!backend.sends_prompt(&test_request()));
     }
 
     #[test]

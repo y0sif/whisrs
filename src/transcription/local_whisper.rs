@@ -477,6 +477,12 @@ impl TranscriptionBackend for LocalWhisperBackend {
     fn supports_streaming(&self) -> bool {
         true
     }
+
+    // `run_whisper_inference` hands the prompt to `set_initial_prompt`, so
+    // whisper.cpp really does decode conditioned on it.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

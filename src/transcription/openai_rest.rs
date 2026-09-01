@@ -154,6 +154,11 @@ impl TranscriptionBackend for OpenAIRestBackend {
 
     // Uses the default transcribe_stream (collect + transcribe) since this
     // backend does not support streaming.
+
+    // `transcribe` puts the prompt on the wire as the `prompt` multipart field.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -33,6 +33,15 @@ impl TranscriptionBackend for ParakeetBackend {
              Use the `local-whisper` backend instead, or check back in a future release."
         )
     }
+
+    // Unreachable: `transcribe` bails before a request exists. `false` is
+    // what the rule on the trait method yields — read the answer off the
+    // request-building code, and there is none yet — and it is the safe
+    // direction, since a stale `true` is the exact shape of #133. Whoever
+    // implements Parakeet answers it again off the real request.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -416,6 +416,11 @@ impl TranscriptionBackend for DeepgramRestBackend {
 
     // Uses the default transcribe_stream (collect + transcribe) since this
     // backend does not support streaming.
+
+    // Deepgram has no prompt field; vocabulary rides as `keyterm` params.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        false
+    }
 }
 
 // ===========================================================================
@@ -609,11 +614,30 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
     fn supports_streaming(&self) -> bool {
         true
     }
+
+    // Same as the REST backend: no prompt field on the wire, vocabulary rides
+    // as `keyterm` query params.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepgram_backends_never_send_the_prompt() {
+        let request = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "nova-3".to_string(),
+            prompt: Some("Hyprland, whisrs".to_string()),
+            keyterms: Vec::new(),
+        };
+
+        assert!(!DeepgramRestBackend::new(String::new()).sends_prompt(&request));
+        assert!(!DeepgramStreamingBackend::new(String::new()).sends_prompt(&request));
+    }
 
     #[test]
     fn map_language_auto_to_multi() {

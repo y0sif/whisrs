@@ -806,7 +806,11 @@ pub fn write_config(config: &Config) -> Result<PathBuf> {
 }
 
 /// Implementation of [`write_config`] against an explicit path (testable).
-fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
+///
+/// `pub(crate)` so the `whisrs config` save path can be driven end to end in a
+/// temp dir — the composition of "write vocabulary.txt, then write config.toml
+/// with the right list" is where the destructive bugs live, not in either half.
+pub(crate) fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
     let config_dir = config_path
         .parent()
         .expect("config path should have a parent directory");
@@ -1071,7 +1075,11 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
 
 /// Create (or truncate) `path` with mode 0600 and write `contents`, fsyncing
 /// before returning.
-fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+///
+/// `pub(crate)` because every file whisrs writes next to `config.toml` gets the
+/// same treatment — `vocabulary.txt` included, since the feature moves user
+/// data out of the 0600 config into a sibling file.
+pub(crate) fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let mut options = fs::OpenOptions::new();

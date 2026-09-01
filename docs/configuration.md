@@ -18,14 +18,22 @@ audio_feedback = true       # play tones on record start/stop/done
 audio_feedback_volume = 0.5 # 0.0 to 1.0
 vocabulary = ["whisrs", "Hyprland"]  # custom terms for better transcription accuracy
                             # (sent to Deepgram as keyterms on Nova-3/Flux, ignored on
-                            # older models; folded into the prompt hint elsewhere)
+                            # older models; elsewhere it is folded into the prompt hint,
+                            # so it only reaches the backends that send one — see prompt)
                             # very long lists are truncated for Deepgram, since every
                             # keyterm rides in the request URI — the daemon warns at
                             # startup naming how many terms actually reach it
+                            # more terms can come from an optional vocabulary.txt next
+                            # to this file — see "The vocabulary file" below
 prompt = "Speech is in English or Spanish. Transcribe in the language spoken; never translate."
                             # optional sentence-style context, prepended to vocabulary
-                            # (passed to Groq, OpenAI REST/Realtime, and local whisper.cpp;
-                            # Deepgram takes no prompt — use vocabulary there)
+                            # (reaches Groq, OpenAI REST, local whisper.cpp, and the
+                            # asr-sidecar, which takes it as its `hotwords` field.
+                            # Deepgram sends no prompt — use vocabulary there instead.
+                            # openai-compatible-realtime sends neither, so neither key
+                            # reaches it. openai-realtime sends a prompt only on
+                            # server-VAD models like gpt-4o-transcribe, not on the
+                            # gpt-realtime-whisper that `whisrs setup` writes for it)
 tray = true                 # system tray icon (requires SNI host like waybar)
 overlay = false             # bottom-screen recording overlay (Hyprland/Sway, GNOME extension)
 
@@ -410,6 +418,44 @@ which today means Hyprland, Niri, Sway and X11. On KDE and GNOME a terminal is
 treated as an ordinary target, so a multi-line reply is typed there. Add any
 class the built-in list misses to `[input] terminal_classes`.
 
+## The vocabulary file
+
+Vocabulary terms can also live in `~/.config/whisrs/vocabulary.txt`, next to
+`config.toml`. This exists for setups where `config.toml` is generated and
+read-only (Nix, chezmoi, any templated dotfiles), where adding one proper noun
+to `[general] vocabulary` would otherwise mean a rebuild. The path is fixed —
+there is deliberately no config key naming it, since setting one would need
+the very `config.toml` edit the file avoids.
+
+```
+# One term per line. Blank lines and lines starting with # are skipped.
+whisrs
+Claude Code
+NixOS
+```
+
+A term that starts with `#` is stored with a single leading backslash
+(`\#rust`), which is stripped when the file is read; a `#` anywhere else on the
+line is literal, so `C# dev` needs nothing.
+
+At daemon startup the file is merged into `[general] vocabulary` — config.toml's
+terms first, then the file's, duplicates dropped — before the config is
+validated, so the Deepgram keyterm limits and their startup warnings count the
+real list. A missing file is simply ignored; the feature is opt-in by creating
+it. Like the rest of the config, the file is read once at startup, so run
+`whisrs restart` after editing it.
+
+When the file exists, the `whisrs config` vocabulary editor shows the merged
+list. If you change that list, the whole of it is written back to
+`vocabulary.txt` on save and config.toml is saved with an empty `vocabulary`,
+so no term is stored twice. That rewrite is flat, so any comment lines and
+blank-line grouping you added by hand are dropped at that point. If you leave
+the vocabulary alone — including opening the editor and accepting the list as
+shown — saving other settings touches neither store: your `vocabulary.txt`
+keeps its comments and config.toml keeps its terms. Only
+`vocabulary` gets this treatment; `prompt` and everything else stay in
+`config.toml`.
+
 ## Environment variables
 
 The following variables override the matching `api_key` in `config.toml`:
@@ -418,6 +464,9 @@ The following variables override the matching `api_key` in `config.toml`:
 - `WHISRS_DEEPGRAM_API_KEY`
 - `WHISRS_OPENAI_API_KEY`
 - `WHISRS_ASR_SIDECAR_API_KEY`
+
+With one of these set, the matching `api_key` line can be left out of `config.toml`
+entirely. Keep the section itself if you set `model` there.
 
 These provider keys are also used by the matching TTS backend (`groq`/`openai`/`deepgram`) unless `[tts] api_key` is set. The `tts-sidecar` backend needs no key.
 
