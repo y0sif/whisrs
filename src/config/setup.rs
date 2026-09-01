@@ -1292,6 +1292,37 @@ fn setup_user_service() {
 /// Prefers the file shipped in `contrib/`, falling back to an inline copy for
 /// installs where `contrib/` isn't on disk (e.g. `cargo install`). Returns
 /// false when it printed an error and the caller should stop.
+/// Repoint a systemd unit's `ExecStart=` at `whisrsd_path`, leaving the rest of
+/// the file alone.
+///
+/// Only the binary is replaced: everything after the first whitespace is kept,
+/// so a unit that grows a flag does not silently lose it. Replacing the whole
+/// line is the obvious spelling and the wrong one, since it fails in exactly
+/// the case nobody would re-test, and `contrib/whisrs.service` carries no
+/// arguments today to make it visible.
+///
+/// `ExecStartPre=` and `ExecStartPost=` are deliberately untouched: they are
+/// not the daemon, and rewriting them to the daemon path would be nonsense.
+fn rewrite_exec_start(contents: &str, whisrsd_path: &str) -> String {
+    let mut out = String::with_capacity(contents.len() + whisrsd_path.len());
+    for line in contents.lines() {
+        match line.strip_prefix("ExecStart=") {
+            Some(command) => {
+                out.push_str("ExecStart=");
+                out.push_str(whisrsd_path);
+                // Everything after the binary is the caller's, keep it verbatim.
+                if let Some(args) = command.split_once(char::is_whitespace) {
+                    out.push(' ');
+                    out.push_str(args.1);
+                }
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn write_service_file(manager: ServiceManager, dest: &Path) -> bool {
     let contrib_name = match manager {
         ServiceManager::Systemd => "whisrs.service",
@@ -1301,25 +1332,13 @@ fn write_service_file(manager: ServiceManager, dest: &Path) -> bool {
 
     if let Some(src) = find_contrib_file(contrib_name) {
         if manager == ServiceManager::Systemd {
-            // Keep the packaged unit, but write an absolute ExecStart. User
-            // services do not reliably inherit the shell's PATH, especially
-            // for cargo installs under ~/.cargo/bin.
+            // Keep the packaged unit, but write an absolute ExecStart. systemd
+            // resolves a bare `ExecStart=whisrsd` against a compiled-in search
+            // path that never contains ~/.cargo/bin, so the shipped line only
+            // works when the binary landed in /usr/bin or /usr/local/bin.
             let whisrsd_path = which_whisrsd();
             let content = match fs::read_to_string(&src) {
-                Ok(contents) => {
-                    contents
-                        .lines()
-                        .map(|line| {
-                            if line.starts_with("ExecStart=") {
-                                format!("ExecStart={whisrsd_path}")
-                            } else {
-                                line.to_string()
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        + "\n"
-                }
+                Ok(contents) => rewrite_exec_start(&contents, &whisrsd_path),
                 Err(e) => {
                     println!("  {RED}Failed to read service file: {e}{RESET}");
                     return false;
@@ -2165,6 +2184,65 @@ mod tests {
     /// `contrib/openrc/whisrs.initd` is the copy users actually install, so it
     /// is held to the same list: asserting the two loops are byte-equal catches
     /// drift in either direction and covers the shipped file's own var list.
+    /// `whisrs setup` rewrites the packaged unit's `ExecStart=` instead of
+    /// copying it, because systemd resolves a bare `whisrsd` against a
+    /// compiled-in search path that never contains `~/.cargo/bin`. Verified
+    /// directly: a user unit with `ExecStart=whisrsd` fails to run while the
+    /// same unit with an absolute path starts, on the same binary.
+    #[test]
+    fn exec_start_rewrite_repoints_the_binary() {
+        let out = rewrite_exec_start("[Service]\nExecStart=whisrsd\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "[Service]\nExecStart=/opt/bin/whisrsd\n");
+    }
+
+    /// The obvious spelling of the rewrite replaces the whole line, which
+    /// throws away every argument. `contrib/whisrs.service` carries none
+    /// today, so nothing would have caught it: the first flag added to the
+    /// unit would just stop reaching the daemon, on the install path least
+    /// likely to be re-tested.
+    #[test]
+    fn exec_start_rewrite_keeps_arguments() {
+        let out = rewrite_exec_start("ExecStart=whisrsd --foo bar\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo bar\n");
+    }
+
+    /// `ExecStartPre=`/`ExecStartPost=`/`ExecStop=` are not the daemon, so
+    /// repointing them at the daemon path would be nonsense. `starts_with`
+    /// on the bare directive name would match the first two.
+    #[test]
+    fn exec_start_rewrite_leaves_sibling_directives_alone() {
+        let unit = "ExecStartPre=/bin/true\nExecStartPost=/bin/true\nExecStop=/bin/kill\n";
+        assert_eq!(rewrite_exec_start(unit, "/opt/bin/whisrsd"), unit);
+    }
+
+    /// The rewrite is the only edit: comments, blank lines, section order and
+    /// every other directive survive byte-for-byte. Run against the file users
+    /// actually get, so a change to the packaged unit is covered too.
+    #[test]
+    fn exec_start_rewrite_touches_nothing_else_in_the_shipped_unit() {
+        let Some(src) = find_contrib_file("whisrs.service") else {
+            return; // no contrib/ on disk (cargo install); the inline unit applies
+        };
+        let original = std::fs::read_to_string(&src).expect("contrib unit is readable");
+        let rewritten = rewrite_exec_start(&original, "/opt/bin/whisrsd");
+
+        let changed: Vec<_> = original
+            .lines()
+            .zip(rewritten.lines())
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![("ExecStart=whisrsd", "ExecStart=/opt/bin/whisrsd")],
+            "the rewrite edited a line other than ExecStart"
+        );
+        assert_eq!(
+            original.lines().count(),
+            rewritten.lines().count(),
+            "the rewrite added or dropped a line"
+        );
+    }
+
     #[test]
     fn openrc_scripts_reexport_confd_vars() {
         let script = openrc_initd_contents("/usr/bin/whisrsd");
