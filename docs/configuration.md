@@ -245,6 +245,17 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 # model (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR, …). Keeps
 # Python/PyTorch out of the Rust daemon. See contrib/asr-sidecars/ for
 # ready-to-run sidecars and the wire-format contract.
+#
+# The contract is the OpenAI /v1/audio/transcriptions shape (multipart
+# file/model/language in, {"text": ...} back), so this is also the backend for
+# any OpenAI-compatible transcription endpoint — LiteLLM, Speaches, or a server
+# you wrote yourself. The path is whatever you configure; /transcribe is only
+# the default:
+#   [asr-sidecar]
+#   url = "http://127.0.0.1:8000/v1/audio/transcriptions"
+#   model = "<model the endpoint serves>"
+# One divergence from OpenAI: [general] prompt rides as the `hotwords` field
+# (see prompt above), so a strict OpenAI-compatible server ignores it.
 [asr-sidecar]
 url = "http://127.0.0.1:8765/transcribe"
 model = "microsoft/VibeVoice-ASR-HF"

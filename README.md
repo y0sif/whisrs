@@ -237,13 +237,13 @@ bindsym $mod+w exec whisrs toggle
 | **OpenAI REST** | Cloud | Batch | Paid | Simple fallback |
 | **OpenAI-compatible Realtime** | External WebSocket | Completed-utterance realtime | Free / self-hosted | Lemonade and similar OpenAI-style ASR servers |
 | **Local whisper.cpp** | Local (CPU/GPU) | Silence-split phrases | Free | Privacy, offline use |
-| **ASR sidecar** | Local sidecar | Batch | Free | Bring-your-own local ASR (Moonshine, Parakeet, VibeVoice-ASR, …) |
+| **ASR sidecar** | Local sidecar or any OpenAI-compatible endpoint | Batch | Free | Bring-your-own ASR (Moonshine, Parakeet, VibeVoice-ASR, LiteLLM, Speaches, …) |
 
 Groq is the default. For fully offline use, run `whisrs setup` and select **Local > whisper.cpp** — `base.en` (142 MB, ~388 MB RAM) is recommended; `tiny.en` (75 MB) for low-end hardware, `small.en` (466 MB) for higher accuracy.
 
 Local whisper.cpp streams by splitting dictation into phrases at natural pauses and decoding each phrase exactly once (the `[local-whisper]` defaults `segmentation = "silence"`, `phrase_silence_ms = 400`); set `segmentation = "window"` for the legacy overlapping sliding window. See [docs/configuration.md](docs/configuration.md).
 
-For local ASR models without a Rust runtime (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR), use the generic ASR sidecar backend — it talks to a small local HTTP service that hosts the model. See [`contrib/asr-sidecars/`](contrib/asr-sidecars/) for ready-to-run sidecars.
+For local ASR models without a Rust runtime (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR), use the generic ASR sidecar backend — it talks to a small local HTTP service that hosts the model. See [`contrib/asr-sidecars/`](contrib/asr-sidecars/) for ready-to-run sidecars. Its wire format is the OpenAI `/v1/audio/transcriptions` shape, so the same backend also drives any OpenAI-compatible transcription endpoint (LiteLLM, Speaches, your own server): set `[asr-sidecar] url` to its full URL.
 
 For external realtime servers that speak the OpenAI Realtime transcription event model over WebSocket, use `backend = "openai-compatible-realtime"`. Lemonade is the first supported profile. Unlike OpenAI cloud, Lemonade-style interim partials are replaceable, so whisrs types completed phrases as they stabilize instead of blindly appending every partial hypothesis.
 

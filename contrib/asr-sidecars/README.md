@@ -25,6 +25,12 @@ Response:
 { "text": "transcribed text" }
 ```
 
+This is the OpenAI `/v1/audio/transcriptions` shape, so an OpenAI-compatible
+transcription server needs no wrapper: point `[asr-sidecar] url` at its full
+URL. The path is whatever you configure, `/transcribe` is only the default.
+The one divergence is the prompt, which whisrs sends as `hotwords` rather than
+`prompt`, so a strict OpenAI-compatible server ignores `[general] prompt`.
+
 ## Implementations
 
 ## Recommended choices
