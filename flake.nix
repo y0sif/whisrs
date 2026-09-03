@@ -38,6 +38,12 @@
             substituteInPlace contrib/99-whisrs.rules \
               --replace-fail /usr/bin/setfacl ${pkgs.acl}/bin/setfacl
 
+            # systemd resolves a non-absolute ExecStart against a compile-time
+            # search path, never $PATH, and no store path is ever in it — the
+            # packaged unit would name a binary systemd cannot find.
+            substituteInPlace contrib/whisrs.service \
+              --replace-fail ExecStart=whisrsd ExecStart=$out/bin/whisrsd
+
             install -Dm644 contrib/whisrs.1 $out/share/man/man1/whisrs.1
             install -Dm644 contrib/whisrsd.1 $out/share/man/man1/whisrsd.1
             install -Dm644 contrib/99-whisrs.rules $out/lib/udev/rules.d/99-whisrs.rules
