@@ -840,6 +840,9 @@ fn render_masked_toml(config: &Config) -> Result<String> {
     if let Some(l) = clone.llm.as_mut() {
         l.api_key = setup::mask_api_key(&l.api_key);
     }
+    if let Some(t) = clone.tts.as_mut() {
+        t.api_key = t.api_key.as_ref().map(|key| setup::mask_api_key(key));
+    }
     toml::to_string_pretty(&clone).context("failed to serialize config")
 }
 
@@ -1651,6 +1654,139 @@ mod tests {
             assert!(
                 any_hotkey_set(&hotkeys),
                 "a lone `{field}` binding was treated as an empty section and dropped"
+            );
+        }
+    }
+
+    /// Every `Config` field whose section carries an `api_key`, discovered from
+    /// the struct definitions rather than a hand-written list. `[tts]` was
+    /// missed by `render_masked_toml` for six releases precisely because the
+    /// set of key-bearing sections lived only in that function's body.
+    fn key_bearing_config_fields() -> Vec<String> {
+        let types_src = include_str!("types.rs");
+
+        let mut with_key: Vec<&str> = Vec::new();
+        for src in [types_src, include_str!("../llm.rs")] {
+            for chunk in src.split("\npub struct ").skip(1) {
+                let name = chunk
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or_default();
+                let body = chunk.split("\n}").next().unwrap_or_default();
+                if body.contains("pub api_key") {
+                    with_key.push(name);
+                }
+            }
+        }
+        assert_eq!(
+            with_key.len(),
+            7,
+            "the struct scan found {with_key:?} — it only sees column-0 `pub struct` \
+             in types.rs and llm.rs, so a key-bearing struct that moved elsewhere is \
+             invisible here and would pass vacuously"
+        );
+
+        let config_body = types_src
+            .split("\npub struct Config {")
+            .nth(1)
+            .expect("types.rs defines Config")
+            .split("\n}")
+            .next()
+            .expect("Config has a body");
+
+        let mut fields = Vec::new();
+        for line in config_body.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub ") else {
+                continue;
+            };
+            let Some((name, ty)) = rest.split_once(':') else {
+                continue;
+            };
+            if with_key.iter().any(|s| ty.contains(s)) {
+                fields.push(name.trim().to_string());
+            }
+        }
+        fields
+    }
+
+    /// `render_masked_toml` masks a hand-written list of sections, so a new
+    /// key-bearing section is silently printed in cleartext under a heading
+    /// that promises "masked". Assert the function touches every section the
+    /// struct definitions say carries a key.
+    ///
+    /// Structural only: it proves each section is *mentioned*, not that the
+    /// mention masks anything. `a_populated_config_renders_no_cleartext_key`
+    /// is the semantic half, and neither test replaces the other.
+    #[test]
+    fn render_masked_toml_covers_every_key_bearing_section() {
+        let source = include_str!("edit.rs");
+        let body = source
+            .split("fn render_masked_toml(")
+            .nth(1)
+            .expect("edit.rs defines render_masked_toml")
+            .split("\nfn ")
+            .next()
+            .expect("render_masked_toml has a body");
+
+        let fields = key_bearing_config_fields();
+        for field in &fields {
+            // The trailing dot is load-bearing: `clone.openai` is a prefix of
+            // `clone.openai_compatible_realtime`, so an unanchored match let a
+            // deleted `[openai]` arm pass this test.
+            assert!(
+                body.contains(&format!("clone.{field}.")),
+                "render_masked_toml never masks `[{field}] api_key`, so \
+                 `whisrs config` prints it in cleartext under \"Current config (masked)\""
+            );
+        }
+        assert_eq!(
+            fields.len(),
+            7,
+            "expected 7 key-bearing sections, found {fields:?} — update this count \
+             deliberately once the new section is masked above"
+        );
+    }
+
+    /// The value half: a config with a key in every section must render with
+    /// no secret surviving, and with every `api_key` still present and masked.
+    /// A section dropped from serialization would otherwise pass the scan test.
+    #[test]
+    fn a_populated_config_renders_no_cleartext_key() {
+        let config: Config = toml::from_str(
+            r#"
+[deepgram]
+api_key = "deepgram-SECRET-aaaa"
+[groq]
+api_key = "groq-SECRET-bbbb"
+[openai]
+api_key = "openai-SECRET-cccc"
+[asr-sidecar]
+api_key = "sidecar-SECRET-dddd"
+[openai-compatible-realtime]
+api_key = "realtime-SECRET-eeee"
+[llm]
+api_key = "llm-SECRET-ffff"
+[tts]
+api_key = "tts-SECRET-gggg"
+"#,
+        )
+        .expect("fixture parses");
+
+        let rendered = render_masked_toml(&config).expect("renders");
+
+        assert!(
+            !rendered.contains("SECRET"),
+            "a key survived masking:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("api_key").count(),
+            7,
+            "every section must still print a masked api_key:\n{rendered}"
+        );
+        for tail in ["aaaa", "bbbb", "cccc", "dddd", "eeee", "ffff", "gggg"] {
+            assert!(
+                rendered.contains(&format!("****{tail}")),
+                "`{tail}` section is missing its masked key:\n{rendered}"
             );
         }
     }
