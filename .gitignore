@@ -6,6 +6,7 @@ crates/*/Cargo.lock
 !/docs/comparison.md
 !/docs/configuration.md
 !/docs/faq.md
+!/docs/gpu-acceleration.md
 !/docs/troubleshooting.md
 !/docs/version-roadmap.md
 .worktrees/

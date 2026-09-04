@@ -13,7 +13,7 @@ sudo usermod -aG input $USER
 Log out and back in for the group change to take effect.
 
 The rule also grants the `input` group an ACL on `/dev/uinput`, which matters when
-another rule (e.g. brltty) sets one — ACLs override plain group permissions. That
+another rule (e.g. brltty) sets one; ACLs override plain group permissions. That
 line is written against the FHS path `/usr/bin/setfacl` and is skipped when the
 path does not exist, so on distributions that put `setfacl` elsewhere (NixOS,
 Guix) rewrite it after copying:
@@ -69,9 +69,9 @@ rc-service --user whisrs start
 rc-service --user whisrs status
 ```
 
-If it fails, check the logs — `journalctl --user -u whisrs.service` under systemd,
+If it fails, check the logs: `journalctl --user -u whisrs.service` under systemd,
 `$XDG_STATE_HOME/whisrs/whisrsd.log` (default `~/.local/state/whisrs/whisrsd.log`)
-under OpenRC — or run `RUST_LOG=debug whisrsd` in the foreground.
+under OpenRC. Or run `RUST_LOG=debug whisrsd` in the foreground.
 
 ## No window tracking or clipboard paste under OpenRC
 
@@ -99,3 +99,41 @@ https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 ```
 
 Place it in `~/.local/share/whisrs/models/` and update `model_path` in your config.
+
+## Garbled output / wrong characters on non-US layouts
+
+whisrs auto-detects your XKB layout via the active compositor (Hyprland / Sway), then `setxkbmap` (X11), then `localectl` (systemd), then the `XKB_DEFAULT_LAYOUT` / `XKB_DEFAULT_VARIANT` env vars, in that order. If none succeed, it falls back to US/QWERTY, and on a non-US layout that produces garbled output (e.g. `"this"` typed as `"èCDU"` on `fr(bepo)`).
+
+To diagnose, run the daemon in the foreground with debug logging and look for the detected layout:
+
+```bash
+RUST_LOG=debug whisrsd
+```
+
+If the layout is missing or wrong, fix it one of two ways:
+
+1. Make sure `localectl status` reports the right `X11 Layout` and `X11 Variant`. This is the system source-of-truth and works without any X session env vars.
+2. Force the layout via env vars on the service.
+
+   systemd (`systemctl --user edit whisrs.service`):
+
+   ```ini
+   [Service]
+   Environment=XKB_DEFAULT_LAYOUT=fr
+   Environment=XKB_DEFAULT_VARIANT=bepo
+   ```
+
+   Then `systemctl --user restart whisrs.service`.
+
+   OpenRC (add to `~/.config/rc/conf.d/whisrs`):
+
+   ```sh
+   XKB_DEFAULT_LAYOUT="fr"
+   XKB_DEFAULT_VARIANT="bepo"
+   ```
+
+   Then `rc-service --user whisrs restart`.
+
+## Hotkey keys are physical positions, not layout characters
+
+The configured hotkey trigger (e.g. `Ctrl+Shift+W`) is interpreted as the physical evdev keycode at the US/QWERTY `W` position, regardless of the active layout. This is intentional: the hotkey listener reads raw evdev events before any XKB translation, which is how every evdev-based hotkey tool works (xremap, sxhkd --evdev). On non-US layouts, pick the trigger by its physical position on a QWERTY keyboard.
