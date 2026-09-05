@@ -13,15 +13,17 @@
 [![Crates.io](https://img.shields.io/crates/v/whisrs)](https://crates.io/crates/whisrs)
 [![docs.rs](https://img.shields.io/docsrs/whisrs)](https://docs.rs/whisrs)
 
-**Linux-first voice-to-text dictation tool, written in Rust.**
+**Voice for the Linux desktop, written in Rust: dictation, read-aloud, and voice-driven LLM commands.**
 
-Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor. Works with any app, any window manager, any desktop environment. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. It can also read the selected text back aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar).
+Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source.
+
+![whisrs demo: dictation, read aloud, and command mode](assets/demo.gif)
 
 ---
 
 ## Why whisrs?
 
-Dictation tools like Wispr Flow and Superwhisper are not available on Linux. [xhisper](https://github.com/imaginalnika/xhisper) proved the concept works, but I kept running into limitations. whisrs takes that idea and rebuilds it in Rust as a single async process with native keyboard layout support, window tracking, and multiple transcription backends.
+Dictation tools like Wispr Flow and Superwhisper are not available on Linux. whisrs fills that gap natively: a single Rust daemon with layout-aware keyboard injection (AltGr and dead keys included), per-compositor window tracking, and pluggable backends. What started as a dictation tool has grown into a voice layer for the whole desktop: speech in (dictation, voice commands), speech out (read any selection aloud), one hotkey each.
 
 ---
 
@@ -37,69 +39,20 @@ The install script downloads the latest prebuilt tarball, installs `whisrs`/`whi
 
 Pin a specific version with `WHISRS_VERSION=v0.1.10` or use the cloud-only minimal build with `WHISRS_MINIMAL=1`. Re-run the same command later to upgrade.
 
-To **build from source** instead — including custom feature flag combos or unsupported architectures — use `cargo install whisrs --locked` or the `whisrs-git` AUR package.
+To **build from source** instead (including custom feature flag combos or unsupported architectures), use `cargo install whisrs --locked` or the `whisrs-git` AUR package.
 
 After install, **press your hotkey** to start recording, **press again** to stop. Text appears at your cursor.
 
 ### GPU acceleration (local whisper.cpp)
 
-The default build — and every prebuilt tarball that ships whisper.cpp at all — runs it on the CPU. If you use the `local-whisper` backend, building with a GPU feature moves the model onto your GPU and cuts dictation latency from seconds to near-instant:
-
-```bash
-cargo install whisrs --features vulkan
-```
-
-| Feature | Backend | Hardware |
-|---|---|---|
-| `vulkan` | Vulkan | AMD, Intel, NVIDIA (cross-vendor; the safe default) |
-| `cuda` | CUDA | NVIDIA, needs the CUDA toolkit |
-| `hipblas` | ROCm/HIP | AMD, needs ROCm |
-
-These are compile-time features — the GPU backend has to be linked in, so there is no runtime switch. Each one implies `local-whisper`; the cloud backends are unaffected, and CPU stays the default.
-
-**Build-time system dependencies** (on top of the usual `alsa-lib`, `libxkbcommon`, `clang`, `cmake`). For `vulkan`:
-
-```bash
-# Arch Linux
-sudo pacman -S vulkan-headers vulkan-icd-loader shaderc
-
-# Debian/Ubuntu
-sudo apt install libvulkan-dev glslc
-
-# Fedora
-sudo dnf install vulkan-headers vulkan-loader-devel glslc
-```
-
-Your GPU driver package alone is **not** enough. The driver ships the runtime, not the development headers or the shader compiler, so a machine that runs Vulkan games fine will still fail the build with:
-
-```
-Could NOT find Vulkan (missing: Vulkan_INCLUDE_DIR)
-```
-
-Install the packages above and rebuild. `cuda` and `hipblas` likewise need their full toolkits (`cuda` / `rocm-hip-sdk`), not just the driver.
-
-**Verify it worked.** The binary should link against the Vulkan loader:
-
-```bash
-ldd ~/.cargo/bin/whisrsd | grep vulkan
-```
-
-No output means you got a CPU build. Then start the daemon in the foreground and watch whisper.cpp report the device it picked up:
-
-```bash
-RUST_LOG=debug whisrsd
-```
-
-A working Vulkan build names your GPU at load time (for example `ggml_vulkan: Found 1 Vulkan devices: Radeon RX 9070 XT (RADV GFX1201)`) and loads the model onto it.
-
-> **If you installed whisrs from a distro package or the tarball**, `cargo install` writes the new binaries to `~/.cargo/bin` and leaves the old ones in `/usr/local/bin` or `/usr/bin` untouched. Check that your systemd unit still points at the binary you just built — `systemctl --user show whisrs.service -p ExecStart` — and point `ExecStart` at `~/.cargo/bin/whisrsd` if it doesn't, otherwise you'll keep running the CPU build without noticing. Don't just delete the old binary: `whisrs setup` writes an absolute `ExecStart`, so removing what it points at stops the daemon starting rather than moving it to the new build.
+Prebuilt tarballs run whisper.cpp on the CPU. Building with a GPU feature (`cargo install whisrs --features vulkan`, or `cuda` / `hipblas`) moves the model onto your GPU and cuts dictation latency from seconds to near-instant. It needs the toolkit's development packages, not just the GPU driver; see [docs/gpu-acceleration.md](docs/gpu-acceleration.md) for per-distro packages, how to verify the build, and the systemd pitfall when upgrading an existing install.
 
 <details>
 <summary><b>Other install methods (pre-built binary, AUR, Cargo, Nix, manual)</b></summary>
 
 ### Pre-built binary (manual)
 
-The Quick install above already does this — this section is for users who want to install the tarball by hand.
+The Quick install above already does this; this section is for users who want to install the tarball by hand.
 
 Each tagged release publishes tarballs on [GitHub Releases](https://github.com/y0sif/whisrs/releases/latest) with both `whisrs` and `whisrsd` plus the contrib files (udev rule, systemd unit, man pages).
 
@@ -108,7 +61,7 @@ Each tagged release publishes tarballs on [GitHub Releases](https://github.com/y
 ARCH=x86_64   # or aarch64
 curl -sSL -o whisrs.tar.gz https://github.com/y0sif/whisrs/releases/latest/download/whisrs-linux-${ARCH}.tar.gz
 
-# Or the minimal build (cloud backends only — no whisper.cpp; keeps tray + overlay):
+# Or the minimal build (cloud backends only, no whisper.cpp; keeps tray + overlay):
 # curl -sSL -o whisrs.tar.gz https://github.com/y0sif/whisrs/releases/latest/download/whisrs-linux-${ARCH}-minimal.tar.gz
 
 tar xzf whisrs.tar.gz
@@ -186,7 +139,7 @@ whisrs setup
 
 The interactive setup will walk you through backend selection, API keys / model download, microphone test, uinput permissions, the user service, and keybindings.
 
-Setup detects your init system and installs the matching service — a systemd user unit from `contrib/whisrs.service`, or an OpenRC user service from `contrib/openrc/`. To install by hand instead:
+Setup detects your init system and installs the matching service: a systemd user unit from `contrib/whisrs.service`, or an OpenRC user service from `contrib/openrc/`. To install by hand instead:
 
 <details>
 <summary>systemd</summary>
@@ -239,19 +192,15 @@ bindsym $mod+w exec whisrs toggle
 | **Local whisper.cpp** | Local (CPU/GPU) | Silence-split phrases | Free | Privacy, offline use |
 | **ASR sidecar** | Local sidecar or any OpenAI-compatible endpoint | Batch | Free | Bring-your-own ASR (Moonshine, Parakeet, VibeVoice-ASR, LiteLLM, Speaches, …) |
 
-Groq is the default. For fully offline use, run `whisrs setup` and select **Local > whisper.cpp** — `base.en` (142 MB, ~388 MB RAM) is recommended; `tiny.en` (75 MB) for low-end hardware, `small.en` (466 MB) for higher accuracy.
+Groq is the default. For fully offline use, run `whisrs setup` and select **Local > whisper.cpp**: `base.en` (142 MB, ~388 MB RAM) is recommended; `tiny.en` (75 MB) for low-end hardware, `small.en` (466 MB) for higher accuracy.
 
-Local whisper.cpp streams by splitting dictation into phrases at natural pauses and decoding each phrase exactly once (the `[local-whisper]` defaults `segmentation = "silence"`, `phrase_silence_ms = 400`); set `segmentation = "window"` for the legacy overlapping sliding window. See [docs/configuration.md](docs/configuration.md).
-
-For local ASR models without a Rust runtime (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR), use the generic ASR sidecar backend — it talks to a small local HTTP service that hosts the model. See [`contrib/asr-sidecars/`](contrib/asr-sidecars/) for ready-to-run sidecars. Its wire format is the OpenAI `/v1/audio/transcriptions` shape, so the same backend also drives any OpenAI-compatible transcription endpoint (LiteLLM, Speaches, your own server): set `[asr-sidecar] url` to its full URL.
-
-For external realtime servers that speak the OpenAI Realtime transcription event model over WebSocket, use `backend = "openai-compatible-realtime"`. Lemonade is the first supported profile. Unlike OpenAI cloud, Lemonade-style interim partials are replaceable, so whisrs types completed phrases as they stabilize instead of blindly appending every partial hypothesis.
+Local whisper.cpp streams by splitting dictation into phrases at natural pauses and decoding each phrase exactly once; for local models without a Rust runtime (Moonshine, NVIDIA Parakeet, VibeVoice-ASR) the ASR sidecar backend talks to a small local HTTP service (ready-to-run recipes in [`contrib/asr-sidecars/`](contrib/asr-sidecars/)), and its OpenAI `/v1/audio/transcriptions` wire format also drives any OpenAI-compatible endpoint (LiteLLM, Speaches, your own server). External realtime servers that speak the OpenAI Realtime event model over WebSocket (Lemonade is the first supported profile) use `backend = "openai-compatible-realtime"`. Details for all three: [docs/configuration.md](docs/configuration.md).
 
 ---
 
 ## Configuration
 
-Config file: `~/.config/whisrs/config.toml` — `whisrs setup` writes a working file. A minimal example:
+Config file: `~/.config/whisrs/config.toml`; `whisrs setup` writes a working file. A minimal example:
 
 ```toml
 [general]
@@ -265,7 +214,7 @@ api_key = "gsk_..."
 
 Env-var overrides: `WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, `WHISRS_OPENAI_API_KEY`, `WHISRS_ASR_SIDECAR_API_KEY`.
 
-For the full reference (overlay, `[input]`, `[openai-compatible-realtime]`, `[asr-sidecar]`, `[llm]`, `[hotkeys]`, `[hooks]`, GNOME extension setup), see [docs/configuration.md](docs/configuration.md).
+For the full reference (overlay, `[input]`, `[tts]`, `[llm]`, `[hotkeys]`, `[hooks]`, backend sections, GNOME extension setup), see [docs/configuration.md](docs/configuration.md).
 
 ---
 
@@ -290,56 +239,24 @@ whisrs log --clear  # Clear all history
 
 ### Per-language keys
 
-`toggle` accepts an optional `--language`/`-l <CODE>` (ISO 639-1, or `auto`) that
-overrides `general.language` for that one session only -- no config edit or daemon
-restart. Bind a separate key per language so you can dictate in each without
-switching settings. Hyprland:
+`toggle` accepts `--language`/`-l <CODE>` (ISO 639-1, or `auto`) to override `general.language` for that one session, with no config edit or daemon restart. Bind a separate key per language to dictate in each without switching settings:
+
 ```
-bind = , F1, exec, whisrs toggle -l en
+bind = , F1, exec, whisrs toggle -l en   # Hyprland
 bind = , F2, exec, whisrs toggle -l pl
 ```
-Sway:
-```
-bindsym F1 exec whisrs toggle -l en
-bindsym F2 exec whisrs toggle -l pl
-```
-Without `-l`, `whisrs toggle` keeps using `general.language`, so an existing
-plain-toggle key is unaffected.
 
-### LLM post-processing
+### Voice + LLM
 
-Three ways to put an LLM between your voice and the cursor, all sharing the one
-`[llm]` section:
+Three ways to put an LLM between your voice and the cursor, all sharing the one `[llm]` section (any OpenAI-compatible `/chat/completions` endpoint works, including a local LM Studio / Ollama / llama.cpp server):
 
-- `whisrs command`: select text, speak an instruction, the selection is rewritten in place.
-- `[[llm_commands]]`: a named instruction on its own hotkey. Dictate, the LLM applies it, the result is typed. One hotkey per entry.
-- `[general] llm_post_process`: the same rewrite on the normal toggle key, with no extra binding.
+- **`whisrs command`**: select text, speak an instruction ("make this formal"), and the selection is rewritten in place.
+- **`[[llm_commands]]`**: a named instruction on its own hotkey. Dictate, the LLM applies it, the result is typed. A generic entry turns speech into artifacts: say "the command to install steam on arch" and `sudo pacman -S steam` lands at your cursor.
+- **`[general] llm_post_process`**: the same rewrite applied to every dictation on the normal toggle key, no extra binding.
 
-```toml
-[general]
-backend = "groq"           # a batch backend
-llm_post_process = true    # off by default
-llm_instruction = "Fix punctuation and obvious transcription errors. Keep the wording unchanged. Return only the corrected text."
-```
+`llm_post_process` works with **batch backends only** (`deepgram`, `groq`, `openai`, `asr-sidecar`). Streaming backends (including `local-whisper`) type text as it arrives, so no whole transcript ever exists to post-process and the flag is a silent no-op; `whisrsd` warns at startup if you pair them. Use an `[[llm_commands]]` hotkey instead, which works whatever the backend.
 
-With it on, every `whisrs toggle` dictation goes through `[llm]` before it is
-typed.
-
-**Batch backends only:** `deepgram`, `groq`, `openai`, `asr-sidecar`. The
-streaming backends, which are `deepgram-streaming`, `openai-realtime`,
-`openai-compatible-realtime` **and `local-whisper`**, type text at the cursor as
-it arrives, so no whole transcript ever exists to post-process and the flag does
-nothing at all. `local-whisper` is the one to watch: it runs offline and
-transcribes in a single call, but dictation with it always streams, so
-`llm_post_process` is a silent no-op there too. `whisrsd` warns at startup if you
-pair the two. Use an `[[llm_commands]]` hotkey instead, which works whatever the
-backend.
-
-If the LLM call fails, times out, or returns nothing, the raw transcript is typed
-instead, so a dictation is never lost to post-processing. A post-processed entry
-shows up in `whisrs log` tagged `<backend>+llm` (for example `groq+llm`); a
-dictation that fell back to the raw transcript keeps the plain backend name. See
-[docs/configuration.md](docs/configuration.md).
+If the LLM call fails, times out, or returns nothing, the raw transcript is typed instead, so a dictation is never lost to post-processing. Post-processed entries show up in `whisrs log` tagged `<backend>+llm`. Full reference: [docs/configuration.md](docs/configuration.md).
 
 ---
 
@@ -356,13 +273,13 @@ dictation that fell back to the raw transcript keeps the plain backend name. See
 | **Audio** | PipeWire, PulseAudio, ALSA (auto-detected via cpal) |
 | **Distros** | Confirmed on Arch Linux and Ubuntu 24.04; any Linux with the system dependencies above |
 
-> **Note:** whisrs is daily-driven on Hyprland (Arch Linux), with community confirmation on GNOME Wayland (Ubuntu 24.04 + Arch), Xorg (Ubuntu 24.04), and Niri (CachyOS). Sway, i3, and KDE reports are still wanted — if you use whisrs there, please open an issue with what works and what doesn't.
+> **Note:** whisrs is daily-driven on Hyprland (Arch Linux), with community confirmation on GNOME Wayland (Ubuntu 24.04 + Arch), Xorg (Ubuntu 24.04), and Niri (CachyOS). Sway, i3, and KDE reports are still wanted; if you use whisrs there, please open an issue with what works and what doesn't.
 
 ---
 
 ## Project Status
 
-whisrs is functional and usable for daily dictation. Streaming transcription, command mode, read-selection-aloud (TTS via Groq, OpenAI, Deepgram, or a local sidecar), multi-language support, system tray (status, restart and quit in the menu; left-click toggles recording where the tray host forwards it, as waybar and Plasma do), OSD overlay, layout-aware injection (incl. AltGr + dead keys), the generic ASR sidecar backend (Moonshine, Parakeet, VibeVoice-ASR), and packaging for AUR / Nix / crates.io all ship today. Native local Vosk and Parakeet backends are next.
+whisrs is functional and daily-driven. Streaming transcription, command mode, read-selection-aloud (TTS via Groq, OpenAI, Deepgram, or a local sidecar), LLM post-processing and named voice commands, multi-language support, system tray, OSD overlay, layout-aware injection (incl. AltGr + dead keys), the generic ASR sidecar backend, and packaging for AUR / Nix / crates.io all ship today. Native local Vosk and Parakeet backends are next.
 
 Per-release details: [docs/version-roadmap.md](docs/version-roadmap.md).
 
@@ -370,45 +287,10 @@ Per-release details: [docs/version-roadmap.md](docs/version-roadmap.md).
 
 ## Troubleshooting
 
-See [docs/troubleshooting.md](docs/troubleshooting.md) for the full list. Two issues come up often enough to call out here:
+See [docs/troubleshooting.md](docs/troubleshooting.md) for the full list. The two issues that come up most:
 
-### Garbled output / wrong characters on non-US layouts
-
-whisrs auto-detects your XKB layout via the active compositor (Hyprland / Sway), then `setxkbmap` (X11), then `localectl` (systemd), then the `XKB_DEFAULT_LAYOUT` / `XKB_DEFAULT_VARIANT` env vars — in that order. If none succeed, it falls back to US/QWERTY, and on a non-US layout that produces garbled output (e.g. `"this"` typed as `"èCDU"` on `fr(bepo)`).
-
-To diagnose, run the daemon in the foreground with debug logging and look for the detected layout:
-
-```bash
-RUST_LOG=debug whisrsd
-```
-
-If the layout is missing or wrong, fix it one of two ways:
-
-1. Make sure `localectl status` reports the right `X11 Layout` and `X11 Variant`. This is the system source-of-truth and works without any X session env vars.
-2. Force the layout via env vars on the service.
-
-   systemd — `systemctl --user edit whisrs.service`:
-
-   ```ini
-   [Service]
-   Environment=XKB_DEFAULT_LAYOUT=fr
-   Environment=XKB_DEFAULT_VARIANT=bepo
-   ```
-
-   Then `systemctl --user restart whisrs.service`.
-
-   OpenRC — add to `~/.config/rc/conf.d/whisrs`:
-
-   ```sh
-   XKB_DEFAULT_LAYOUT="fr"
-   XKB_DEFAULT_VARIANT="bepo"
-   ```
-
-   Then `rc-service --user whisrs restart`.
-
-### Hotkey keys are physical positions, not layout characters
-
-The configured hotkey trigger (e.g. `Ctrl+Shift+W`) is interpreted as the physical evdev keycode at the US/QWERTY `W` position, regardless of the active layout. This is intentional — the hotkey listener reads raw evdev events before any XKB translation, which is how every evdev-based hotkey tool works (xremap, sxhkd --evdev). On non-US layouts, pick the trigger by its physical position on a QWERTY keyboard.
+- **Garbled output / wrong characters on non-US layouts**: whisrs auto-detects your XKB layout (compositor → `setxkbmap` → `localectl` → env vars) and falls back to US/QWERTY when all of those fail. [How to fix the detection](docs/troubleshooting.md#garbled-output--wrong-characters-on-non-us-layouts).
+- **Hotkeys fire on physical key positions, not layout characters**: intentional; the listener reads raw evdev events before any XKB translation, like every evdev-based hotkey tool. On non-US layouts, pick triggers by their QWERTY position. [Details](docs/troubleshooting.md#hotkey-keys-are-physical-positions-not-layout-characters).
 
 ---
 
@@ -416,9 +298,9 @@ The configured hotkey trigger (e.g. `Ctrl+Shift+W`) is interpreted as the physic
 
 The biggest way to help right now:
 
-1. **Test on your compositor** — Sway, i3, KDE, GNOME. Report what works and what doesn't.
-2. **Test on your distro** — Ubuntu, Fedora, NixOS, etc. Build issues, missing deps, etc.
-3. **Bug reports** — if text goes to the wrong window, characters get dropped, or audio doesn't capture, open an issue.
+1. **Test on your compositor**: Sway, i3, KDE, GNOME. Report what works and what doesn't.
+2. **Test on your distro**: Ubuntu, Fedora, NixOS, etc. Build issues, missing deps, etc.
+3. **Bug reports**: if text goes to the wrong window, characters get dropped, or audio doesn't capture, open an issue.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and project structure.
 
