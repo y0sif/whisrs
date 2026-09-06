@@ -234,7 +234,8 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 # segmentation: how streaming audio is split before decoding.
 # - "silence" (default): split into phrases at natural pauses and decode each
 #   phrase exactly once. No overlap, no dedup — prevents repeated/invented
-#   text. Continuous speech is force-split at 20 s so it still emits.
+#   text. Continuous speech is force-split at the first silent moment after
+#   20 s (hard ceiling 28 s) so it still emits.
 # - "window": legacy 8s/2s overlapping sliding window with text-based dedup.
 # segmentation = "silence"
 # phrase_silence_ms: continuous silence (ms) that ends a phrase in "silence"

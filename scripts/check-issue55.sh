@@ -8,9 +8,10 @@
 #                           repeated n-grams (the original issue #55 repro)
 #                           and >= 80% ground-truth word coverage, so silently
 #                           dropped words fail too.
-#   2. issue55_nopause.wav  ~28 s of continuous pause-free speech — must be
+#   2. issue55_nopause.wav  ~41 s of continuous pause-free speech — must be
 #                           transcribed in full (>= 80% ground-truth word
-#                           coverage), proving the 20 s max-segment cap emits
+#                           coverage), proving the 20 s soft cap (cutting only
+#                           at silence) and the 28 s hard ceiling both emit
 #                           instead of stalling.
 #
 # Exit code: 0 = both checks pass, 1 = at least one failed.
@@ -49,7 +50,7 @@ WHISRS_ISSUE55_MIN_COVERAGE=0.8 "$BIN" "$WAV" "$MODEL" "$TRUTH" \
     || pause_status=$?
 
 echo
-echo "=== 2/2 no-pause fixture (coverage gate, 20s cap) ==="
+echo "=== 2/2 no-pause fixture (coverage gate, 20s soft cap / 28s hard ceiling) ==="
 nopause_status=0
 WHISRS_ISSUE55_MIN_COVERAGE=0.8 "$BIN" "$NP_WAV" "$MODEL" "$NP_TRUTH" \
     || nopause_status=$?
