@@ -6,13 +6,14 @@
 # separated by 2-6 s silence gaps, including a trailing incomplete phrase
 # right before a pause (the golden repro for the repetition bug).
 #
-# Also builds a continuous no-pause fixture (~28 s of speech with no gaps)
-# used to prove that pause-free dictation still emits (20 s max-segment cap).
+# Also builds a continuous no-pause fixture (~41 s of speech with no gaps)
+# used to prove that pause-free dictation still emits past both the 20 s soft
+# cap and the 28 s hard ceiling.
 #
 # Output (gitignored, never commit the WAVs):
 #   fixtures/issue55.wav           16 kHz mono s16 test audio (~45 s, pauses)
 #   fixtures/issue55.txt           ground-truth transcript (one line)
-#   fixtures/issue55_nopause.wav   16 kHz mono s16 test audio (~28 s, no gaps)
+#   fixtures/issue55_nopause.wav   16 kHz mono s16 test audio (~41 s, no gaps)
 #   fixtures/issue55_nopause.txt   ground-truth transcript (one line)
 #
 # Requires: espeak-ng, ffmpeg
@@ -36,7 +37,7 @@ for arg in "$@"; do
     case "$arg" in
         --force) FORCE=1 ;;
         -h|--help)
-            sed -n '2,17p' "$0" | sed 's/^# \?//'
+            sed -n '2,18p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -128,15 +129,20 @@ info "Wrote:" "$OUT_TXT (ground truth)"
 # ---------------------------------------------------------------------------
 # Continuous no-pause fixture: one long run-on utterance with no punctuation
 # (espeak-ng inserts pauses at clause boundaries, so the text avoids them).
-# Exercises the streaming max-segment cap: continuous speech past 20 s must
-# still be emitted in full.
+# Long enough (~41 s of speech) to exceed both the 20 s soft cap and the 28 s
+# hard ceiling, so both forced-cut paths are exercised: the soft cap only
+# cuts at a genuinely silent frame, and the hard ceiling cuts unconditionally
+# at the quietest frame if none ever appears.
 # ---------------------------------------------------------------------------
 NOPAUSE_TEXT="this recording keeps going without any pauses so the streaming \
 backend must split the audio on its own the quick brown fox jumps over the \
 lazy dog while the developer keeps talking about testing the local whisper \
-backend and the words continue to flow one after another until the very end \
-of the recording where the final words prove the whole utterance was \
-transcribed"
+streaming backend and the words continue to flow one after another until \
+the very end of the recording where the final words prove the whole \
+utterance was transcribed and even though the sentence keeps running past \
+twenty seconds the pipeline should still wait for a quiet moment before it \
+cuts the audio and falls back to the hard ceiling a little later if none \
+ever comes"
 
 NP_RAW="$WORK_DIR/nopause_raw.wav"
 NP_SEG="$WORK_DIR/nopause_seg.wav"
