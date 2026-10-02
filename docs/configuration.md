@@ -350,10 +350,14 @@ response_format = "wav"     # audio format requested from the API
 
 # Built-in global hotkeys (optional, works without WM keybinds)
 # Triggers: A-Z, 0-9, F1-F24, space, enter, escape, tab, backspace, delete,
-#   insert, home, end, pageup, pagedown, up, down, left, right.
-# Modifiers: Super, Alt, Ctrl, Shift. At least one is required, so a bare
-#   "F13" is rejected; write "Shift+F13". The modifier set must match exactly,
-#   so "Ctrl+Alt+Ins" does not fire while Shift is also held.
+#   insert, home, end, pageup, pagedown, up, down, left, right, scrolllock,
+#   pause.
+# Modifiers: Super, Alt, Ctrl, Shift. At least one is required, except for
+#   ScrollLock, Pause and F13-F24, which can be bound alone ("ScrollLock").
+#   A bare binding fires only when no modifier is held. The modifier set must
+#   match exactly, so "Ctrl+Alt+Ins" does not fire while Shift is also held.
+#   Keys are not grabbed: the press still reaches the system, so ScrollLock
+#   still toggles its LED.
 # Two bindings sharing a combo both fire on one press, so whisrs warns at
 #   startup when it finds a duplicate across [hotkeys] and [[llm_commands]].
 [hotkeys]

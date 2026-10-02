@@ -15,15 +15,29 @@ pub struct HotkeyBinding {
 ///
 /// Format: `Modifier+Modifier+Key` (case-insensitive).
 /// Supported modifiers: Super, Alt, Ctrl, Shift.
+///
+/// Keys that never type text and have no common desktop binding (ScrollLock,
+/// Pause, F13-F24) may also be bound bare, e.g. `"ScrollLock"`. Everything
+/// else needs a modifier: devices are not grabbed, so a bare letter would
+/// fire on every keystroke while still reaching the focused window.
 pub fn parse_hotkey(s: &str) -> anyhow::Result<HotkeyBinding> {
     let parts: Vec<&str> = s.split('+').map(|p| p.trim()).collect();
-    if parts.is_empty() {
+    if s.trim().is_empty() {
         anyhow::bail!("empty hotkey string");
     }
     if parts.len() < 2 {
-        anyhow::bail!(
-            "hotkey must have at least one modifier and a key (e.g. \"Super+D\"), got: {s}"
-        );
+        let trigger = parse_key(s.trim())
+            .ok_or_else(|| anyhow::anyhow!("unknown key '{}' in hotkey '{s}'", s.trim()))?;
+        if !bare_allowed(trigger) {
+            anyhow::bail!(
+                "hotkey must have at least one modifier and a key (e.g. \"Super+D\"); only \
+                 ScrollLock, Pause and F13-F24 can be bound alone, got: {s}"
+            );
+        }
+        return Ok(HotkeyBinding {
+            modifiers: Vec::new(),
+            trigger,
+        });
     }
 
     let mut modifiers = Vec::new();
@@ -51,6 +65,27 @@ fn parse_modifier(s: &str) -> Option<Key> {
         "shift" => Some(Key::KEY_LEFTSHIFT),
         _ => None,
     }
+}
+
+/// Keys that may be bound without a modifier (see [`parse_hotkey`]).
+fn bare_allowed(key: Key) -> bool {
+    matches!(
+        key,
+        Key::KEY_SCROLLLOCK
+            | Key::KEY_PAUSE
+            | Key::KEY_F13
+            | Key::KEY_F14
+            | Key::KEY_F15
+            | Key::KEY_F16
+            | Key::KEY_F17
+            | Key::KEY_F18
+            | Key::KEY_F19
+            | Key::KEY_F20
+            | Key::KEY_F21
+            | Key::KEY_F22
+            | Key::KEY_F23
+            | Key::KEY_F24
+    )
 }
 
 fn parse_key(s: &str) -> Option<Key> {
@@ -105,6 +140,8 @@ fn parse_key(s: &str) -> Option<Key> {
         "down" => Some(Key::KEY_DOWN),
         "left" => Some(Key::KEY_LEFT),
         "right" => Some(Key::KEY_RIGHT),
+        "scrolllock" | "scroll_lock" | "scroll" => Some(Key::KEY_SCROLLLOCK),
+        "pause" | "break" => Some(Key::KEY_PAUSE),
         "f1" => Some(Key::KEY_F1),
         "f2" => Some(Key::KEY_F2),
         "f3" => Some(Key::KEY_F3),
@@ -212,6 +249,41 @@ mod tests {
     #[test]
     fn parse_no_modifier_fails() {
         assert!(parse_hotkey("D").is_err());
+        assert!(parse_hotkey("F5").is_err());
+        assert!(parse_hotkey("Space").is_err());
+    }
+
+    #[test]
+    fn parse_empty_fails() {
+        assert!(parse_hotkey("").is_err());
+        assert!(parse_hotkey("  ").is_err());
+    }
+
+    #[test]
+    fn parse_bare_scroll_lock() {
+        for name in ["ScrollLock", "scroll_lock", "Scroll"] {
+            let binding = parse_hotkey(name).unwrap();
+            assert!(
+                binding.modifiers.is_empty(),
+                "{name} should have no modifiers"
+            );
+            assert_eq!(binding.trigger, Key::KEY_SCROLLLOCK);
+        }
+    }
+
+    #[test]
+    fn parse_bare_pause_and_high_function_keys() {
+        assert_eq!(parse_hotkey("Pause").unwrap().trigger, Key::KEY_PAUSE);
+        let binding = parse_hotkey("F13").unwrap();
+        assert!(binding.modifiers.is_empty());
+        assert_eq!(binding.trigger, Key::KEY_F13);
+    }
+
+    #[test]
+    fn parse_scroll_lock_with_modifier() {
+        let binding = parse_hotkey("Shift+ScrollLock").unwrap();
+        assert_eq!(binding.modifiers, vec![Key::KEY_LEFTSHIFT]);
+        assert_eq!(binding.trigger, Key::KEY_SCROLLLOCK);
     }
 
     #[test]
