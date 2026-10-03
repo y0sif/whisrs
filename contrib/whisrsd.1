@@ -31,6 +31,15 @@ Initializes the selected transcription backend
 Binds the Unix domain socket and begins accepting commands
 .SH OPTIONS
 .TP
+.BR \-q ", " \-\-quiet
+Log startup only. When the first command arrives (from the socket, a hotkey or
+the tray), standard output and standard error are redirected to
+.I /dev/null
+for the rest of the run, so nothing about dictation, selections or windows
+reaches the journal. This includes output from whisper.cpp, audio libraries and
+hook commands. Errors after startup are not logged either; drop the flag to
+debug.
+.TP
 .BR \-h ", " \-\-help
 Print a short help message and exit.
 .TP
@@ -160,6 +169,19 @@ Run the daemon in the background:
 .PP
 .RS
 whisrsd &
+.RE
+.PP
+The packaged systemd unit runs
+.BR "whisrsd \-\-quiet" .
+To get runtime logs back, override it with a drop-in
+.RB ( "systemctl \-\-user edit whisrs.service" ):
+.PP
+.RS
+.nf
+[Service]
+ExecStart=
+ExecStart=whisrsd
+.fi
 .RE
 .PP
 Enable as a systemd user service:

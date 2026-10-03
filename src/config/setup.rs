@@ -1730,10 +1730,11 @@ fn setup_user_service() {
                     // against a compiled-in search path that never contains
                     // ~/.cargo/bin. Copying it verbatim is the same broken
                     // unit `write_service_file` exists to avoid, so name the
-                    // resolved path here too.
+                    // resolved path here too. Only the binary is replaced, so
+                    // `--quiet` survives.
                     println!("    cp contrib/whisrs.service ~/.config/systemd/user/");
                     println!(
-                        "    sed -i 's|^ExecStart=.*|ExecStart={}|' \
+                        "    sed -i 's|^ExecStart=whisrsd|ExecStart={}|' \
                          ~/.config/systemd/user/whisrs.service",
                         which_whisrsd()
                     );
@@ -2161,7 +2162,7 @@ fn systemd_unit_contents(whisrsd_path: &str) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={whisrsd_path}\n\
+         ExecStart={whisrsd_path} --quiet\n\
          Restart=on-failure\n\
          RestartSec=3\n\
          PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE NIRI_SOCKET SWAYSOCK WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR\n\
@@ -2977,7 +2978,10 @@ mod tests {
             .collect();
         assert_eq!(
             changed,
-            vec![("ExecStart=whisrsd", "ExecStart=/opt/bin/whisrsd")],
+            vec![(
+                "ExecStart=whisrsd --quiet",
+                "ExecStart=/opt/bin/whisrsd --quiet"
+            )],
             "the rewrite edited a line other than ExecStart"
         );
         assert_eq!(

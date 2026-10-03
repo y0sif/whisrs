@@ -150,7 +150,7 @@ Setup detects your init system and installs the matching service: a systemd user
 install -Dm644 contrib/whisrs.service ~/.config/systemd/user/whisrs.service
 # systemd ignores your shell's PATH, so point ExecStart at the installed binary
 # (required for ~/.cargo/bin; harmless for /usr/bin and /usr/local/bin):
-sed -i "s|^ExecStart=.*|ExecStart=$(command -v whisrsd)|" ~/.config/systemd/user/whisrs.service
+sed -i "s|^ExecStart=whisrsd|ExecStart=$(command -v whisrsd)|" ~/.config/systemd/user/whisrs.service
 systemctl --user enable --now whisrs.service
 ```
 </details>
