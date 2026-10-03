@@ -20,8 +20,17 @@
 //! 8s/2s overlapping windows with text-based n-gram overlap removal
 //! (`asr_dedup::TextDedup`) for lower-latency partial output.
 //!
+//! `segmentation = "none"` turns streaming off: [`supports_streaming`]
+//! returns `false`, so the daemon records the whole session and hands it to
+//! [`transcribe`] in one call when recording stops. Nothing is typed while
+//! you talk, and the batch-only dictation features (`[general]
+//! llm_post_process`, `[input] paste`) apply.
+//!
 //! Both streaming modes create one decoder state per stream and reuse it
 //! across decodes; see [`create_state`].
+//!
+//! [`supports_streaming`]: TranscriptionBackend::supports_streaming
+//! [`transcribe`]: TranscriptionBackend::transcribe
 
 use std::sync::Arc;
 
@@ -60,6 +69,9 @@ pub enum SegmentationMode {
     Silence,
     /// Legacy overlapping sliding window with text-based dedup.
     Window,
+    /// No segmentation, no streaming: decode the whole recording once,
+    /// after it stops (config value `"none"`).
+    Unsegmented,
 }
 
 impl SegmentationMode {
@@ -68,6 +80,7 @@ impl SegmentationMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "silence" => Self::Silence,
             "window" => Self::Window,
+            "none" => Self::Unsegmented,
             other => {
                 warn!("unknown local-whisper segmentation {other:?}, using \"silence\"");
                 Self::Silence
@@ -112,8 +125,9 @@ impl LocalWhisperBackend {
 
     /// Configure the streaming segmentation strategy.
     ///
-    /// `mode` is `"silence"` (default) or `"window"`; `phrase_silence_ms` is
-    /// how much continuous silence ends a phrase in silence mode.
+    /// `mode` is `"silence"` (default), `"window"` or `"none"`;
+    /// `phrase_silence_ms` is how much continuous silence ends a phrase in
+    /// silence mode.
     pub fn with_segmentation(mut self, mode: &str, phrase_silence_ms: u64) -> Self {
         self.segmentation = SegmentationMode::parse(mode);
         self.phrase_silence_ms = phrase_silence_ms.max(1);
@@ -299,6 +313,34 @@ impl LocalWhisperBackend {
             }
         }
 
+        Ok(())
+    }
+
+    /// Unsegmented mode over a stream: buffer everything, decode once at
+    /// the end.
+    ///
+    /// The daemon never gets here, since this mode reports
+    /// `supports_streaming() == false` and dictation takes the batch path
+    /// instead. It exists so a direct `transcribe_stream` caller still gets
+    /// batch semantics (one decode, one send) rather than a silent fallback
+    /// to phrase streaming.
+    async fn stream_unsegmented(
+        &self,
+        ctx: &Arc<whisper_rs::WhisperContext>,
+        mut audio_rx: mpsc::Receiver<AudioChunk>,
+        text_tx: mpsc::Sender<String>,
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<()> {
+        let mut buffer: Vec<i16> = Vec::new();
+        while let Some(chunk) = audio_rx.recv().await {
+            buffer.extend_from_slice(&chunk);
+        }
+
+        if buffer.is_empty() || audio_silence_gate::is_silent(&buffer, SILENCE_THRESHOLD) {
+            return Ok(());
+        }
+
+        decode_phrase(ctx, create_state(ctx)?, buffer, false, config, &text_tx).await?;
         Ok(())
     }
 }
@@ -524,11 +566,17 @@ impl TranscriptionBackend for LocalWhisperBackend {
         match self.segmentation {
             SegmentationMode::Silence => self.stream_phrases(ctx, audio_rx, text_tx, config).await,
             SegmentationMode::Window => self.stream_windows(ctx, audio_rx, text_tx, config).await,
+            SegmentationMode::Unsegmented => {
+                self.stream_unsegmented(ctx, audio_rx, text_tx, config)
+                    .await
+            }
         }
     }
 
+    // Unsegmented mode opts out so the daemon records the whole session and calls
+    // `transcribe` once on stop, instead of typing phrases as they end.
     fn supports_streaming(&self) -> bool {
-        true
+        self.segmentation != SegmentationMode::Unsegmented
     }
 
     // `run_whisper_inference` hands the prompt to `set_initial_prompt`, so
@@ -620,8 +668,30 @@ mod tests {
             SegmentationMode::parse(" window "),
             SegmentationMode::Window
         );
+        assert_eq!(
+            SegmentationMode::parse("none"),
+            SegmentationMode::Unsegmented
+        );
+        assert_eq!(
+            SegmentationMode::parse(" NONE "),
+            SegmentationMode::Unsegmented
+        );
         // Unknown values fall back to the default.
         assert_eq!(SegmentationMode::parse("bogus"), SegmentationMode::Silence);
         assert_eq!(SegmentationMode::default(), SegmentationMode::Silence);
+    }
+
+    #[test]
+    fn no_segmentation_disables_streaming() {
+        // A missing model only logs a warning, which is all this test needs:
+        // `supports_streaming` must not depend on the model being loaded.
+        let backend = |mode: &str| {
+            LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
+                .with_segmentation(mode, 400)
+        };
+        assert!(!backend("none").supports_streaming());
+        assert!(backend("silence").supports_streaming());
+        assert!(backend("window").supports_streaming());
+        assert!(backend("bogus").supports_streaming());
     }
 }

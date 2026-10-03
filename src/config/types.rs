@@ -358,9 +358,9 @@ pub struct InputConfig {
     /// dictation and command-mode output (`whisrs command` injects its LLM
     /// result with a single injection call, so it honors this regardless of
     /// the configured backend). The streaming *dictation* path is the
-    /// exception: streaming backends (including `local-whisper`, which always
-    /// streams regardless of its `segmentation` mode) type incrementally as
-    /// text arrives and ignore this setting. [`Config::validate`] warns when
+    /// exception: streaming backends (including `local-whisper`, unless its
+    /// `segmentation` is `"none"`) type incrementally as text arrives and
+    /// ignore this setting. [`Config::validate`] warns when
     /// this is set alongside one of those backends.
     #[serde(default)]
     pub paste: bool,
@@ -553,7 +553,9 @@ pub struct LocalWhisperConfig {
     pub model_path: String,
     /// Streaming segmentation strategy: `"silence"` (default) splits audio
     /// into phrases at natural pauses and decodes each exactly once;
-    /// `"window"` is the legacy overlapping sliding window with text dedup.
+    /// `"window"` is the legacy overlapping sliding window with text dedup;
+    /// `"none"` turns streaming off, so nothing is typed until recording
+    /// stops and the whole recording is decoded at once.
     #[serde(default = "default_local_whisper_segmentation")]
     pub segmentation: String,
     /// Milliseconds of continuous silence that ends a phrase in `"silence"`
@@ -570,6 +572,16 @@ impl LocalWhisperConfig {
             segmentation: default_local_whisper_segmentation(),
             phrase_silence_ms: default_phrase_silence_ms(),
         }
+    }
+
+    /// Whether `segmentation` is `"none"`, in which case dictation with
+    /// local-whisper does not stream and takes the batch path.
+    ///
+    /// Matches `SegmentationMode::parse` in the backend (trimmed,
+    /// case-insensitive). That type is not reachable from here: the module
+    /// is replaced by a stub when the `local-whisper` feature is off.
+    pub fn is_unsegmented(&self) -> bool {
+        self.segmentation.trim().eq_ignore_ascii_case("none")
     }
 }
 
@@ -1621,8 +1633,8 @@ impl Config {
         warnings.extend(self.deepgram_keyterm_warnings(backend));
         warnings.extend(self.inert_prompt_warnings(backend));
 
-        // Streaming backends (including local-whisper, which always streams
-        // regardless of its `segmentation` mode) type dictated text
+        // Streaming backends (including local-whisper, unless its
+        // `segmentation` is "none") type dictated text
         // incrementally as it arrives and never go through the
         // paste-injection path, so `[input] paste` does not apply to
         // dictation with them. Command mode is unaffected whatever backend
@@ -1635,16 +1647,7 @@ impl Config {
         // but their `transcribe()` bails with "not yet implemented", so
         // recommending them would trade a no-op flag for broken dictation.
         // Keep them out of every recommendation here until they are real.
-        if self.input.paste
-            && matches!(
-                backend,
-                "deepgram-streaming"
-                    | "openai-realtime"
-                    | "openai-compatible-realtime"
-                    | "local-whisper"
-                    | "local"
-            )
-        {
+        if self.input.paste && self.dictation_streams(backend) {
             warnings.push(ConfigWarning {
                 message: format!(
                     "[input] paste = true does not apply to dictation with backend = \
@@ -1653,7 +1656,8 @@ impl Config {
                      arrives and never use the paste path. Command mode output is injected in \
                      one shot, so it still uses paste where that mode is configured. Switch to \
                      a non-streaming backend (deepgram, groq, openai, asr-sidecar) to use \
-                     paste injection for dictation too."
+                     paste injection for dictation too.{}",
+                    Self::local_whisper_batch_hint(backend)
                 ),
             });
         }
@@ -1713,16 +1717,10 @@ impl Config {
             // never a whole transcript to post-process. local-whisper belongs
             // here even though its `transcribe()` is a real batch path (which
             // is why the llm_commands warning below excludes it) — dictation
-            // with it always streams. Unlike llm_commands there is no degraded
-            // mode: the flag does nothing at all.
-            if matches!(
-                backend,
-                "deepgram-streaming"
-                    | "openai-realtime"
-                    | "openai-compatible-realtime"
-                    | "local-whisper"
-                    | "local"
-            ) {
+            // with it streams unless `segmentation = "none"`. Unlike
+            // llm_commands there is no degraded mode: the flag does nothing
+            // at all.
+            if self.dictation_streams(backend) {
                 warnings.push(ConfigWarning {
                     message: format!(
                         "[general] llm_post_process = true does not apply to dictation with \
@@ -1732,7 +1730,8 @@ impl Config {
                          post-process. Nothing runs — dictation is typed unmodified. Switch to \
                          a non-streaming backend (deepgram, groq, openai, asr-sidecar) to \
                          post-process dictation, or use an [[llm_commands]] hotkey, which \
-                         works whatever the backend."
+                         works whatever the backend.{}",
+                        Self::local_whisper_batch_hint(backend)
                     ),
                 });
             }
@@ -1931,6 +1930,37 @@ impl Config {
             .as_ref()
             .map(|o| o.model.clone())
             .unwrap_or_else(|| "gpt-realtime-whisper".to_string())
+    }
+
+    /// Whether dictation with `backend` takes the streaming path, which
+    /// ignores `[input] paste` and `[general] llm_post_process`.
+    ///
+    /// local-whisper streams unless `[local-whisper] segmentation = "none"`;
+    /// a missing section means the default, `"silence"`, which streams.
+    fn dictation_streams(&self, backend: &str) -> bool {
+        match backend {
+            "deepgram-streaming" | "openai-realtime" | "openai-compatible-realtime" => true,
+            "local-whisper" | "local" => !self
+                .local_whisper
+                .as_ref()
+                .is_some_and(LocalWhisperConfig::is_unsegmented),
+            _ => false,
+        }
+    }
+
+    /// Extra sentence for the streaming-dictation warnings when the user is
+    /// already on local-whisper: `segmentation = "none"` fixes it without leaving the
+    /// backend. Empty for every other backend, so no warning ever points a
+    /// user *towards* local-whisper (see `assert_no_stub_backend_advice`).
+    fn local_whisper_batch_hint(backend: &str) -> &'static str {
+        match backend {
+            "local-whisper" | "local" => {
+                " To keep local-whisper, set [local-whisper] segmentation = \"none\", \
+                 which types nothing until recording stops and then transcribes the \
+                 whole recording at once."
+            }
+            _ => "",
+        }
     }
 
     /// Load-time warnings about `[general] vocabulary` reaching Deepgram.
@@ -4613,7 +4643,8 @@ mod tests {
     fn config_validate_warns_llm_post_process_with_streaming_backend() {
         // local-whisper is in this list even though it is absent from the
         // llm_commands one: its transcribe() is a real batch path, but
-        // dictation with it always streams, so the flag no-ops there too.
+        // dictation with it streams by default (no [local-whisper] section
+        // here), so the flag no-ops there too.
         for backend in [
             "deepgram-streaming",
             "openai-realtime",
@@ -4671,6 +4702,56 @@ mod tests {
                 "backend {backend} goes through the batch path; no streaming warning expected: \
                  {warnings:?}"
             );
+        }
+    }
+
+    #[test]
+    fn config_validate_local_whisper_no_segmentation_takes_batch_path() {
+        // segmentation = "none" makes local-whisper dictation non-streaming,
+        // so neither batch-only key is inert and neither warning may fire.
+        for segmentation in ["none", " None "] {
+            let mut config = validatable_config("local-whisper");
+            config.general.llm_post_process = true;
+            config.input.paste = true;
+            config.local_whisper = Some(LocalWhisperConfig {
+                segmentation: segmentation.to_string(),
+                ..LocalWhisperConfig::new("/m.bin".to_string())
+            });
+
+            let warnings = config.validate().unwrap();
+            assert!(
+                warnings
+                    .iter()
+                    .all(|w| !w.message.contains("does not apply")),
+                "segmentation {segmentation:?} dictates through the batch path; no \
+                 streaming warning expected: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validate_local_whisper_streaming_warnings_point_at_no_segmentation() {
+        // On local-whisper the warnings name the in-backend fix; on every
+        // other backend they must not mention it.
+        for (backend, expect_hint) in [("local-whisper", true), ("openai-realtime", false)] {
+            let mut config = validatable_config(backend);
+            config.general.llm_post_process = true;
+            config.input.paste = true;
+
+            let warnings = config.validate().unwrap();
+            let streaming: Vec<_> = warnings
+                .iter()
+                .filter(|w| w.message.contains("does not apply"))
+                .collect();
+            assert_eq!(streaming.len(), 2, "{backend}: {warnings:?}");
+            for warning in streaming {
+                assert_eq!(
+                    warning.message.contains("segmentation = \"none\""),
+                    expect_hint,
+                    "{backend}: {}",
+                    warning.message
+                );
+            }
         }
     }
 
