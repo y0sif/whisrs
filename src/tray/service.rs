@@ -9,56 +9,93 @@ use super::NotifyFn;
 use crate::service::{RestartOutcome, ServiceManager};
 use crate::{Command, State};
 
-/// 16x16 ARGB icon data for each state.
-/// Format: each pixel is 4 bytes (ARGB, big-endian).
+/// Speech-bubble tray icons, one set per state, at several sizes so HiDPI
+/// panels get a sharp render instead of an upscaled 16x16.
+///
+/// The PNGs in `src/tray/icons/` are rendered from the SVGs next to them:
+/// `rsvg-convert -w N -h N <state>.svg -o <state>-N.png` for each size.
 mod icons {
-    /// Generate a simple 16x16 solid circle icon with the given ARGB color.
-    pub fn circle_icon(argb: u32) -> Vec<u8> {
-        let size = 16;
-        let center = size as f32 / 2.0;
-        let radius = 6.0;
-        let mut pixels = Vec::with_capacity(size * size * 4);
+    use std::sync::OnceLock;
 
-        for y in 0..size {
-            for x in 0..size {
-                let dx = x as f32 + 0.5 - center;
-                let dy = y as f32 + 0.5 - center;
-                let dist = (dx * dx + dy * dy).sqrt();
+    use ksni::Icon;
 
-                if dist <= radius {
-                    pixels.extend_from_slice(&argb.to_be_bytes());
-                } else if dist <= radius + 1.0 {
-                    let alpha = ((radius + 1.0 - dist) * 255.0) as u8;
-                    let [_, r, g, b] = argb.to_be_bytes();
-                    pixels.extend_from_slice(&[alpha, r, g, b]);
-                } else {
-                    pixels.extend_from_slice(&[0, 0, 0, 0]);
-                }
-            }
+    use crate::State;
+
+    macro_rules! state_pngs {
+        ($name:literal) => {
+            [
+                include_bytes!(concat!("icons/", $name, "-16.png")).as_slice(),
+                include_bytes!(concat!("icons/", $name, "-22.png")).as_slice(),
+                include_bytes!(concat!("icons/", $name, "-32.png")).as_slice(),
+                include_bytes!(concat!("icons/", $name, "-48.png")).as_slice(),
+            ]
+        };
+    }
+
+    fn pngs(state: State) -> [&'static [u8]; 4] {
+        match state {
+            State::Idle => state_pngs!("idle"),
+            State::Recording => state_pngs!("recording"),
+            State::Transcribing => state_pngs!("transcribing"),
+            State::Synthesizing => state_pngs!("synthesizing"),
+            State::Speaking => state_pngs!("speaking"),
         }
-        pixels
     }
 
-    pub fn idle() -> Vec<u8> {
-        circle_icon(0xFF_88_88_88)
+    /// Decode an RGBA PNG into the ARGB (big-endian) pixmap SNI expects.
+    fn decode(png_bytes: &[u8]) -> Icon {
+        let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+        let mut reader = decoder
+            .read_info()
+            .expect("embedded tray icon is a valid PNG");
+        let mut buf = vec![
+            0;
+            reader
+                .output_buffer_size()
+                .expect("tray icon size fits in memory")
+        ];
+        let info = reader
+            .next_frame(&mut buf)
+            .expect("embedded tray icon decodes");
+        assert_eq!(
+            (info.color_type, info.bit_depth),
+            (png::ColorType::Rgba, png::BitDepth::Eight),
+            "tray icons must be 8-bit RGBA (rsvg-convert's output)"
+        );
+        let data = buf[..info.buffer_size()]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b, a]| [a, r, g, b])
+            .collect();
+        Icon {
+            width: info.width as i32,
+            height: info.height as i32,
+            data,
+        }
     }
 
-    pub fn recording() -> Vec<u8> {
-        circle_icon(0xFF_E0_40_40)
-    }
-
-    pub fn transcribing() -> Vec<u8> {
-        circle_icon(0xFF_E0_A0_20)
-    }
-
-    /// Read-aloud: synthesizing speech (blue/purple).
-    pub fn synthesizing() -> Vec<u8> {
-        circle_icon(0xFF_7C_5C_FF)
-    }
-
-    /// Read-aloud: playing speech (green).
-    pub fn speaking() -> Vec<u8> {
-        circle_icon(0xFF_34_D3_99)
+    /// All sizes for `state`, decoded once and cached for the daemon's lifetime.
+    pub fn for_state(state: State) -> Vec<Icon> {
+        static CACHE: OnceLock<[Vec<Icon>; 5]> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| {
+            [
+                State::Idle,
+                State::Recording,
+                State::Transcribing,
+                State::Synthesizing,
+                State::Speaking,
+            ]
+            .map(|s| pngs(s).iter().map(|b| decode(b)).collect())
+        });
+        let index = match state {
+            State::Idle => 0,
+            State::Recording => 1,
+            State::Transcribing => 2,
+            State::Synthesizing => 3,
+            State::Speaking => 4,
+        };
+        cache[index].clone()
     }
 }
 
@@ -125,18 +162,7 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        let data = match self.state.current {
-            State::Idle => icons::idle(),
-            State::Recording => icons::recording(),
-            State::Transcribing => icons::transcribing(),
-            State::Synthesizing => icons::synthesizing(),
-            State::Speaking => icons::speaking(),
-        };
-        vec![Icon {
-            width: 16,
-            height: 16,
-            data,
-        }]
+        icons::for_state(self.state.current)
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -345,5 +371,37 @@ mod tests {
             matches!(cmd, Command::Toggle { language: None }),
             "expected Command::Toggle {{ language: None }}, got {cmd:?}"
         );
+    }
+
+    /// Every state ships every size, and each decodes to a full ARGB pixmap
+    /// that is not blank. Catches a missing or mis-rendered PNG at test time
+    /// rather than as a panic in the running tray.
+    #[test]
+    fn every_state_has_all_icon_sizes() {
+        for state in [
+            State::Idle,
+            State::Recording,
+            State::Transcribing,
+            State::Synthesizing,
+            State::Speaking,
+        ] {
+            let set = icons::for_state(state);
+            let sizes: Vec<i32> = set.iter().map(|i| i.width).collect();
+            assert_eq!(sizes, [16, 22, 32, 48], "{state:?}");
+            for icon in &set {
+                assert_eq!(icon.width, icon.height, "{state:?} icon is square");
+                assert_eq!(
+                    icon.data.len(),
+                    (icon.width * icon.height * 4) as usize,
+                    "{state:?} {}px pixmap length",
+                    icon.width
+                );
+                assert!(
+                    icon.data.as_chunks::<4>().0.iter().any(|p| p[0] > 0),
+                    "{state:?} {}px icon is fully transparent",
+                    icon.width
+                );
+            }
+        }
     }
 }

@@ -41,7 +41,7 @@ required-features = ["local-whisper"]
 [features]
 default = ["local-whisper", "tray", "overlay", "hooks"]
 local-whisper = ["dep:whisper-rs"]
-tray = ["dep:ksni"]
+tray = ["dep:ksni", "dep:png"]
 overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:tiny-skia", "dep:zbus"]
 hooks = ["dep:zbus"]
 # GPU backends for the bundled whisper.cpp. Opt-in at build time — the backend
@@ -91,6 +91,12 @@ zbus = { version = "5", optional = true }
 
 [dependencies.ksni]
 version = "0.3"
+optional = true
+
+# Decodes the embedded tray icons. Already in the build via arboard -> image,
+# so this adds no new crate.
+[dependencies.png]
+version = "0.18"
 optional = true
 
 [dependencies.smithay-client-toolkit]
