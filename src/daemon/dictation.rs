@@ -118,6 +118,7 @@ pub(crate) async fn handle_toggle(
                     keys: KeystrokeSettings::from_config(&context.config.input),
                     clipboard_fallback: context.config.input.clipboard_fallback,
                     clipboard_only: context.config.input.clipboard_only,
+                    input: context.config.input.clone(),
                 };
 
                 let task = tokio::spawn(run_streaming_pipeline(params));

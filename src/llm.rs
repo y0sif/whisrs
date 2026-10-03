@@ -311,6 +311,11 @@ pub fn contains_line_break(text: &str) -> bool {
     text.contains(LINE_BREAKS)
 }
 
+/// Whether `c` is one of the characters [`contains_line_break`] looks for.
+pub fn is_line_break(c: char) -> bool {
+    LINE_BREAKS.contains(&c)
+}
+
 /// Normalize CRLF and bare CR to LF, so exactly one character has to be
 /// looked for downstream.
 fn normalize_line_endings(text: &str) -> String {

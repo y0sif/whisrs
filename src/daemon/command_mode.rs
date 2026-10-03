@@ -13,8 +13,9 @@ use whisrs::{Config, Response, State};
 
 use crate::context::{CommandModeContext, DaemonContext, DaemonState, LlmCommandContext};
 use crate::injection::{
-    clear_line_and_inject, inject_text, is_terminal_class, notify_copied_for_held_modifier,
-    prepare_llm_injection, Injection, KeystrokeSettings, LlmInjection,
+    clear_line_and_inject, inject_text, is_terminal_class, line_breaks_unsafe_at,
+    notify_copied_for_held_modifier, prepare_llm_injection, Injection, KeystrokeSettings,
+    LlmInjection,
 };
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
@@ -44,8 +45,8 @@ fn refused_multi_line_message(label: Option<&str>) -> String {
         None => "Result".to_string(),
     };
     format!(
-        "{subject} spans multiple lines and the target is a terminal — not typed. \
-         Recover it with 'whisrs log'."
+        "{subject} spans multiple lines and the target is or may be a terminal, so it was \
+         not typed. Recover it with 'whisrs log'."
     )
 }
 
@@ -398,17 +399,17 @@ async fn command_mode_background_inner(
     // Hyprland, Niri, Sway and X11. It returns `None` on KWin and GNOME
     // (`src/window/dbus.rs`: GNOME would need a Shell extension, #72; KWin the
     // `org_kde_plasma_window_management` Wayland protocol, #127), so it stays
-    // false there and terminals fall back to plain
-    // injection at the
-    // cursor (and to plain Ctrl+V on the paste branch). The practical
-    // consequence for the gate is that on those two desktops a multi-line reply
-    // is typed into a terminal rather than refused, the same exposure the
-    // line-clear already has.
-    let is_terminal = context
-        .window_tracker
-        .get_focused_window_class()
-        .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
-        .unwrap_or(false);
+    // false there and terminals fall back to plain injection at the cursor
+    // (and to plain Ctrl+V on the paste branch), with no line clear.
+    //
+    // The multi-line gate does not share that blind spot: it uses
+    // `line_breaks_unsafe_at`, which counts an unknown class as a terminal
+    // unless `[input] unknown_window_is_terminal = false`.
+    let class = context.window_tracker.get_focused_window_class();
+    let is_terminal = class
+        .as_deref()
+        .is_some_and(|c| is_terminal_class(c, &context.config.input.terminal_classes));
+    let gate_line_breaks = line_breaks_unsafe_at(class.as_deref(), &context.config.input);
 
     // Read once, because the gate, the line clear and `inject_text` below must
     // agree on it: the gate lets a multi-line reply through at a terminal
@@ -418,7 +419,7 @@ async fn command_mode_background_inner(
 
     // Clean the reply and decide whether it may be typed here (shared with the
     // `[[llm_commands]]` path — see `prepare_llm_injection`).
-    let result = match prepare_llm_injection(&raw, is_terminal, clipboard_only) {
+    let result = match prepare_llm_injection(&raw, gate_line_breaks, clipboard_only) {
         LlmInjection::Inject(text) => text,
         LlmInjection::Empty => {
             warn!("command mode: LLM returned no usable text");
@@ -920,17 +921,17 @@ async fn llm_command_background_inner(
         }
     }
 
-    // Resolved unconditionally, not just on the paste branch: the multi-line
-    // gate needs it too. Same caveat as command mode: `get_focused_window_class()`
-    // returns `None` on GNOME (would need a Shell extension, #72) and on KWin
-    // (would need the `org_kde_plasma_window_management` Wayland protocol,
-    // #127), so this stays false there and a terminal is treated as an
-    // ordinary target.
-    let is_terminal = context
-        .window_tracker
-        .get_focused_window_class()
-        .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
-        .unwrap_or(false);
+    // Same split as command mode: `get_focused_window_class()` returns `None`
+    // on GNOME (would need a Shell extension, #72) and on KWin (would need the
+    // `org_kde_plasma_window_management` Wayland protocol, #127), so
+    // `is_terminal` stays false there and the paste combo treats a terminal as
+    // an ordinary target, while the multi-line gate counts the unknown class
+    // as a terminal (see `line_breaks_unsafe_at`).
+    let class = context.window_tracker.get_focused_window_class();
+    let is_terminal = class
+        .as_deref()
+        .is_some_and(|c| is_terminal_class(c, &context.config.input.terminal_classes));
+    let gate_line_breaks = line_breaks_unsafe_at(class.as_deref(), &context.config.input);
 
     let duration_secs = recording_started_at
         .map(|t| t.elapsed().as_secs_f64())
@@ -940,9 +941,9 @@ async fn llm_command_background_inner(
     // Clean the reply and decide whether it may be typed here — the same gate
     // command mode uses. Multi-line output is normal for these commands
     // (translate a paragraph, draft an email) and is injected as-is; it is only
-    // refused when the target is a terminal, where a line break is an Enter
-    // (never under `clipboard_only`, see above).
-    let result = match prepare_llm_injection(&raw, is_terminal, clipboard_only) {
+    // refused when the target is or may be a terminal, where a line break is an
+    // Enter (never under `clipboard_only`, see above).
+    let result = match prepare_llm_injection(&raw, gate_line_breaks, clipboard_only) {
         LlmInjection::Inject(text) => text,
         LlmInjection::Empty => {
             if context.notify_error() {

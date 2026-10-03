@@ -436,6 +436,22 @@ pub struct InputConfig {
     /// strings in `WM_CLASS`, falling back to the first.
     #[serde(default)]
     pub terminal_classes: Vec<String>,
+    /// Treat a window whose class cannot be read as a terminal, for the
+    /// line-break guards only. On by default.
+    ///
+    /// A line break typed at a shell prompt is an Enter that runs whatever
+    /// came before it, so whisrs never types one into a terminal: dictation
+    /// turns it into a space, and a multi-line LLM reply is refused and kept
+    /// in `whisrs log`. Those guards need the focused window class, which
+    /// GNOME and KDE never report (#72, #127) and other desktops can fail to.
+    /// With this on, an unknown window gets the guards; turn it off to let
+    /// multi-line LLM replies through on GNOME and KDE, at the cost of having
+    /// no guard in a terminal there.
+    ///
+    /// Nothing else changes: the paste combo, the selection copy and command
+    /// mode's prompt-line clear still need a positive terminal match.
+    #[serde(default = "default_true")]
+    pub unknown_window_is_terminal: bool,
 }
 
 impl Default for InputConfig {
@@ -448,6 +464,7 @@ impl Default for InputConfig {
             clipboard_fallback: false,
             clipboard_only: false,
             terminal_classes: Vec::new(),
+            unknown_window_is_terminal: true,
         }
     }
 }

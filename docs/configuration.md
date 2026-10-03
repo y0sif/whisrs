@@ -218,6 +218,15 @@ clipboard_only = false
 # With `clipboard_only = true` only the third applies: nothing is typed or
 # pasted, so there is no line clear, no refusal and no Ctrl+Shift+V.
 terminal_classes = []
+# Treat a window whose class cannot be read as a possible terminal for the
+# line-break guards. A line break typed at a shell prompt is an Enter, so whisrs
+# never types one into a terminal: dictation turns it into a space, and a
+# multi-line LLM reply is refused and kept in `whisrs log`. KDE and GNOME never
+# report a class, so with this on (the default) those guards cover every window
+# there. Set it to false to have multi-line LLM replies typed on KDE and GNOME,
+# with no guard when the focused window is a terminal. Line clear, Ctrl+Shift+V
+# and Ctrl+Shift+C still need a confirmed terminal class either way.
+unknown_window_is_terminal = true
 
 [groq]
 api_key = "gsk_..."
@@ -457,9 +466,18 @@ any other. If you paste it into a shell yourself, the bracketed paste caveat
 above still applies.
 
 Terminal detection needs the compositor to report the focused window class,
-which today means Hyprland, Niri, Sway and X11. On KDE and GNOME a terminal is
-treated as an ordinary target, so a multi-line reply is typed there. Add any
+which today means Hyprland, Niri, Sway and X11. When no class can be read (always
+on KDE and GNOME, and on the others if the query fails), the window counts as a
+possible terminal for this refusal, so on KDE and GNOME every multi-line reply is
+refused and kept in `whisrs log`. Set `[input] unknown_window_is_terminal = false`
+to have them typed instead, which also types them into terminals there. Add any
 class the built-in list misses to `[input] terminal_classes`.
+
+Dictation follows the same rule with a gentler outcome. Speech never produces a
+line break, so if a transcript or an `llm_post_process` rewrite contains one and
+the focused window is or may be a terminal, each run of line breaks is typed as a
+single space instead. Control characters such as Escape and Backspace are removed
+from everything whisrs types, pastes or copies, wherever it is going.
 
 ## Choosing the microphone
 

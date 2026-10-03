@@ -32,8 +32,9 @@ impl DbusTracker {
         warn!(
             "{desktop} exposes no unprivileged focused-window query, so window tracking is off: \
              focus is not restored after recording (text goes wherever focus ends up), and \
-             terminal detection never fires, which leaves the terminal-aware selection copy, \
-             the multi-line LLM guard and [input] terminal_classes inactive"
+             terminal detection never fires, which leaves the terminal-aware selection copy \
+             and [input] terminal_classes inactive; the line-break guards treat every window \
+             as a possible terminal unless [input] unknown_window_is_terminal = false"
         );
         Self {
             desktop: desktop.to_string(),

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +23,9 @@ use xkb_type::ClipboardBackend;
 use crate::context::{DaemonContext, DaemonState};
 use crate::factory::get_model_for_backend;
 use crate::injection::{
-    deliver_streaming_delta, inject_text, is_terminal_class, notify_copied_for_held_modifier,
-    Injection, KeystrokeSettings, ModifierWaitTracker, StreamingDelivery,
+    deliver_streaming_delta, fold_line_breaks, inject_text, is_terminal_class,
+    line_breaks_unsafe_at, notify_copied_for_held_modifier, sanitize_for_injection, Injection,
+    KeystrokeSettings, ModifierWaitTracker, StreamingDelivery,
 };
 use crate::notify::{send_notification, truncate_preview};
 
@@ -74,6 +76,10 @@ pub(crate) struct StreamingPipelineParams {
     /// `[input] clipboard_only`: copy-only dictation — the transcript is
     /// written to the clipboard and never typed at the cursor.
     pub(crate) clipboard_only: bool,
+    /// The whole `[input]` table, for the line-break guard
+    /// ([`line_breaks_unsafe_at`]), which needs `terminal_classes` and
+    /// `unknown_window_is_terminal`.
+    pub(crate) input: whisrs::InputConfig,
 }
 
 /// The streaming pipeline: reads audio in real-time, sends to API, types text.
@@ -100,6 +106,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         keys,
         clipboard_fallback,
         clipboard_only,
+        input,
     } = params;
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
@@ -148,11 +155,17 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         // Sequenced by the batcher awaiting each sink call, so a plain
         // atomic is enough to carry the flag into the 'static sink futures.
         let focused = Arc::new(AtomicBool::new(false));
+        // Whether the target may be a terminal, resolved once after the
+        // refocus below and reused for every delta (see `line_breaks_unsafe_at`).
+        let fold_breaks = Arc::new(AtomicBool::new(false));
+        let input = Arc::new(input);
         let full_text =
             run_typing_batcher(text_rx, typing_cancel, filler_filter, move |text_to_type| {
                 let wid = wid.clone();
                 let tracker = Arc::clone(&window_tracker);
                 let focused = Arc::clone(&focused);
+                let fold_breaks = Arc::clone(&fold_breaks);
+                let input = Arc::clone(&input);
                 let cancel = Arc::clone(&sink_cancel);
                 let modifier_waits = Arc::clone(&sink_modifier_waits);
                 async move {
@@ -166,7 +179,13 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                 }
                             }
+                            let class = tracker.get_focused_window_class();
+                            fold_breaks.store(
+                                line_breaks_unsafe_at(class.as_deref(), &input),
+                                Ordering::SeqCst,
+                            );
                         }
+                        let fold_breaks = fold_breaks.load(Ordering::SeqCst);
 
                         // Streaming deliberately bypasses `inject_text` / `[input]
                         // paste`: partial deltas are typed as they arrive, and a
@@ -174,8 +193,14 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                         // modifier makes the delta wait, uncapped, until it is
                         // released or the session is cancelled (#154).
                         match tokio::task::spawn_blocking(move || {
-                            deliver_streaming_delta(&text_to_type, keys, &cancel, &modifier_waits)
-                                .map(|delivery| (delivery, text_to_type))
+                            deliver_streaming_delta(
+                                &text_to_type,
+                                fold_breaks,
+                                keys,
+                                &cancel,
+                                &modifier_waits,
+                            )
+                            .map(|delivery| (delivery, text_to_type))
                         })
                         .await
                         {
@@ -890,13 +915,16 @@ pub(crate) fn history_backend_tag(backend: &str, post_processed: bool) -> String
 /// a failure means the command did not happen; here they pressed plain
 /// dictate, and losing a whole dictation to a flaky endpoint would be a
 /// regression against `llm_post_process = false`.
-/// The completion is trimmed before it is injected. A trailing newline typed at
-/// a shell prompt submits the line, and unlike the llm-command hotkey this runs
-/// on every dictation, so a chatty model would append one every time.
+/// The completion goes through [`llm::clean_llm_output`], the same cleaning
+/// the llm-command path uses: line endings normalized, a wrapping code fence
+/// stripped, the ends trimmed. A trailing newline typed at a shell prompt
+/// submits the line, and unlike the llm-command hotkey this runs on every
+/// dictation, so a chatty model would append one every time. Line breaks
+/// *inside* the reply are folded later, at injection, once the target is known.
 fn post_processed_or_raw(original: String, rewritten: Option<String>) -> DictationOutcome {
-    match rewritten {
-        Some(text) if !text.trim().is_empty() => DictationOutcome {
-            text: text.trim().to_string(),
+    match rewritten.map(|text| llm::clean_llm_output(&text)) {
+        Some(text) if !text.is_empty() => DictationOutcome {
+            text,
             post_processed: true,
         },
         _ => DictationOutcome::raw(original),
@@ -1032,16 +1060,33 @@ pub(crate) async fn process_recording_batch(
 
     // Inject the text at the cursor — type keystrokes, or paste via the
     // clipboard when `[input] paste = true` (layout-independent).
-    let text_clone = outcome.text.clone();
-    let is_terminal = if paste {
-        context
-            .window_tracker
-            .get_focused_window_class()
-            .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
-            .unwrap_or(false)
+    //
+    // No line break reaches a window that may be a terminal, where it would
+    // be an Enter: a transcript never legitimately holds one, and with
+    // `llm_post_process` a steered model could otherwise add one on every
+    // dictation. Under `clipboard_only` nothing is typed, so nothing is folded.
+    // `outcome.text` takes the sanitized, folded form so history records what
+    // was typed.
+    let class = if clipboard_only {
+        None
     } else {
-        false
+        context.window_tracker.get_focused_window_class()
     };
+    let is_terminal = paste
+        && class
+            .as_deref()
+            .is_some_and(|c| is_terminal_class(c, &context.config.input.terminal_classes));
+    let mut outcome = outcome;
+    if let Some(sanitized) = owned(sanitize_for_injection(&outcome.text)) {
+        outcome.text = sanitized;
+    }
+    if !clipboard_only && line_breaks_unsafe_at(class.as_deref(), &context.config.input) {
+        if let Some(folded) = owned(fold_line_breaks(&outcome.text)) {
+            warn!("folded line breaks in dictation: the focused window may be a terminal");
+            outcome.text = folded;
+        }
+    }
+    let text_clone = outcome.text.clone();
     match tokio::task::spawn_blocking(move || {
         inject_text(
             &text_clone,
@@ -1065,6 +1110,15 @@ pub(crate) async fn process_recording_batch(
     }
 
     Ok(outcome)
+}
+
+/// The new text when a `Cow`-returning filter changed something, else `None`,
+/// so the caller can overwrite the very string the filter borrowed.
+fn owned(text: Cow<'_, str>) -> Option<String> {
+    match text {
+        Cow::Owned(s) => Some(s),
+        Cow::Borrowed(_) => None,
+    }
 }
 
 /// `device` is the configured `[audio] device`: a stock `"default"` lists
@@ -1852,6 +1906,18 @@ mod tests {
                 "surrounding whitespace is trimmed",
                 Some("\n  Hello, world.  \n\n".to_string()),
                 "Hello, world.",
+                true,
+            ),
+            (
+                "a wrapping fence is stripped, as on the llm-command path",
+                Some("```text\nHello, world.\n```".to_string()),
+                "Hello, world.",
+                true,
+            ),
+            (
+                "CRLF is normalized so no bare CR is typed as Return",
+                Some("Hello,\r\nworld.".to_string()),
+                "Hello,\nworld.",
                 true,
             ),
         ];
