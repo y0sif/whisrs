@@ -20,6 +20,7 @@ mod hooks;
 mod injection;
 mod notify;
 mod pipeline;
+mod quiet;
 mod selection;
 mod speak;
 mod startup;
@@ -38,12 +39,16 @@ use crate::startup::{
     load_config, validate_config,
 };
 
-/// The daemon takes no options of its own, but declaring the interface means
-/// `--version` and `--help` are answered and exit, instead of being ignored and
-/// starting a daemon.
+/// Declaring the interface also means `--version` and `--help` are answered
+/// and exit, instead of being ignored and starting a daemon.
 #[derive(Parser)]
 #[command(name = "whisrsd", about = "whisrs dictation daemon", version)]
-struct Args {}
+struct Args {
+    /// Log startup only. Once the first command arrives, nothing more is
+    /// written to stdout or stderr (the journal under systemd).
+    #[arg(short, long)]
+    quiet: bool,
+}
 
 /// The pulseaudio crate logs every connection, and an ERROR on each normal
 /// disconnect, so it is silenced unless `RUST_LOG` names it.
@@ -61,8 +66,10 @@ fn log_directives(rust_log: Option<&str>) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Not dead code: this call is what makes the flags above exit.
-    Args::parse();
+    let args = Args::parse();
+    if args.quiet {
+        quiet::enable();
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -144,6 +151,7 @@ async fn main() -> Result<()> {
         let dispatch_ctx = Arc::clone(&context);
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
+                quiet::enter_runtime();
                 info!("internal command (hotkey/tray): {cmd:?}");
                 let _response =
                     handle_command(cmd, Arc::clone(&dispatch_state), Arc::clone(&dispatch_ctx))
@@ -245,6 +253,7 @@ async fn handle_connection(
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let cmd: Command = read_message(&mut reader).await?;
+    quiet::enter_runtime();
     info!("received command: {cmd:?}");
 
     let response = handle_command(cmd, Arc::clone(&daemon_state), Arc::clone(&context)).await;
@@ -311,6 +320,13 @@ mod tests {
         Args::command().debug_assert();
     }
 
+    #[test]
+    fn daemon_quiet_flag_parses() {
+        assert!(!Args::try_parse_from(["whisrsd"]).unwrap().quiet);
+        assert!(Args::try_parse_from(["whisrsd", "-q"]).unwrap().quiet);
+        assert!(Args::try_parse_from(["whisrsd", "--quiet"]).unwrap().quiet);
+    }
+
     /// `Args` exists only so `--version` and `--help` are answered and exit
     /// instead of being ignored and starting a daemon. Pin that behaviour,
     /// since nothing else in the daemon would notice if it regressed.
@@ -346,8 +362,8 @@ mod tests {
         );
     }
 
-    /// `contrib/whisrs.service` runs `whisrsd` with no arguments, so a
-    /// required field or positional on `Args` would break every install.
+    /// Units written before `--quiet` run `whisrsd` with no arguments, so a
+    /// required field or positional on `Args` would break those installs.
     #[test]
     fn daemon_parses_with_no_arguments() {
         assert!(Args::try_parse_from(["whisrsd"]).is_ok());
