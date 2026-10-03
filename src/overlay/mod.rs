@@ -1,4 +1,4 @@
-//! Bottom-screen recording overlay.
+//! On-screen recording overlay.
 //!
 //! The overlay is optional and has native Wayland layer-shell and X11 backends.
 

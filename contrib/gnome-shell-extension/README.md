@@ -1,6 +1,6 @@
 # whisrs GNOME Shell overlay
 
-This extension renders the whisrs bottom recording overlay on GNOME Wayland.
+This extension renders the whisrs recording overlay on GNOME Wayland.
 The daemon publishes recording state over the session D-Bus name
 `org.whisrs.Overlay`; the extension listens for those state changes and draws
 inside GNOME Shell.

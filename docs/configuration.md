@@ -37,7 +37,7 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
                             # `whisrsd` warns at startup if either key targets a backend
                             # that discards it. `whisrs config` warns the same on save.
 tray = true                 # system tray icon (requires SNI host like waybar)
-overlay = false             # bottom-screen recording overlay (Hyprland/Sway, GNOME extension)
+overlay = false             # on-screen recording overlay (Hyprland/Sway, GNOME extension)
 
 # Run every dictation through the [llm] backend before it is typed.
 # Default: false. This is the always-on flavor of [[llm_commands]] below:
@@ -74,6 +74,11 @@ llm_instruction = "Fix punctuation, capitalization and obvious transcription err
 theme = "carbon"            # "carbon" (default) | "ember" | "cyan" | "custom"
 width = 100                 # 90..=120 (clamped)
 height = 40                 # 36..=48 (clamped)
+# Where the pill sits: "bottom-center" (default) | "bottom-left" |
+# "bottom-right" | "top-left" | "top-center" | "top-right".
+# "-middle" works as a synonym for "-center". 16 px from the screen edges.
+# On GNOME this needs the updated Shell extension from this release.
+position = "bottom-center"
 
 # When theme = "custom", these override the named theme. Hex strings:
 # #RGB, #RRGGBB, or #RRGGBBAA. Anything missing falls back to carbon.

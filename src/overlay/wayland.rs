@@ -26,9 +26,9 @@ use wayland_client::{
     Connection as WaylandConnection, Dispatch, QueueHandle,
 };
 
-use crate::{OverlayConfig, State};
+use crate::{OverlayConfig, OverlayHAlign, State};
 
-use super::render::{OverlayRenderer, Theme, BOTTOM_MARGIN, FRAME_MS};
+use super::render::{OverlayRenderer, Theme, EDGE_MARGIN, FRAME_MS};
 use super::service::OverlayError;
 
 pub(super) fn run_overlay(
@@ -39,6 +39,7 @@ pub(super) fn run_overlay(
     let width = config.clamped_width();
     let height = config.clamped_height();
     let theme = Theme::from_config(&config);
+    let position = config.position();
 
     let conn = WaylandConnection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
@@ -51,8 +52,20 @@ pub(super) fn run_overlay(
     let surface = compositor.create_surface(&qh);
     let layer =
         layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("whisrs"), None);
-    layer.set_anchor(Anchor::BOTTOM);
-    layer.set_margin(0, 0, BOTTOM_MARGIN, 0);
+    // Anchoring to one edge centers along it; adding a side pins a corner.
+    let vertical = if position.is_top() {
+        Anchor::TOP
+    } else {
+        Anchor::BOTTOM
+    };
+    let horizontal = match position.h_align() {
+        OverlayHAlign::Left => Anchor::LEFT,
+        OverlayHAlign::Center => Anchor::empty(),
+        OverlayHAlign::Right => Anchor::RIGHT,
+    };
+    layer.set_anchor(vertical | horizontal);
+    // Margins on unanchored edges are ignored, so set all four.
+    layer.set_margin(EDGE_MARGIN, EDGE_MARGIN, EDGE_MARGIN, EDGE_MARGIN);
     layer.set_exclusive_zone(0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.set_size(width, height);
@@ -71,7 +84,14 @@ pub(super) fn run_overlay(
         shm,
         pool,
         layer,
-        renderer: OverlayRenderer::new(state_rx, level_rx, width, height, theme)?,
+        renderer: OverlayRenderer::new(
+            state_rx,
+            level_rx,
+            width,
+            height,
+            theme,
+            position.is_top(),
+        )?,
         exit: false,
         first_configure: true,
     };

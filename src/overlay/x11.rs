@@ -19,9 +19,9 @@ use x11rb::protocol::{
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as X11WrapperConnectionExt;
 
-use crate::{OverlayConfig, State};
+use crate::{OverlayConfig, OverlayHAlign, OverlayPosition, State};
 
-use super::render::{OverlayRenderer, Theme, BOTTOM_MARGIN, FRAME_MS};
+use super::render::{OverlayRenderer, Theme, EDGE_MARGIN, FRAME_MS};
 use super::service::OverlayError;
 
 pub(super) fn run_x11_overlay(
@@ -32,6 +32,7 @@ pub(super) fn run_x11_overlay(
     let width = config.clamped_width() as u16;
     let height = config.clamped_height() as u16;
     let theme = Theme::from_config(&config);
+    let position = config.position();
 
     let (conn, screen_num) = RustConnection::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
@@ -41,8 +42,7 @@ pub(super) fn run_x11_overlay(
     let colormap = conn.generate_id()?;
     conn.create_colormap(ColormapAlloc::NONE, colormap, screen.root, visual.visual_id)?;
 
-    let x = centered_x(screen, width);
-    let y = bottom_y(screen, height);
+    let (x, y) = screen_position(screen, width, height, position);
     let window = conn.generate_id()?;
     conn.create_window(
         visual.depth,
@@ -70,8 +70,14 @@ pub(super) fn run_x11_overlay(
     conn.create_gc(gc, window, &CreateGCAux::default().graphics_exposures(0))?;
     conn.flush()?;
 
-    let mut renderer =
-        OverlayRenderer::new(state_rx, level_rx, width as u32, height as u32, theme)?;
+    let mut renderer = OverlayRenderer::new(
+        state_rx,
+        level_rx,
+        width as u32,
+        height as u32,
+        theme,
+        position.is_top(),
+    )?;
     let mut frame = vec![0_u8; width as usize * height as usize * 4];
     let mut mapped = false;
     // Cache of the last bounding-shape rectangles applied to the window.
@@ -110,7 +116,7 @@ pub(super) fn run_x11_overlay(
         }
         copy_pixmap_to_x11_zpixmap(&renderer.pixmap, visual, &mut frame);
         if !mapped {
-            let (x, y) = x11_overlay_position(&conn, screen, &atoms, width, height);
+            let (x, y) = x11_overlay_position(&conn, screen, &atoms, width, height, position);
             conn.configure_window(
                 window,
                 &ConfigureWindowAux::default()
@@ -351,6 +357,7 @@ fn x11_overlay_position(
     atoms: &X11Atoms,
     width: u16,
     height: u16,
+    position: OverlayPosition,
 ) -> (i16, i16) {
     let monitors = match active_x11_monitors(conn, screen.root) {
         Ok(monitors) => monitors,
@@ -378,6 +385,7 @@ fn x11_overlay_position(
                 u32::from(monitor.height),
                 width,
                 height,
+                position,
             );
         }
     }
@@ -394,10 +402,11 @@ fn x11_overlay_position(
             u32::from(monitor.height),
             width,
             height,
+            position,
         );
     }
 
-    (centered_x(screen, width), bottom_y(screen, height))
+    screen_position(screen, width, height, position)
 }
 
 fn active_x11_monitors(
@@ -458,6 +467,7 @@ fn position_in_rect(
     rect_height: u32,
     width: u16,
     height: u16,
+    position: OverlayPosition,
 ) -> (i16, i16) {
     let width = i32::from(width);
     let height = i32::from(height);
@@ -469,32 +479,45 @@ fn position_in_rect(
         .saturating_add(rect_width)
         .saturating_sub(width)
         .max(min_x);
-    let centered_x = x.saturating_add((rect_width - width) / 2);
+    let px = match position.h_align() {
+        OverlayHAlign::Left => x.saturating_add(EDGE_MARGIN),
+        OverlayHAlign::Center => x.saturating_add((rect_width - width) / 2),
+        OverlayHAlign::Right => max_x.saturating_sub(EDGE_MARGIN),
+    };
 
     let min_y = y;
     let max_y = y
         .saturating_add(rect_height)
         .saturating_sub(height)
         .max(min_y);
-    let bottom_y = y
-        .saturating_add(rect_height)
-        .saturating_sub(height)
-        .saturating_sub(BOTTOM_MARGIN);
+    let py = if position.is_top() {
+        y.saturating_add(EDGE_MARGIN)
+    } else {
+        max_y.saturating_sub(EDGE_MARGIN)
+    };
 
     (
-        to_i16_coord(centered_x.clamp(min_x, max_x)),
-        to_i16_coord(bottom_y.clamp(min_y, max_y)),
+        to_i16_coord(px.clamp(min_x, max_x)),
+        to_i16_coord(py.clamp(min_y, max_y)),
     )
 }
 
-fn centered_x(screen: &Screen, width: u16) -> i16 {
-    let x = (i32::from(screen.width_in_pixels) - i32::from(width)) / 2;
-    to_i16_coord(x.max(0))
-}
-
-fn bottom_y(screen: &Screen, height: u16) -> i16 {
-    let y = i32::from(screen.height_in_pixels) - i32::from(height) - BOTTOM_MARGIN;
-    to_i16_coord(y.max(0))
+/// Placement on the whole X screen, for when XRandR reports no monitors.
+fn screen_position(
+    screen: &Screen,
+    width: u16,
+    height: u16,
+    position: OverlayPosition,
+) -> (i16, i16) {
+    position_in_rect(
+        0,
+        0,
+        u32::from(screen.width_in_pixels),
+        u32::from(screen.height_in_pixels),
+        width,
+        height,
+        position,
+    )
 }
 
 fn to_i16_coord(value: i32) -> i16 {
@@ -537,11 +560,36 @@ mod tests {
 
     #[test]
     fn x11_position_in_rect_uses_monitor_bounds() {
+        let bc = OverlayPosition::BottomCenter;
         assert_eq!(
-            position_in_rect(1920, 360, 1920, 1200, 100, 40),
+            position_in_rect(1920, 360, 1920, 1200, 100, 40, bc),
             (2830, 1504)
         );
-        assert_eq!(position_in_rect(3840, 0, 1200, 1920, 100, 40), (4390, 1864));
+        assert_eq!(
+            position_in_rect(3840, 0, 1200, 1920, 100, 40, bc),
+            (4390, 1864)
+        );
+    }
+
+    #[test]
+    fn x11_position_in_rect_honors_every_position() {
+        // 1920x1200 monitor at (1920, 360), 100x40 pill, 16 px margins.
+        let at = |p| position_in_rect(1920, 360, 1920, 1200, 100, 40, p);
+        assert_eq!(at(OverlayPosition::BottomLeft), (1936, 1504));
+        assert_eq!(at(OverlayPosition::BottomCenter), (2830, 1504));
+        assert_eq!(at(OverlayPosition::BottomRight), (3724, 1504));
+        assert_eq!(at(OverlayPosition::TopLeft), (1936, 376));
+        assert_eq!(at(OverlayPosition::TopCenter), (2830, 376));
+        assert_eq!(at(OverlayPosition::TopRight), (3724, 376));
+    }
+
+    #[test]
+    fn x11_position_in_rect_stays_on_a_tiny_monitor() {
+        // Smaller than pill + margins: clamp inside, never off-screen.
+        assert_eq!(
+            position_in_rect(0, 0, 100, 40, 100, 40, OverlayPosition::TopRight),
+            (0, 0)
+        );
     }
 
     #[test]

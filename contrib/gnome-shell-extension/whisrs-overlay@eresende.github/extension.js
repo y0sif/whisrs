@@ -11,10 +11,11 @@ const DBUS_PATH = '/org/whisrs/Overlay';
 const STATE_SIGNAL = 'StateChanged';
 const LEVEL_SIGNAL = 'LevelChanged';
 const THEME_SIGNAL = 'ThemeChanged';
+const POSITION_SIGNAL = 'PositionChanged';
 
 const OVERLAY_WIDTH = 100;
 const OVERLAY_HEIGHT = 40;
-const BOTTOM_MARGIN = 16;
+const EDGE_MARGIN = 16;
 const BAR_COUNT = 7;
 const BAR_W = 3;
 const BAR_GAP = 2;
@@ -22,7 +23,7 @@ const BAR_BASELINE = 6;
 const BAR_VPAD = 6;
 
 // Spawn animation: pill height morphs from a 4-px sliver to its full
-// height, anchored to the bottom of its placement. Slight overshoot via
+// height, anchored to the screen edge it sits against. Slight overshoot via
 // EASE_OUT_BACK for a "physical arrival" pop.
 const SPAWN_IN_MS = 220;
 const SPAWN_OUT_MS = 140;
@@ -31,10 +32,15 @@ const BARS_GRACE_MS = 80;
 const BARS_FADE_MS = 80;
 
 const KNOWN_THEMES = ['ember', 'carbon', 'cyan'];
+const KNOWN_POSITIONS = [
+    'bottom-left', 'bottom-center', 'bottom-right',
+    'top-left', 'top-center', 'top-right',
+];
 
 export default class WhisrsOverlayExtension extends Extension {
     enable() {
         this._theme = 'carbon';
+        this._placement = 'bottom-center';
 
         this._actor = new St.Widget({
             style_class: 'whisrs-overlay whisrs-overlay-hidden whisrs-theme-carbon',
@@ -90,6 +96,14 @@ export default class WhisrsOverlayExtension extends Extension {
                 this._setTheme(theme);
             }
         );
+        this._positionSignalId = Gio.DBus.session.signal_subscribe(
+            null, DBUS_INTERFACE, POSITION_SIGNAL, DBUS_PATH, null,
+            Gio.DBusSignalFlags.NONE,
+            (_c, _s, _p, _i, _sig, parameters) => {
+                const [position] = parameters.deep_unpack();
+                this._setPlacement(position);
+            }
+        );
 
         this._state = 'idle';
         this._level = 0;
@@ -104,12 +118,16 @@ export default class WhisrsOverlayExtension extends Extension {
     disable() {
         this._stopAnimation();
 
-        for (const id of [this._signalId, this._levelSignalId, this._themeSignalId]) {
+        for (const id of [
+            this._signalId, this._levelSignalId,
+            this._themeSignalId, this._positionSignalId,
+        ]) {
             if (id) Gio.DBus.session.signal_unsubscribe(id);
         }
         this._signalId = 0;
         this._levelSignalId = 0;
         this._themeSignalId = 0;
+        this._positionSignalId = 0;
 
         if (this._monitorsChangedId) {
             Main.layoutManager.disconnect(this._monitorsChangedId);
@@ -129,6 +147,15 @@ export default class WhisrsOverlayExtension extends Extension {
         this._actor.remove_style_class_name(`whisrs-theme-${this._theme}`);
         this._actor.add_style_class_name(`whisrs-theme-${next}`);
         this._theme = next;
+    }
+
+    _setPlacement(position) {
+        const next = KNOWN_POSITIONS.includes(String(position))
+            ? String(position)
+            : 'bottom-center';
+        if (next === this._placement) return;
+        this._placement = next;
+        this._position();
     }
 
     _setState(state) {
@@ -166,7 +193,7 @@ export default class WhisrsOverlayExtension extends Extension {
         }
     }
 
-    /// Pill "draws out" from a thin line at the bottom edge, growing to
+    /// Pill "draws out" from a thin line at its screen edge, growing to
     /// full height with EASE_OUT_BACK overshoot. Bars stay invisible
     /// during the grow, then fade in once the pill is mostly settled.
     _spawnIn() {
@@ -174,7 +201,8 @@ export default class WhisrsOverlayExtension extends Extension {
 
         // Snap to the start state.
         this._actor.set_easing_duration(0);
-        this._actor.set_pivot_point(0.5, 1.0); // bottom-center
+        // Grow out of the screen edge: pivot on the pill's top or bottom.
+        this._actor.set_pivot_point(0.5, this._placement.startsWith('top') ? 0.0 : 1.0);
         this._actor.set_scale(1.0, SPAWN_PILL_MIN_H / OVERLAY_HEIGHT);
         this._actor.opacity = 0;
         if (this._barsBox) this._barsBox.opacity = 0;
@@ -227,9 +255,17 @@ export default class WhisrsOverlayExtension extends Extension {
         if (!this._actor) return;
 
         const monitor = Main.layoutManager.primaryMonitor;
-        const x = Math.floor(monitor.x + (monitor.width - OVERLAY_WIDTH) / 2);
-        const y = Math.floor(monitor.y + monitor.height - OVERLAY_HEIGHT - BOTTOM_MARGIN);
-        this._actor.set_position(Math.max(monitor.x, x), Math.max(monitor.y, y));
+        const [vertical, horizontal] = this._placement.split('-');
+        const maxX = monitor.x + monitor.width - OVERLAY_WIDTH;
+        const maxY = monitor.y + monitor.height - OVERLAY_HEIGHT;
+        let x;
+        if (horizontal === 'left') x = monitor.x + EDGE_MARGIN;
+        else if (horizontal === 'right') x = maxX - EDGE_MARGIN;
+        else x = Math.floor(monitor.x + (monitor.width - OVERLAY_WIDTH) / 2);
+        const y = vertical === 'top' ? monitor.y + EDGE_MARGIN : maxY - EDGE_MARGIN;
+        this._actor.set_position(
+            Math.min(Math.max(monitor.x, x), Math.max(monitor.x, maxX)),
+            Math.min(Math.max(monitor.y, y), Math.max(monitor.y, maxY)));
         this._actor.set_size(OVERLAY_WIDTH, OVERLAY_HEIGHT);
 
         const cy = Math.floor(OVERLAY_HEIGHT / 2);

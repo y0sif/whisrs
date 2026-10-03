@@ -675,7 +675,7 @@ fn edit_tray_overlay(config: &mut Config) -> Result<()> {
         .unwrap_or(config.general.tray);
 
     config.general.overlay = Confirm::new()
-        .with_prompt("Show bottom recording overlay?")
+        .with_prompt("Show recording overlay?")
         .default(config.general.overlay)
         .interact()
         .unwrap_or(config.general.overlay);
@@ -686,7 +686,7 @@ fn edit_tray_overlay(config: &mut Config) -> Result<()> {
         overlay_cfg.theme = theme;
         config.overlay = Some(overlay_cfg);
         println!(
-            "  {DIM}Note: width/height and custom colors can be set by hand in config.toml.{RESET}"
+            "  {DIM}Note: position, width/height and custom colors can be set by hand in config.toml.{RESET}"
         );
     }
     Ok(())

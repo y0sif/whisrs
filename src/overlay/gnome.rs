@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::info;
 
-use crate::State;
+use crate::{OverlayPosition, State};
 
 use super::service::OverlayError;
 
@@ -23,6 +23,7 @@ pub(super) async fn run_gnome_broadcaster(
     mut state_rx: watch::Receiver<State>,
     level_rx: watch::Receiver<f32>,
     theme: String,
+    position: OverlayPosition,
 ) -> Result<(), OverlayError> {
     // Custom themes don't sync over D-Bus for v1 — the GNOME extension only
     // knows the named themes it ships. Fall back to "ember" so the bar
@@ -40,6 +41,7 @@ pub(super) async fn run_gnome_broadcaster(
 
     info!("GNOME overlay D-Bus broadcaster started");
     emit_gnome_theme(&conn, &advertised_theme).await?;
+    emit_gnome_position(&conn, position).await?;
     let initial_state = *state_rx.borrow();
     emit_gnome_state(&conn, initial_state).await?;
     let initial_level = *level_rx.borrow();
@@ -98,6 +100,20 @@ async fn emit_gnome_theme(conn: &zbus::Connection, theme: &str) -> zbus::Result<
         "org.whisrs.Overlay",
         "ThemeChanged",
         &theme,
+    )
+    .await
+}
+
+async fn emit_gnome_position(
+    conn: &zbus::Connection,
+    position: OverlayPosition,
+) -> zbus::Result<()> {
+    conn.emit_signal(
+        None::<&str>,
+        "/org/whisrs/Overlay",
+        "org.whisrs.Overlay",
+        "PositionChanged",
+        &position.as_str(),
     )
     .await
 }

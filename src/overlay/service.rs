@@ -41,7 +41,7 @@ pub(super) enum OverlayError {
     Pixmap(u32, u32),
 }
 
-/// Spawn the bottom recording overlay.
+/// Spawn the recording overlay.
 ///
 /// Native compositor event loops run on a dedicated OS thread because they are
 /// blocking client loops. A small Tokio task forwards daemon state changes into
@@ -55,8 +55,11 @@ pub async fn spawn_overlay(
         let gnome_state_rx = state_rx.clone();
         let gnome_level_rx = level_rx.clone();
         let gnome_theme = config.theme.clone();
+        let gnome_position = config.position();
         tokio::spawn(async move {
-            if let Err(e) = run_gnome_broadcaster(gnome_state_rx, gnome_level_rx, gnome_theme).await
+            if let Err(e) =
+                run_gnome_broadcaster(gnome_state_rx, gnome_level_rx, gnome_theme, gnome_position)
+                    .await
             {
                 warn!("GNOME overlay D-Bus broadcaster unavailable: {e:#}");
             }

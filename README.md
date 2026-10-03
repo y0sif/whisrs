@@ -211,7 +211,7 @@ Config file: `~/.config/whisrs/config.toml`; `whisrs setup` writes a working fil
 [general]
 backend = "groq"   # groq | deepgram-streaming | deepgram | openai-realtime | openai | openai-compatible-realtime | local-whisper | asr-sidecar
 language = "en"    # ISO 639-1 or "auto"
-overlay = false    # bottom-screen recording overlay
+overlay = false    # on-screen recording overlay
 
 [groq]
 api_key = "gsk_..."
