@@ -11,7 +11,7 @@ members = [
 
 [package]
 name = "whisrs"
-version = "0.1.28"
+version = "0.1.29"
 edition = "2021"
 description = "Voice for the Linux desktop: dictation, read-aloud (TTS), and voice-driven LLM commands, with Groq, OpenAI, Deepgram, and local Whisper backends"
 license = "MIT"
