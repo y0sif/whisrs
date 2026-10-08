@@ -866,7 +866,7 @@ fn inject_text_with_clipboard(
     let saved = match clipboard.get_text() {
         Ok(s) => s,
         Err(e) => {
-            debug!("clipboard unreadable as text, typing instead of pasting: {e:#}");
+            warn!("clipboard unreadable as text, typing instead of pasting: {e:#}");
             return match type_text_with_clear(text, keys, clear_line)? {
                 KeystrokeOutcome::Sent => Ok(Injection::Delivered),
                 // Overwrites the non-text clipboard (#69's concern), but the
