@@ -94,6 +94,7 @@ impl OpenAiCompatibleRealtimeBackend {
             host_header: None,
             profile: OpenAiRealtimeProfile::Lemonade,
             turn_detection: self.turn_detection,
+            languages: Vec::new(),
             final_completion_timeout: self.final_completion_timeout,
         })
     }

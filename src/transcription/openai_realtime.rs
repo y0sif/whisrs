@@ -5,21 +5,30 @@ use tokio::sync::mpsc;
 
 use crate::audio::AudioChunk;
 
+use super::openai_realtime_protocol::openai_model_supports_prompt;
 use super::openai_realtime_protocol::{
     openai_turn_detection_mode_for_model, OpenAiRealtimeProfile, OpenAiRealtimeProtocolEngine,
-    RealtimeEngineConfig, TurnDetectionMode,
+    RealtimeEngineConfig,
 };
 use super::{TranscriptionBackend, TranscriptionConfig};
 
 /// OpenAI Realtime API transcription backend.
 pub struct OpenAIRealtimeBackend {
     api_key: String,
+    languages: Vec<String>,
 }
 
 impl OpenAIRealtimeBackend {
     /// Create a new OpenAI Realtime backend.
     pub fn new(api_key: String) -> Self {
-        Self { api_key }
+        Self {
+            api_key,
+            languages: Vec::new(),
+        }
+    }
+
+    pub fn with_languages(api_key: String, languages: Vec<String>) -> Self {
+        Self { api_key, languages }
     }
 
     /// Resolve the API key from the struct field or environment variable.
@@ -45,6 +54,7 @@ impl OpenAIRealtimeBackend {
             host_header: Some("api.openai.com".to_string()),
             profile: OpenAiRealtimeProfile::OpenAi,
             turn_detection: openai_turn_detection_mode_for_model(&request.model),
+            languages: self.languages.clone(),
             final_completion_timeout: None,
         }))
     }
@@ -77,25 +87,10 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
         true
     }
 
-    // Per request, not per backend: the model picks the turn-detection mode,
-    // and the mode decides whether a prompt goes on the wire at all. Derived
-    // from the same `openai_turn_detection_mode_for_model` call
-    // `engine_for_request` hands the engine, so this cannot drift from what is
-    // actually sent — `OpenAiSessionUpdate::new` sets `prompt = None` on the
-    // `ManualCommit` arm and `clamp_prompt`s it on the `ServerVad` one.
-    //
-    // Manual commit is not an exotic corner: `whisrs setup` writes `[openai]
-    // model = "gpt-realtime-whisper"` when this backend is chosen and
-    // `get_model_for_backend` falls back to the same string, so the default
-    // openai-realtime install is the promptless case. Answering `true` there
-    // would reproduce #133 one backend over — real speech shaped like the
-    // user's own `[general] vocabulary` discarded as an echo of a prompt
-    // OpenAI never saw.
+    // gpt-realtime-whisper is promptless even though the newer manual-commit
+    // models accept prompt. Keep this gate aligned with the wire serializer.
     fn sends_prompt(&self, config: &TranscriptionConfig) -> bool {
-        !matches!(
-            openai_turn_detection_mode_for_model(&config.model),
-            TurnDetectionMode::ManualCommit
-        )
+        openai_model_supports_prompt(&config.model)
     }
 }
 
@@ -126,6 +121,10 @@ mod tests {
         assert!(
             backend.sends_prompt(&request_for_model("gpt-4o-transcribe")),
             "server-VAD models carry the clamped prompt in the session.update"
+        );
+        assert!(
+            backend.sends_prompt(&request_for_model("gpt-live-transcribe")),
+            "gpt-live-transcribe accepts a prompt despite manual commit"
         );
     }
 }

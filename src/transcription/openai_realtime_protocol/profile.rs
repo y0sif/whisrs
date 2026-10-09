@@ -56,6 +56,7 @@ impl OpenAiRealtimeProfile {
         self,
         model: &str,
         language: &str,
+        languages: &[String],
         prompt: Option<&str>,
         turn_detection: TurnDetectionMode,
     ) -> anyhow::Result<serde_json::Value> {
@@ -63,6 +64,7 @@ impl OpenAiRealtimeProfile {
             Self::OpenAi => serde_json::to_value(OpenAiSessionUpdate::new(
                 model,
                 language,
+                languages,
                 prompt,
                 turn_detection,
             ))?,
@@ -104,11 +106,23 @@ impl TurnDetectionMode {
 }
 
 pub fn openai_turn_detection_mode_for_model(model: &str) -> TurnDetectionMode {
-    if model.eq_ignore_ascii_case("gpt-realtime-whisper") {
+    if model.eq_ignore_ascii_case("gpt-realtime-whisper")
+        || model.eq_ignore_ascii_case("gpt-live-transcribe")
+        || model.eq_ignore_ascii_case("gpt-transcribe")
+    {
         TurnDetectionMode::ManualCommit
     } else {
         TurnDetectionMode::ServerVad
     }
+}
+
+pub fn openai_model_supports_prompt(model: &str) -> bool {
+    !model.eq_ignore_ascii_case("gpt-realtime-whisper")
+}
+
+pub fn openai_model_supports_languages(model: &str) -> bool {
+    model.eq_ignore_ascii_case("gpt-live-transcribe")
+        || model.eq_ignore_ascii_case("gpt-transcribe")
 }
 
 /// Trim, drop empties, and truncate at the API's 1024-char limit on a char
@@ -214,6 +228,7 @@ mod tests {
             .session_update(
                 "gpt-4o-mini-transcribe",
                 "en",
+                &[],
                 None,
                 TurnDetectionMode::ServerVad,
             )
@@ -247,6 +262,7 @@ mod tests {
             .session_update(
                 "Whisper-Tiny",
                 "auto",
+                &[],
                 Some("ignored"),
                 TurnDetectionMode::ServerVad,
             )
@@ -265,6 +281,7 @@ mod tests {
             .session_update(
                 "Whisper-Tiny",
                 "en",
+                &[],
                 Some("ignored"),
                 TurnDetectionMode::ManualCommit,
             )
@@ -281,6 +298,7 @@ mod tests {
             .session_update(
                 "gpt-realtime-whisper",
                 "en",
+                &[],
                 Some("domain prompt is unsupported here"),
                 TurnDetectionMode::ManualCommit,
             )
@@ -297,6 +315,7 @@ mod tests {
             .session_update(
                 "gpt-4o-transcribe",
                 "auto",
+                &[],
                 None,
                 TurnDetectionMode::ServerVad,
             )
@@ -313,6 +332,7 @@ mod tests {
             .session_update(
                 "gpt-4o-transcribe",
                 "en",
+                &[],
                 Some("Yocto, Hyprland, NixOS"),
                 TurnDetectionMode::ServerVad,
             )
@@ -329,6 +349,7 @@ mod tests {
             .session_update(
                 "gpt-4o-transcribe",
                 "en",
+                &[],
                 Some("   \t\n  "),
                 TurnDetectionMode::ServerVad,
             )
@@ -363,6 +384,51 @@ mod tests {
             openai_turn_detection_mode_for_model("gpt-4o-mini-transcribe"),
             TurnDetectionMode::ServerVad
         );
+        assert_eq!(
+            openai_turn_detection_mode_for_model("gpt-live-transcribe"),
+            TurnDetectionMode::ManualCommit
+        );
+    }
+
+    #[test]
+    fn live_transcribe_sends_two_language_hints_and_prompt_without_server_vad() {
+        let languages = vec!["ru".to_string(), "en".to_string()];
+        let json = OpenAiRealtimeProfile::OpenAi
+            .session_update(
+                "gpt-live-transcribe",
+                "auto",
+                &languages,
+                Some("Russian speech may contain English technical terms."),
+                openai_turn_detection_mode_for_model("gpt-live-transcribe"),
+            )
+            .unwrap();
+        let input = &json["session"]["audio"]["input"];
+        assert!(input.get("turn_detection").is_none());
+        assert_eq!(
+            input["transcription"]["languages"],
+            serde_json::json!(["ru", "en"])
+        );
+        assert!(input["transcription"].get("language").is_none());
+        assert_eq!(
+            input["transcription"]["prompt"],
+            "Russian speech may contain English technical terms."
+        );
+    }
+
+    #[test]
+    fn live_transcribe_uses_languages_for_single_language_too() {
+        let json = OpenAiRealtimeProfile::OpenAi
+            .session_update(
+                "gpt-live-transcribe",
+                "ru",
+                &[],
+                None,
+                TurnDetectionMode::ManualCommit,
+            )
+            .unwrap();
+        let transcription = &json["session"]["audio"]["input"]["transcription"];
+        assert_eq!(transcription["languages"], serde_json::json!(["ru"]));
+        assert!(transcription.get("language").is_none());
     }
 
     #[test]

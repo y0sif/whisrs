@@ -32,6 +32,7 @@ pub struct RealtimeEngineConfig {
     pub host_header: Option<String>,
     pub profile: OpenAiRealtimeProfile,
     pub turn_detection: TurnDetectionMode,
+    pub languages: Vec<String>,
     pub final_completion_timeout: Option<std::time::Duration>,
 }
 
@@ -326,6 +327,7 @@ impl OpenAiRealtimeProtocolEngine {
         let session_update = self.config.profile.session_update(
             &request.model,
             &request.language,
+            &self.config.languages,
             request.prompt.as_deref(),
             self.config.turn_detection,
         )?;
@@ -1058,6 +1060,7 @@ mod tests {
             host_header: None,
             profile: OpenAiRealtimeProfile::Lemonade,
             turn_detection: TurnDetectionMode::ServerVad,
+            languages: Vec::new(),
             final_completion_timeout: None,
         });
         let (text_tx, _text_rx) = mpsc::channel::<String>(1);
@@ -1112,6 +1115,7 @@ mod stream_lifecycle_tests {
             host_header: None,
             profile: OpenAiRealtimeProfile::OpenAi,
             turn_detection: TurnDetectionMode::ServerVad,
+            languages: Vec::new(),
             final_completion_timeout: None,
         })
     }
@@ -1124,6 +1128,7 @@ mod stream_lifecycle_tests {
             host_header: None,
             profile: OpenAiRealtimeProfile::OpenAi,
             turn_detection: TurnDetectionMode::ServerVad,
+            languages: Vec::new(),
             final_completion_timeout: Some(Duration::from_millis(50)),
         })
     }

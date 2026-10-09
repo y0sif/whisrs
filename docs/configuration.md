@@ -34,9 +34,9 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
                             # asr-sidecar, which takes it as its `hotwords` field.
                             # Deepgram sends no prompt — use vocabulary there instead.
                             # openai-compatible-realtime sends neither, so neither key
-                            # reaches it. openai-realtime sends a prompt only on
-                            # server-VAD models like gpt-4o-transcribe, not on the
-                            # gpt-realtime-whisper that `whisrs setup` writes for it)
+                            # reaches it. openai-realtime sends a prompt with
+                            # gpt-live-transcribe and gpt-4o-transcribe, but not
+                            # with gpt-realtime-whisper)
                             # `whisrsd` warns at startup if either key targets a backend
                             # that discards it. `whisrs config` warns the same on save.
 tray = true                 # system tray icon (requires SNI host like waybar)
@@ -243,6 +243,15 @@ model = "nova-3"
 [openai]
 api_key = "sk-..."
 model = "gpt-4o-mini-transcribe"
+
+# For backend = "openai-realtime", select model = "gpt-live-transcribe".
+# languages = ["ru", "en"]  # expected input languages for mixed-language dictation
+
+# gpt-live-transcribe streams text as you speak and commits the final transcript
+# when recording stops. languages are hints, not an output-language guarantee.
+# For this model, languages takes precedence over [general] language. If the
+# list is absent and [general] language is not "auto", that language is sent
+# as a one-item list. OpenAI also accepts some three-letter and regional codes.
 
 # External OpenAI-compatible realtime server (WebSocket).
 # Use this for Lemonade-style services that speak the OpenAI Realtime

@@ -557,7 +557,31 @@ pub(crate) fn configure_backend(
                 "WHISRS_OPENAI_API_KEY",
             )?;
             let model = if backend == "openai-realtime" {
-                "gpt-realtime-whisper".to_string()
+                let choices = [
+                    "gpt-realtime-whisper (legacy)",
+                    "gpt-live-transcribe (live multilingual transcription)",
+                    "gpt-4o-transcribe (legacy)",
+                ];
+                let current = existing
+                    .and_then(|c| c.openai.as_ref())
+                    .map(|o| o.model.as_str());
+                let default = match current {
+                    Some("gpt-live-transcribe") => 1,
+                    Some("gpt-4o-transcribe") => 2,
+                    _ => 0,
+                };
+                let selection = Select::new()
+                    .with_prompt("Select OpenAI Realtime model")
+                    .items(&choices)
+                    .default(default)
+                    .interact()
+                    .context("failed to read realtime model selection")?;
+                match selection {
+                    1 => "gpt-live-transcribe",
+                    2 => "gpt-4o-transcribe",
+                    _ => "gpt-realtime-whisper",
+                }
+                .to_string()
             } else {
                 let selection = Select::new()
                     .with_prompt("Select OpenAI model")
@@ -577,7 +601,20 @@ pub(crate) fn configure_backend(
                 .to_string()
             };
             Ok(BackendConfigSelection {
-                openai: Some(OpenAiConfig { api_key, model }),
+                openai: Some(OpenAiConfig {
+                    api_key,
+                    languages: if backend == "openai-realtime"
+                        && matches!(model.as_str(), "gpt-live-transcribe" | "gpt-transcribe")
+                    {
+                        existing
+                            .and_then(|c| c.openai.as_ref())
+                            .map(|o| o.languages.clone())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
+                    model,
+                }),
                 ..BackendConfigSelection::default()
             })
         }

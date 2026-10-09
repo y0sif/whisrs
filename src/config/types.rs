@@ -8,8 +8,11 @@ use std::path::{Path, PathBuf};
 use crate::hotkey;
 use crate::llm;
 use crate::transcription::deepgram;
+#[cfg(test)]
+use crate::transcription::openai_realtime_protocol::openai_turn_detection_mode_for_model;
 use crate::transcription::openai_realtime_protocol::{
-    openai_turn_detection_mode_for_model, OpenAiRealtimeProfile, TurnDetectionMode,
+    openai_model_supports_languages, openai_model_supports_prompt, OpenAiRealtimeProfile,
+    TurnDetectionMode,
 };
 use crate::WhisrsError;
 
@@ -576,6 +579,10 @@ pub struct OpenAiConfig {
     pub api_key: String,
     #[serde(default = "default_openai_model")]
     pub model: String,
+    /// Expected input languages for gpt-live-transcribe or gpt-transcribe.
+    /// An empty list preserves the single-language/auto behavior.
+    #[serde(default)]
+    pub languages: Vec<String>,
 }
 
 /// Text-to-speech configuration for the read-selection-aloud feature.
@@ -1593,6 +1600,22 @@ impl Config {
                             .to_string(),
                     ));
                 }
+                if let Some(openai) = &self.openai {
+                    if !openai.languages.is_empty() {
+                        if backend != "openai-realtime"
+                            || !openai_model_supports_languages(&openai.model)
+                        {
+                            return Err(WhisrsError::Config(
+                                "[openai] languages requires openai-realtime with gpt-live-transcribe or gpt-transcribe".to_string(),
+                            ));
+                        }
+                        if openai.languages.iter().any(String::is_empty) {
+                            return Err(WhisrsError::Config(
+                                "[openai] languages cannot contain empty codes".to_string(),
+                            ));
+                        }
+                    }
+                }
             }
             "local-whisper" | "local" => {
                 let model_path = self
@@ -2307,13 +2330,10 @@ impl Config {
             "openai-compatible-realtime" => InertPromptCase::Lemonade,
             "openai-realtime" => {
                 let model = self.openai_realtime_model();
-                match openai_turn_detection_mode_for_model(&model) {
-                    TurnDetectionMode::ManualCommit => {
-                        InertPromptCase::OpenAiRealtimeManualCommit { model }
-                    }
-                    // Server-VAD models carry a real `prompt`, so neither key
-                    // is inert here.
-                    TurnDetectionMode::ServerVad => return warnings,
+                if !openai_model_supports_prompt(&model) {
+                    InertPromptCase::OpenAiRealtimeManualCommit { model }
+                } else {
+                    return warnings;
                 }
             }
             _ => return warnings,
@@ -3558,6 +3578,7 @@ mod tests {
                 openai: Some(OpenAiConfig {
                     api_key: "test-key".to_string(),
                     model: default_openai_model(),
+                    languages: Vec::new(),
                 }),
                 local_whisper: None,
                 local_vosk: None,
@@ -4634,6 +4655,7 @@ mod tests {
             openai: Some(OpenAiConfig {
                 api_key: "test-key".to_string(),
                 model: default_openai_model(),
+                languages: Vec::new(),
             }),
             local_whisper: None,
             local_vosk: None,

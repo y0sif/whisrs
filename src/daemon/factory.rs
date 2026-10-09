@@ -160,7 +160,12 @@ pub(crate) fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
                 warn!("no OpenAI API key configured");
             }
             info!("using OpenAI Realtime transcription backend");
-            Arc::new(OpenAIRealtimeBackend::new(api_key))
+            let languages = config
+                .openai
+                .as_ref()
+                .map(|o| o.languages.clone())
+                .unwrap_or_default();
+            Arc::new(OpenAIRealtimeBackend::with_languages(api_key, languages))
         }
         "openai" => {
             let api_key = resolve_openai_api_key(config).unwrap_or_default();
