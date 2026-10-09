@@ -136,30 +136,57 @@ impl ClipboardBackend for WaylandClipboard {
 // X11: arboard crate (behind "arboard" feature)
 // ---------------------------------------------------------------------------
 
+/// The one process-wide `arboard` handle behind every [`X11Clipboard`] call.
+///
+/// X11 has no clipboard store: the app that copied must keep serving the
+/// selection. arboard treats dropping its last handle as the app exiting, so
+/// it asks the clipboard manager to take the data (waiting at most 100 ms)
+/// and destroys its selection window. The old per-call handle therefore gave
+/// the selection away milliseconds after each copy, and the Ctrl+V that
+/// followed raced the clipboard manager or compositor, often pasting nothing
+/// (#193). This handle is opened on first use and never dropped.
+///
+/// A failed open is returned, not cached, so a later call retries. The guard
+/// must not be held across another clipboard call: the lock is not reentrant.
+#[cfg(feature = "arboard")]
+fn x11_clipboard() -> anyhow::Result<std::sync::MutexGuard<'static, arboard::Clipboard>> {
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    static CLIPBOARD: OnceLock<Mutex<arboard::Clipboard>> = OnceLock::new();
+
+    if CLIPBOARD.get().is_none() {
+        let clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
+        // A lost race drops this extra handle, which is harmless: the
+        // winner's handle still exists, so arboard keeps the selection.
+        let _ = CLIPBOARD.set(Mutex::new(clipboard));
+    }
+    let clipboard = CLIPBOARD.get().expect("X11 clipboard was just initialized");
+    // A panic in another clipboard call leaves the handle itself usable.
+    Ok(clipboard.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
 /// Clipboard backend that uses the `arboard` crate (X11).
+/// All instances share one handle that lives as long as the process.
 #[cfg(feature = "arboard")]
 pub struct X11Clipboard;
 
 #[cfg(feature = "arboard")]
 impl ClipboardBackend for X11Clipboard {
     fn get_text(&self) -> anyhow::Result<String> {
-        let mut clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
-        clipboard
+        x11_clipboard()?
             .get_text()
             .context("failed to get text from X11 clipboard")
     }
 
     fn set_text(&self, text: &str) -> anyhow::Result<()> {
-        let mut clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
-        clipboard
+        x11_clipboard()?
             .set_text(text)
             .context("failed to set text on X11 clipboard")
     }
 
     fn get_primary_selection(&self) -> anyhow::Result<String> {
         use arboard::GetExtLinux;
-        let mut clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
-        clipboard
+        x11_clipboard()?
             .get()
             .clipboard(arboard::LinuxClipboardKind::Primary)
             .text()
