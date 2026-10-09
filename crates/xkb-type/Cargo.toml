@@ -13,7 +13,7 @@ categories = ["os::linux-apis", "hardware-support"]
 [features]
 default = []
 logging = ["dep:log"]
-arboard = ["dep:arboard"]
+arboard = ["dep:arboard", "dep:x11rb"]
 wayland-vk = ["dep:wayland-client", "dep:wayland-protocols-misc", "dep:rustix"]
 
 [dependencies]
@@ -29,6 +29,7 @@ rustix = { version = "0.38", features = ["fs"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3", optional = true }
+x11rb = { version = "0.13", optional = true }
 
 [dev-dependencies]
 # Used only by the `vk_recorder` example (the focused client in the headless

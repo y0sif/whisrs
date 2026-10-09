@@ -165,6 +165,26 @@ fn x11_clipboard() -> anyhow::Result<std::sync::MutexGuard<'static, arboard::Cli
     Ok(clipboard.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
+/// Whether nothing owns the X11 CLIPBOARD selection, i.e. the clipboard is
+/// genuinely empty (fresh login, nothing copied yet).
+///
+/// arboard reports "no owner" and "the owner offers no text target" with the
+/// same `ContentNotAvailable` error. Only the second must stay an error: a
+/// caller restoring a saved clipboard reads `Err` as "non-text, do not
+/// overwrite it", so `whisrs` typed every paste-mode dictation on an empty
+/// X11 clipboard (#79). Asking the X server directly gives [`X11Clipboard`]
+/// the same contract as `run_wl_paste` on Wayland. Uses its own short-lived
+/// connection, not the arboard handle, and only runs after a read failed.
+#[cfg(feature = "arboard")]
+fn x11_clipboard_unowned() -> anyhow::Result<bool> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let (conn, _screen) = x11rb::connect(None).context("failed to connect to X server")?;
+    let clipboard = conn.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
+    let owner = conn.get_selection_owner(clipboard)?.reply()?.owner;
+    Ok(owner == x11rb::NONE)
+}
+
 /// Clipboard backend that uses the `arboard` crate (X11).
 /// All instances share one handle that lives as long as the process.
 #[cfg(feature = "arboard")]
@@ -173,9 +193,18 @@ pub struct X11Clipboard;
 #[cfg(feature = "arboard")]
 impl ClipboardBackend for X11Clipboard {
     fn get_text(&self) -> anyhow::Result<String> {
-        x11_clipboard()?
-            .get_text()
-            .context("failed to get text from X11 clipboard")
+        // Bound first so the handle's guard drops before the owner check.
+        let result = x11_clipboard()?.get_text();
+        match result {
+            // No owner means empty, not non-text (#79). A failed owner check
+            // keeps the error, so an uncertain clipboard is still protected.
+            Err(arboard::Error::ContentNotAvailable)
+                if matches!(x11_clipboard_unowned(), Ok(true)) =>
+            {
+                Ok(String::new())
+            }
+            result => result.context("failed to get text from X11 clipboard"),
+        }
     }
 
     fn set_text(&self, text: &str) -> anyhow::Result<()> {
