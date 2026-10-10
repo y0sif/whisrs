@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_commit_session_update_omits_prompt_and_turn_detection() {
+    fn realtime_whisper_session_update_omits_prompt_and_turn_detection() {
         let json = OpenAiRealtimeProfile::OpenAi
             .session_update(
                 "gpt-realtime-whisper",

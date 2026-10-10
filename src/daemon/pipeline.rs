@@ -1767,8 +1767,8 @@ mod tests {
     /// and `openai-compatible-realtime` never put it on the wire, so without
     /// that condition genuine speech resembling the user's own
     /// `[general] vocabulary` was discarded as an echo of something the model
-    /// never saw. `openai-realtime` joins them whenever the model puts the
-    /// session in manual-commit mode, which is why the flag is read per
+    /// never saw. `openai-realtime` joins them on gpt-realtime-whisper, the
+    /// one model that takes no prompt, which is why the flag is read per
     /// request rather than per backend.
     #[test]
     fn prompt_echo_guard_conditions() {

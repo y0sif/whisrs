@@ -249,9 +249,11 @@ model = "gpt-4o-mini-transcribe"
 
 # gpt-live-transcribe streams text as you speak and commits the final transcript
 # when recording stops. languages are hints, not an output-language guarantee.
-# For this model, languages takes precedence over [general] language. If the
-# list is absent and [general] language is not "auto", that language is sent
-# as a one-item list. OpenAI also accepts some three-letter and regional codes.
+# Precedence for this model: a per-session `whisrs toggle -l <code>`, then
+# languages, then [general] language sent as a one-item list, then no hint when
+# it is "auto". A -l equal to [general] language counts as no override and keeps
+# the list. On any other model or backend, languages is ignored and `whisrsd`
+# warns at startup. OpenAI also accepts some three-letter and regional codes.
 
 # External OpenAI-compatible realtime server (WebSocket).
 # Use this for Lemonade-style services that speak the OpenAI Realtime

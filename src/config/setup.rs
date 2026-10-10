@@ -16,6 +16,7 @@ use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 use crate::config::types::{unknown_config_keys, unknown_keys_warning, PreservedKeys};
 use crate::llm::LlmConfig;
 use crate::service::{ServiceManager, OPENRC_SERVICE, SYSTEMD_UNIT};
+use crate::transcription::openai_realtime_protocol::openai_model_supports_languages;
 use crate::{
     AsrSidecarConfig, AudioConfig, Config, DeepgramConfig, GeneralConfig, GroqConfig,
     InjectorBackend, InputConfig, LocalWhisperConfig, OpenAiCompatibleRealtimeConfig, OpenAiConfig,
@@ -558,9 +559,9 @@ pub(crate) fn configure_backend(
             )?;
             let model = if backend == "openai-realtime" {
                 let choices = [
-                    "gpt-realtime-whisper (legacy)",
-                    "gpt-live-transcribe (live multilingual transcription)",
-                    "gpt-4o-transcribe (legacy)",
+                    "gpt-realtime-whisper (manual-commit, no prompt or vocabulary)",
+                    "gpt-live-transcribe  (manual-commit, prompt, vocabulary and language hints)",
+                    "gpt-4o-transcribe    (server-vad, prompt and vocabulary)",
                 ];
                 let current = existing
                     .and_then(|c| c.openai.as_ref())
@@ -604,7 +605,7 @@ pub(crate) fn configure_backend(
                 openai: Some(OpenAiConfig {
                     api_key,
                     languages: if backend == "openai-realtime"
-                        && matches!(model.as_str(), "gpt-live-transcribe" | "gpt-transcribe")
+                        && openai_model_supports_languages(&model)
                     {
                         existing
                             .and_then(|c| c.openai.as_ref())
