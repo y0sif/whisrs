@@ -112,6 +112,11 @@ impl KeyInjector for Keyboard {
 /// Trait for clipboard get/set operations.
 pub trait ClipboardBackend: Send + Sync {
     /// Read the current clipboard text content.
+    ///
+    /// Returns `Ok("")` when the clipboard is empty (nothing owns it) and
+    /// `Err` when it holds content that cannot be read as text, so a caller
+    /// that saves and restores the clipboard never mistakes non-text content
+    /// for empty and overwrites it with `""`.
     fn get_text(&self) -> anyhow::Result<String>;
 
     /// Set the clipboard to the given text.

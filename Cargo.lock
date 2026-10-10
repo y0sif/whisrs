@@ -4160,6 +4160,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-misc",
+ "x11rb",
  "xkbcommon 0.8.0",
 ]
 
