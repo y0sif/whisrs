@@ -189,6 +189,11 @@ pub(super) struct OverlayRenderer {
     /// Pill sits at the top of the screen: anchor the grow to the surface's
     /// top edge instead of its bottom.
     from_top: bool,
+    /// Set on every idle to visible transition, cleared by
+    /// [`Self::take_session_started`]. The Wayland backend recreates its
+    /// layer surface on it so the pill opens on the output focused now, not
+    /// the one focused when the daemon started (issue #198).
+    session_started: bool,
 }
 
 /// Per-frame animation state computed from `spawn_t` + `spawn_in`. The
@@ -240,6 +245,7 @@ impl OverlayRenderer {
             last_update: Instant::now(),
             theme,
             from_top,
+            session_started: false,
         })
     }
 
@@ -257,10 +263,13 @@ impl OverlayRenderer {
 
                     // Trigger spawn / despawn only on the boundary between
                     // idle and visible. Recording ↔ Transcribing keeps the
-                    // pill steady.
+                    // pill steady. `target_state` turns Idle as soon as the
+                    // despawn starts, so a new session that lands mid-despawn
+                    // still counts as a start.
                     if was_idle && !now_idle {
                         self.spawn_in = true;
                         self.spawn_started = Instant::now();
+                        self.session_started = true;
                     } else if !was_idle && now_idle {
                         self.spawn_in = false;
                         self.spawn_started = Instant::now();
@@ -309,6 +318,12 @@ impl OverlayRenderer {
         if !self.spawn_in && self.spawn_t() >= 1.0 {
             self.visible_state = State::Idle;
         }
+    }
+
+    /// Whether a session started (idle to visible) since the last call.
+    /// Reading it clears it.
+    pub(super) fn take_session_started(&mut self) -> bool {
+        std::mem::take(&mut self.session_started)
     }
 
     /// Wall-clock progress through the current spawn animation, 0..=1.
@@ -817,6 +832,63 @@ mod tests {
         let t = Theme::ember();
         draw_overlay(&mut pm, State::Synthesizing, 0, 0.0, shown(), &t, false);
         assert!(pm.data().as_chunks::<4>().0.iter().any(|px| px[3] != 0));
+    }
+
+    /// Renderer fed by live channels. The senders are returned so the
+    /// channels stay connected for the test's lifetime.
+    fn renderer() -> (mpsc::Sender<State>, mpsc::Sender<f32>, OverlayRenderer) {
+        let (state_tx, state_rx) = mpsc::channel();
+        let (level_tx, level_rx) = mpsc::channel();
+        let r = OverlayRenderer::new(state_rx, level_rx, W, H, Theme::ember(), false).unwrap();
+        (state_tx, level_tx, r)
+    }
+
+    /// Send `state`, apply it, and report whether it started a session.
+    fn starts_session(tx: &mpsc::Sender<State>, r: &mut OverlayRenderer, state: State) -> bool {
+        tx.send(state).unwrap();
+        r.apply_state_updates();
+        r.take_session_started()
+    }
+
+    #[test]
+    fn idle_to_recording_starts_a_session_once() {
+        let (tx, _levels, mut r) = renderer();
+        assert!(starts_session(&tx, &mut r, State::Recording));
+        assert!(!r.take_session_started());
+    }
+
+    #[test]
+    fn recording_to_transcribing_is_not_a_new_session() {
+        let (tx, _levels, mut r) = renderer();
+        assert!(starts_session(&tx, &mut r, State::Recording));
+        assert!(!starts_session(&tx, &mut r, State::Transcribing));
+    }
+
+    #[test]
+    fn next_session_after_idle_starts_again() {
+        // The second Recording lands while the despawn is still animating.
+        let (tx, _levels, mut r) = renderer();
+        assert!(starts_session(&tx, &mut r, State::Recording));
+        assert!(!starts_session(&tx, &mut r, State::Idle));
+        assert!(starts_session(&tx, &mut r, State::Recording));
+    }
+
+    #[test]
+    fn idle_to_synthesizing_starts_a_session() {
+        let (tx, _levels, mut r) = renderer();
+        assert!(starts_session(&tx, &mut r, State::Synthesizing));
+        assert!(!starts_session(&tx, &mut r, State::Speaking));
+    }
+
+    #[test]
+    fn draw_frame_drain_still_flags_the_session() {
+        // In production the frame callback's `draw_frame` usually drains the
+        // state change, and the run loop reads the flag on its next pass.
+        let (tx, _levels, mut r) = renderer();
+        tx.send(State::Recording).unwrap();
+        r.draw_frame();
+        assert!(r.take_session_started());
+        assert!(!r.take_session_started());
     }
 
     #[test]
