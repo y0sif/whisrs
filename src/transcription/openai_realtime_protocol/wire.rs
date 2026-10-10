@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use super::profile::{clamp_prompt, TurnDetectionMode};
+use super::profile::{
+    clamp_prompt, openai_model_supports_languages, openai_model_supports_prompt, TurnDetectionMode,
+};
 
 /// Client message: input_audio_buffer.append
 #[derive(Debug, Serialize)]
@@ -101,6 +103,8 @@ struct AudioTranscriptionConfig {
     #[serde(skip_serializing_if = "String::is_empty")]
     language: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    languages: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
 }
 
@@ -128,21 +132,33 @@ impl OpenAiSessionUpdate {
     pub(crate) fn new(
         model: &str,
         language: &str,
+        languages: &[String],
         prompt: Option<&str>,
         turn_detection: TurnDetectionMode,
     ) -> Self {
-        let lang = if language == "auto" {
+        let supports_languages = openai_model_supports_languages(model);
+        let expected_languages = if supports_languages {
+            if !languages.is_empty() {
+                Some(languages.to_vec())
+            } else if language != "auto" {
+                Some(vec![language.to_string()])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let lang = if language == "auto" || supports_languages {
             String::new()
         } else {
             language.to_string()
         };
 
-        // Manual-commit models intentionally omit both prompt and turn
-        // detection, matching the current OpenAI-specific behavior.
-        let prompt = match turn_detection {
-            TurnDetectionMode::ServerVad => clamp_prompt(prompt),
-            TurnDetectionMode::ManualCommit => None,
-        };
+        // gpt-realtime-whisper does not accept prompt; the newer manual-commit
+        // transcription models do.
+        let prompt = openai_model_supports_prompt(model)
+            .then(|| clamp_prompt(prompt))
+            .flatten();
         let turn_detection = match turn_detection {
             TurnDetectionMode::ServerVad => Some(TurnDetectionConfig::server_vad_default()),
             TurnDetectionMode::ManualCommit => None,
@@ -161,6 +177,7 @@ impl OpenAiSessionUpdate {
                         transcription: AudioTranscriptionConfig {
                             model: model.to_string(),
                             language: lang,
+                            languages: expected_languages,
                             prompt,
                         },
                         turn_detection,

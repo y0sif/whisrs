@@ -117,6 +117,26 @@ fn asr_sidecar_backend_from(env_key: Option<&str>, config: &Config) -> AsrSideca
     AsrSidecarBackend::new(url, api_key)
 }
 
+/// Build the OpenAI Realtime backend described by `config`.
+///
+/// Returns the concrete type for the same reason [`asr_sidecar_backend`] does:
+/// `[openai] languages` and `[general] language` are joined into the backend
+/// here and nowhere else, and a refactor that dropped either would otherwise
+/// show up only as hints missing from the user's session.update.
+fn openai_realtime_backend(config: &Config) -> OpenAIRealtimeBackend {
+    let api_key = resolve_openai_api_key(config).unwrap_or_default();
+    if api_key.is_empty() {
+        warn!("no OpenAI API key configured");
+    }
+    info!("using OpenAI Realtime transcription backend");
+    let languages = config
+        .openai
+        .as_ref()
+        .map(|o| o.languages.clone())
+        .unwrap_or_default();
+    OpenAIRealtimeBackend::with_languages(api_key, languages, config.general.language.clone())
+}
+
 fn sanitize_ws_endpoint_for_log(url: &str) -> String {
     let Ok(mut parsed) = reqwest::Url::parse(url) else {
         return "<invalid ws endpoint>".to_string();
@@ -154,14 +174,7 @@ pub(crate) fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
             info!("using Groq transcription backend");
             Arc::new(GroqBackend::new(api_key))
         }
-        "openai-realtime" => {
-            let api_key = resolve_openai_api_key(config).unwrap_or_default();
-            if api_key.is_empty() {
-                warn!("no OpenAI API key configured");
-            }
-            info!("using OpenAI Realtime transcription backend");
-            Arc::new(OpenAIRealtimeBackend::new(api_key))
-        }
+        "openai-realtime" => Arc::new(openai_realtime_backend(config)),
         "openai" => {
             let api_key = resolve_openai_api_key(config).unwrap_or_default();
             if api_key.is_empty() {
@@ -286,7 +299,7 @@ pub(crate) fn get_model_for_backend(config: &Config) -> String {
             .map(|g| g.model.clone())
             .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
         // Same pin as the deepgram arm above: `Config::validate`'s
-        // inert-prompt gate resolves the turn-detection mode from this
+        // inert-prompt gate decides whether the model takes a prompt from this
         // accessor, so a copy here could drift from what the wire carries.
         "openai-realtime" => config.openai_realtime_model(),
         "openai" => config
@@ -540,12 +553,12 @@ mod tests {
     /// `Config::openai_realtime_model` reports, on an absent `[openai]`
     /// section and on an explicit one.
     ///
-    /// `Config::validate`'s inert-prompt warning derives the turn-detection
-    /// mode from that accessor, and the mode decides whether the session.update
-    /// carries `[general] prompt` at all. Let the two answers drift apart and
-    /// the daemon warns that the prompt is dropped while sending it, or stays
-    /// silent while dropping it. Same pin as the deepgram arm above, for the
-    /// same reason.
+    /// `Config::validate`'s inert-prompt warning reads that accessor to decide
+    /// whether the model takes a prompt, which decides whether the
+    /// session.update carries `[general] prompt` at all. Let the two answers
+    /// drift apart and the daemon warns that the prompt is dropped while
+    /// sending it, or stays silent while dropping it. Same pin as the deepgram
+    /// arm above, for the same reason.
     ///
     /// What is pinned is agreement, not routing. Re-duplicating the literal
     /// keeps this green, since a copy holding the same string still answers
@@ -582,6 +595,39 @@ mod tests {
             explicit.openai_realtime_model(),
             "the model the daemon sends and the model the inert-prompt gate reads have \
              diverged on an explicit [openai] model"
+        );
+    }
+
+    /// `[openai] languages` and `[general] language` both reach the realtime
+    /// backend. Asserted through `languages_for_request`, which is what the
+    /// engine config is built from, so dropping either join in
+    /// `openai_realtime_backend` turns this red: a lost list fails the first
+    /// assert, and a lost or replaced default language fails one of the two.
+    #[test]
+    fn openai_realtime_backend_carries_languages_and_default_language() {
+        let config: Config = toml::from_str(
+            "[general]\nbackend = \"openai-realtime\"\nlanguage = \"ru\"\n\
+             [openai]\napi_key = \"test-key\"\nmodel = \"gpt-live-transcribe\"\n\
+             languages = [\"ru\", \" en \", \"\"]\n",
+        )
+        .expect("an [openai] section with languages parses");
+        let request = |language: &str| whisrs::transcription::TranscriptionConfig {
+            language: language.to_string(),
+            model: "gpt-live-transcribe".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+        };
+
+        let backend = openai_realtime_backend(&config);
+
+        assert_eq!(
+            backend.languages_for_request(&request("ru")),
+            ["ru", "en"],
+            "a session on [general] language must carry the trimmed [openai] languages"
+        );
+        assert!(
+            backend.languages_for_request(&request("pl")).is_empty(),
+            "a per-session -l must win over [openai] languages"
         );
     }
 }
