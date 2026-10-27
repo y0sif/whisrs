@@ -652,8 +652,8 @@ pub(crate) enum BatchOrigin<'a> {
 }
 
 /// `message` with the advice for `reason` after it ([`quality::skip_hint`]).
-fn with_skip_hint(message: String, reason: GateReason) -> String {
-    match quality::skip_hint(reason) {
+fn with_skip_hint(message: String, reason: GateReason, levels: &Levels) -> String {
+    match quality::skip_hint(reason, levels) {
         Some(hint) => format!("{message}. {hint}"),
         None => message,
     }
@@ -668,6 +668,7 @@ fn nothing_typed_message(reason: GateReason, levels: &Levels) -> String {
             quality::skip_label(reason, levels)
         ),
         reason,
+        levels,
     )
 }
 
@@ -694,6 +695,7 @@ impl BatchOrigin<'_> {
         with_skip_hint(
             self.gate_skip_message(&quality::skip_label(reason, levels)),
             reason,
+            levels,
         )
     }
 
@@ -2063,6 +2065,19 @@ mod tests {
         assert_eq!(
             nothing_typed_message(GateReason::Silent, &levels),
             "Nothing typed: the audio was silent (peak -82 dB). Is the mic muted?"
+        );
+        // With `vad` = rms a quiet room is silent too: no muted-mic hint.
+        let quiet_room = Levels {
+            peak_dbfs: -44.0,
+            ..levels
+        };
+        assert_eq!(
+            BatchOrigin::Dictation.gate_skip_toast(GateReason::Silent, &quiet_room),
+            "Skipped: the audio was silent (peak -44 dB)"
+        );
+        assert_eq!(
+            nothing_typed_message(GateReason::Silent, &quiet_room),
+            "Nothing typed: the audio was silent (peak -44 dB)"
         );
     }
 

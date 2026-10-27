@@ -349,18 +349,25 @@ pub(crate) fn save(dir: &Path, meta: &RecordingMeta) -> anyhow::Result<()> {
     store::write_meta(dir, meta)
 }
 
-/// Give each recorded track with no quality one measured from its file as
-/// recorded ([`measure_track`]): a recovered recording, whose writers never
-/// finished, or one made before tracks were measured. A track that cannot be
-/// read keeps none; transcribing it says why.
+/// Give each recorded track with no measured quality one measured from its
+/// file as recorded ([`measure_track`]): a recovered recording, whose writers
+/// never finished, one made before tracks were measured, or a track whose
+/// writer wrote nothing or failed. A warning raised live on that track
+/// (`system-silent`, [`TrackQuality::unmeasured`]) is kept. A track that
+/// cannot be read keeps what it has; transcribing it says why.
 async fn fill_track_quality(dir: &Path, meta: &mut RecordingMeta, vad: Vad) {
-    for track in meta.tracks.iter_mut().filter(|t| t.quality.is_none()) {
+    let measured =
+        |t: &&mut super::TrackMeta| t.quality.as_ref().is_some_and(TrackQuality::is_measured);
+    for track in meta.tracks.iter_mut().filter(|t| !measured(t)) {
         let path = dir.join(&track.file);
         if !path.exists() {
             continue;
         }
         match blocking(move || measure_track(&path, vad)).await {
-            Ok(report) => track.quality = Some(TrackQuality::from_report(&report)),
+            Ok(report) => {
+                let measured = TrackQuality::from_report(track.kind, &report);
+                track.quality = Some(measured.measured_over(track.quality.take()));
+            }
             Err(e) => warn!(
                 "recording {}: could not measure the {} track: {e:#}",
                 meta.id,
@@ -2048,6 +2055,37 @@ mod tests {
         assert!(
             !tmp.path().join(CACHE_DIR).exists(),
             "the cancelled track goes with the cache"
+        );
+    }
+
+    /// A system track whose writer measured nothing but that the mic's live
+    /// check found silent ([`TrackQuality::unmeasured`]): processing measures
+    /// it from the file and keeps the warning, in `recording.json` and in
+    /// the front matter.
+    #[tokio::test]
+    async fn the_fill_keeps_a_live_system_silent_warning() {
+        let (mic, _) = speaker_call();
+        let (tmp, mut meta) = recording(&[
+            (TrackKind::Mic, 0, Some(mic)),
+            (TrackKind::System, 0, Some(vec![0; RATE])),
+        ]);
+        let mut unmeasured = TrackQuality::unmeasured();
+        unmeasured.add_warning(crate::audio::quality::Check::SystemSilent);
+        meta.tracks[1].quality = Some(unmeasured);
+        store::write_meta(tmp.path(), &meta).unwrap();
+
+        let backend = Arc::new(RecordingBackend::default());
+        let meta = run_recording(tmp.path(), &backend).await.unwrap();
+        let system = meta.tracks[1].quality.as_ref().unwrap();
+        assert!(system.is_measured(), "{system:?}");
+        assert_eq!(system.warnings, ["system-silent"]);
+        assert_eq!(store::read_meta(tmp.path()).unwrap().tracks, meta.tracks);
+        let markdown = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            markdown.contains(
+                "  - \"system: system silent (nothing played while the mic heard speech)\"\n"
+            ),
+            "{markdown}"
         );
     }
 

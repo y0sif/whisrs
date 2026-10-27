@@ -30,7 +30,8 @@ use whisrs::audio::quality::{Check, Verdict};
 use whisrs::recording::naming::USER_NAME_LOST;
 use whisrs::recording::process::process_recording;
 use whisrs::recording::recorder::{
-    is_disk_full, spawn_mic_writer, spawn_system_writer, MicAlarm, TrackStats, SILENCE_WARN_AFTER,
+    is_disk_full, spawn_mic_writer, spawn_system_writer, MicAlarm, SystemSignal, TrackStats,
+    SILENCE_WARN_AFTER,
 };
 use whisrs::recording::speakers::separation_failure;
 use whisrs::recording::summary::{self, SUMMARY_FAILED, SUMMARY_TIMEOUT};
@@ -755,8 +756,8 @@ fn resolve_system(system: SystemSource) -> Option<Result<SystemDevice>> {
 /// silence for [`SILENCE_WARN_AFTER`] (likely muted or the wrong device),
 /// and again only after real audio came back in between. And each live
 /// quality warning, at most once per recording ([`live_warning_toast`]);
-/// `system_heard` is the flag the system track's writer sets.
-fn mic_alarm(id: &str, notify: bool, system_heard: Arc<AtomicBool>) -> MicAlarm {
+/// `system` is what the system track's writer tells the mic's.
+fn mic_alarm(id: &str, notify: bool, system: Arc<SystemSignal>) -> MicAlarm {
     let silence_id = id.to_string();
     let warning_id = id.to_string();
     let minutes = SILENCE_WARN_AFTER.as_secs() / 60;
@@ -782,7 +783,7 @@ fn mic_alarm(id: &str, notify: bool, system_heard: Arc<AtomicBool>) -> MicAlarm 
                 send_notification("whisrs", &live_warning_toast(&verdict));
             }
         }),
-        system_heard,
+        system,
     }
 }
 
@@ -801,8 +802,9 @@ fn live_warning_toast(verdict: &Verdict) -> String {
 /// writer started as soon as its capture is up so the first-chunk times are
 /// not skewed by the other device's start. Both writers measure their
 /// track with `vad`; the mic's raises `alarm` when the mic is muted and for
-/// each live quality warning. Without a system track, `alarm.system_heard`
-/// is set here, so no system-silent warning comes. Blocking: runs on the
+/// each live quality warning. Without a system track, `alarm.system` is told
+/// so here ([`SystemSignal::no_system_track`]), so no system-silent warning
+/// comes. Blocking: runs on the
 /// blocking pool, where the runtime handle is available for the writers.
 // Reached only through `DEVICES`, which test builds replace with stand-ins.
 #[cfg_attr(test, allow(dead_code))]
@@ -821,7 +823,7 @@ fn open_tracks(
     let rx = handle
         .take_receiver()
         .context("mic capture has no receiver")?;
-    let system_heard = Arc::clone(&alarm.system_heard);
+    let system_signal = Arc::clone(&alarm.system);
     let writer = spawn_mic_writer(
         rx,
         store::audio_path(dir, TrackKind::Mic),
@@ -833,7 +835,7 @@ fn open_tracks(
     metas.push(track_meta(TrackKind::Mic, mic.to_string()));
 
     let Some(system) = system else {
-        system_heard.store(true, Ordering::Relaxed);
+        system_signal.no_system_track();
         return Ok((captures, metas, None));
     };
     // The strict start's errors already name the device.
@@ -860,14 +862,14 @@ fn open_tracks(
                 store::audio_path(dir, TrackKind::System),
                 FLUSH_EVERY,
                 vad,
-                system_heard,
+                system_signal,
             );
             captures.push(TrackCapture::new(TrackKind::System, Some(handle), writer));
             metas.push(track_meta(TrackKind::System, name));
             Ok((captures, metas, None))
         }
         Err(e) => {
-            system_heard.store(true, Ordering::Relaxed);
+            system_signal.no_system_track();
             Ok((captures, metas, Some(format!("{e:#}"))))
         }
     }
@@ -957,7 +959,7 @@ async fn start(
 
     let started = Instant::now();
     let open_dir = dir.clone();
-    let alarm = mic_alarm(&id, context.notify, Arc::new(AtomicBool::new(false)));
+    let alarm = mic_alarm(&id, context.notify, Arc::new(SystemSignal::new()));
     let vad = context.config.audio.vad();
     let opened = tokio::task::spawn_blocking(move || {
         (devices.open_tracks)(&open_dir, &mic, system, vad, alarm)
@@ -1319,7 +1321,9 @@ async fn finish_tracks(
 /// Fold the writers' results into the meta: sample counts, offsets, each
 /// track's quality, and a note for any track that did not finalize cleanly.
 /// A `system-silent` warning the mic's writer raised goes on the system
-/// track, which it is about.
+/// track, which it is about, even when that track measured nothing (its
+/// writer wrote nothing, or failed): then on an unmeasured quality, which
+/// the worker's measurement from the file keeps it on.
 fn apply_outcomes(meta: &mut RecordingMeta, started: Instant, outcomes: &[TrackOutcome]) {
     let system_silent = outcomes.iter().any(|o| {
         o.kind == TrackKind::Mic
@@ -1344,18 +1348,24 @@ fn apply_outcomes(meta: &mut RecordingMeta, started: Instant, outcomes: &[TrackO
             Ok(stats) => {
                 track.samples = stats.samples;
                 track.offset_ms = offset_ms(started, stats.first_chunk_at);
-                track.quality = stats.quality.as_ref().map(TrackQuality::from_report);
-                if let Some(quality) = track.quality.as_mut() {
-                    if system_silent && track.kind == TrackKind::System {
-                        quality.add_warning(Check::SystemSilent);
-                    }
-                }
+                track.quality = stats
+                    .quality
+                    .as_ref()
+                    .map(|report| TrackQuality::from_report(track.kind, report));
             }
             Err(e) => {
                 let note = format!("{} track did not finalize: {e}", outcome.kind.file_stem());
                 warn!("recording {}: {note}", meta.id);
                 meta.errors.push(note);
             }
+        }
+    }
+    if system_silent {
+        if let Some(track) = meta.tracks.iter_mut().find(|t| t.kind == TrackKind::System) {
+            track
+                .quality
+                .get_or_insert_with(TrackQuality::unmeasured)
+                .add_warning(Check::SystemSilent);
         }
     }
 }
@@ -2854,6 +2864,55 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let back: RecordingMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tracks, meta.tracks);
+
+        // A system writer that wrote nothing, or failed, measured nothing:
+        // the live warning is stored all the same, on an unmeasured quality.
+        let silent_mic = || {
+            outcome(
+                TrackKind::Mic,
+                TrackStats {
+                    samples: 16_000,
+                    quality: report(&tone),
+                    raised: vec![Check::SystemSilent],
+                    ..TrackStats::default()
+                },
+            )
+        };
+        let failed = TrackOutcome {
+            kind: TrackKind::System,
+            stats: Err("failed to finalize system.wav".to_string()),
+            stuck: false,
+            ended_early: false,
+        };
+        for system_outcome in [outcome(TrackKind::System, TrackStats::default()), failed] {
+            let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+            meta.tracks = vec![
+                track_meta(TrackKind::Mic, "mic".into()),
+                track_meta(TrackKind::System, "sys".into()),
+            ];
+            apply_outcomes(&mut meta, start, &[silent_mic(), system_outcome]);
+            let system = meta.tracks[1].quality.as_ref().expect("stored");
+            assert!(!system.is_measured());
+            assert_eq!(system.speech_dbfs, None);
+            assert_eq!(system.warnings, ["system-silent"]);
+        }
+        // Without the live warning nothing is stored for it.
+        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+        meta.tracks = vec![
+            track_meta(TrackKind::Mic, "mic".into()),
+            track_meta(TrackKind::System, "sys".into()),
+        ];
+        let quiet_mic = outcome(
+            TrackKind::Mic,
+            TrackStats {
+                samples: 16_000,
+                quality: report(&tone),
+                ..TrackStats::default()
+            },
+        );
+        let empty_system = outcome(TrackKind::System, TrackStats::default());
+        apply_outcomes(&mut meta, start, &[quiet_mic, empty_system]);
+        assert_eq!(meta.tracks[1].quality, None);
     }
 
     #[test]

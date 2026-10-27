@@ -13,6 +13,8 @@
 #   babble +20 dB SNR        auto-stop +1.9 to +3.0 s in each of 6 draws
 #                            (babble at +10 dB and louder is printed, not gated)
 #   lone "yes"               gate passes; auto-stop arms and fires
+#   "Oh!" +20 and +26 dB,    auto-stop never before the sentences end;
+#   then two sentences       recall of the sentences >= 0.80
 #   pink only, -40 dBFS      gate "without speech"; auto-stop never arms
 #   quiet, speech -70 dBFS   gate "too quiet"
 #   CPU                      earshot faster than 100x real time
@@ -32,7 +34,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIXTURES="$REPO_ROOT/fixtures/vad"
 
-for name in clean autostop yes pink brown babble; do
+for name in clean autostop yes burst pink brown babble; do
     if [ ! -f "$FIXTURES/$name.wav" ]; then
         "$REPO_ROOT/scripts/gen-vad-fixture.sh"
         break

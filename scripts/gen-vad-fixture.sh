@@ -9,6 +9,7 @@
 #   fixtures/vad/clean.wav     2 s dead air, the issue #55 dictation (long pauses), 2 s dead air
 #   fixtures/vad/autostop.wav  2 s dead air, one dictation with short pauses, 6 s dead air
 #   fixtures/vad/yes.wav       2 s dead air, a lone "yes", 4 s dead air
+#   fixtures/vad/burst.wav     2 s dead air, an "Oh!" (0.4 s), two sentences, 6 s dead air
 #   fixtures/vad/pink.wav      90 s of pink noise (fan-like)
 #   fixtures/vad/brown.wav     90 s of brown noise
 #   fixtures/vad/babble.wav    90 s of four other voices talking at once
@@ -34,7 +35,7 @@ for arg in "$@"; do
     case "$arg" in
         --force) FORCE=1 ;;
         -h|--help)
-            sed -n '2,20p' "$0" | sed 's/^# \?//'
+            sed -n '2,21p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -53,7 +54,7 @@ done
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$REPO_ROOT/fixtures/vad"
-NAMES=(clean autostop yes pink brown babble)
+NAMES=(clean autostop yes burst pink brown babble)
 
 all_present=1
 for name in "${NAMES[@]}"; do
@@ -130,6 +131,14 @@ build "$OUT/autostop.wav" 2 6 0.5 0.6 0.4 -- \
 
 # The shortest answer an agent turn gets: it must still arm auto-stop.
 build "$OUT/yes.wav" 2 4 -- "yes"
+
+# An interjection at the mic before the dictation: the check plays the "Oh!"
+# 20 and 26 dB louder than the sentences, which must not stay under the
+# relative floor it raised.
+build "$OUT/burst.wav" 2 6 0.1 0.5 -- \
+    "Oh!" \
+    "Please send the quarterly report to the whole team by Friday." \
+    "Make sure the numbers in the second table match the invoice."
 
 # Fan-like noise beds.
 for color in pink brown; do

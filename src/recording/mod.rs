@@ -321,11 +321,18 @@ pub struct TrackMeta {
 /// A track's audio quality ([`crate::audio::quality`]), measured on the
 /// audio as recorded, before echo removal: clipping and loudness are about
 /// the mic as it was. Levels in dB are rounded to 0.1, shares to 0.0001.
+///
+/// Both tracks keep their levels, but the warnings about how the audio
+/// sounds (too quiet, noisy, clipping, DC offset, strong echo) are the
+/// mic's only: a music bed is no noisy room, quiet playback no quiet mic.
+/// The system track's one warning is `system-silent`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrackQuality {
     /// The speech detector that measured it (`[audio] vad`): "earshot" or
-    /// "rms".
+    /// "rms". Empty (and not written) on an [`unmeasured`](Self::unmeasured)
+    /// quality.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub vad: String,
     /// Power mean of the speech, in dBFS: the speaker's loudness.
     pub speech_dbfs: Option<f32>,
@@ -349,8 +356,9 @@ pub struct TrackQuality {
 }
 
 impl TrackQuality {
-    /// Store `report`, its warnings with it.
-    pub fn from_report(report: &QualityReport) -> Self {
+    /// Store `report` for a track of `kind`, with the warnings that kind
+    /// takes: the mic's that warn, none on the system track.
+    pub fn from_report(kind: TrackKind, report: &QualityReport) -> Self {
         let levels = &report.levels;
         let db = |v: f32| (v * 10.0).round() / 10.0;
         let share = |v: f32| (v * 10_000.0).round() / 10_000.0;
@@ -363,12 +371,40 @@ impl TrackQuality {
             dc_offset: share(levels.dc_offset),
             speech_share: share(levels.speech_share),
             echo_path_db: report.echo_path_db.map(db),
-            warnings: report
-                .warnings()
-                .iter()
-                .map(|v| v.code().to_string())
-                .collect(),
+            warnings: match kind {
+                TrackKind::Mic => report
+                    .warnings()
+                    .iter()
+                    .map(|v| v.code().to_string())
+                    .collect(),
+                TrackKind::System => Vec::new(),
+            },
         }
+    }
+
+    /// The quality of a track nothing was measured on yet (its writer wrote
+    /// nothing, or failed), to hold a warning raised live: no detector, no
+    /// levels. The worker measures it from the file and keeps the warning
+    /// ([`measured_over`](Self::measured_over)).
+    pub fn unmeasured() -> Self {
+        Self::default()
+    }
+
+    /// Whether levels were measured: not an [`unmeasured`](Self::unmeasured)
+    /// one.
+    pub fn is_measured(&self) -> bool {
+        !self.vad.is_empty()
+    }
+
+    /// This measurement in place of `earlier` (an unmeasured quality, or
+    /// none), keeping the warnings `earlier` held.
+    pub fn measured_over(mut self, earlier: Option<TrackQuality>) -> Self {
+        for code in earlier.into_iter().flat_map(|q| q.warnings) {
+            if !self.warnings.contains(&code) {
+                self.warnings.push(code);
+            }
+        }
+        self
     }
 
     /// Add a warning decided elsewhere (`system-silent`, raised live), once.
@@ -1033,7 +1069,7 @@ mod tests {
             duration_ms: 60_000,
         };
         let report = QualityReport::new(audio_silence_gate::Vad::Earshot, levels);
-        let mut quality = TrackQuality::from_report(&report);
+        let mut quality = TrackQuality::from_report(TrackKind::Mic, &report);
         assert_eq!(quality.vad, "earshot");
         assert_eq!(quality.speech_dbfs, Some(-41.3));
         assert_eq!(quality.snr_db, Some(7.1));
@@ -1052,6 +1088,64 @@ mod tests {
         let shown: Vec<&str> = quality.verdicts().iter().map(|v| v.code()).collect();
         assert_eq!(shown, ["noisy", "system-silent"]);
         assert!(quality.verdicts().iter().all(|v| v.warn));
+    }
+
+    /// The system track keeps its levels but none of the mic's warnings: a
+    /// music bed is no noisy room, quiet or clipped playback no mic problem.
+    #[test]
+    fn the_system_track_warns_only_when_silent() {
+        let levels = audio_silence_gate::Levels {
+            speech_dbfs: Some(-58.0),
+            noise_dbfs: Some(-62.0),
+            snr_db: Some(4.0),
+            clipped_share: 0.01,
+            dc_offset: 0.05,
+            speech_share: 0.5,
+            peak_dbfs: 0.0,
+            duration_ms: 60_000,
+        };
+        let report = QualityReport::new(audio_silence_gate::Vad::Earshot, levels);
+        let mic = TrackQuality::from_report(TrackKind::Mic, &report);
+        assert_eq!(
+            mic.warnings,
+            ["too-quiet", "noisy", "clipping", "dc-offset"]
+        );
+        let mut system = TrackQuality::from_report(TrackKind::System, &report);
+        assert_eq!(system.speech_dbfs, Some(-58.0));
+        assert_eq!(system.snr_db, Some(4.0));
+        assert_eq!(system.clipped, 0.01);
+        assert!(system.warnings.is_empty());
+        system.add_warning(Check::SystemSilent);
+        assert_eq!(system.warnings, ["system-silent"]);
+    }
+
+    /// A warning raised live on a track nothing was measured on is stored
+    /// with null levels and no detector; measuring the file later keeps it.
+    #[test]
+    fn an_unmeasured_quality_keeps_its_warning() {
+        let mut unmeasured = TrackQuality::unmeasured();
+        unmeasured.add_warning(Check::SystemSilent);
+        assert!(!unmeasured.is_measured());
+        let json = serde_json::to_string(&unmeasured).unwrap();
+        assert_eq!(
+            json,
+            r#"{"speech_dbfs":null,"noise_dbfs":null,"snr_db":null,"clipped":0.0,"dc_offset":0.0,"speech_share":0.0,"warnings":["system-silent"]}"#
+        );
+        let loaded: TrackQuality = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, unmeasured);
+
+        let report = crate::audio::quality::analyze(&[0; 16_000], audio_silence_gate::Vad::Rms);
+        let measured =
+            TrackQuality::from_report(TrackKind::System, &report).measured_over(Some(loaded));
+        assert!(measured.is_measured());
+        assert_eq!(measured.vad, "rms");
+        assert_eq!(measured.warnings, ["system-silent"]);
+        assert_eq!(
+            TrackQuality::from_report(TrackKind::System, &report)
+                .measured_over(None)
+                .warnings,
+            Vec::<String>::new()
+        );
     }
 
     /// The number of voices goes to the system track, and to the mic only

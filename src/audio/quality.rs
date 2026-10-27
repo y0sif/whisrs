@@ -7,7 +7,11 @@
 //! them as well as recordings, so this module is in every build. [`analyze`]
 //! is the seam a mic check calls.
 
-use audio_silence_gate::{GateReason, Levels, SpeechDetector, Vad, VadConfig};
+use std::time::Duration;
+
+use audio_silence_gate::{
+    GateReason, LevelMeter, Levels, SpeechDetector, Vad, VadConfig, VAD_FRAME,
+};
 
 use super::capture::SAMPLE_RATE;
 
@@ -34,6 +38,12 @@ pub const STRONG_ECHO_DB: f32 = -15.0;
 /// Peak level (dBFS) at or under which a stream is digital silence: between
 /// the peaks of 4 (-78.3 dBFS, the gate's digital silence) and 5 (-76.3).
 const DIGITAL_SILENCE_DBFS: f32 = -77.3;
+
+/// Own speech a stream needs for a speech level (and so an SNR) once part of
+/// it was set aside ([`QualityMeter::feed_marked`]): 30 s, what a
+/// recording's live checks wait for too. Less is too little to judge a mic
+/// or a room by.
+pub const OWN_SPEECH_FOR_LEVEL: Duration = Duration::from_secs(30);
 
 /// What a stream measured: its levels by the detector that decided what was
 /// speech, and the speaker echo path when echo removal ran on it.
@@ -91,29 +101,94 @@ pub fn analyze(samples: &[i16], vad: Vad) -> QualityReport {
 }
 
 /// [`analyze`] over a stream: feed it chunks of any size.
+///
+/// Every frame is 16 ms (256 samples): the meter runs at 16 kHz, where
+/// earshot and the RMS test frame alike.
 pub struct QualityMeter {
     vad: Vad,
     detector: SpeechDetector,
     /// Samples in speech frames so far.
     speech_samples: u64,
+    own: OwnLevels,
+}
+
+/// The speech level and background of the frames fed as the user's own
+/// ([`QualityMeter::feed_marked`]).
+struct OwnLevels {
+    meter: LevelMeter,
+    /// Samples in its speech frames.
+    speech_samples: u64,
+    /// Whether any frame was set aside. Until one is, the own figures are
+    /// the stream's.
+    set_aside: bool,
+    /// The stream from the start of the detector's frame in progress on:
+    /// each frame it completes is cut from here.
+    tail: Vec<i16>,
+    /// Stream position of `tail[0]`.
+    tail_start: u64,
 }
 
 impl QualityMeter {
+    /// A meter with `vad`'s open profile (any voice counts).
     pub fn new(vad: Vad) -> Self {
+        Self::with_config(VadConfig::open(vad))
+    }
+
+    /// A meter whose detector runs `cfg`.
+    pub fn with_config(cfg: VadConfig) -> Self {
         Self {
-            vad,
-            detector: SpeechDetector::new(VadConfig::open(vad), SAMPLE_RATE),
+            vad: cfg.vad,
+            detector: SpeechDetector::new(cfg, SAMPLE_RATE),
             speech_samples: 0,
+            own: OwnLevels {
+                meter: LevelMeter::new(SAMPLE_RATE),
+                speech_samples: 0,
+                set_aside: false,
+                tail: Vec::with_capacity(2 * VAD_FRAME),
+                tail_start: 0,
+            },
         }
     }
 
     pub fn feed(&mut self, samples: &[i16]) {
-        let speech = &mut self.speech_samples;
-        self.detector.feed(samples, |frame| {
+        self.feed_marked(samples, true);
+    }
+
+    /// [`feed`](Self::feed), saying whether `samples` are the user's own
+    /// audio. With `own` false (speakers playing into the mic while a
+    /// recording's system track plays) they are left out of the speech
+    /// level, the background and the SNR; clipping, the DC offset and the
+    /// other figures still count them. Once any were left out, a speech level
+    /// needs [`OWN_SPEECH_FOR_LEVEL`] of own speech: no figure beats a wrong
+    /// one. A frame is marked by the feed that completes it.
+    pub fn feed_marked(&mut self, samples: &[i16], own: bool) {
+        let Self {
+            detector,
+            speech_samples,
+            own: mine,
+            ..
+        } = self;
+        mine.tail.extend_from_slice(samples);
+        detector.feed(samples, |frame| {
             if frame.speech {
-                *speech += audio_silence_gate::VAD_FRAME as u64;
+                *speech_samples += VAD_FRAME as u64;
+            }
+            if !own {
+                mine.set_aside = true;
+                return;
+            }
+            let at = (frame.start_sample - mine.tail_start) as usize;
+            mine.meter
+                .add_frame(&mine.tail[at..at + VAD_FRAME], frame.speech);
+            if frame.speech {
+                mine.speech_samples += VAD_FRAME as u64;
             }
         });
+        // Keep only the frame in progress.
+        let fed = mine.tail_start + mine.tail.len() as u64;
+        let done = fed - fed % VAD_FRAME as u64;
+        mine.tail.drain(..(done - mine.tail_start) as usize);
+        mine.tail_start = done;
     }
 
     /// Speech heard so far, in samples.
@@ -121,8 +196,26 @@ impl QualityMeter {
         self.speech_samples
     }
 
+    /// Speech heard so far in the audio fed as the user's own, in samples:
+    /// all of it until some was set aside ([`feed_marked`](Self::feed_marked)).
+    pub fn own_speech_samples(&self) -> u64 {
+        self.own.speech_samples
+    }
+
     pub fn report(&self) -> QualityReport {
-        QualityReport::new(self.vad, self.detector.levels())
+        let mut levels = self.detector.levels();
+        if self.own.set_aside {
+            let own = self.own.meter.levels();
+            let enough = self.own.speech_samples as f64
+                >= OWN_SPEECH_FOR_LEVEL.as_secs_f64() * f64::from(SAMPLE_RATE);
+            levels.speech_dbfs = own.speech_dbfs.filter(|_| enough);
+            levels.noise_dbfs = own.noise_dbfs;
+            levels.snr_db = levels
+                .speech_dbfs
+                .zip(levels.noise_dbfs)
+                .map(|(speech, noise)| speech - noise);
+        }
+        QualityReport::new(self.vad, levels)
     }
 }
 
@@ -272,10 +365,13 @@ pub fn skip_label(reason: GateReason, levels: &Levels) -> String {
     }
 }
 
-/// The advice a skip toast ends with: silent audio is most often a muted
-/// mic.
-pub fn skip_hint(reason: GateReason) -> Option<&'static str> {
-    (reason == GateReason::Silent).then_some("Is the mic muted?")
+/// The advice a skip toast ends with: digital silence is most often a muted
+/// mic. Only when the peak is digital silence: with `vad` = rms, "silent"
+/// means only that the whole buffer was under the loudness test, which a
+/// quiet room is too.
+pub fn skip_hint(reason: GateReason, levels: &Levels) -> Option<&'static str> {
+    (reason == GateReason::Silent && levels.peak_dbfs <= DIGITAL_SILENCE_DBFS)
+        .then_some("Is the mic muted?")
 }
 
 /// Why a stream that produced no text had nothing to transcribe, as the gate
@@ -491,6 +587,68 @@ mod tests {
         assert_eq!(analyze(&samples, Vad::Rms), report, "pure");
     }
 
+    /// `frames` 16 ms frames alternating speech to the RMS test (-45 dBFS)
+    /// and a background 7 dB under it.
+    fn alternating(frames: usize, speech: i16, background: i16) -> Vec<i16> {
+        (0..frames)
+            .flat_map(|f| square(if f % 2 == 0 { speech } else { background }, 256))
+            .collect()
+    }
+
+    /// Audio fed as not the user's own counts for the rails and the share of
+    /// speech, never for the speech level, the background or the SNR; in
+    /// any chunk size.
+    #[test]
+    fn audio_set_aside_counts_only_for_the_rails() {
+        // 64 s of own audio, 32 s of it speech.
+        let own = alternating(4000, 184, 82);
+        let mut echo = alternating(2000, 3000, 1500);
+        echo[100..110].fill(i16::MAX);
+        let alone = analyze(&own, Vad::Rms);
+
+        let mut meter = QualityMeter::new(Vad::Rms);
+        for chunk in own.chunks(777) {
+            meter.feed_marked(chunk, true);
+        }
+        // The last own chunk ends on a frame: no frame straddles the two.
+        assert_eq!(own.len() % 256, 0);
+        for chunk in echo.chunks(800) {
+            meter.feed_marked(chunk, false);
+        }
+        let report = meter.report();
+        assert_eq!(report.levels.speech_dbfs, alone.levels.speech_dbfs);
+        assert_eq!(report.levels.noise_dbfs, alone.levels.noise_dbfs);
+        assert_eq!(report.levels.snr_db, alone.levels.snr_db);
+        assert!(
+            report.levels.clipped_share > 0.0,
+            "the echo's clipping counts"
+        );
+        assert!(report.levels.peak_dbfs > alone.levels.peak_dbfs);
+        assert_eq!(meter.own_speech_samples(), 2000 * 256);
+        assert_eq!(meter.speech_samples(), 4000 * 256, "the echo is speech too");
+
+        // Nothing set aside: the whole stream's figures, as `analyze`.
+        let mut meter = QualityMeter::new(Vad::Rms);
+        meter.feed_marked(&own, true);
+        assert_eq!(meter.report(), alone);
+    }
+
+    /// Once some audio was set aside, a speech level needs 30 s of own
+    /// speech; the background does not.
+    #[test]
+    fn a_level_set_aside_needs_30_seconds_of_own_speech() {
+        let mut meter = QualityMeter::new(Vad::Rms);
+        // 20 s of own speech.
+        meter.feed_marked(&alternating(2500, 184, 82), true);
+        meter.feed_marked(&alternating(100, 3000, 1500), false);
+        let report = meter.report();
+        assert_eq!(report.levels.speech_dbfs, None);
+        assert_eq!(report.levels.snr_db, None);
+        assert!(report.levels.noise_dbfs.is_some());
+        assert_eq!(verdict(&report, Check::TooQuiet), None);
+        assert_eq!(verdict(&report, Check::Noisy), None);
+    }
+
     #[test]
     fn analyze_finds_a_dc_offset() {
         let samples: Vec<i16> = square(1000, 16_000).iter().map(|s| s + 655).collect();
@@ -535,8 +693,29 @@ mod tests {
         l.duration_ms = 210;
         assert_eq!(skip_label(GateReason::TooShort, &l), "too short (0.2 s)");
         assert_eq!(skip_label(GateReason::Empty, &l), "empty");
-        assert_eq!(skip_hint(GateReason::Silent), Some("Is the mic muted?"));
-        assert_eq!(skip_hint(GateReason::NoSpeech), None);
+        assert_eq!(skip_hint(GateReason::NoSpeech, &l), None);
+    }
+
+    /// The muted-mic hint needs a peak of digital silence: with `vad` = rms
+    /// a quiet room is "silent" too, and that is no muted mic.
+    #[test]
+    fn the_muted_hint_needs_digital_silence() {
+        let mut l = levels();
+        l.peak_dbfs = analyze(&[4, -4], Vad::Rms).levels.peak_dbfs;
+        assert_eq!(
+            skip_hint(GateReason::Silent, &l),
+            Some("Is the mic muted?"),
+            "a peak of 4"
+        );
+        // A quiet room under the RMS test: silent, but not muted.
+        l.peak_dbfs = analyze(&[200, -200], Vad::Rms).levels.peak_dbfs;
+        assert_eq!(
+            stream_skip_reason(Vad::Rms, &l, false),
+            Some(GateReason::Silent)
+        );
+        assert_eq!(skip_hint(GateReason::Silent, &l), None);
+        l.peak_dbfs = analyze(&[5, -5], Vad::Rms).levels.peak_dbfs;
+        assert_eq!(skip_hint(GateReason::Silent, &l), None, "a peak of 5");
     }
 
     #[test]

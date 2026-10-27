@@ -68,21 +68,28 @@ pub struct VadConfig {
     /// A frame quieter than this (dBFS) is never speech, whatever its score.
     pub min_speech_dbfs: f32,
     /// A frame more than this many dB under the running speech level is never
-    /// speech, once 300 ms of speech has set that level. `None` turns the
-    /// relative floor off.
+    /// speech, once 300 ms of speech has set that level. The floor never
+    /// rises above [`rms_threshold`](Self::rms_threshold): a frame the RMS
+    /// test calls speech is never under it, so a short loud burst (a laugh at
+    /// the mic) cannot push the user's normal speech under it. `None` turns
+    /// the relative floor off.
     pub relative_floor_db: Option<f32>,
-    /// [`Vad::Rms`]: normalized RMS at or above which a block is speech.
+    /// [`Vad::Rms`]: normalized RMS at or above which a block is speech. With
+    /// [`Vad::Earshot`], the highest the relative floor goes.
     pub rms_threshold: f64,
 }
 
 impl VadConfig {
     /// One user near the mic (dictation, command mode, agent turns): frames
-    /// under -65 dBFS, or more than 18 dB under the user, are not speech, so
-    /// a TV or a colleague behind them does not hold a recording open.
+    /// under -65 dBFS, or more than 18 dB under the user (and under the RMS
+    /// test's -50.5 dBFS), are not speech, so a TV or a colleague behind them
+    /// does not hold a recording open.
     ///
     /// The values are tuned with `scripts/check-vad.sh` (18 dB: 20 let
     /// babble 20 dB under the user hold auto-stop open in a quarter of the
-    /// noise draws, 15 cost the user's own soft frames).
+    /// noise draws, 15 cost the user's own soft frames; the cap at the RMS
+    /// threshold: a 0.4 s "Oh!" 26 dB over the dictation after it otherwise
+    /// left the dictation all under the floor, and auto-stop cut it off).
     pub fn close(vad: Vad) -> Self {
         Self {
             vad,
@@ -209,10 +216,15 @@ impl SpeechLevel {
         self.frames += 1;
     }
 
-    /// The level under which a frame is rejected, once enough speech set it.
-    fn floor(&self, relative_db: Option<f32>) -> Option<f32> {
-        let db = relative_db?;
-        (self.frames * FRAME_MS >= RELATIVE_FLOOR_AFTER_MS).then_some(self.dbfs - db)
+    /// The level under which a frame is rejected, once enough speech set it:
+    /// `relative_floor_db` under the level, but never above the RMS test's
+    /// threshold. The level follows only accepted frames, so without that
+    /// cap a loud burst could set it so high that no later frame passes to
+    /// bring it down again.
+    fn floor(&self, cfg: &VadConfig) -> Option<f32> {
+        let db = cfg.relative_floor_db?;
+        (self.frames * FRAME_MS >= RELATIVE_FLOOR_AFTER_MS)
+            .then(|| (self.dbfs - db).min(dbfs(cfg.rms_threshold)))
     }
 }
 
@@ -234,8 +246,8 @@ pub(crate) struct Step {
 ///    intact;
 /// 2. the first 10 frames (160 ms) after `new` or `reset` are never speech;
 /// 3. a frame under [`VadConfig::min_speech_dbfs`], or more than
-///    [`VadConfig::relative_floor_db`] under the running speech level, is
-///    never speech;
+///    [`VadConfig::relative_floor_db`] under the running speech level (and
+///    under [`VadConfig::rms_threshold`]), is never speech;
 /// 4. speech starts after 2 consecutive frames at or above
 ///    [`VadConfig::threshold`];
 /// 5. once in speech, frames at or above [`VadConfig::release`] keep it;
@@ -347,7 +359,7 @@ impl SpeechDetector {
                     let loud = frame_dbfs >= self.cfg.min_speech_dbfs;
                     let above_level = self
                         .level
-                        .floor(self.cfg.relative_floor_db)
+                        .floor(&self.cfg)
                         .is_none_or(|floor| frame_dbfs >= floor);
                     let verdict = self.hysteresis.step(loud && above_level, score, &self.cfg);
                     if self.unfloored.step(true, score, &self.cfg) == Verdict::Voiced {
@@ -809,6 +821,30 @@ mod tests {
         let mut detector = scripted(open(), vec![1.0; WARM + 70]);
         let decisions = run(&mut detector, &samples);
         assert!(flags(&decisions[WARM + 1..]).iter().all(|&s| s));
+    }
+
+    /// The relative floor never rises above the RMS test's threshold
+    /// (-50.5 dBFS): after a 400 ms burst at -15 dBFS (a laugh at the mic),
+    /// the user's speech at -40, 25 dB under it, is speech; a voice at -55
+    /// after it is still rejected.
+    #[test]
+    fn relative_floor_stays_under_the_rms_threshold() {
+        let burst = 25;
+        let mut samples = at_level(-15.0, WARM + burst);
+        samples.extend(at_level(-40.0, 60));
+        let mut detector = scripted(close(), vec![1.0; WARM + burst + 60]);
+        let decisions = run(&mut detector, &samples);
+        assert!(
+            flags(&decisions[WARM + 1..]).iter().all(|&s| s),
+            "the speech after the burst is speech"
+        );
+
+        let mut samples = at_level(-15.0, WARM + burst);
+        samples.extend(at_level(-55.0, 40));
+        let mut detector = scripted(close(), vec![1.0; WARM + burst + 40]);
+        let decisions = run(&mut detector, &samples);
+        let after = WARM + burst + HANGOVER_FRAMES as usize;
+        assert!(flags(&decisions[after..]).iter().all(|&s| !s));
     }
 
     #[test]

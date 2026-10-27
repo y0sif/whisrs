@@ -2156,7 +2156,8 @@ impl Config {
         if self.general.silence_timeout_ms == 0 {
             warnings.push(ConfigWarning {
                 message: "[general] silence_timeout_ms is 0, so auto-stop is off: dictation, \
-                          command mode and agent turns stop only on a second press"
+                          command mode, [[llm_commands]] and agent turns stop only on a second \
+                          press"
                     .to_string(),
             });
         }
@@ -4988,8 +4989,8 @@ mod tests {
         assert_eq!(
             zero,
             [
-                "[general] silence_timeout_ms is 0, so auto-stop is off: dictation, command mode \
-              and agent turns stop only on a second press"
+                "[general] silence_timeout_ms is 0, so auto-stop is off: dictation, command mode, \
+                 [[llm_commands]] and agent turns stop only on a second press"
             ]
         );
     }

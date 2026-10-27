@@ -9,14 +9,16 @@ meter built on it. The plain RMS test of 0.1 stays beside it.
 ## The detector
 
 `SpeechDetector` scores every 16 ms frame of 16 kHz `i16` audio with earshot,
-then decides per frame, in order:
+then decides per frame, in order (levels are in dBFS, decibels relative to
+full scale: 0 is the loudest a sample can be, and a normal voice near a mic
+sits around -40):
 
 1. the first 160 ms after `new` or `reset` are never speech (an abrupt noise
    onset scores high while the model settles);
 2. a frame under an absolute level floor, or too far under the running speech
    level, is not speech whatever its score;
 3. speech starts after 2 frames in a row at or above the threshold (0.55), so
-   a click or a key never starts it;
+   a one-frame click never starts it;
 4. once in speech, frames at or above the release score keep it;
 5. speech ends only after 96 ms under the release score, which bridges the dips
    inside words.
@@ -34,7 +36,7 @@ detector.feed(&chunk, |frame| {
 });
 ```
 
-At any sample rate other than 16 kHz, and with `Vad::Rms`, a frame is speech
+At any sample rate other than 16 kHz, or with `Vad::Rms`, a frame is speech
 when its RMS reaches `VadConfig::rms_threshold` instead: a documented fallback,
 never a panic.
 
@@ -45,12 +47,15 @@ The right level floor depends on who may speak:
 - `VadConfig::close`: one user near the mic (dictation, voice commands). Frames
   under -65 dBFS, or more than 18 dB under the user's running level, are not
   speech, so a TV or a colleague behind the user does not hold a recording open.
+  That relative floor never rises above the RMS test's threshold (-50.5 dBFS),
+  so a laugh at the mic cannot push the user's normal speech under it.
 - `VadConfig::open`: any voice counts (a meeting track, system audio). Only
   frames under -80 dBFS are rejected, since dropping a quiet voice there loses
   transcript.
 
 The fields are public for tuning. The shipped values are tuned with the
-benchmark in whisrs' `scripts/check-vad.sh`.
+benchmark in whisrs'
+[`scripts/check-vad.sh`](https://github.com/y0sif/whisrs/blob/main/scripts/check-vad.sh).
 
 ## Real-time auto-stop
 
@@ -101,21 +106,22 @@ muted mic never pays for it. `audio_gate_reason` keeps the 0.1 RMS gate.
 ## Speech mask and levels
 
 `SpeechMask` streams per-frame speech flags over a long track (one flag per
-`frame_len` samples) without loading it. `LevelMeter` runs inside every
-detector; `levels()` gives the speech level, the background level (median of
-the non-speech frames), the SNR, the share of clipped samples (runs of 3 or
-more at the rail; single full-scale peaks do not count), the DC offset, the
-share of speech, the peak and the duration. What counts as too quiet or too
-noisy is left to the caller.
+`frame_len` samples) without loading it. It runs at 16 kHz only.
+`LevelMeter` runs inside every detector; `levels()` gives the speech level,
+the background level (median of the non-speech frames), the SNR
+(signal-to-noise ratio: how far the speech is above the background, in dB),
+the share of clipped samples (runs of 3 or more at the rail; single
+full-scale peaks do not count), the DC offset (a constant shift some mics
+add), the share of speech, the peak and the duration. What counts as too
+quiet or too noisy is left to the caller.
 
 ## When to use audio-silence-gate vs Silero VAD
 
 |                   | audio-silence-gate (earshot)       | audio-silence-gate (`Vad::Rms`) | Silero VAD             |
 |-------------------|------------------------------------|---------------------------------|------------------------|
 | Dependencies      | earshot (std only, none of its own) | same                           | ONNX runtime           |
-| Cost              | about 11 us per 16 ms frame        | microseconds                    | milliseconds           |
-| Decision delay    | 48 to 64 ms                        | one frame                       | one window             |
-| Accuracy          | F1 0.928 in an independent benchmark | loudness only                 | F1 0.938 in the same benchmark |
+| Cost              | about 11 microseconds per 16 ms frame, measured by check-vad.sh on one machine | microseconds | milliseconds |
+| Decision delay    | 48 to 64 ms, earshot's own (onset confirmation adds a frame) | one frame | one window |
 | Noise             | a steady fan or hum is not speech  | anything loud is speech         | neural                 |
 | Best for          | auto-stop and gating on 16 kHz audio | a mic the model handles badly | precise speech segmentation |
 

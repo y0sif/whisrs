@@ -12,7 +12,10 @@ backend = "groq"            # groq | deepgram-streaming | deepgram | openai-real
 language = "en"             # ISO 639-1 or "auto"
 silence_timeout_ms = 2000   # auto-stop after this much silence once you spoke: streaming
                             # dictation, and command mode, [[llm_commands]] and agent
-                            # turns on every backend. 0 = off (stop with a second press)
+                            # turns on every backend. Batch dictation (groq, openai,
+                            # deepgram, asr-sidecar, and local-whisper with
+                            # segmentation = "none") stops on a second press.
+                            # 0 = off (stop with a second press)
 notify = true               # desktop notifications
 history = true              # save dictations to ~/.local/share/whisrs/history.jsonl for
                             # `whisrs log`. false stops new writes only: existing
@@ -1299,22 +1302,22 @@ without a whisrs release: whisrs reads the output of 1.0.103.
 
 PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matches nothing logs a warning listing the valid names and falls back to the system default. The daemon reads the device when it starts, so restart it after a change (`whisrs restart`); its startup log shows which device the name resolved to. Audio cues and read-aloud playback always use the default output device.
 
-### Speech detection
+## Speech detection
 
-`[audio] vad` decides what counts as speech: when auto-stop fires, whether a batch dictation, command or agent turn is worth sending, and where a recording track holds speech.
+`[audio] vad` decides what counts as speech: when auto-stop fires, whether a batch dictation, command or agent turn is worth sending, where local-whisper cuts a dictation into phrases, where a recording is cut into phrases for a backend that returns no timestamps, and where a recording track holds speech. Levels are in dBFS, decibels relative to full scale: 0 is the loudest a sample can be, and a normal speaking voice near the mic sits around -40.
 
 - `"earshot"` (the default): a small learned voice activity detector that scores every 16 ms of audio. A steady fan or hum does not count as speech, and a quiet voice still does. During dictation, command mode, `[[llm_commands]]` and agent turns, a voice far under yours (a TV, a colleague behind you) does not count either; a recording counts every voice.
 - `"rms"`: the loudness test of whisrs 0.1.31 (a block is speech when it is louder than about -50 dBFS). Use it if the model handles your mic badly. In a noisy room it may never auto-stop.
 
 An unknown value warns at startup and uses `"earshot"`. Restart the daemon after a change.
 
-Audio that is not sent is skipped with a notification that names the reason and the level whisrs measured (levels are in dB relative to full scale; a normal speaking voice sits near -40):
+Audio that is not sent is skipped with a notification that names the reason and the level whisrs measured:
 
-- "Skipped: the audio was silent (peak -82 dB). Is the mic muted?"
+- "Skipped: the audio was silent (peak -120 dB). Is the mic muted?"
 - "Skipped: the audio was too quiet (speech at -68 dB)"
 - "Skipped: the audio was without speech (background at -48 dB)"
 
-Command mode and agent turns say the same in their own words ("Agent 'jarvis': the audio was too quiet (speech at -68 dB), nothing was sent"). A streaming dictation that typed nothing says "Nothing typed: the audio was ..." with the same reason. Each dictation, command and agent turn also logs one line of levels (speech, background, SNR, peak, clipping) to the daemon log. [Noisy room or quiet mic](troubleshooting.md#noisy-room-or-quiet-mic) explains what to do about each.
+Command mode and agent turns say the same in their own words ("Agent 'jarvis': the audio was too quiet (speech at -68 dB), nothing was sent"). A streaming dictation that typed nothing because its audio held no speech says "Nothing typed: the audio was ..." with the same reason. With the overlay on (`[general] overlay`), the dictation and `[[llm_commands]]` skip notifications and "Nothing typed" do not show; command mode and agent turns always show theirs. Every skip is in the daemon log either way (`journalctl --user -u whisrs`), and each dictation, command and agent turn logs one line of levels there: speech, background, SNR (signal-to-noise ratio: how far the speech is above the background, in dB), peak and clipping. [Noisy room or quiet mic](troubleshooting.md#noisy-room-or-quiet-mic) explains what to do about each.
 
 ## Recording
 
@@ -1795,27 +1798,39 @@ since a paused video is silent too.
 
 **Warnings while recording.** Once your mic has heard 30 seconds of speech,
 whisrs checks it every 30 seconds and notifies you (per `[general] notify`)
-when your speech is too quiet, the audio clipped in the last 30 seconds, or
-the room is noisy. After 2 minutes of your speech with only digital silence
-on the system track it says "Recording: nothing has played on the system
-track yet. If this is a call, check [recording] system_device." (a solo memo
-can trip it). Each of these comes at most once per recording, and each is
-logged too.
+when the audio clipped in the last 30 seconds and, once 30 seconds of that
+speech is your own, when your speech is too quiet or the room is noisy. Your
+own speech is what the mic records while nothing plays on the system track
+(and for 0.3 seconds after): a lecture or a call on your speakers reaches the
+mic too, and its echo is not your voice. After 2 minutes of your speech with
+only digital silence on the system track it says "Recording: nothing has
+played on the system track yet. If this is a call, check [recording]
+system_device." (a solo memo can trip it). Each of these comes at most once
+per recording, and each is logged too.
 
 **Audio quality.** Each track is measured as it is recorded, before echo
 removal: the speech level, the background level, the SNR (how far the speech
-is above the background), the share of clipped samples and any DC offset.
-`recording.json` keeps that per track under `quality`, with the speech
-detector that measured it (`vad`) and, on the mic, `echo_path_db` (how loud
-the speakers reach your mic) when echo removal ran. Its `warnings` list what
-was off over the whole track: `too-quiet` (speech under -55 dBFS), `noisy`
-(speech less than 10 dB above the background), `clipping` (0.1 % or more of
-the samples at the limit), `dc-offset` (an offset of 1 % or more of full
-scale), `strong-echo` (an echo path above -15 dB) and `system-silent` (the
-warning above). A recording from an older whisrs, or one recovered after a
-crash, is measured from its audio when it is transcribed or retried. The
-transcript's front matter shows the levels of each measured track after
-`model`, and `audio_warnings` only when a track warned:
+is above the background), the share of clipped samples and any DC offset (a
+constant shift some mics add to the signal). On the mic, the speech level,
+the background and the SNR count only your own speech, as above; when the
+speakers played and left under 30 seconds of it, the speech level and the SNR
+are not measured, rather than measured on the echo. `recording.json` keeps
+each track's figures under `quality`: `vad` (the speech detector that
+measured them), `speech_dbfs`, `noise_dbfs` and `snr_db` (in dB),
+`clipped` and `speech_share` (shares from 0 to 1), `dc_offset` (a signed
+share of full scale), `echo_path_db` (on the mic, how loud the speakers reach
+it, when echo removal ran) and `warnings`, what was off over the whole track.
+The mic's warnings are `too-quiet` (speech under -55 dBFS), `noisy` (speech
+less than 10 dB above the background), `clipping` (0.1 % or more of the
+samples at the limit), `dc-offset` (an offset of 1 % or more of full scale)
+and `strong-echo` (an echo path above -15 dB). The system track keeps its
+levels, but a music bed is no noisy room and quiet playback no quiet mic, so
+its one warning is `system-silent` (the warning above), stored even when the
+system track recorded nothing that could be measured. A recording from an
+older whisrs, or one recovered after a crash, is measured from its audio when
+it is transcribed or retried. The transcript's front matter shows the levels
+of each measured track after `model`, and `audio_warnings` only when a track
+warned:
 
 ```yaml
 audio:
@@ -1826,7 +1841,8 @@ audio_warnings:
 ```
 
 `null` is a level that could not be measured: a track with no speech has no
-speech level, and a system track whose pauses are digital silence has no
+speech level, your mic has none when the speakers left too little of your own
+speech, and a system track whose pauses are digital silence has no
 background.
 
 **Disk space.** A recording takes about 1.9 MB a minute per track, and

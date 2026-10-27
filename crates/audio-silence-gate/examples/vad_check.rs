@@ -42,6 +42,9 @@ const BABBLE_STOP_WINDOW: (f64, f64) = (1.9, 3.0);
 /// one draw can pass or fail by luck at 0 dB SNR.
 const DRAWS: usize = 6;
 const DRAW_STEP_S: usize = 10;
+/// How much louder than the sentences the burst clip's "Oh!" plays, one row
+/// each: a laugh or an interjection close to the mic.
+const BURST_DB: [f64; 2] = [20.0, 26.0];
 
 fn close(vad: Vad) -> VadConfig {
     VadConfig::close(vad)
@@ -289,6 +292,14 @@ struct Clips {
     auto_end: f64,
     yes: Vec<f64>,
     yes_end: f64,
+    /// The burst clip's "Oh!" alone, and its sentences alone, each at the
+    /// speech level: the rows mix them with the "Oh!" [`BURST_DB`] louder.
+    burst_word: Vec<f64>,
+    burst_rest: Vec<f64>,
+    /// The sentences' labels (the "Oh!" is not among them).
+    burst_labels: Vec<bool>,
+    /// Labelled length of the "Oh!", in seconds.
+    burst_s: f64,
     beds: Vec<(&'static str, Vec<f64>)>,
     speech_rms: f64,
 }
@@ -323,6 +334,8 @@ fn load(dir: &str, speech_dbfs: f64) -> Result<Clips, String> {
     let (clean, clean_labels) = scale(&read("clean")?);
     let (auto, auto_labels) = scale(&read("autostop")?);
     let (yes, yes_labels) = scale(&read("yes")?);
+    let (burst_word, burst_rest, burst_labels, burst_s) = split_burst(&read("burst")?, speech_rms)
+        .ok_or_else(|| format!("{dir}/burst.wav: no speech after the burst"))?;
     let (auto_start, auto_end) = speech_span(&auto_labels);
     let (_, yes_end) = speech_span(&yes_labels);
     let mut beds = Vec::new();
@@ -344,9 +357,47 @@ fn load(dir: &str, speech_dbfs: f64) -> Result<Clips, String> {
         auto_end,
         yes,
         yes_end,
+        burst_word,
+        burst_rest,
+        burst_labels,
+        burst_s,
         beds,
         speech_rms,
     })
+}
+
+/// A split burst clip: the "Oh!" alone, the sentences alone, the
+/// sentences' labels, and the "Oh!"'s labelled length in seconds.
+type Burst = (Vec<f64>, Vec<f64>, Vec<bool>, f64);
+
+/// The burst clip split into its first labelled run (the "Oh!") and the
+/// rest (the sentences), each alone (zeros elsewhere) at `speech_rms` as an
+/// active level, cut halfway through the dead air between them.
+fn split_burst(raw: &[i16], speech_rms: f64) -> Option<Burst> {
+    let labels = reference_labels(raw);
+    let start = labels.iter().position(|&l| l)?;
+    let end = start + labels[start..].iter().position(|&l| !l)?;
+    let next = end + labels[end..].iter().position(|&l| l)?;
+    let split = (end + next) / 2 * FRAME;
+    let mut rest_labels = labels.clone();
+    rest_labels[..end].fill(false);
+    let mut word_labels = vec![false; labels.len()];
+    word_labels[start..end].fill(true);
+    let f = to_f(raw);
+    let word_gain = speech_rms / active_rms(&f, &word_labels);
+    let rest_gain = speech_rms / active_rms(&f, &rest_labels);
+    let part = |range: std::ops::Range<usize>, gain: f64| -> Vec<f64> {
+        f.iter()
+            .enumerate()
+            .map(|(i, x)| if range.contains(&i) { x * gain } else { 0.0 })
+            .collect()
+    };
+    Some((
+        part(0..split, word_gain),
+        part(split..f.len(), rest_gain),
+        rest_labels,
+        ((end - start) * FRAME) as f64 / SR as f64,
+    ))
 }
 
 /// One measured condition: the clips mixed with a bed at an SNR.
@@ -645,6 +696,41 @@ fn run(clips: &Clips, real: &[String]) -> Report {
                     && e.armed_s.is_some()
                     && e.after(clips.yes_end).is_some_and(|d| d >= 0.0),
             ),
+        );
+    }
+
+    // A loud interjection, then the sentences: the level it raised must not
+    // keep the sentences under the relative floor.
+    for db in BURST_DB {
+        let gain = db_to_rms(db);
+        let mixed: Vec<f64> = clips
+            .burst_word
+            .iter()
+            .zip(&clips.burst_rest)
+            .map(|(word, rest)| word * gain + rest)
+            .collect();
+        let burst = to_i16(&mixed);
+        let (_, sentences_end) = speech_span(&clips.burst_labels);
+        let e = auto_stop(&burst, close(Vad::Earshot));
+        let rms = auto_stop(&burst, close(Vad::Rms));
+        let recall_e = prf(&earshot_flags(&burst), &clips.burst_labels).recall;
+        let recall_r = prf(&rms_flags(&burst), &clips.burst_labels).recall;
+        let early = e.fired_s.is_some_and(|t| t < sentences_end);
+        r.row(
+            &format!(
+                "\"Oh!\" ({:.1} s) {db:+.0} dB, then two sentences",
+                clips.burst_s
+            ),
+            format!(
+                "sentence recall {recall_e:.3}; stop {}",
+                e.label(sentences_end)
+            ),
+            format!(
+                "sentence recall {recall_r:.3}; stop {}",
+                rms.label(sentences_end)
+            ),
+            "stop never before the sentences end; sentence recall >= 0.80",
+            Some(!early && recall_e >= 0.80),
         );
     }
 

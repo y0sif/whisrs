@@ -543,6 +543,12 @@ mod tests {
             ),
             "{md}"
         );
+        // A system track nothing was measured on, with the live warning:
+        // the same lines.
+        let mut unmeasured = TrackQuality::unmeasured();
+        unmeasured.add_warning(crate::audio::quality::Check::SystemSilent);
+        m.tracks[1].quality = Some(unmeasured);
+        assert_eq!(render_markdown(&m), md);
         // A track without a report has no line.
         m.tracks[1].quality = None;
         assert!(!render_markdown(&m).contains("  system:"));
