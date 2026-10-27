@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use audio_silence_gate::{AutoStopDetector, SILENCE_RMS_THRESHOLD};
+use audio_silence_gate::{AutoStopDetector, VadConfig};
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
 use whisrs::audio::feedback;
 use whisrs::llm;
@@ -18,8 +18,8 @@ use crate::injection::{
 };
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
-    format_api_error, format_no_microphone_error, save_history_entry, transcribe_batch_audio,
-    BatchOptions,
+    describe_levels, format_api_error, format_no_microphone_error, save_history_entry,
+    transcribe_batch_audio, BatchOptions,
 };
 #[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
@@ -93,6 +93,10 @@ pub(crate) fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Optio
 /// audio channel closes (a manual stop, a cancel, or a vanished device). On
 /// auto-stop the capture is stopped here. `label` names the flow in the log.
 ///
+/// Auto-stop decides speech with `[audio] vad` (the close profile: one user
+/// near the mic). `silence_timeout_ms = 0` never fires (#178), so the
+/// instruction records until the channel closes.
+///
 /// Shared by command mode, `[[llm_commands]]` and agent voice turns, which
 /// all record a whole instruction before transcribing it.
 pub(crate) async fn collect_instruction_audio(
@@ -102,7 +106,11 @@ pub(crate) async fn collect_instruction_audio(
     label: &str,
 ) -> Vec<i16> {
     let silence_timeout = context.config.general.silence_timeout_ms;
-    let mut auto_stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout, SAMPLE_RATE);
+    let mut auto_stop = AutoStopDetector::with_vad(
+        VadConfig::close(context.config.audio.vad()),
+        silence_timeout,
+        SAMPLE_RATE,
+    );
     let mut all_samples: Vec<i16> = Vec::new();
     if let Some(mut rx) = audio_rx {
         while let Some(chunk) = rx.recv().await {
@@ -118,6 +126,7 @@ pub(crate) async fn collect_instruction_audio(
             }
         }
     }
+    info!("{label} audio: {}", describe_levels(&auto_stop.levels()));
     all_samples
 }
 
@@ -1450,5 +1459,99 @@ mod tests {
         assert!(claim_command_mode_session(&mut ds).is_none());
         assert!(claim_llm_command_session(&mut ds).is_none());
         assert_eq!(ds.state_machine.state(), State::Transcribing);
+    }
+
+    /// A backend the instruction tests never reach.
+    struct NoBackend;
+
+    #[async_trait::async_trait]
+    impl whisrs::transcription::TranscriptionBackend for NoBackend {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _config: &whisrs::transcription::TranscriptionConfig,
+        ) -> anyhow::Result<String> {
+            unreachable!("collecting audio never transcribes")
+        }
+
+        fn sends_prompt(&self, _config: &whisrs::transcription::TranscriptionConfig) -> bool {
+            false
+        }
+
+        fn stream_text(&self) -> whisrs::transcription::StreamText {
+            whisrs::transcription::StreamText::Phrases
+        }
+
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &whisrs::transcription::TranscriptionConfig,
+        ) -> anyhow::Result<whisrs::transcription::Transcript> {
+            unreachable!("collecting audio never transcribes")
+        }
+
+        fn max_segment_chunk_secs(
+            &self,
+            _config: &whisrs::transcription::TranscriptionConfig,
+        ) -> Option<u32> {
+            None
+        }
+    }
+
+    fn instruction_context(toml_text: &str) -> DaemonContext {
+        DaemonContext {
+            config: toml::from_str(toml_text).unwrap(),
+            window_tracker: Arc::new(whisrs::window::NoopTracker),
+            transcription_backend: Arc::new(NoBackend),
+            notify: false,
+            state_tx: crate::context::StateBus::new(),
+            overlay_level_tx: None,
+            overlay_enabled: false,
+            #[cfg(feature = "recording")]
+            recording: crate::recording::RecordingRuntime::new().0,
+            agents: crate::agent::AgentRuntime::disabled(),
+            agent_board: tokio::sync::watch::channel(Vec::new()).0,
+            agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Collect 1 s of a loud square wave (speech to the RMS test) and then
+    /// 10 s of digital silence, in 50 ms chunks, then close the channel.
+    async fn collect(toml_text: &str) -> usize {
+        let context = instruction_context(toml_text);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let loud: Vec<i16> = (0..800)
+            .map(|i| if i % 2 == 0 { 8_000 } else { -8_000 })
+            .collect();
+        for _ in 0..20 {
+            tx.send(loud.clone()).unwrap();
+        }
+        for _ in 0..200 {
+            tx.send(vec![0i16; 800]).unwrap();
+        }
+        drop(tx);
+        let daemon_state = Mutex::new(DaemonState::new());
+        collect_instruction_audio(Some(rx), &daemon_state, &context, "test")
+            .await
+            .len()
+    }
+
+    /// Command mode, `[[llm_commands]]` and agent turns auto-stop by
+    /// `[general] silence_timeout_ms`, and 0 turns auto-stop off (#178):
+    /// the instruction records through 10 s of silence until the channel
+    /// closes.
+    #[tokio::test]
+    async fn instruction_auto_stop_follows_the_silence_timeout() {
+        let rms = "[audio]\nvad = \"rms\"\n[general]\n";
+        // 2 s of silence after the speech: stopped on the chunk reaching it.
+        let stopped = collect(&format!("{rms}silence_timeout_ms = 2000\n")).await;
+        assert_eq!(stopped, 60 * 800);
+        // Off: everything up to the close.
+        let all = collect(&format!("{rms}silence_timeout_ms = 0\n")).await;
+        assert_eq!(all, 220 * 800);
+        // The default detector never calls a square wave speech, so it
+        // never arms and records to the close too.
+        let earshot = collect("[general]\nsilence_timeout_ms = 2000\n").await;
+        assert_eq!(earshot, 220 * 800);
     }
 }

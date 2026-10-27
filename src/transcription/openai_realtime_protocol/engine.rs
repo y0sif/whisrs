@@ -1102,6 +1102,7 @@ mod stream_lifecycle_tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
         }
     }
 

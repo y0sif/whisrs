@@ -360,6 +360,7 @@ pub fn run_setup() -> Result<()> {
         },
         audio: AudioConfig {
             device: "default".to_string(),
+            ..AudioConfig::default()
         },
         input: InputConfig {
             backend: injector_backend,

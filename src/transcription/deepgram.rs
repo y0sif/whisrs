@@ -900,6 +900,7 @@ mod tests {
             prompt: Some("Hyprland, whisrs".to_string()),
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
         };
 
         assert!(!DeepgramRestBackend::new(String::new()).sends_prompt(&request));
@@ -1015,6 +1016,7 @@ mod tests {
             prompt: None,
             keyterms: keyterms.iter().map(|t| t.to_string()).collect(),
             diarize: false,
+            vad: Default::default(),
         }
     }
 
@@ -1026,6 +1028,7 @@ mod tests {
             prompt: None,
             keyterms: keyterms.to_vec(),
             diarize: false,
+            vad: Default::default(),
         }
     }
 
@@ -1480,6 +1483,7 @@ mod tests {
     fn diarized(model: &str) -> TranscriptionConfig {
         TranscriptionConfig {
             diarize: true,
+            vad: Default::default(),
             ..query_config(model, &[])
         }
     }

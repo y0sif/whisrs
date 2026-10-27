@@ -256,13 +256,19 @@ where
     use crate::audio::wav::encode_wav;
 
     let samples = decode_wav_samples(audio)?;
-    let mut splitter = phrase_split::PhraseSplitter::new(
-        SEGMENT_SAMPLE_RATE,
-        audio_silence_gate::SILENCE_RMS_THRESHOLD,
-        FALLBACK_PHRASE_SILENCE_MS,
-    );
-    let mut phrases = splitter.feed(&samples);
-    phrases.extend(splitter.flush());
+    // The open profile: a recording track carries voices at any level, and a
+    // phrase the splitter drops is transcript lost. Minutes of audio per
+    // chunk, so the detector runs off the async worker.
+    let phrases = crate::audio::block_off_runtime(|| {
+        let mut splitter = phrase_split::PhraseSplitter::new(
+            SEGMENT_SAMPLE_RATE,
+            audio_silence_gate::VadConfig::open(config.vad),
+            FALLBACK_PHRASE_SILENCE_MS,
+        );
+        let mut phrases = splitter.feed(&samples);
+        phrases.extend(splitter.flush());
+        phrases
+    });
 
     let mut segments = Vec::new();
     for phrase in phrases {
@@ -328,6 +334,9 @@ pub struct TranscriptionConfig {
     /// [`TranscriptionBackend::transcribe_segments`]); dictation never
     /// does.
     pub diarize: bool,
+    /// `[audio] vad`: what decides speech where a backend cuts audio at
+    /// pauses (local whisper's phrases and windows, [`segments_by_phrase`]).
+    pub vad: audio_silence_gate::Vad,
 }
 
 /// How the pieces of text a backend sends on `text_tx` in
@@ -547,6 +556,8 @@ mod tests {
         }
     }
 
+    /// The RMS test: a tone is loud but no voice, so earshot would find no
+    /// phrase in these fixtures, and the phrase mechanics are under test.
     fn cfg() -> TranscriptionConfig {
         TranscriptionConfig {
             language: "en".into(),
@@ -554,6 +565,7 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: audio_silence_gate::Vad::Rms,
         }
     }
 
@@ -605,6 +617,34 @@ mod tests {
         let t = EchoLength.transcribe_segments(&wav, &cfg()).await.unwrap();
         let starts: Vec<u64> = t.segments.iter().map(|s| s.start_ms).collect();
         assert_eq!(starts, [900, 3400], "{t:?}");
+    }
+
+    /// `[audio] vad` reaches the splitter: hiss at -40 dBFS is all speech
+    /// to the RMS test and none to earshot.
+    #[tokio::test]
+    async fn phrase_fallback_decides_speech_by_the_request_vad() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let hiss: Vec<i16> = (0..3 * SEGMENT_SAMPLE_RATE)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Uniform in about +-570: an RMS near 0.01 of full scale.
+                (state % 1141) as i16 - 570
+            })
+            .collect();
+        let wav = crate::audio::wav::encode_wav(&hiss).unwrap();
+        let rms = EchoLength.transcribe_segments(&wav, &cfg()).await.unwrap();
+        assert_eq!(rms.segments.len(), 1, "{rms:?}");
+        let earshot = TranscriptionConfig {
+            vad: audio_silence_gate::Vad::Earshot,
+            ..cfg()
+        };
+        let t = EchoLength
+            .transcribe_segments(&wav, &earshot)
+            .await
+            .unwrap();
+        assert!(t.segments.is_empty(), "{t:?}");
     }
 
     #[tokio::test]

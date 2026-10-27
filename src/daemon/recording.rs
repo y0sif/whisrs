@@ -2841,8 +2841,11 @@ mod tests {
         extra: &str,
         free_space: FreeSpaceFn,
     ) -> (Arc<DaemonContext>, mpsc::UnboundedReceiver<QueuedRecording>) {
+        // `[audio] vad = "rms"`: the test tracks are tones, loud but no voice,
+        // which earshot would find no speech in.
         let config: Config = toml::from_str(&format!(
-            "[general]\nbackend = \"groq\"\n[recording]\nuser_name = \"Tester\"\ndir = \"{}\"\n{extra}",
+            "[audio]\nvad = \"rms\"\n[general]\nbackend = \"groq\"\n[recording]\n\
+             user_name = \"Tester\"\ndir = \"{}\"\n{extra}",
             root.display()
         ))
         .unwrap();

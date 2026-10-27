@@ -320,6 +320,7 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
         }
     }
 
@@ -453,6 +454,7 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -467,6 +469,7 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
         };
         let err = backend.transcribe(&[1, 2, 3], &config).await.unwrap_err();
         assert!(err.to_string().contains("sidecar URL"));

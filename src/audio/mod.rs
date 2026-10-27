@@ -10,6 +10,14 @@ pub mod wav;
 /// A chunk of 16-bit PCM audio samples.
 pub type AudioChunk = Vec<i16>;
 
+// The speech detector (`[audio] vad = "earshot"`) runs at 16 kHz only; at any
+// other rate it silently takes the RMS test. Capture and recording tracks
+// must stay at its rate.
+const _: () = {
+    assert!(capture::SAMPLE_RATE == audio_silence_gate::VAD_SAMPLE_RATE);
+    assert!(crate::recording::SAMPLE_RATE == audio_silence_gate::VAD_SAMPLE_RATE);
+};
+
 /// Run a blocking `f` without stalling a tokio worker: on the multi-thread
 /// runtime the worker hands its tasks off first. `block_in_place` panics on a
 /// current-thread runtime, where `f` simply runs inline, as it does with no

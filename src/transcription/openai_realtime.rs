@@ -174,6 +174,7 @@ mod tests {
             prompt: Some("Hyprland, whisrs".to_string()),
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
         }
     }
 

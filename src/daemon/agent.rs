@@ -2758,7 +2758,10 @@ mod tests {
         );
         rt.store_path = dir.join("agents.json");
         Arc::new(DaemonContext {
-            config: toml::from_str("[general]\naudio_feedback = false\n").unwrap(),
+            // The RMS test: the voice turns' test audio is a square wave,
+            // loud but no voice, which earshot would gate.
+            config: toml::from_str("[audio]\nvad = \"rms\"\n[general]\naudio_feedback = false\n")
+                .unwrap(),
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(UnreachableBackend),
             notify: false,

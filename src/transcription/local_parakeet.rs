@@ -74,6 +74,7 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("not yet implemented"));

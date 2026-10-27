@@ -451,6 +451,7 @@ pub fn recording_transcription_config(
         prompt,
         keyterms: config.general.vocabulary.clone(),
         diarize: false,
+        vad: config.audio.vad(),
     }
 }
 
@@ -796,6 +797,7 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
         };
 
         let backend = openai_realtime_backend(&config);
@@ -975,6 +977,7 @@ mod tests {
                 prompt: None,
                 keyterms: Vec::new(),
                 diarize: false,
+                vad: Default::default(),
             };
             let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
             for case in &cases {
