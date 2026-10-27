@@ -336,6 +336,13 @@ fn load(dir: &str, speech_dbfs: f64) -> Result<Clips, String> {
     let (yes, yes_labels) = scale(&read("yes")?);
     let (burst_word, burst_rest, burst_labels, burst_s) = split_burst(&read("burst")?, speech_rms)
         .ok_or_else(|| format!("{dir}/burst.wav: no speech after the burst"))?;
+    // A burst longer than a second merged with the speech after it, so the
+    // rows would test something else.
+    if burst_s > 1.0 {
+        return Err(format!(
+            "{dir}/burst.wav: the burst lasts {burst_s:.2} s, not isolated"
+        ));
+    }
     let (auto_start, auto_end) = speech_span(&auto_labels);
     let (_, yes_end) = speech_span(&yes_labels);
     let mut beds = Vec::new();

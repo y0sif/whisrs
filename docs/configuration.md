@@ -1306,7 +1306,7 @@ PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matc
 
 `[audio] vad` decides what counts as speech: when auto-stop fires, whether a batch dictation, command or agent turn is worth sending, where local-whisper cuts a dictation into phrases, where a recording is cut into phrases for a backend that returns no timestamps, and where a recording track holds speech. Levels are in dBFS, decibels relative to full scale: 0 is the loudest a sample can be, and a normal speaking voice near the mic sits around -40.
 
-- `"earshot"` (the default): a small learned voice activity detector that scores every 16 ms of audio. A steady fan or hum does not count as speech, and a quiet voice still does. During dictation, command mode, `[[llm_commands]]` and agent turns, a voice far under yours (a TV, a colleague behind you) does not count either; a recording counts every voice.
+- `"earshot"` (the default): a small learned voice activity detector that scores every 16 ms of audio. A steady fan or hum does not count as speech, and a quiet voice still does. During dictation, command mode, `[[llm_commands]]` and agent turns, a voice far under yours (a TV, a colleague behind you) does not count either, unless it is louder than about -50 dBFS, the level `"rms"` calls speech. With a loud mic (your speech above about -32 dBFS), a TV in the room can still count. A recording counts every voice.
 - `"rms"`: the loudness test of whisrs 0.1.31 (a block is speech when it is louder than about -50 dBFS). Use it if the model handles your mic badly. In a noisy room it may never auto-stop.
 
 An unknown value warns at startup and uses `"earshot"`. Restart the daemon after a change.
@@ -1814,7 +1814,9 @@ is above the background), the share of clipped samples and any DC offset (a
 constant shift some mics add to the signal). On the mic, the speech level,
 the background and the SNR count only your own speech, as above; when the
 speakers played and left under 30 seconds of it, the speech level and the SNR
-are not measured, rather than measured on the echo. `recording.json` keeps
+are not measured, rather than measured on the echo. A recording measured
+after the fact (recovered after a crash, or a retry of one made before
+whisrs 0.2.0) is measured from its WAV, echo included. `recording.json` keeps
 each track's figures under `quality`: `vad` (the speech detector that
 measured them), `speech_dbfs`, `noise_dbfs` and `snr_db` (in dB),
 `clipped` and `speech_share` (shares from 0 to 1), `dc_offset` (a signed

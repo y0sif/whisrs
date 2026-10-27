@@ -454,8 +454,8 @@ Each `TrackMeta` has `quality: Option<TrackQuality>` (plain type, every build; `
 `recording.json`): the track writer's meter on the raw chunks (`TrackStats::quality`, stored by
 `apply_outcomes`), else measured from the raw WAV by `process_recording`, plus the mic's `echo_path_db`
 when echo removal ran; `warnings` are `audio::quality::Check` codes. The front matter gets an `audio:`
-block (and `audio_warnings:` only when warned) for measured tracks only, so an older recording renders
-byte for byte as before. The mic writer's `LiveQuality` raises clipping (every 30 s once 30 s of speech
+block (and `audio_warnings:` only when warned) for each track with a `quality` (an unmeasured one prints
+nulls), so an older recording, which has none, renders byte for byte as before. The mic writer's `LiveQuality` raises clipping (every 30 s once 30 s of speech
 was heard), too quiet and noisy (once 30 s of the user's own speech was) and `system-silent` (2 minutes
 of speech while `SystemSignal::heard` is false), each once per recording, through
 `MicAlarm::on_warning`; the muted-mic alarm (`on_silence`) re-arms as before. The system writer marks
