@@ -1,0 +1,1125 @@
+//! Speech detection: the earshot model behind warm-up, level floors, onset
+//! confirmation, hysteresis and hangover, the RMS test beside it, and the
+//! whole-buffer gate and per-frame mask built on the same detector.
+
+use crate::level::{dbfs, FrameStats, LevelMeter, Levels, SILENT_PEAK};
+use crate::{audio_gate_reason, duration_reason, rms_energy, GateReason, SILENCE_RMS_THRESHOLD};
+
+/// The only sample rate the earshot model runs at. A detector built for any
+/// other rate falls back to [`Vad::Rms`].
+pub const VAD_SAMPLE_RATE: u32 = 16_000;
+
+/// Samples in one earshot frame: 16 ms at [`VAD_SAMPLE_RATE`].
+pub const VAD_FRAME: usize = 256;
+
+/// Duration of one analysis frame.
+const FRAME_MS: u64 = 16;
+
+/// Frames after `new` or `reset` that are never speech (160 ms): an abrupt
+/// noise onset scores about 0.5 for about 130 ms while the model settles.
+pub(crate) const WARMUP_FRAMES: u64 = 10;
+
+/// Consecutive frames at or above the threshold that start speech (32 ms),
+/// so a one-frame blip (a click, a key) never does.
+const ONSET_FRAMES: u32 = 2;
+
+/// Frames under the release score that speech survives (96 ms), which
+/// bridges the dips inside words.
+const HANGOVER_FRAMES: u32 = 6;
+
+/// Accepted speech that arms auto-stop and passes the gate (160 ms): more
+/// than a noise onset scores, less than a lone "yes".
+pub(crate) const MIN_SPEECH_MS: u64 = 160;
+
+/// Accepted speech that must set the running level before the relative
+/// floor hangs from it (300 ms).
+const RELATIVE_FLOOR_AFTER_MS: u64 = 300;
+
+/// Time constants of the running speech level, counted in speech time.
+const LEVEL_ATTACK_MS: f32 = 50.0;
+const LEVEL_RELEASE_MS: f32 = 5_000.0;
+
+/// Which test decides speech.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Vad {
+    /// The earshot model (16 kHz only), behind the guards of
+    /// [`SpeechDetector`].
+    #[default]
+    Earshot,
+    /// The 0.1.31 loudness test: a block is speech when its RMS reaches
+    /// [`VadConfig::rms_threshold`].
+    Rms,
+}
+
+/// Detector settings. Start from [`VadConfig::close`] or
+/// [`VadConfig::open`]; the fields are public for tuning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VadConfig {
+    pub vad: Vad,
+    /// earshot score at or above which speech starts (0.55). Lower values
+    /// let noise hold speech open: after speech the model's context lifts
+    /// the score of the same noise from about 0.15 to 0.37 (+10 dB SNR) and
+    /// 0.46 (0 dB), with runs above 0.5. 0.6 costs quiet speakers recall.
+    pub threshold: f32,
+    /// earshot score under which speech may end (0.55, the threshold). A
+    /// lower release is the band that post-speech noise sits in; the
+    /// hysteresis is there for a custom `threshold` above it.
+    pub release: f32,
+    /// A frame quieter than this (dBFS) is never speech, whatever its score.
+    pub min_speech_dbfs: f32,
+    /// A frame more than this many dB under the running speech level is never
+    /// speech, once 300 ms of speech has set that level. `None` turns the
+    /// relative floor off.
+    pub relative_floor_db: Option<f32>,
+    /// [`Vad::Rms`]: normalized RMS at or above which a block is speech.
+    pub rms_threshold: f64,
+}
+
+impl VadConfig {
+    /// One user near the mic (dictation, command mode, agent turns): frames
+    /// under -65 dBFS, or more than 18 dB under the user, are not speech, so
+    /// a TV or a colleague behind them does not hold a recording open.
+    ///
+    /// The values are tuned with `scripts/check-vad.sh` (18 dB: 20 let
+    /// babble 20 dB under the user hold auto-stop open in a quarter of the
+    /// noise draws, 15 cost the user's own soft frames).
+    pub fn close(vad: Vad) -> Self {
+        Self {
+            vad,
+            threshold: 0.55,
+            release: 0.55,
+            min_speech_dbfs: -65.0,
+            relative_floor_db: Some(18.0),
+            rms_threshold: SILENCE_RMS_THRESHOLD,
+        }
+    }
+
+    /// Any voice counts (recording tracks: a shared mic, the system track):
+    /// only frames under -80 dBFS are rejected, since dropping a quiet voice
+    /// there loses transcript.
+    pub fn open(vad: Vad) -> Self {
+        Self {
+            min_speech_dbfs: -80.0,
+            relative_floor_db: None,
+            ..Self::close(vad)
+        }
+    }
+}
+
+/// A [`SpeechDetector`]'s verdict on one frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameDecision {
+    /// The frame's first sample, counted from `new` or the last `reset`.
+    pub start_sample: u64,
+    /// Whether the frame is speech, after every guard.
+    pub speech: bool,
+    /// The earshot score (0.0 to 1.0). With [`Vad::Rms`], 1.0 for a frame at
+    /// or above the threshold and 0.0 otherwise.
+    pub score: f32,
+    /// The frame's RMS level in dBFS (-120 for digital silence).
+    pub dbfs: f32,
+}
+
+/// A source of per-frame speech scores: earshot, or a script in tests.
+trait FrameScorer: Send {
+    fn score(&mut self, frame: &[i16]) -> f32;
+    fn reset(&mut self);
+}
+
+impl FrameScorer for earshot::Detector {
+    fn score(&mut self, frame: &[i16]) -> f32 {
+        self.predict_i16(frame)
+    }
+
+    fn reset(&mut self) {
+        earshot::Detector::reset(self);
+    }
+}
+
+/// What [`Hysteresis::step`] made of a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Silence,
+    /// Speech on its own score.
+    Voiced,
+    /// Speech only through the hangover.
+    Held,
+}
+
+/// Onset confirmation, hysteresis and hangover over per-frame scores.
+#[derive(Debug, Clone, Copy, Default)]
+struct Hysteresis {
+    in_speech: bool,
+    /// Consecutive frames at or above the threshold, outside speech.
+    onset: u32,
+    /// Consecutive frames under the release score, inside speech.
+    below: u32,
+}
+
+impl Hysteresis {
+    /// `eligible`: the frame passed the level floors.
+    fn step(&mut self, eligible: bool, score: f32, cfg: &VadConfig) -> Verdict {
+        if self.in_speech {
+            if eligible && score >= cfg.release {
+                self.below = 0;
+                return Verdict::Voiced;
+            }
+            self.below += 1;
+            if self.below <= HANGOVER_FRAMES {
+                return Verdict::Held;
+            }
+            self.in_speech = false;
+            self.below = 0;
+        }
+        if eligible && score >= cfg.threshold {
+            self.onset += 1;
+            if self.onset >= ONSET_FRAMES {
+                self.in_speech = true;
+                self.onset = 0;
+                return Verdict::Voiced;
+            }
+        } else {
+            self.onset = 0;
+        }
+        Verdict::Silence
+    }
+}
+
+/// The running speech level the relative floor hangs from. It follows
+/// voiced frames only (fast attack, slow release), so silence and rejected
+/// voices never move it.
+#[derive(Debug, Clone, Copy, Default)]
+struct SpeechLevel {
+    dbfs: f32,
+    frames: u64,
+}
+
+impl SpeechLevel {
+    fn follow(&mut self, dbfs: f32) {
+        if self.frames == 0 {
+            self.dbfs = dbfs;
+        } else {
+            let ms = if dbfs > self.dbfs {
+                LEVEL_ATTACK_MS
+            } else {
+                LEVEL_RELEASE_MS
+            };
+            self.dbfs += (1.0 - (-(FRAME_MS as f32) / ms).exp()) * (dbfs - self.dbfs);
+        }
+        self.frames += 1;
+    }
+
+    /// The level under which a frame is rejected, once enough speech set it.
+    fn floor(&self, relative_db: Option<f32>) -> Option<f32> {
+        let db = relative_db?;
+        (self.frames * FRAME_MS >= RELATIVE_FLOOR_AFTER_MS).then_some(self.dbfs - db)
+    }
+}
+
+/// One frame's decision plus what auto-stop and the gate need beyond it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Step {
+    pub(crate) decision: FrameDecision,
+    /// Speech on its own score, not only through the hangover: what arms
+    /// auto-stop and passes the gate.
+    pub(crate) voiced: bool,
+}
+
+/// Streaming speech detector: feed it audio in chunks of any size and it
+/// calls back once per completed 16 ms frame.
+///
+/// With [`Vad::Earshot`] at 16 kHz, per frame, in order:
+///
+/// 1. earshot scores every frame, quiet ones too, so its context stays
+///    intact;
+/// 2. the first 10 frames (160 ms) after `new` or `reset` are never speech;
+/// 3. a frame under [`VadConfig::min_speech_dbfs`], or more than
+///    [`VadConfig::relative_floor_db`] under the running speech level, is
+///    never speech;
+/// 4. speech starts after 2 consecutive frames at or above
+///    [`VadConfig::threshold`];
+/// 5. once in speech, frames at or above [`VadConfig::release`] keep it;
+/// 6. speech ends only after 6 frames (96 ms) under the release score.
+///
+/// With [`Vad::Rms`], or at any rate other than 16 kHz (a documented
+/// fallback, never a panic), a 16 ms frame is speech when its RMS reaches
+/// [`VadConfig::rms_threshold`], with none of the guards above.
+///
+/// A [`LevelMeter`] runs on everything fed: see [`levels`](Self::levels).
+pub struct SpeechDetector {
+    cfg: VadConfig,
+    frame_len: usize,
+    /// `None`: the RMS test decides.
+    scorer: Option<Box<dyn FrameScorer>>,
+    /// Samples of the frame in progress: capture chunks (800 samples) are
+    /// not a multiple of the frame.
+    pending: Vec<i16>,
+    frames: u64,
+    hysteresis: Hysteresis,
+    /// The same decision without the level floors: the voice the floors
+    /// rejected is what makes a gate verdict "too quiet".
+    unfloored: Hysteresis,
+    level: SpeechLevel,
+    voiced_frames: u64,
+    unfloored_frames: u64,
+    unfloored_sum_squares: f64,
+    meter: LevelMeter,
+}
+
+impl SpeechDetector {
+    /// A detector for a stream at `sample_rate` Hz. earshot runs only at
+    /// [`VAD_SAMPLE_RATE`]; any other rate decides with [`Vad::Rms`].
+    pub fn new(cfg: VadConfig, sample_rate: u32) -> Self {
+        let scorer = (cfg.vad == Vad::Earshot && sample_rate == VAD_SAMPLE_RATE)
+            .then(|| earshot::Detector::default_boxed() as Box<dyn FrameScorer>);
+        Self::build(cfg, sample_rate, scorer)
+    }
+
+    fn build(cfg: VadConfig, sample_rate: u32, scorer: Option<Box<dyn FrameScorer>>) -> Self {
+        let frame_len = if scorer.is_some() {
+            VAD_FRAME
+        } else {
+            (sample_rate as u64 * FRAME_MS / 1000).max(1) as usize
+        };
+        Self {
+            cfg,
+            frame_len,
+            scorer,
+            pending: Vec::with_capacity(frame_len),
+            frames: 0,
+            hysteresis: Hysteresis::default(),
+            unfloored: Hysteresis::default(),
+            level: SpeechLevel::default(),
+            voiced_frames: 0,
+            unfloored_frames: 0,
+            unfloored_sum_squares: 0.0,
+            meter: LevelMeter::new(sample_rate),
+        }
+    }
+
+    /// Feed the next samples of the stream; `on_frame` runs once per frame
+    /// they complete, in order. A partial frame waits for the next feed.
+    pub fn feed(&mut self, samples: &[i16], mut on_frame: impl FnMut(FrameDecision)) {
+        self.feed_steps(samples, |step| on_frame(step.decision));
+    }
+
+    pub(crate) fn feed_steps(&mut self, samples: &[i16], mut on_step: impl FnMut(Step)) {
+        self.meter.add_samples(samples);
+        let mut rest = samples;
+        if !self.pending.is_empty() {
+            let take = (self.frame_len - self.pending.len()).min(rest.len());
+            self.pending.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.pending.len() < self.frame_len {
+                return;
+            }
+            let frame = std::mem::take(&mut self.pending);
+            on_step(self.step(&frame));
+            self.pending = frame;
+            self.pending.clear();
+        }
+        let mut frames = rest.chunks_exact(self.frame_len);
+        for frame in &mut frames {
+            on_step(self.step(frame));
+        }
+        self.pending.extend_from_slice(frames.remainder());
+    }
+
+    fn step(&mut self, frame: &[i16]) -> Step {
+        let stats = FrameStats::of(frame);
+        let index = self.frames;
+        self.frames += 1;
+        let frame_dbfs = stats.dbfs();
+        let (score, verdict) = match self.scorer.as_mut() {
+            None => {
+                let speech = stats.rms() >= self.cfg.rms_threshold;
+                if speech {
+                    (1.0, Verdict::Voiced)
+                } else {
+                    (0.0, Verdict::Silence)
+                }
+            }
+            Some(scorer) => {
+                let score = scorer.score(frame);
+                if index < WARMUP_FRAMES {
+                    (score, Verdict::Silence)
+                } else {
+                    let loud = frame_dbfs >= self.cfg.min_speech_dbfs;
+                    let above_level = self
+                        .level
+                        .floor(self.cfg.relative_floor_db)
+                        .is_none_or(|floor| frame_dbfs >= floor);
+                    let verdict = self.hysteresis.step(loud && above_level, score, &self.cfg);
+                    if self.unfloored.step(true, score, &self.cfg) == Verdict::Voiced {
+                        self.unfloored_frames += 1;
+                        self.unfloored_sum_squares += stats.rms() * stats.rms();
+                    }
+                    if verdict == Verdict::Voiced {
+                        self.level.follow(frame_dbfs);
+                    }
+                    (score, verdict)
+                }
+            }
+        };
+        let voiced = verdict == Verdict::Voiced;
+        if voiced {
+            self.voiced_frames += 1;
+        }
+        let speech = verdict != Verdict::Silence;
+        self.meter.record(stats, speech);
+        Step {
+            decision: FrameDecision {
+                start_sample: index * self.frame_len as u64,
+                speech,
+                score,
+                dbfs: frame_dbfs,
+            },
+            voiced,
+        }
+    }
+
+    /// Forget the stream: earshot's context, the frame in progress, the
+    /// running level and the meter. Warm-up starts again.
+    pub fn reset(&mut self) {
+        if let Some(scorer) = self.scorer.as_mut() {
+            scorer.reset();
+        }
+        self.pending.clear();
+        self.frames = 0;
+        self.hysteresis = Hysteresis::default();
+        self.unfloored = Hysteresis::default();
+        self.level = SpeechLevel::default();
+        self.voiced_frames = 0;
+        self.unfloored_frames = 0;
+        self.unfloored_sum_squares = 0.0;
+        self.meter.reset();
+    }
+
+    /// The meter's figures for the stream so far.
+    pub fn levels(&self) -> Levels {
+        self.meter.levels()
+    }
+
+    /// Samples per analysis frame.
+    pub(crate) fn frame_len(&self) -> usize {
+        self.frame_len
+    }
+
+    /// Whether earshot decides (else the RMS test does).
+    pub(crate) fn uses_model(&self) -> bool {
+        self.scorer.is_some()
+    }
+
+    /// Power mean (dBFS) of the frames that would be voiced without the
+    /// level floors.
+    fn unfloored_dbfs(&self) -> Option<f32> {
+        (self.unfloored_frames > 0)
+            .then(|| dbfs((self.unfloored_sum_squares / self.unfloored_frames as f64).sqrt()))
+    }
+}
+
+/// What [`speech_gate`] decided, with the levels it measured on the way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateOutcome {
+    /// Why to skip the buffer; `None` sends it.
+    pub reason: Option<GateReason>,
+    /// The buffer's levels. With [`GateReason::TooQuiet`], `speech_dbfs`
+    /// (and `snr_db`) describe the voice the level floor rejected.
+    pub levels: Levels,
+}
+
+/// Decide whether a recorded buffer carries speech worth sending to a
+/// transcription backend.
+///
+/// With [`Vad::Earshot`] at 16 kHz: `Empty`, `Invalid` and `TooShort` as
+/// [`audio_gate_reason`] has them; `Silent` when the peak is at or under 4
+/// (digital silence), checked before the model runs, so a muted mic never
+/// pays for it; then the detector runs over the buffer and the buffer passes
+/// with at least 160 ms of accepted speech at a speech level of at least
+/// [`VadConfig::min_speech_dbfs`]. `TooQuiet` means the model heard a voice
+/// the level floor rejected, `NoSpeech` that there was sound but no voice.
+///
+/// With [`Vad::Rms`], or any rate other than 16 kHz, `reason` is exactly what
+/// [`audio_gate_reason`] returns with [`VadConfig::rms_threshold`].
+pub fn speech_gate(
+    samples: &[i16],
+    sample_rate: u32,
+    min_duration_ms: u64,
+    cfg: &VadConfig,
+) -> GateOutcome {
+    if cfg.vad == Vad::Rms || sample_rate != VAD_SAMPLE_RATE {
+        let reason = audio_gate_reason(samples, sample_rate, min_duration_ms, cfg.rms_threshold);
+        let mut detector = SpeechDetector::new(
+            VadConfig {
+                vad: Vad::Rms,
+                ..*cfg
+            },
+            sample_rate,
+        );
+        detector.feed(samples, |_| {});
+        return GateOutcome {
+            reason,
+            levels: detector.levels(),
+        };
+    }
+    gate_with(
+        samples,
+        min_duration_ms,
+        SpeechDetector::new(*cfg, sample_rate),
+    )
+}
+
+/// The earshot side of [`speech_gate`], on a 16 kHz `detector`.
+fn gate_with(samples: &[i16], min_duration_ms: u64, mut detector: SpeechDetector) -> GateOutcome {
+    let early = duration_reason(samples, VAD_SAMPLE_RATE, min_duration_ms).or_else(|| {
+        let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        (peak <= SILENT_PEAK).then_some(GateReason::Silent)
+    });
+    if let Some(reason) = early {
+        // Measured without the model: nothing here is speech.
+        let mut meter = LevelMeter::new(VAD_SAMPLE_RATE);
+        meter.add_samples(samples);
+        for frame in samples.chunks_exact(VAD_FRAME) {
+            meter.add_frame(frame, false);
+        }
+        return GateOutcome {
+            reason: Some(reason),
+            levels: meter.levels(),
+        };
+    }
+
+    detector.feed(samples, |_| {});
+    let min_frames = MIN_SPEECH_MS / FRAME_MS;
+    let mut levels = detector.levels();
+    let heard_dbfs = detector.unfloored_dbfs();
+    let quiet = heard_dbfs.is_some_and(|level| level < detector.cfg.min_speech_dbfs);
+    let reason = if detector.voiced_frames >= min_frames && !quiet {
+        None
+    } else if detector.unfloored_frames >= min_frames {
+        // A voice, but the floor rejected it, all of it or on average.
+        levels.speech_dbfs = heard_dbfs;
+        levels.snr_db = heard_dbfs.zip(levels.noise_dbfs).map(|(s, n)| s - n);
+        Some(GateReason::TooQuiet)
+    } else {
+        Some(GateReason::NoSpeech)
+    };
+    GateOutcome { reason, levels }
+}
+
+/// Per-frame speech flags for a 16 kHz stream: one flag per `frame_len`
+/// samples (a `frame_len` of 0 counts as 1), the last frame possibly
+/// partial. It streams, so a long track can be scanned without loading it.
+///
+/// With [`Vad::Earshot`] a frame is active when any 16 ms speech frame of a
+/// [`SpeechDetector`] overlaps it. With [`Vad::Rms`] it is active when
+/// `rms_energy(frame) >= rms_threshold`, the 0.1.31 rule bit for bit.
+pub struct SpeechMask {
+    frame_len: usize,
+    total: u64,
+    flags: Vec<bool>,
+    /// [`Vad::Rms`]: the samples of the mask frame in progress.
+    rms_frame: Vec<i16>,
+    /// Decides with earshot; with [`Vad::Rms`] it only meters.
+    detector: SpeechDetector,
+}
+
+impl SpeechMask {
+    pub fn new(cfg: VadConfig, frame_len: usize) -> Self {
+        Self::with_detector(SpeechDetector::new(cfg, VAD_SAMPLE_RATE), frame_len)
+    }
+
+    fn with_detector(detector: SpeechDetector, frame_len: usize) -> Self {
+        let frame_len = frame_len.max(1);
+        let rms_frame = if detector.uses_model() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(frame_len)
+        };
+        Self {
+            frame_len,
+            total: 0,
+            flags: Vec::new(),
+            rms_frame,
+            detector,
+        }
+    }
+
+    /// Feed the next samples of the stream.
+    pub fn feed(&mut self, samples: &[i16]) {
+        self.total += samples.len() as u64;
+        let frame_len = self.frame_len;
+        let flags = &mut self.flags;
+        if self.detector.uses_model() {
+            self.detector.feed(samples, |decision| {
+                if !decision.speech {
+                    return;
+                }
+                let first = (decision.start_sample / frame_len as u64) as usize;
+                let last =
+                    ((decision.start_sample + VAD_FRAME as u64 - 1) / frame_len as u64) as usize;
+                if flags.len() <= last {
+                    flags.resize(last + 1, false);
+                }
+                flags[first..=last].fill(true);
+            });
+            return;
+        }
+        self.detector.feed(samples, |_| {});
+        let threshold = self.detector.cfg.rms_threshold;
+        let mut rest = samples;
+        while !rest.is_empty() {
+            let take = (frame_len - self.rms_frame.len()).min(rest.len());
+            self.rms_frame.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.rms_frame.len() == frame_len {
+                flags.push(rms_energy(&self.rms_frame) >= threshold);
+                self.rms_frame.clear();
+            }
+        }
+    }
+
+    /// The meter's figures for the stream so far.
+    pub fn levels(&self) -> Levels {
+        self.detector.levels()
+    }
+
+    /// The flags: `total.div_ceil(frame_len)` of them.
+    pub fn finish(mut self) -> Vec<bool> {
+        if !self.rms_frame.is_empty() {
+            let threshold = self.detector.cfg.rms_threshold;
+            self.flags.push(rms_energy(&self.rms_frame) >= threshold);
+        }
+        self.flags
+            .resize(self.total.div_ceil(self.frame_len as u64) as usize, false);
+        self.flags
+    }
+}
+
+/// [`SpeechMask`] over a buffer already in memory.
+pub fn speech_mask(samples: &[i16], cfg: &VadConfig, frame_len: usize) -> Vec<bool> {
+    let mut mask = SpeechMask::new(*cfg, frame_len);
+    mask.feed(samples);
+    mask.finish()
+}
+
+// Detectors run on tokio tasks and on recording writer threads.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<SpeechDetector>();
+    assert_send::<SpeechMask>();
+    assert_send::<crate::AutoStopDetector>();
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AutoStopDetector;
+
+    /// Scores read from a script, one per frame, then 0.0. `reset` replays it.
+    struct Script {
+        scores: Vec<f32>,
+        next: usize,
+    }
+
+    impl FrameScorer for Script {
+        fn score(&mut self, _frame: &[i16]) -> f32 {
+            let score = self.scores.get(self.next).copied().unwrap_or(0.0);
+            self.next += 1;
+            score
+        }
+
+        fn reset(&mut self) {
+            self.next = 0;
+        }
+    }
+
+    /// A scorer that must never run.
+    struct Unreachable;
+
+    impl FrameScorer for Unreachable {
+        fn score(&mut self, _frame: &[i16]) -> f32 {
+            panic!("the model ran");
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    fn scripted(cfg: VadConfig, scores: Vec<f32>) -> SpeechDetector {
+        SpeechDetector::build(
+            cfg,
+            VAD_SAMPLE_RATE,
+            Some(Box::new(Script { scores, next: 0 })),
+        )
+    }
+
+    fn close() -> VadConfig {
+        VadConfig::close(Vad::Earshot)
+    }
+
+    fn open() -> VadConfig {
+        VadConfig::open(Vad::Earshot)
+    }
+
+    /// `frames` frames of alternating `±a` at `level` dBFS (RMS `a`, no DC).
+    fn at_level(level: f32, frames: usize) -> Vec<i16> {
+        let a = (10f64.powf(level as f64 / 20.0) * i16::MAX as f64).round() as i16;
+        (0..frames * VAD_FRAME)
+            .map(|i| if i % 2 == 0 { a } else { -a })
+            .collect()
+    }
+
+    fn run(detector: &mut SpeechDetector, samples: &[i16]) -> Vec<FrameDecision> {
+        let mut out = Vec::new();
+        detector.feed(samples, |d| out.push(d));
+        out
+    }
+
+    fn flags(decisions: &[FrameDecision]) -> Vec<bool> {
+        decisions.iter().map(|d| d.speech).collect()
+    }
+
+    /// Indices of the speech frames.
+    fn speech_at(decisions: &[FrameDecision]) -> Vec<usize> {
+        (0..decisions.len())
+            .filter(|&i| decisions[i].speech)
+            .collect()
+    }
+
+    fn scores(parts: &[(f32, usize)]) -> Vec<f32> {
+        parts
+            .iter()
+            .flat_map(|&(score, n)| std::iter::repeat_n(score, n))
+            .collect()
+    }
+
+    const WARM: usize = WARMUP_FRAMES as usize;
+
+    #[test]
+    fn warm_up_frames_are_never_speech() {
+        let mut detector = scripted(close(), vec![1.0; 20]);
+        let decisions = run(&mut detector, &at_level(-30.0, 20));
+        // 10 warm-up frames, one onset frame, then speech.
+        assert_eq!(speech_at(&decisions), (WARM + 1..20).collect::<Vec<_>>());
+        assert_eq!(decisions[WARM + 1].start_sample, (WARM as u64 + 1) * 256);
+    }
+
+    #[test]
+    fn onset_needs_two_frames_in_a_row() {
+        let script = scores(&[
+            (0.0, WARM + 2),
+            (0.9, 1),
+            (0.0, 2),
+            (0.9, 1),
+            (0.0, 1),
+            (0.9, 3),
+        ]);
+        let mut detector = scripted(close(), script);
+        let decisions = run(&mut detector, &at_level(-30.0, 40));
+        // Lone blips at 12 and 15 never start speech; the pair at 17 and 18
+        // does, on its second frame, then 19, then the 6-frame hangover.
+        assert_eq!(speech_at(&decisions), (18..=25).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn hysteresis_keeps_speech_above_release() {
+        // The profiles release at the threshold; a band needs a custom one.
+        let banded = VadConfig {
+            threshold: 0.6,
+            release: 0.4,
+            ..close()
+        };
+        let mut detector = scripted(banded, scores(&[(0.0, WARM), (0.9, 2), (0.45, 30)]));
+        let decisions = run(&mut detector, &at_level(-30.0, WARM + 32));
+        assert_eq!(
+            speech_at(&decisions),
+            (WARM + 1..WARM + 32).collect::<Vec<_>>()
+        );
+
+        // Between release and threshold never starts speech.
+        let mut detector = scripted(banded, scores(&[(0.0, WARM), (0.45, 30)]));
+        let decisions = run(&mut detector, &at_level(-30.0, WARM + 30));
+        assert!(speech_at(&decisions).is_empty());
+    }
+
+    #[test]
+    fn hangover_bridges_six_frames() {
+        // A 6-frame dip is bridged.
+        let script = scores(&[(0.0, WARM), (0.9, 4), (0.39, 6), (0.9, 4)]);
+        let mut detector = scripted(close(), script);
+        let decisions = run(&mut detector, &at_level(-30.0, WARM + 14));
+        assert_eq!(
+            speech_at(&decisions),
+            (WARM + 1..WARM + 14).collect::<Vec<_>>()
+        );
+
+        // A 7-frame dip ends speech on its seventh frame.
+        let script = scores(&[(0.0, WARM), (0.9, 4), (0.1, 7), (0.9, 1)]);
+        let mut detector = scripted(close(), script);
+        let decisions = run(&mut detector, &at_level(-30.0, WARM + 12));
+        assert_eq!(
+            speech_at(&decisions),
+            (WARM + 1..WARM + 10).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn absolute_floor_rejects_quiet_frames() {
+        // -70 dBFS: under close's -65, over open's -80.
+        let mut detector = scripted(close(), vec![1.0; 40]);
+        assert!(speech_at(&run(&mut detector, &at_level(-70.0, 40))).is_empty());
+
+        let mut detector = scripted(open(), vec![1.0; 40]);
+        assert_eq!(run(&mut detector, &at_level(-70.0, 40)).len(), 40);
+        let mut detector = scripted(open(), vec![1.0; 40]);
+        assert_eq!(
+            speech_at(&run(&mut detector, &at_level(-70.0, 40))).len(),
+            40 - WARM - 1
+        );
+
+        let mut detector = scripted(close(), vec![1.0; 40]);
+        assert_eq!(
+            speech_at(&run(&mut detector, &at_level(-62.0, 40))).len(),
+            40 - WARM - 1
+        );
+    }
+
+    #[test]
+    fn relative_floor_rejects_quiet_background_voices() {
+        // The user at -30 dBFS for 480 ms, then a voice 25 dB under them.
+        let mut samples = at_level(-30.0, WARM + 30);
+        samples.extend(at_level(-55.0, 40));
+        let mut detector = scripted(close(), vec![1.0; WARM + 70]);
+        let decisions = run(&mut detector, &samples);
+        let after = WARM + 30 + HANGOVER_FRAMES as usize;
+        assert!(
+            flags(&decisions[after..]).iter().all(|&s| !s),
+            "the background voice must not be speech"
+        );
+
+        // 15 dB under the user is still the user (a soft passage).
+        let mut samples = at_level(-30.0, WARM + 30);
+        samples.extend(at_level(-45.0, 40));
+        let mut detector = scripted(close(), vec![1.0; WARM + 70]);
+        let decisions = run(&mut detector, &samples);
+        assert!(flags(&decisions[WARM + 1..]).iter().all(|&s| s));
+
+        // Open profile: no relative floor.
+        let mut samples = at_level(-30.0, WARM + 30);
+        samples.extend(at_level(-55.0, 40));
+        let mut detector = scripted(open(), vec![1.0; WARM + 70]);
+        let decisions = run(&mut detector, &samples);
+        assert!(flags(&decisions[WARM + 1..]).iter().all(|&s| s));
+    }
+
+    #[test]
+    fn relative_floor_waits_for_300_ms_of_speech() {
+        // 192 ms of the user (frames 11 to 22) does not set the level yet, so
+        // the quieter voice after it is speech until 300 ms of speech in all
+        // (frame 29), then rejected: frames 30 to 35 are the hangover.
+        let mut samples = at_level(-30.0, WARM + 1 + 12);
+        samples.extend(at_level(-55.0, 40));
+        let mut detector = scripted(close(), vec![1.0; WARM + 53]);
+        let decisions = run(&mut detector, &samples);
+        assert_eq!(speech_at(&decisions), (WARM + 1..36).collect::<Vec<_>>());
+
+        // A quiet voice alone (over the absolute floor) is speech.
+        let mut detector = scripted(close(), vec![1.0; 40]);
+        let decisions = run(&mut detector, &at_level(-55.0, 40));
+        assert!(flags(&decisions[WARM + 1..]).iter().all(|&s| s));
+    }
+
+    /// Frames of varying level with varying scores, plus a partial frame.
+    fn varied() -> (Vec<i16>, Vec<f32>) {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut samples = Vec::new();
+        let mut script = Vec::new();
+        for _ in 0..300 {
+            let level = -75.0 + (next() % 60) as f32;
+            samples.extend(at_level(level, 1));
+            script.push((next() % 1000) as f32 / 1000.0);
+        }
+        samples.extend(at_level(-30.0, 1).into_iter().take(100));
+        (samples, script)
+    }
+
+    #[test]
+    fn chunk_sizes_do_not_change_decisions() {
+        let (samples, script) = varied();
+        let mut whole = scripted(close(), script.clone());
+        let expected = run(&mut whole, &samples);
+        assert_eq!(expected.len(), 300);
+        assert!(expected.iter().any(|d| d.speech) && expected.iter().any(|d| !d.speech));
+        for size in [1, 255, 256, 257, 800] {
+            let mut detector = scripted(close(), script.clone());
+            let mut got = Vec::new();
+            for chunk in samples.chunks(size) {
+                detector.feed(chunk, |d| got.push(d));
+            }
+            assert_eq!(got, expected, "chunk size {size}");
+            assert_eq!(detector.levels(), whole.levels(), "chunk size {size}");
+        }
+    }
+
+    #[test]
+    fn reset_starts_over() {
+        let (samples, script) = varied();
+        let mut detector = scripted(close(), script);
+        let first = run(&mut detector, &samples);
+        let first_levels = detector.levels();
+        detector.reset();
+        assert_eq!(detector.levels().duration_ms, 0);
+        // Same input after reset: same decisions, from sample 0, warm-up
+        // included, and the partial frame was dropped.
+        assert_eq!(run(&mut detector, &samples), first);
+        assert_eq!(detector.levels(), first_levels);
+    }
+
+    /// Feed `samples` frame by frame; the index of the frame on which
+    /// auto-stop first fires.
+    fn fires_at(stop: &mut AutoStopDetector, samples: &[i16]) -> Option<usize> {
+        samples.chunks(VAD_FRAME).position(|frame| stop.feed(frame))
+    }
+
+    #[test]
+    fn auto_stop_arms_after_160_ms_of_speech() {
+        let silence_after = |strong: usize| {
+            let script = scores(&[(0.0, WARM), (0.9, strong)]);
+            let mut stop = AutoStopDetector::from_detector(scripted(close(), script), 160);
+            let samples = at_level(-30.0, WARM + strong + 200);
+            (fires_at(&mut stop, &samples), stop.has_speech())
+        };
+        // 10 strong frames: one onset frame and 144 ms voiced.
+        assert_eq!(silence_after(10), (None, false));
+        // 11 strong frames: 160 ms voiced.
+        let (fired, armed) = silence_after(11);
+        assert!(armed);
+        assert!(fired.is_some());
+
+        // A 130 ms noise onset: 8 strong frames, 7 voiced, and the hangover
+        // after them does not count.
+        assert_eq!(silence_after(8), (None, false));
+
+        // Arming counts speech in total: two 112 ms bursts.
+        let script = scores(&[(0.0, WARM), (0.9, 8), (0.0, 20), (0.9, 8)]);
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), script), 160);
+        let samples = at_level(-30.0, WARM + 36);
+        assert_eq!(fires_at(&mut stop, &samples), None);
+        assert!(stop.has_speech());
+    }
+
+    #[test]
+    fn auto_stop_fires_when_the_timeout_is_reached() {
+        // Speech on frames 11 to 29, the hangover to 35, then silence from
+        // 36: 2 s (125 frames) of it is reached on frame 160.
+        let script = scores(&[(0.0, WARM), (0.9, 20)]);
+        let samples = at_level(-30.0, 400);
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), script.clone()), 2000);
+        assert_eq!(fires_at(&mut stop, &samples), Some(160));
+        // It stays fired while the silence lasts.
+        assert!(stop.feed(&at_level(-30.0, 1)));
+
+        // In 800-sample chunks it fires in the chunk that completes frame 160.
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), script), 2000);
+        let chunk = samples.chunks(800).position(|c| stop.feed(c));
+        assert_eq!(chunk, Some((161 * VAD_FRAME - 1) / 800));
+    }
+
+    #[test]
+    fn auto_stop_never_fires_with_zero_timeout() {
+        let script = scores(&[(0.0, WARM), (0.9, 40)]);
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), script), 0);
+        assert_eq!(fires_at(&mut stop, &at_level(-30.0, 2000)), None);
+        assert!(stop.has_speech());
+    }
+
+    #[test]
+    fn auto_stop_reset_disarms() {
+        let script = scores(&[(0.0, WARM), (0.9, 20)]);
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), script), 2000);
+        assert!(fires_at(&mut stop, &at_level(-30.0, 200)).is_some());
+        stop.reset();
+        assert!(!stop.has_speech());
+        assert_eq!(stop.levels().duration_ms, 0);
+    }
+
+    fn gate(samples: &[i16], scorer: Box<dyn FrameScorer>) -> GateOutcome {
+        gate_with(
+            samples,
+            300,
+            SpeechDetector::build(close(), VAD_SAMPLE_RATE, Some(scorer)),
+        )
+    }
+
+    fn scorer(scores: Vec<f32>) -> Box<dyn FrameScorer> {
+        Box::new(Script { scores, next: 0 })
+    }
+
+    #[test]
+    fn gate_reasons() {
+        let cfg = close();
+        assert_eq!(
+            speech_gate(&[], 16_000, 300, &cfg).reason,
+            Some(GateReason::Empty)
+        );
+        assert_eq!(
+            speech_gate(&at_level(-30.0, 60), 0, 300, &cfg).reason,
+            Some(GateReason::Invalid)
+        );
+        assert_eq!(
+            gate(&at_level(-30.0, 6), Box::new(Unreachable)).reason,
+            Some(GateReason::TooShort)
+        );
+
+        // Digital silence: decided from the peak, without the model.
+        let muted = gate(&at_level(-80.0, 62), Box::new(Unreachable));
+        assert_eq!(muted.reason, Some(GateReason::Silent));
+        assert_eq!(muted.levels.duration_ms, 992);
+        assert!(muted.levels.peak_dbfs < -78.0);
+
+        // A voice at -30 dBFS: sent.
+        let speech = gate(&at_level(-30.0, 62), scorer(vec![1.0; 62]));
+        assert_eq!(speech.reason, None);
+        assert!((speech.levels.speech_dbfs.unwrap() + 30.0).abs() < 0.1);
+
+        // The same voice at -70 dBFS: too quiet, with its level.
+        let quiet = gate(&at_level(-70.0, 62), scorer(vec![1.0; 62]));
+        assert_eq!(quiet.reason, Some(GateReason::TooQuiet));
+        assert!((quiet.levels.speech_dbfs.unwrap() + 70.0).abs() < 0.5);
+
+        // Loud sound without a voice.
+        let noise = gate(&at_level(-30.0, 62), scorer(vec![0.1; 62]));
+        assert_eq!(noise.reason, Some(GateReason::NoSpeech));
+        assert_eq!(noise.levels.speech_dbfs, None);
+        assert!((noise.levels.noise_dbfs.unwrap() + 30.0).abs() < 0.2);
+
+        // 144 ms of voice is not enough; 160 ms is.
+        let short = scores(&[(0.0, WARM), (1.0, 10)]);
+        assert_eq!(
+            gate(&at_level(-30.0, 62), scorer(short)).reason,
+            Some(GateReason::NoSpeech)
+        );
+        let enough = scores(&[(0.0, WARM), (1.0, 11)]);
+        assert_eq!(gate(&at_level(-30.0, 62), scorer(enough)).reason, None);
+    }
+
+    #[test]
+    fn gate_labels() {
+        assert_eq!(GateReason::TooQuiet.as_str(), "too quiet");
+        assert_eq!(GateReason::NoSpeech.as_str(), "without speech");
+    }
+
+    #[test]
+    fn mask_marks_frames_a_speech_frame_overlaps() {
+        // 5100 samples: three 100 ms frames and a partial one of 300.
+        // Speech starts on 16 ms frame 17 (4352..4608, mask frame 2) and the
+        // hangover holds frame 18 (4608..4864, mask frames 2 and 3).
+        let script = scores(&[(0.0, 16), (0.9, 2)]);
+        let detector = scripted(close(), script);
+        let mut mask = SpeechMask::with_detector(detector, 1600);
+        let samples = at_level(-30.0, 20);
+        mask.feed(&samples[..2000]);
+        mask.feed(&samples[2000..5100]);
+        // Hangover frames 18 to 23; only 18 is complete in 5100 samples.
+        assert_eq!(mask.finish(), vec![false, false, true, true]);
+
+        let mask = SpeechMask::with_detector(scripted(close(), vec![]), 1600);
+        assert_eq!(mask.finish(), Vec::<bool>::new());
+        let mut mask = SpeechMask::with_detector(scripted(close(), vec![]), 1600);
+        mask.feed(&samples[..5100]);
+        assert_eq!(mask.finish(), vec![false; 4]);
+    }
+
+    #[test]
+    fn rms_mask_keeps_a_partial_last_frame() {
+        let mut samples = vec![0i16; 1600];
+        samples.extend(at_level(-30.0, 7).into_iter().take(1600));
+        samples.extend(at_level(-30.0, 1).into_iter().take(150));
+        let cfg = VadConfig::close(Vad::Rms);
+        assert_eq!(speech_mask(&samples, &cfg, 1600), vec![false, true, true]);
+    }
+
+    /// Seeded Gaussian noise (Box-Muller over xorshift).
+    fn gaussian(n: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed;
+        let mut uniform = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        (0..n)
+            .map(|_| {
+                let (u, v) = (uniform(), uniform());
+                (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+            })
+            .collect()
+    }
+
+    /// `signal` scaled to an RMS of `level` dBFS.
+    fn scaled(signal: &[f64], level: f64) -> Vec<i16> {
+        let rms = (signal.iter().map(|x| x * x).sum::<f64>() / signal.len() as f64).sqrt();
+        let gain = 10f64.powf(level / 20.0) * i16::MAX as f64 / rms;
+        signal
+            .iter()
+            .map(|x| (x * gain).round().clamp(-32768.0, 32767.0) as i16)
+            .collect()
+    }
+
+    #[test]
+    fn earshot_never_calls_noise_speech() {
+        let n = 10 * VAD_SAMPLE_RATE as usize;
+        let white = scaled(&gaussian(n, 7), -40.0);
+        let mut acc = 0.0;
+        let brown_raw: Vec<f64> = gaussian(n, 11)
+            .into_iter()
+            .map(|x| {
+                acc = 0.995 * acc + x;
+                acc
+            })
+            .collect();
+        let brown = scaled(&brown_raw, -40.0);
+        let silence = vec![0i16; n];
+        for (name, samples) in [("silence", &silence), ("white", &white), ("brown", &brown)] {
+            for cfg in [close(), open()] {
+                let mut detector = SpeechDetector::new(cfg, VAD_SAMPLE_RATE);
+                assert!(detector.uses_model());
+                let mut speech = 0;
+                for chunk in samples.chunks(800) {
+                    detector.feed(chunk, |d| speech += d.speech as usize);
+                }
+                assert_eq!(speech, 0, "{name} was speech in {speech} frames");
+
+                let mut stop = AutoStopDetector::with_vad(cfg, 2000, VAD_SAMPLE_RATE);
+                assert!(!samples.chunks(800).any(|c| stop.feed(c)));
+                assert!(!stop.has_speech(), "{name} armed auto-stop");
+            }
+            let expected = if name == "silence" {
+                GateReason::Silent
+            } else {
+                GateReason::NoSpeech
+            };
+            assert_eq!(
+                speech_gate(samples, VAD_SAMPLE_RATE, 300, &close()).reason,
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_rates_fall_back_to_rms() {
+        let detector = SpeechDetector::new(close(), 48_000);
+        assert!(!detector.uses_model());
+        assert_eq!(detector.frame_len(), 768);
+        // A rate of 0 does not panic.
+        let mut detector = SpeechDetector::new(close(), 0);
+        detector.feed(&[1, 2, 3], |_| {});
+        assert_eq!(detector.levels().duration_ms, 0);
+    }
+}

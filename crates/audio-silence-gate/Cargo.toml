@@ -1,14 +1,17 @@
 [package]
 name = "audio-silence-gate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.70"
-description = "Lightweight RMS-based silence detection and auto-stop for audio capture"
+rust-version = "1.87"
+description = "Speech detection for audio capture: the earshot VAD with level floors and hangover, an RMS gate, auto-stop and a level meter"
 repository = "https://github.com/y0sif/whisrs/tree/main/crates/audio-silence-gate"
 license = "MIT"
 readme = "README.md"
-keywords = ["audio", "vad", "silence", "rms", "detection"]
+keywords = ["audio", "vad", "silence", "speech", "detection"]
 categories = ["multimedia::audio"]
 
 [dependencies]
-# None — pure std
+# The learned detector (std only, no dependencies of its own). Patch releases
+# only: the thresholds in `vad.rs` are tuned to these weights, so a new minor
+# version must pass scripts/check-vad.sh before it is allowed in.
+earshot = "~1.2.2"
