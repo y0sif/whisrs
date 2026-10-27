@@ -115,6 +115,7 @@ src/
 │   ├── wav.rs              # PCM-to-WAV encoding
 │   ├── playback.rs         # TTS audio playback
 │   ├── feedback.rs         # Audio cues
+│   ├── quality.rs          # Quality report: analyze (pure, open profile), verdicts, skip labels with levels
 │   └── recovery.rs         # Save/load audio on transcription failure
 ├── transcription/
 │   ├── mod.rs              # TranscriptionBackend trait, timed segments, phrase fallback
@@ -181,7 +182,7 @@ crates/
 │   ├── clipboard.rs        #   Clipboard ops (wl-copy/arboard, save/restore)
 │   └── wayland_vk.rs       #   zwp_virtual_keyboard_v1 backend
 ├── asr-dedup/              # 0.1.0 — timestamp + n-gram dedup for chunked ASR
-├── audio-silence-gate/     # 0.1.0 — RMS energy gate / VAD
+├── audio-silence-gate/     # 0.2.0 - earshot VAD + RMS gate, auto-stop, level meter
 ├── filler-remove/          # 0.1.0 — filler-word stripping
 └── prompt-echo/            # 0.1.0 — prompt-echo hallucination filter
 ```
@@ -410,6 +411,14 @@ there until a `Stop` or `idle_loop`'s listing ends it (one `session_phases` per 
 backing off to 120 s, reset by a turn start or a row change). `TranscriptTail` (`claude_tail.rs`) sends
 `Activity` and `Interim` updates; `ProgressGate` admits interims per `feedback`.
 
+Speech detection: `[audio] vad` = `earshot` (default) | `rms` (the 0.1.31 loudness test), read through
+`AudioConfig::vad()` (an unknown value warns and uses earshot). Every speech decision on both
+transcription paths goes through `audio-silence-gate`: the `close` profile for dictation, command mode,
+`[[llm_commands]]` and agent turns (auto-stop, the batch gate), `open` for recording tracks. A skip toast
+names its reason with a level (`audio::quality::skip_label`: "silent (peak -82 dB)", "too quiet (speech
+at -68 dB)", "without speech (background at -48 dB)"); a streaming dictation that typed nothing says
+"Nothing typed: the audio was ..." (`notify_state`). Each turn logs one info line of levels.
+
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 
 Recording (mic + system audio, transcribed after the stop): the `[recording]` section (`backend`,
@@ -435,6 +444,15 @@ then holds the recording just to merge its fields into `recording.json` as it is
 (`summary::write_result`, stale if a name changed meanwhile) and re-render `<id>.md`
 (`process::save`); it never re-transcribes. A retry or a rename over a summary marks it
 `summary_stale`.
+Each `TrackMeta` has `quality: Option<TrackQuality>` (plain type, every build; `None` in an older
+`recording.json`): the track writer's meter on the raw chunks (`TrackStats::quality`, stored by
+`apply_outcomes`), else measured from the raw WAV by `process_recording`, plus the mic's `echo_path_db`
+when echo removal ran; `warnings` are `audio::quality::Check` codes. The front matter gets an `audio:`
+block (and `audio_warnings:` only when warned) for measured tracks only, so an older recording renders
+byte for byte as before. The mic writer's `LiveQuality` raises too quiet, clipping and noisy (every
+30 s once 30 s of speech was heard) and `system-silent` (2 minutes of speech while the system writer's
+`system_heard` flag is false), each once per recording, through `MicAlarm::on_warning`; the muted-mic
+alarm (`on_silence`) re-arms as before.
 
 Environment variable overrides:
 - `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key` (also used by the `deepgram` TTS backend)

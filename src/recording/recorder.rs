@@ -3,22 +3,27 @@
 //!
 //! One writer per track (mic, system). The header is rewritten every
 //! `flush_every`, so a crash leaves a file that [`super::wav_repair`] can fix
-//! with at most that much audio missing from the header's length. The mic's
-//! writer also watches for a muted mic ([`SilenceDetector`]) on the chunks it
-//! writes anyway.
+//! with at most that much audio missing from the header's length. A track's
+//! writer also measures its quality ([`QualityMeter`]) on the chunks it
+//! writes anyway; the mic's watches for a muted mic ([`SilenceDetector`])
+//! and raises the live quality warnings ([`LiveQuality`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use audio_silence_gate::{LevelMeter, Vad};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::audio::capture::SAMPLE_RATE;
+use crate::audio::quality::{Check, QualityMeter, QualityReport, Verdict};
 use crate::audio::AudioChunk;
 
 /// Loudest sample of a chunk that is still digital silence: a muted mic,
@@ -65,20 +70,125 @@ impl SilenceDetector {
     }
 }
 
-/// What the mic's writer does once the mic has sent only silence for
-/// `after`: called on the writer's thread, so it must not block.
-pub struct SilenceAlarm {
-    pub after: Duration,
+/// How often the mic's writer looks at its live quality: every 30 s of
+/// audio.
+pub const LIVE_CHECK_EVERY: Duration = Duration::from_secs(30);
+
+/// Speech the mic must have heard before the live checks start (30 s): less
+/// is too little to judge a mic or a room by.
+pub const LIVE_SPEECH_BEFORE: Duration = Duration::from_secs(30);
+
+/// Mic speech after which a system track that has sent only digital silence
+/// is warned about (2 minutes).
+pub const SYSTEM_SILENT_AFTER: Duration = Duration::from_secs(2 * 60);
+
+fn samples_in(duration: Duration) -> u64 {
+    (duration.as_secs_f64() * f64::from(SAMPLE_RATE)) as u64
+}
+
+/// The mic's live quality warnings, each raised at most once per recording:
+/// every [`LIVE_CHECK_EVERY`] of audio, once [`LIVE_SPEECH_BEFORE`] of
+/// speech was heard, a mic too quiet and a noisy room (over the recording so
+/// far) and clipping (over the last check's 30 s); and `system-silent` once
+/// the mic has heard [`SYSTEM_SILENT_AFTER`] of speech while the system
+/// track sent only digital silence (`system_heard` still false).
+pub struct LiveQuality {
+    meter: QualityMeter,
+    /// Clipping since the last check.
+    window: LevelMeter,
+    since_check: u64,
+    raised: Vec<Check>,
+    system_heard: Arc<AtomicBool>,
+}
+
+impl LiveQuality {
+    pub fn new(vad: Vad, system_heard: Arc<AtomicBool>) -> Self {
+        Self {
+            meter: QualityMeter::new(vad),
+            window: LevelMeter::new(SAMPLE_RATE),
+            since_check: 0,
+            raised: Vec::new(),
+            system_heard,
+        }
+    }
+
+    /// Take the next chunk; the warnings it raises, none twice.
+    pub fn feed(&mut self, chunk: &[i16]) -> Vec<Verdict> {
+        self.meter.feed(chunk);
+        self.window.add_samples(chunk);
+        self.since_check += chunk.len() as u64;
+        let speech = self.meter.speech_samples();
+        let mut found = Vec::new();
+        if speech >= samples_in(SYSTEM_SILENT_AFTER) && !self.system_heard.load(Ordering::Relaxed) {
+            found.push(Verdict::of(Check::SystemSilent, 0.0));
+        }
+        if self.since_check >= samples_in(LIVE_CHECK_EVERY) {
+            self.since_check = 0;
+            let clipped = self.window.levels().clipped_share;
+            self.window.reset();
+            if speech >= samples_in(LIVE_SPEECH_BEFORE) {
+                found.extend(check_warnings(&self.meter.report(), clipped));
+            }
+        }
+        found.retain(|v| !self.raised.contains(&v.check));
+        self.raised.extend(found.iter().map(|v| v.check));
+        found
+    }
+
+    /// The warnings raised so far.
+    pub fn raised(&self) -> &[Check] {
+        &self.raised
+    }
+
+    /// The track's quality so far.
+    pub fn report(&self) -> QualityReport {
+        self.meter.report()
+    }
+}
+
+/// What one live check warns about: a mic too quiet or a noisy room by
+/// `report` (the recording so far), clipping by `clipped` (the share over
+/// the last [`LIVE_CHECK_EVERY`]).
+fn check_warnings(report: &QualityReport, clipped: f32) -> Vec<Verdict> {
+    let mut found: Vec<Verdict> = report
+        .warnings()
+        .into_iter()
+        .filter(|v| matches!(v.check, Check::TooQuiet | Check::Noisy))
+        .collect();
+    let clipping = Verdict::of(Check::Clipping, clipped);
+    if clipping.warn {
+        found.push(clipping);
+    }
+    found
+}
+
+/// What the mic's writer raises, on the writer's thread, so neither callback
+/// may block: `on_silence` once the mic has sent only digital silence for
+/// `silence_after` (and again only after real audio came back in between),
+/// `on_warning` for each live quality warning ([`LiveQuality`]).
+pub struct MicAlarm {
+    pub silence_after: Duration,
     pub on_silence: Box<dyn FnMut() + Send>,
+    pub on_warning: Box<dyn FnMut(Verdict) + Send>,
+    /// Set by the system track's writer once that track carried sound, or
+    /// from the start when no system track is recorded: `system-silent` is
+    /// raised only while it is false.
+    pub system_heard: Arc<AtomicBool>,
 }
 
 /// What a track writer recorded.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackStats {
     /// Samples written (16 kHz mono).
     pub samples: u64,
     /// When the first non-empty chunk arrived, to align the tracks.
     pub first_chunk_at: Option<Instant>,
+    /// The track's quality, measured on the chunks as written. `None` from a
+    /// writer that does not measure ([`spawn_track_writer`]) or that wrote
+    /// nothing.
+    pub quality: Option<QualityReport>,
+    /// The live warnings the mic's writer raised.
+    pub raised: Vec<Check>,
 }
 
 /// Whether a track writer failed because the disk is full (or the user's
@@ -108,25 +218,107 @@ fn track_spec() -> hound::WavSpec {
 }
 
 /// Write the chunks from `rx` to a WAV file at `path` (created 0600) until
-/// the channel closes, then finalize it. Runs on the blocking pool.
+/// the channel closes, then finalize it. Runs on the blocking pool. Measures
+/// nothing: [`spawn_mic_writer`] and [`spawn_system_writer`] do.
 pub fn spawn_track_writer(
     rx: mpsc::UnboundedReceiver<AudioChunk>,
     path: PathBuf,
     flush_every: Duration,
 ) -> JoinHandle<anyhow::Result<TrackStats>> {
-    tokio::task::spawn_blocking(move || write_track(rx, &path, flush_every, None))
+    tokio::task::spawn_blocking(move || write_track(rx, &path, flush_every, Monitor::None))
 }
 
-/// [`spawn_track_writer`] for the mic, which also raises `silence` when the
-/// mic sends only digital silence. Never used for the system track: a
-/// paused video is silent too.
+/// [`spawn_track_writer`] for the mic, which also measures its quality with
+/// `vad`, raises `alarm.on_silence` when the mic sends only digital silence
+/// and `alarm.on_warning` for each live quality warning. Never used for the
+/// system track: a paused video is silent too.
 pub fn spawn_mic_writer(
     rx: mpsc::UnboundedReceiver<AudioChunk>,
     path: PathBuf,
     flush_every: Duration,
-    silence: SilenceAlarm,
+    vad: Vad,
+    alarm: MicAlarm,
 ) -> JoinHandle<anyhow::Result<TrackStats>> {
-    tokio::task::spawn_blocking(move || write_track(rx, &path, flush_every, Some(silence)))
+    let monitor = Monitor::Mic {
+        silence: SilenceDetector::new(alarm.silence_after),
+        live: Box::new(LiveQuality::new(vad, Arc::clone(&alarm.system_heard))),
+        alarm,
+    };
+    tokio::task::spawn_blocking(move || write_track(rx, &path, flush_every, monitor))
+}
+
+/// [`spawn_track_writer`] for the system track, which also measures its
+/// quality with `vad` and sets `heard` once a chunk is more than digital
+/// silence.
+pub fn spawn_system_writer(
+    rx: mpsc::UnboundedReceiver<AudioChunk>,
+    path: PathBuf,
+    flush_every: Duration,
+    vad: Vad,
+    heard: Arc<AtomicBool>,
+) -> JoinHandle<anyhow::Result<TrackStats>> {
+    let monitor = Monitor::System {
+        meter: QualityMeter::new(vad),
+        heard,
+    };
+    tokio::task::spawn_blocking(move || write_track(rx, &path, flush_every, monitor))
+}
+
+/// What a track writer watches besides writing.
+enum Monitor {
+    None,
+    Mic {
+        silence: SilenceDetector,
+        live: Box<LiveQuality>,
+        alarm: MicAlarm,
+    },
+    System {
+        meter: QualityMeter,
+        heard: Arc<AtomicBool>,
+    },
+}
+
+impl Monitor {
+    fn feed(&mut self, chunk: &[i16]) {
+        match self {
+            Monitor::None => {}
+            Monitor::Mic {
+                silence,
+                live,
+                alarm,
+            } => {
+                if silence.feed(chunk) {
+                    (alarm.on_silence)();
+                }
+                for warning in live.feed(chunk) {
+                    (alarm.on_warning)(warning);
+                }
+            }
+            Monitor::System { meter, heard } => {
+                meter.feed(chunk);
+                if !heard.load(Ordering::Relaxed)
+                    && chunk.iter().any(|s| s.unsigned_abs() > SILENCE_PEAK)
+                {
+                    heard.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Put what it measured into `stats`; nothing for a track with no audio.
+    fn finish(self, stats: &mut TrackStats) {
+        if stats.samples == 0 {
+            return;
+        }
+        match self {
+            Monitor::None => {}
+            Monitor::Mic { live, .. } => {
+                stats.quality = Some(live.report());
+                stats.raised = live.raised().to_vec();
+            }
+            Monitor::System { meter, .. } => stats.quality = Some(meter.report()),
+        }
+    }
 }
 
 fn create_track_file(path: &Path) -> anyhow::Result<File> {
@@ -148,26 +340,19 @@ fn write_track(
     mut rx: mpsc::UnboundedReceiver<AudioChunk>,
     path: &Path,
     flush_every: Duration,
-    mut silence: Option<SilenceAlarm>,
+    mut monitor: Monitor,
 ) -> anyhow::Result<TrackStats> {
     let file = create_track_file(path)?;
     let mut writer = hound::WavWriter::new(BufWriter::new(file), track_spec())
         .with_context(|| format!("failed to start WAV {}", path.display()))?;
     let mut stats = TrackStats::default();
     let mut last_flush = Instant::now();
-    let mut detector = silence
-        .as_ref()
-        .map(|alarm| SilenceDetector::new(alarm.after));
 
     while let Some(chunk) = rx.blocking_recv() {
         if chunk.is_empty() {
             continue;
         }
-        if let (Some(detector), Some(alarm)) = (detector.as_mut(), silence.as_mut()) {
-            if detector.feed(&chunk) {
-                (alarm.on_silence)();
-            }
-        }
+        monitor.feed(&chunk);
         stats.first_chunk_at.get_or_insert_with(Instant::now);
         for &sample in &chunk {
             writer
@@ -188,6 +373,7 @@ fn write_track(
         .finalize()
         .with_context(|| format!("failed to finalize {}", path.display()))?;
     debug!("wrote {} samples to {}", stats.samples, path.display());
+    monitor.finish(&mut stats);
     Ok(stats)
 }
 
@@ -382,13 +568,15 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = std::sync::Arc::clone(&fired);
-        let alarm = SilenceAlarm {
-            after: Duration::from_millis(200),
+        let alarm = MicAlarm {
+            silence_after: Duration::from_millis(200),
             on_silence: Box::new(move || {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }),
+            on_warning: Box::new(|v| panic!("no live warning in 1.3 s: {v:?}")),
+            system_heard: Arc::new(AtomicBool::new(false)),
         };
-        let task = spawn_mic_writer(rx, path.clone(), Duration::from_secs(2), alarm);
+        let task = spawn_mic_writer(rx, path.clone(), Duration::from_secs(2), Vad::Rms, alarm);
         for chunk in [
             vec![0i16; 1600],
             vec![0; 1600],
@@ -405,6 +593,157 @@ mod tests {
         assert_eq!(stats.samples, 8 * 1600, "every chunk is still written");
         assert_eq!(fired.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(read_samples(&path).len(), 8 * 1600);
+    }
+
+    /// `secs` seconds of 100 ms chunks whose 16 ms frames alternate speech
+    /// to the RMS test (-45 dBFS) and a background 7 dB under it, so half the
+    /// audio is speech and the room is noisy. `clip` puts runs of 3 samples
+    /// at the rail in every chunk: 0.19% of the audio.
+    fn noisy_room(start: usize, secs: usize, clip: bool) -> Vec<Vec<i16>> {
+        (0..secs * 10)
+            .map(|c| {
+                let mut chunk: Vec<i16> = (0..1600)
+                    .map(|i| {
+                        let n = start * 16_000 + c * 1600 + i;
+                        let amplitude = if (n / 256).is_multiple_of(2) { 184 } else { 82 };
+                        if n.is_multiple_of(2) {
+                            amplitude
+                        } else {
+                            -amplitude
+                        }
+                    })
+                    .collect();
+                if clip {
+                    chunk[100..103].fill(i16::MAX);
+                }
+                chunk
+            })
+            .collect()
+    }
+
+    /// Feed `chunks`, returning the codes raised.
+    fn raised(live: &mut LiveQuality, chunks: &[Vec<i16>]) -> Vec<&'static str> {
+        chunks
+            .iter()
+            .flat_map(|chunk| live.feed(chunk))
+            .map(|v| v.code())
+            .collect()
+    }
+
+    /// Each live warning fires once per recording: nothing before 30 s of
+    /// speech, the noisy room at the first check after it, clipping at the
+    /// first check over a clipping 30 s, and the system track after 2
+    /// minutes of mic speech while it sent only digital silence.
+    #[test]
+    fn live_warnings_fire_once() {
+        let heard = Arc::new(AtomicBool::new(false));
+        let mut live = LiveQuality::new(Vad::Rms, Arc::clone(&heard));
+        // 30 s of audio is 15 s of speech: the first check stays quiet.
+        assert!(raised(&mut live, &noisy_room(0, 30, false)).is_empty());
+        // 30 s of speech by the second check.
+        assert_eq!(raised(&mut live, &noisy_room(30, 30, false)), ["noisy"]);
+        assert!(raised(&mut live, &noisy_room(60, 178, false)).is_empty());
+        // 2 minutes of speech at 240 s, none of it on the system track.
+        assert_eq!(
+            raised(&mut live, &noisy_room(238, 4, false)),
+            ["system-silent"]
+        );
+        // The check at 270 s covers 28 s of clipping.
+        assert_eq!(raised(&mut live, &noisy_room(242, 30, true)), ["clipping"]);
+        assert!(raised(&mut live, &noisy_room(272, 128, true)).is_empty());
+        assert_eq!(
+            live.raised(),
+            [Check::Noisy, Check::SystemSilent, Check::Clipping]
+        );
+    }
+
+    /// A system track that carried sound never gets the warning.
+    #[test]
+    fn a_system_track_that_played_is_never_silent() {
+        let heard = Arc::new(AtomicBool::new(false));
+        let mut live = LiveQuality::new(Vad::Rms, Arc::clone(&heard));
+        assert!(raised(&mut live, &noisy_room(0, 60, false)).contains(&"noisy"));
+        heard.store(true, Ordering::Relaxed);
+        assert!(raised(&mut live, &noisy_room(60, 300, false)).is_empty());
+    }
+
+    /// A check warns about a mic too quiet and a noisy room over the whole
+    /// recording, clipping over its own 30 s.
+    #[test]
+    fn a_check_warns_by_the_report_and_the_window() {
+        let levels = audio_silence_gate::Levels {
+            speech_dbfs: Some(-58.0),
+            noise_dbfs: Some(-70.0),
+            snr_db: Some(12.0),
+            clipped_share: 0.01,
+            dc_offset: 0.05,
+            speech_share: 0.5,
+            peak_dbfs: -20.0,
+            duration_ms: 60_000,
+        };
+        let report = QualityReport::new(Vad::Earshot, levels);
+        let codes = |clipped| -> Vec<&'static str> {
+            check_warnings(&report, clipped)
+                .iter()
+                .map(|v| v.code())
+                .collect()
+        };
+        // The whole recording's clipping and DC offset are not live checks.
+        assert_eq!(codes(0.0), ["too-quiet"]);
+        assert_eq!(codes(0.002), ["too-quiet", "clipping"]);
+    }
+
+    /// The writers measure the track as written; the system's sets the flag
+    /// once it carries more than digital silence.
+    #[tokio::test]
+    async fn the_writers_measure_their_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let heard = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let system = spawn_system_writer(
+            rx,
+            dir.path().join("system.wav"),
+            Duration::from_secs(2),
+            Vad::Rms,
+            Arc::clone(&heard),
+        );
+        tx.send(vec![SILENCE_PEAK as i16; 1600]).unwrap();
+        tx.send(vec![0; 1600]).unwrap();
+        drop(tx);
+        let stats = system.await.unwrap().unwrap();
+        assert!(!heard.load(Ordering::Relaxed), "digital silence");
+        let quality = stats.quality.unwrap();
+        assert_eq!(quality.levels.speech_dbfs, None);
+        assert_eq!(quality.levels.noise_dbfs, None);
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let system = spawn_system_writer(
+            rx,
+            dir.path().join("system.wav"),
+            Duration::from_secs(2),
+            Vad::Rms,
+            Arc::clone(&heard),
+        );
+        for chunk in noisy_room(0, 2, false) {
+            tx.send(chunk).unwrap();
+        }
+        drop(tx);
+        let stats = system.await.unwrap().unwrap();
+        assert!(heard.load(Ordering::Relaxed));
+        assert!(stats.quality.unwrap().levels.speech_dbfs.is_some());
+        assert!(stats.raised.is_empty());
+
+        // No audio, no report.
+        let (tx, rx) = mpsc::unbounded_channel::<AudioChunk>();
+        drop(tx);
+        let system = spawn_system_writer(
+            rx,
+            dir.path().join("empty.wav"),
+            Duration::from_secs(2),
+            Vad::Rms,
+            heard,
+        );
+        assert_eq!(system.await.unwrap().unwrap().quality, None);
     }
 
     #[tokio::test]

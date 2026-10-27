@@ -932,6 +932,7 @@ mod tests {
             device: "test".into(),
             offset_ms: 0,
             samples: 0,
+            quality: None,
         }];
         std::fs::write(store::audio_path(&dir, TrackKind::Mic), b"wav").unwrap();
         edit(&mut meta);

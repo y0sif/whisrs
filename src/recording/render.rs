@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Local};
 
-use super::{RecordingMeta, TrackKind, TrackMeta};
+use super::{RecordingMeta, TrackKind, TrackMeta, TrackQuality};
 
 /// Consecutive segments from one speaker, merged.
 pub(crate) struct Turn<'a> {
@@ -224,6 +224,48 @@ fn language_lines(meta: &RecordingMeta) -> String {
     }
 }
 
+/// The front matter's `audio` block: the levels of each track with a
+/// quality report (whole dB, `null` for a level not measured), then
+/// `audio_warnings` when any track warned. Empty when no track has a report,
+/// so a recording made before tracks were measured renders as it did.
+fn audio_lines(meta: &RecordingMeta) -> String {
+    let measured: Vec<(TrackKind, &TrackQuality)> = meta
+        .tracks
+        .iter()
+        .filter_map(|t| t.quality.as_ref().map(|q| (t.kind, q)))
+        .collect();
+    if measured.is_empty() {
+        return String::new();
+    }
+    let db = |v: Option<f32>| v.map_or_else(|| "null".to_string(), |v| format!("{v:.0}"));
+    let mut out = String::from("audio:\n");
+    for (kind, quality) in &measured {
+        out.push_str(&format!(
+            "  {}: {{speech_dbfs: {}, noise_dbfs: {}, snr_db: {}}}\n",
+            kind.file_stem(),
+            db(quality.speech_dbfs),
+            db(quality.noise_dbfs),
+            db(quality.snr_db)
+        ));
+    }
+    let warnings: Vec<String> = measured
+        .iter()
+        .flat_map(|(kind, quality)| {
+            quality
+                .verdicts()
+                .into_iter()
+                .map(move |v| format!("{}: {}", kind.file_stem(), v.detail()))
+        })
+        .collect();
+    if !warnings.is_empty() {
+        out.push_str("audio_warnings:\n");
+        for warning in warnings {
+            out.push_str(&format!("  - {}\n", yaml_str(&warning)));
+        }
+    }
+    out
+}
+
 /// Render the recording as Markdown with YAML front matter.
 pub fn render_markdown(meta: &RecordingMeta) -> String {
     let mut out = String::from("---\n");
@@ -265,6 +307,7 @@ pub fn render_markdown(meta: &RecordingMeta) -> String {
     if let Some(model) = &meta.model {
         out.push_str(&format!("model: {}\n", yaml_str(model)));
     }
+    out.push_str(&audio_lines(meta));
     out.push_str(&language_lines(meta));
     out.push_str("---\n\n");
     if let Some(summary) = meta
@@ -376,6 +419,7 @@ mod tests {
                 device: "default".into(),
                 offset_ms: 0,
                 samples: 0,
+                quality: None,
             })
             .collect();
         meta.mic_language = Some("de".into());
@@ -434,6 +478,74 @@ mod tests {
         assert_eq!(front(&md), front(&without));
         m.summary = Some("  ".into());
         assert_eq!(render_markdown(&m), without, "a blank summary is none");
+    }
+
+    fn quality(speech: Option<f32>, noise: Option<f32>, warnings: &[&str]) -> TrackQuality {
+        TrackQuality {
+            vad: "earshot".into(),
+            speech_dbfs: speech,
+            noise_dbfs: noise,
+            snr_db: speech.zip(noise).map(|(s, n)| s - n),
+            clipped: 0.0,
+            dc_offset: 0.0,
+            speech_share: 0.3,
+            echo_path_db: None,
+            warnings: warnings.iter().map(|w| w.to_string()).collect(),
+        }
+    }
+
+    /// A recording made before tracks were measured renders byte for byte
+    /// as it did: the expected text is the one
+    /// `markdown_has_front_matter_and_merged_turns` pins, from a meta read
+    /// from a `recording.json` with no `quality`.
+    #[test]
+    fn a_recording_without_quality_renders_as_before() {
+        let json = serde_json::to_string(&meta()).unwrap();
+        assert!(!json.contains("quality"), "{json}");
+        let old: RecordingMeta = serde_json::from_str(&json).unwrap();
+        assert!(old.tracks.iter().all(|t| t.quality.is_none()));
+        assert_eq!(render_markdown(&old), render_markdown(&meta()));
+        assert!(!render_markdown(&old).contains("audio"));
+    }
+
+    /// Each measured track gets a line of levels after the model; the
+    /// warnings follow only when a track warned.
+    #[test]
+    fn front_matter_has_an_audio_block_per_measured_track() {
+        let mut m = meta();
+        m.tracks[0].quality = Some(quality(Some(-41.3), Some(-62.0), &[]));
+        m.tracks[1].quality = Some(quality(Some(-24.0), None, &[]));
+        let md = render_markdown(&m);
+        assert!(
+            md.contains(
+                "model: \"whisper-large-v3-turbo\"\n\
+                 audio:\n  \
+                 mic: {speech_dbfs: -41, noise_dbfs: -62, snr_db: 21}\n  \
+                 system: {speech_dbfs: -24, noise_dbfs: null, snr_db: null}\n\
+                 language: \"de\"\n---\n"
+            ),
+            "{md}"
+        );
+        assert!(!md.contains("audio_warnings"), "{md}");
+
+        m.tracks[0].quality = Some(quality(Some(-41.0), Some(-48.0), &["noisy", "dc-offset"]));
+        m.tracks[0].quality.as_mut().unwrap().dc_offset = 0.02;
+        m.tracks[1].quality = Some(quality(None, None, &["system-silent"]));
+        let md = render_markdown(&m);
+        assert!(
+            md.contains(
+                "  system: {speech_dbfs: null, noise_dbfs: null, snr_db: null}\n\
+                 audio_warnings:\n  \
+                 - \"mic: noisy (speech 7 dB above the background)\"\n  \
+                 - \"mic: DC offset (2%)\"\n  \
+                 - \"system: system silent (nothing played while the mic heard speech)\"\n\
+                 language:"
+            ),
+            "{md}"
+        );
+        // A track without a report has no line.
+        m.tracks[1].quality = None;
+        assert!(!render_markdown(&m).contains("  system:"));
     }
 
     #[test]
@@ -659,6 +771,7 @@ mod tests {
             device: "default".into(),
             offset_ms: 500,
             samples: 16_000 * 90,
+            quality: None,
         });
         assert_eq!(duration_ms(&m), 90_500);
     }

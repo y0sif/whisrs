@@ -36,7 +36,8 @@ use super::speech::{self, TimeMap};
 use super::split::frame_len;
 use super::store::{self, CACHE_DIR};
 use super::{llm_names, naming};
-use super::{RecordingMeta, RecordingState, Segment, TrackKind, TranscriptSegment};
+use super::{RecordingMeta, RecordingState, Segment, TrackKind, TrackQuality, TranscriptSegment};
+use crate::audio::quality::{QualityMeter, QualityReport};
 use crate::audio::wav::encode_wav;
 use crate::replacements::Replacer;
 use crate::transcription::deepgram::refused_diarization;
@@ -93,6 +94,7 @@ async fn process_with_timing(
     meta.error = None;
     fill_stored_settings(&mut meta, config);
     store::write_meta(dir, &meta)?;
+    fill_track_quality(dir, &mut meta, config.audio.vad()).await;
 
     let name = recording_backend_name(config)?;
     let backend = match dictation_backend {
@@ -157,6 +159,12 @@ async fn process_with_timing(
 
     let echo_cache = mic_request.cache.echo_cancelled();
     let cancelled_mic = echo_cancelled_mic(dir, &meta).await;
+    if let Some(echo_path_db) = cancelled_mic.as_ref().and_then(|c| c.echo_path_db) {
+        let mic = meta.tracks.iter_mut().find(|t| t.kind == TrackKind::Mic);
+        if let Some(quality) = mic.and_then(|t| t.quality.as_mut()) {
+            quality.set_echo_path(echo_path_db);
+        }
+    }
     let mut transcribed = Vec::new();
     let mut readable_tracks = 0usize;
     for track in meta.tracks.clone() {
@@ -341,6 +349,27 @@ pub(crate) fn save(dir: &Path, meta: &RecordingMeta) -> anyhow::Result<()> {
     store::write_meta(dir, meta)
 }
 
+/// Give each recorded track with no quality one measured from its file as
+/// recorded ([`measure_track`]): a recovered recording, whose writers never
+/// finished, or one made before tracks were measured. A track that cannot be
+/// read keeps none; transcribing it says why.
+async fn fill_track_quality(dir: &Path, meta: &mut RecordingMeta, vad: Vad) {
+    for track in meta.tracks.iter_mut().filter(|t| t.quality.is_none()) {
+        let path = dir.join(&track.file);
+        if !path.exists() {
+            continue;
+        }
+        match blocking(move || measure_track(&path, vad)).await {
+            Ok(report) => track.quality = Some(TrackQuality::from_report(&report)),
+            Err(e) => warn!(
+                "recording {}: could not measure the {} track: {e:#}",
+                meta.id,
+                track.kind.file_stem()
+            ),
+        }
+    }
+}
+
 /// Give a track with no stored language (a recording made before languages
 /// were stored) the one the config gives it ([`RecordingConfig::language_for`]),
 /// and a recording with no stored `shared_mic` or `num_speakers` the
@@ -498,6 +527,9 @@ struct CancelledMic {
     path: PathBuf,
     /// [`speech::FRAME`] activity from the canceller's near-end detector.
     near_end: Vec<bool>,
+    /// The echo path the canceller measured, in dB; `None` when an earlier
+    /// attempt's track was reused.
+    echo_path_db: Option<f32>,
 }
 
 /// The mic track with the speakers' echo removed ([`cancel_echo`]), or
@@ -532,6 +564,7 @@ async fn echo_cancelled_mic(dir: &Path, meta: &RecordingMeta) -> Option<Cancelle
             Some(CancelledMic {
                 path: out,
                 near_end,
+                echo_path_db: None,
             })
         }
         Ok(EchoStep::Ran(EchoOutcome::Cancelled(done))) => {
@@ -548,6 +581,7 @@ async fn echo_cancelled_mic(dir: &Path, meta: &RecordingMeta) -> Option<Cancelle
             Some(CancelledMic {
                 path: out,
                 near_end: done.near_end,
+                echo_path_db: Some(report.echo_path_db),
             })
         }
         Ok(EchoStep::Ran(EchoOutcome::Skipped(reason))) => {
@@ -687,6 +721,24 @@ pub(super) fn open_track(
         );
     }
     Ok(reader)
+}
+
+/// A track's quality from its file ([`QualityMeter`], the open profile of
+/// `vad`), read in one-second pieces. Blocking.
+fn measure_track(path: &Path, vad: Vad) -> anyhow::Result<QualityReport> {
+    let mut reader = open_track(path)?;
+    let mut meter = QualityMeter::new(vad);
+    let piece = SAMPLE_RATE as usize;
+    let mut buf = Vec::with_capacity(piece);
+    for sample in reader.samples::<i16>() {
+        buf.push(sample.with_context(|| format!("failed to read {}", path.display()))?);
+        if buf.len() == piece {
+            meter.feed(&buf);
+            buf.clear();
+        }
+    }
+    meter.feed(&buf);
+    Ok(meter.report())
 }
 
 /// What one pass over a track learns, without keeping its samples: a
@@ -1476,6 +1528,7 @@ mod tests {
                 device: "test".into(),
                 offset_ms: *offset_ms,
                 samples: samples.as_ref().map_or(0, |s| s.len() as u64),
+                quality: None,
             });
         }
         store::write_meta(tmp.path(), &meta).unwrap();
@@ -1953,7 +2006,26 @@ mod tests {
         let system_path = store::audio_path(tmp.path(), TrackKind::System);
         let recorded = fs::read(&mic_path).unwrap();
         let backend = Arc::new(RecordingBackend::default());
-        run_recording(tmp.path(), &backend).await.unwrap();
+        let meta = run_recording(tmp.path(), &backend).await.unwrap();
+
+        // The writers measured nothing here (a recording from before
+        // tracks were measured): processing measures both from their files,
+        // and the mic gets the echo path the canceller found.
+        assert_eq!(store::read_meta(tmp.path()).unwrap().tracks, meta.tracks);
+        let quality = |kind| {
+            let track = meta.tracks.iter().find(|t| t.kind == kind).unwrap();
+            track.quality.clone().expect("measured")
+        };
+        let (mic_quality, system_quality) = (quality(TrackKind::Mic), quality(TrackKind::System));
+        assert_eq!(mic_quality.vad, "rms");
+        assert!(mic_quality.echo_path_db.is_some(), "{mic_quality:?}");
+        assert!(system_quality.speech_dbfs.is_some(), "{system_quality:?}");
+        assert_eq!(system_quality.echo_path_db, None);
+        let markdown = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            markdown.contains("\naudio:\n  mic: {speech_dbfs: "),
+            "{markdown}"
+        );
 
         let sent = backend.sent.lock().unwrap();
         assert_eq!(sent.len(), 2);
@@ -1987,7 +2059,10 @@ mod tests {
         let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(mic.clone()))]);
         let mic_path = store::audio_path(tmp.path(), TrackKind::Mic);
         let backend = Arc::new(RecordingBackend::default());
-        run_recording(tmp.path(), &backend).await.unwrap();
+        let meta = run_recording(tmp.path(), &backend).await.unwrap();
+        // No echo removal ran: no echo path.
+        let mic_quality = meta.tracks[0].quality.as_ref().unwrap();
+        assert_eq!(mic_quality.echo_path_db, None);
         let raw = condensed(&mic_path, None);
         assert!(
             *backend.sent.lock().unwrap() == [raw.clone()],

@@ -4,6 +4,7 @@ pub mod capture;
 pub mod device;
 pub mod feedback;
 pub mod playback;
+pub mod quality;
 pub mod recovery;
 pub mod wav;
 

@@ -7,11 +7,12 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use audio_silence_gate::{speech_gate, AutoStopDetector, Levels, VadConfig};
+use audio_silence_gate::{speech_gate, AutoStopDetector, GateReason, Levels, VadConfig};
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
 use whisrs::audio::feedback;
+use whisrs::audio::quality;
 use whisrs::history::{self, HistoryEntry};
 use whisrs::llm;
 use whisrs::replacements::Replacer;
@@ -309,7 +310,9 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     }
     // Everything up to the stop: the drain below is the capture's last few
     // chunks.
-    info!("dictation audio: {}", describe_levels(&auto_stop.levels()));
+    let stream_levels = auto_stop.levels();
+    let heard_speech = auto_stop.has_speech();
+    info!("dictation audio: {}", describe_levels(&stream_levels));
 
     // Drain remaining audio from the capture channel into the backend.
     while let Some(chunk) = audio_rx.recv().await {
@@ -420,6 +423,22 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                     &format!("Transcription failed — partial text may have been typed.\n{err_msg}"),
                 );
             }
+        }
+    }
+
+    // Nothing typed, and no error or cancel to say why: name what the audio
+    // was, as a batch skip does. Audio the detector heard speech in is not
+    // why, so that stays a log line.
+    if full_text.is_empty() && stream_error.is_none() && !cancelled {
+        match quality::stream_skip_reason(config.vad, &stream_levels, heard_speech) {
+            Some(reason) => {
+                let message = nothing_typed_message(reason, &stream_levels);
+                info!("{message}");
+                if notify_state {
+                    send_notification("whisrs", &message);
+                }
+            }
+            None => info!("nothing typed: the backend returned no text"),
         }
     }
 
@@ -632,10 +651,30 @@ pub(crate) enum BatchOrigin<'a> {
     Agent { name: &'a str },
 }
 
+/// `message` with the advice for `reason` after it ([`quality::skip_hint`]).
+fn with_skip_hint(message: String, reason: GateReason) -> String {
+    match quality::skip_hint(reason) {
+        Some(hint) => format!("{message}. {hint}"),
+        None => message,
+    }
+}
+
+/// The toast for a streaming dictation that typed nothing because of its
+/// audio: the batch skip toast's label and advice.
+fn nothing_typed_message(reason: GateReason, levels: &Levels) -> String {
+    with_skip_hint(
+        format!(
+            "Nothing typed: the audio was {}",
+            quality::skip_label(reason, levels)
+        ),
+        reason,
+    )
+}
+
 impl BatchOrigin<'_> {
     /// Toast text when the audio gate rejects the audio (`label` is the
-    /// gate's reason, e.g. "too short" or "silent"). It never says
-    /// "recording": that is the recording feature's word.
+    /// gate's reason, e.g. "too short" or "silent", with its level). It
+    /// never says "recording": that is the recording feature's word.
     fn gate_skip_message(&self, label: &str) -> String {
         match self {
             BatchOrigin::Dictation | BatchOrigin::LlmCommand { .. } => {
@@ -646,6 +685,16 @@ impl BatchOrigin<'_> {
                 format!("Agent '{name}': the audio was {label}, nothing was sent")
             }
         }
+    }
+
+    /// The skip toast for `reason`: [`Self::gate_skip_message`] with the level
+    /// that explains it ([`quality::skip_label`]), and for silent audio the
+    /// advice after it.
+    fn gate_skip_toast(&self, reason: GateReason, levels: &Levels) -> String {
+        with_skip_hint(
+            self.gate_skip_message(&quality::skip_label(reason, levels)),
+            reason,
+        )
     }
 
     /// Progress toast shown once the gate passes. `None` for dictation, which
@@ -805,9 +854,17 @@ pub(crate) async fn transcribe_batch_audio(
     let gate = whisrs::audio::block_off_runtime(|| {
         speech_gate(samples, SAMPLE_RATE, AUDIO_GATE_MIN_MS, &vad)
     });
-    debug!("audio gate: {}", describe_levels(&gate.levels));
+    // The turn's one info line with its levels: command mode,
+    // `[[llm_commands]]` and agent turns logged theirs while recording
+    // (`collect_instruction_audio`), batch dictation has only this one.
+    if opts.origin == BatchOrigin::Dictation {
+        info!("dictation audio: {}", describe_levels(&gate.levels));
+    } else {
+        debug!("audio gate: {}", describe_levels(&gate.levels));
+    }
     if let Some(reason) = gate.reason {
-        let label = reason.as_str();
+        let label = quality::skip_label(reason, &gate.levels);
+        let toast = opts.origin.gate_skip_toast(reason, &gate.levels);
         match &opts.origin {
             BatchOrigin::Dictation => {
                 info!(
@@ -815,7 +872,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_state() {
-                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
+                    send_notification("whisrs", &toast);
                 }
             }
             BatchOrigin::CommandMode => {
@@ -824,7 +881,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_error() {
-                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
+                    send_notification("whisrs", &toast);
                 }
             }
             BatchOrigin::LlmCommand { name } => {
@@ -833,7 +890,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_state() {
-                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
+                    send_notification("whisrs", &toast);
                 }
             }
             BatchOrigin::Agent { name } => {
@@ -842,7 +899,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_error() {
-                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
+                    send_notification("whisrs", &toast);
                 }
             }
         }
@@ -1931,6 +1988,81 @@ mod tests {
         assert_eq!(
             BatchOrigin::Dictation.gate_skip_message(GateReason::NoSpeech.as_str()),
             "Skipped: the audio was without speech"
+        );
+    }
+
+    /// The skip toast names its reason with a level, on every origin, and
+    /// silent audio asks about a muted mic after it.
+    #[test]
+    fn gate_skip_toast_names_a_level_per_reason_and_origin() {
+        use audio_silence_gate::GateReason;
+        let levels = Levels {
+            speech_dbfs: Some(-68.0),
+            noise_dbfs: Some(-48.0),
+            snr_db: Some(-20.0),
+            clipped_share: 0.0,
+            dc_offset: 0.0,
+            speech_share: 0.0,
+            peak_dbfs: -82.0,
+            duration_ms: 210,
+        };
+        let cases = [
+            (
+                GateReason::Silent,
+                "silent (peak -82 dB)",
+                ". Is the mic muted?",
+            ),
+            (GateReason::TooQuiet, "too quiet (speech at -68 dB)", ""),
+            (
+                GateReason::NoSpeech,
+                "without speech (background at -48 dB)",
+                "",
+            ),
+            (GateReason::TooShort, "too short (0.2 s)", ""),
+        ];
+        for (reason, label, hint) in cases {
+            for (origin, expected) in [
+                (
+                    BatchOrigin::Dictation,
+                    format!("Skipped: the audio was {label}{hint}"),
+                ),
+                (
+                    BatchOrigin::CommandMode,
+                    format!("Command mode: the audio was {label}{hint}"),
+                ),
+                (
+                    BatchOrigin::LlmCommand { name: "proofread" },
+                    format!("Skipped: the audio was {label}{hint}"),
+                ),
+                (
+                    BatchOrigin::Agent { name: "jarvis" },
+                    format!("Agent 'jarvis': the audio was {label}, nothing was sent{hint}"),
+                ),
+            ] {
+                assert_eq!(
+                    origin.gate_skip_toast(reason, &levels),
+                    expected,
+                    "{origin:?}"
+                );
+            }
+        }
+        // The examples the toasts were designed from.
+        assert_eq!(
+            BatchOrigin::Dictation.gate_skip_toast(GateReason::Silent, &levels),
+            "Skipped: the audio was silent (peak -82 dB). Is the mic muted?"
+        );
+        assert_eq!(
+            BatchOrigin::Agent { name: "jarvis" }.gate_skip_toast(GateReason::TooQuiet, &levels),
+            "Agent 'jarvis': the audio was too quiet (speech at -68 dB), nothing was sent"
+        );
+        // A streaming dictation that typed nothing says the same.
+        assert_eq!(
+            nothing_typed_message(GateReason::NoSpeech, &levels),
+            "Nothing typed: the audio was without speech (background at -48 dB)"
+        );
+        assert_eq!(
+            nothing_typed_message(GateReason::Silent, &levels),
+            "Nothing typed: the audio was silent (peak -82 dB). Is the mic muted?"
         );
     }
 
