@@ -224,7 +224,7 @@ impl AutoStopDetector {
     /// once armed: [`has_speech`](Self::has_speech) turns true after 160 ms
     /// of accepted speech in total (a frame accepted only through
     /// [`VadConfig::soft_threshold`] counting half, and only within its run
-    /// of speech: a pause of 300 ms forgets the soft frames before it), so
+    /// of speech: a pause of 304 ms forgets the soft frames before it), so
     /// a short noise onset, or several apart, cannot arm it while a lone
     /// "yes" or soft talk does. A `timeout_ms` of 0 never fires.
     pub fn with_vad(cfg: VadConfig, timeout_ms: u64, sample_rate: u32) -> Self {

@@ -1830,11 +1830,9 @@ samples at the limit), `dc-offset` (an offset of 1 % or more of full scale)
 and `strong-echo` (an echo path above -15 dB). The system track keeps its
 levels, but a music bed is no noisy room and quiet playback no quiet mic, so
 its one warning is `system-silent` (the warning above), stored even when the
-system track recorded nothing that could be measured. A recording from an
-older whisrs, or one recovered after a crash, is measured from its audio when
-it is transcribed or retried. The transcript's front matter shows the levels
-of each measured track after `model`, and `audio_warnings` only when a track
-warned:
+system track recorded nothing that could be measured. The transcript's front
+matter shows the levels of each measured track after `model`, and
+`audio_warnings` only when a track warned:
 
 ```yaml
 audio:

@@ -56,6 +56,14 @@ jobs:
       - name: Test xkb-type
         run: cargo test -p xkb-type --all-features -- --skip us_qwerty_fr_typeable_via_uinput --skip from_localectl_returns_layout_when_available
 
+      # Likewise for audio-silence-gate: its detector tests and the vad_check
+      # example (which reads fixtures only at run time, so it builds here).
+      - name: Clippy audio-silence-gate
+        run: cargo clippy -p audio-silence-gate --all-targets -- -D warnings
+
+      - name: Test audio-silence-gate
+        run: cargo test -p audio-silence-gate
+
       # The "built without the recording feature" answers (CLI, daemon, config
       # warning) exist only in a build without it, and dictation must pass
       # there too. Without a warm cache this builds much of the tree again:

@@ -414,7 +414,8 @@ backing off to 120 s, reset by a turn start or a row change). `TranscriptTail` (
 `Activity` and `Interim` updates; `ProgressGate` admits interims per `feedback`.
 
 Speech detection: `[audio] vad` = `earshot` (default) | `rms` (the 0.1.31 loudness test), read through
-`AudioConfig::vad()` (an unknown value warns and uses earshot). Every speech decision on both
+`AudioConfig::vad()` (an unknown value warns and uses earshot). `silence_timeout_ms = 0` turns
+auto-stop off on every path (#178). Every speech decision on both
 transcription paths goes through `audio-silence-gate`: `close` for dictation, command mode,
 `[[llm_commands]]` and agent turns (auto-stop, the batch gate, local-whisper's streaming phrase splits),
 `open` for recording tracks and cut points (`capped_phrases`, the segment fallback); on a recording's
@@ -501,6 +502,8 @@ cargo clippy --all-targets --no-default-features --features tray,overlay,hooks,r
 cargo test                                     # all tests must pass
 cargo test --no-default-features --features tray,overlay,hooks   # the "built without recording" answers (CI runs it)
 cargo test -p xkb-type --all-features -- --skip us_qwerty_fr_typeable_via_uinput --skip from_localectl_returns_layout_when_available   # xkb-type (CI runs it; root `cargo test` skips it)
+cargo clippy -p audio-silence-gate --all-targets -- -D warnings   # the detector crate + vad_check example (CI runs it)
+cargo test -p audio-silence-gate                                  # the detector tests (CI runs it; root `cargo test` skips them)
 cargo build                                    # must compile
 ```
 
