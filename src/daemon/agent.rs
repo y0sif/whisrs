@@ -65,8 +65,7 @@ use crate::command_mode::{claim_session, collect_instruction_audio};
 use crate::context::{AgentRecordingContext, AgentVoice, DaemonContext, DaemonState};
 use crate::notify::{send_notification, send_notification_for, truncate_preview};
 use crate::pipeline::{
-    format_api_error, format_no_microphone_error, report_nothing_heard, transcribe_batch_audio,
-    BatchOptions, BatchOrigin,
+    format_api_error, format_no_microphone_error, transcribe_batch_audio, BatchOptions,
 };
 #[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
@@ -2585,7 +2584,7 @@ async fn voice_turn_background(
     agent: Arc<Agent>,
 ) {
     let label = format!("agent '{}'", agent.name);
-    let audio = collect_instruction_audio(audio_rx, &daemon_state, &context, &label).await;
+    let samples = collect_instruction_audio(audio_rx, &daemon_state, &context, &label).await;
 
     // Same claim as command mode: `whisrs cancel` (or a plain toggle taking
     // the recording over as dictation) takes the context under this lock,
@@ -2608,26 +2607,16 @@ async fn voice_turn_background(
         return;
     };
 
-    let transcript = if audio.nothing_heard {
-        // Nothing heard: discarded, with no stop cue (as a cancel).
-        report_nothing_heard(
-            &context,
-            &BatchOrigin::Agent { name: &agent.name },
-            audio.too_quiet.as_ref(),
-        );
-        Ok(String::new())
-    } else {
-        if context.config.general.audio_feedback {
-            feedback::play_stop(context.config.general.audio_feedback_volume);
-        }
-        transcribe_batch_audio(
-            &audio.samples,
-            &context,
-            &context.config.general.language,
-            &BatchOptions::agent(&agent.name),
-        )
-        .await
-    };
+    if context.config.general.audio_feedback {
+        feedback::play_stop(context.config.general.audio_feedback_volume);
+    }
+    let transcript = transcribe_batch_audio(
+        &samples,
+        &context,
+        &context.config.general.language,
+        &BatchOptions::agent(&agent.name),
+    )
+    .await;
 
     // Back to Idle at once: the turn runs on its own task.
     {
@@ -2757,28 +2746,6 @@ mod tests {
     /// A context whose runtime drives `names` with the Claude driver and TTS
     /// on, its store in `dir`, nothing notified and no audio cue played.
     fn test_context(names: &[&str], dir: &Path) -> Arc<DaemonContext> {
-        test_context_with(names, dir, false)
-    }
-
-    /// [`test_context`] with `[general] notify` as given.
-    fn test_context_with(names: &[&str], dir: &Path, notify: bool) -> Arc<DaemonContext> {
-        // The RMS test: the voice turns' test audio is a square wave, loud
-        // but no voice, which earshot would gate.
-        test_context_on(
-            names,
-            dir,
-            notify,
-            "[audio]\nvad = \"rms\"\n[general]\naudio_feedback = false\n",
-        )
-    }
-
-    /// [`test_context_with`] on the config `toml_text`.
-    fn test_context_on(
-        names: &[&str],
-        dir: &Path,
-        notify: bool,
-        toml_text: &str,
-    ) -> Arc<DaemonContext> {
         let mut rt = AgentRuntime::disabled();
         rt.speak = true;
         rt.agents = names.iter().map(|n| Arc::new(test_agent(n))).collect();
@@ -2791,10 +2758,13 @@ mod tests {
         );
         rt.store_path = dir.join("agents.json");
         Arc::new(DaemonContext {
-            config: toml::from_str(toml_text).unwrap(),
+            // The RMS test: the voice turns' test audio is a square wave,
+            // loud but no voice, which earshot would gate.
+            config: toml::from_str("[audio]\nvad = \"rms\"\n[general]\naudio_feedback = false\n")
+                .unwrap(),
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(UnreachableBackend),
-            notify,
+            notify: false,
             state_tx: crate::context::StateBus::new(),
             overlay_level_tx: None,
             overlay_enabled: false,
@@ -3005,84 +2975,6 @@ mod tests {
         assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
         // No turn was started.
         assert!(context.agents.inner.lock().await.store.agents.is_empty());
-    }
-
-    /// A voice turn that hears nothing for 10 s stops itself: the toast,
-    /// "I didn't catch that." spoken, back to Idle, and nothing sent.
-    #[tokio::test]
-    async fn a_voice_turn_that_hears_nothing_stops_and_says_so() {
-        crate::notify::take_sent_toasts();
-        let dir = tempfile::tempdir().unwrap();
-        let context = test_context_with(&["jarvis"], dir.path(), true);
-        let agent = Arc::clone(&context.agents.agents[0]);
-        let ds = Arc::new(Mutex::new(DaemonState::new()));
-        {
-            let mut g = ds.lock().await;
-            g.state_machine.transition(Action::Toggle).unwrap();
-            g.agent_recording = Some(AgentRecordingContext {
-                name: "jarvis".into(),
-                new_session: false,
-            });
-        }
-        // 12 s of digital silence; the turn stops at 10 s on its own.
-        let (tx, rx) = mpsc::unbounded_channel();
-        for _ in 0..240 {
-            tx.send(vec![0i16; 800]).unwrap();
-        }
-        voice_turn_background(Some(rx), Arc::clone(&ds), Arc::clone(&context), agent).await;
-        assert_eq!(
-            crate::notify::take_sent_toasts(),
-            ["Agent 'jarvis': nothing heard for 10 s, stopped"]
-        );
-        assert_eq!(queued(&context.agents), [DIDNT_CATCH]);
-        let g = ds.lock().await;
-        assert_eq!(g.state_machine.state(), State::Idle);
-        assert!(g.agent_recording.is_none() && g.agent_transcribing.is_none());
-        drop(g);
-        // No turn was started.
-        assert!(context.agents.inner.lock().await.store.agents.is_empty());
-        drop(tx);
-    }
-
-    /// A voice turn that hears only a voice the level floors reject, then
-    /// nothing, stops 10 s after it last heard it: the toast calls it too
-    /// quiet, "I didn't catch that." is spoken, and nothing is sent.
-    #[tokio::test]
-    async fn a_voice_turn_that_hears_a_too_quiet_voice_stops_and_says_so() {
-        crate::notify::take_sent_toasts();
-        let dir = tempfile::tempdir().unwrap();
-        // earshot, the default: the RMS test has no "too quiet".
-        let context = test_context_on(
-            &["jarvis"],
-            dir.path(),
-            true,
-            "[general]\naudio_feedback = false\n",
-        );
-        let agent = Arc::clone(&context.agents.agents[0]);
-        let ds = Arc::new(Mutex::new(DaemonState::new()));
-        {
-            let mut g = ds.lock().await;
-            g.state_machine.transition(Action::Toggle).unwrap();
-            g.agent_recording = Some(AgentRecordingContext {
-                name: "jarvis".into(),
-                new_session: false,
-            });
-        }
-        let mut audio = crate::pipeline::tests::quiet_voice(3, -70.0);
-        audio.extend(vec![0i16; 15 * 16_000]);
-        let (tx, rx) = mpsc::unbounded_channel();
-        for chunk in audio.chunks(800) {
-            tx.send(chunk.to_vec()).unwrap();
-        }
-        voice_turn_background(Some(rx), Arc::clone(&ds), Arc::clone(&context), agent).await;
-        assert_eq!(
-            crate::notify::take_sent_toasts(),
-            ["Agent 'jarvis': the audio was too quiet (speech at -68 dB), stopped"]
-        );
-        assert_eq!(queued(&context.agents), [DIDNT_CATCH]);
-        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
-        assert!(context.agents.inner.lock().await.store.agents.is_empty());
-        drop(tx);
     }
 
     /// A hold (a command press capturing its selection) keeps the reply

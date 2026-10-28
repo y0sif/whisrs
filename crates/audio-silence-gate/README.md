@@ -98,10 +98,8 @@ and that count: a sign that someone spoke even when the voice is too quiet to
 arm it, though a noise switching on (a fan, dishes, a knock) can turn it true
 too. `first_heard()` and `last_heard()` give the first and the latest such
 frame (`HeardFrame`: where it starts, its score and level, and whether only
-the soft threshold voiced it). whisrs stops a capture once 10 s pass after the
-latest one (or after the start, with none) before auto-stop arms, so such a
-noise only delays that stop, and a voice it keeps hearing at least every 10 s
-is never cut off.
+the soft threshold voiced it), and the gate's `GateOutcome` carries the same
+two. They decide nothing; whisrs logs them as a diagnostic.
 `AutoStopDetector::new(threshold, ..)` keeps the 0.1 RMS rule.
 
 ## Batch gate

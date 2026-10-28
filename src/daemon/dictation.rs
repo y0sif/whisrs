@@ -4,8 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use audio_silence_gate::{AutoStopDetector, Levels, VadConfig};
-use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
+use whisrs::audio::capture::AudioCaptureHandle;
 use whisrs::audio::feedback;
 use whisrs::state::Action;
 use whisrs::{validate_language_override, Response, State};
@@ -14,9 +13,8 @@ use crate::context::{DaemonContext, DaemonState};
 use crate::injection::KeystrokeSettings;
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
-    build_transcription_config, describe_levels, format_no_microphone_error, history_backend_tag,
-    process_batch_samples, process_recording_batch, report_nothing_heard, run_streaming_pipeline,
-    save_history_entry, BatchOrigin, DictationOutcome, Heard, NoSpeechTimeout,
+    build_transcription_config, format_no_microphone_error, history_backend_tag,
+    process_recording_batch, run_streaming_pipeline, save_history_entry, DictationOutcome,
     StreamingPipelineParams,
 };
 #[cfg(feature = "recording")]
@@ -149,14 +147,6 @@ pub(crate) async fn handle_toggle(
                         warn!("failed to pre-focus window: {e}");
                     }
                 }
-            } else if let Some(audio_rx) = capture.take_receiver() {
-                // Batch: the audio is collected on a task that stops a
-                // capture hearing nothing; the stop press awaits it.
-                ds.batch_audio = Some(tokio::spawn(collect_batch_dictation(
-                    audio_rx,
-                    Arc::clone(&daemon_state),
-                    Arc::clone(&context),
-                )));
             }
 
             ds.audio_capture = Some(capture);
@@ -182,9 +172,6 @@ pub(crate) async fn handle_toggle(
                     ds.recording_window_id = None;
                     ds.streaming_task = None;
                     ds.streaming_cancel = None;
-                    if let Some(task) = ds.batch_audio.take() {
-                        task.abort();
-                    }
                     ds.session_language = None;
                     Response::Error {
                         message: e.to_string(),
@@ -226,7 +213,6 @@ pub(crate) async fn handle_toggle(
                     let capture = ds.audio_capture.take();
                     let window_id = ds.recording_window_id.take();
                     let streaming_task = ds.streaming_task.take();
-                    let batch_audio = ds.batch_audio.take();
                     // Kept to release the slot once the pipeline task is
                     // awaited, in case it never reached its own tail.
                     let streaming_cancel = ds.streaming_cancel.clone();
@@ -275,31 +261,9 @@ pub(crate) async fn handle_toggle(
                             Ok(Err(e)) => Err(e),
                             Err(e) => Err(anyhow::anyhow!("streaming task panicked: {e}")),
                         }
-                    } else if let Some(collector) = batch_audio {
-                        // Batch path: stop the capture, which closes the
-                        // channel the collector reads, then transcribe what
-                        // it collected with the session language (not the
-                        // config default).
-                        if let Some(mut cap) = capture {
-                            cap.stop();
-                            tokio::task::spawn_blocking(move || drop(cap));
-                        }
-                        match collector.await {
-                            Ok(samples) => {
-                                process_batch_samples(
-                                    samples,
-                                    window_id.as_deref(),
-                                    &context,
-                                    &session_language,
-                                )
-                                .await
-                            }
-                            Err(e) => Err(anyhow::anyhow!("batch audio task failed: {e}")),
-                        }
                     } else {
-                        // No collector task: the capture's own channel
-                        // holds the audio. Collect it, then transcribe with
-                        // the session language.
+                        // Batch path: collect all audio, then transcribe with
+                        // the session language (not the config default).
                         process_recording_batch(
                             capture,
                             window_id.as_deref(),
@@ -510,84 +474,10 @@ fn discard_recording_session(ds: &mut DaemonState) {
     if let Some(task) = ds.streaming_task.take() {
         task.abort();
     }
-    if let Some(task) = ds.batch_audio.take() {
-        task.abort();
-    }
     discard_command_sessions(ds, "cancel");
     ds.recording_window_id = None;
     ds.recording_started_at = None;
     ds.session_language = None;
-}
-
-/// Collect a batch dictation's audio until the channel closes (the stop
-/// press stops the capture), and stop the session when nothing was heard
-/// for the timeout ([`no_speech_timeout`](crate::pipeline::no_speech_timeout)):
-/// back to Idle with the audio discarded, as a cancel does, and the
-/// dictation's skip toast. A voice is the close profile of `[audio] vad`, as
-/// for auto-stop, heard on its first frame ([`AutoStopDetector::heard_voice`]),
-/// and every heard frame starts the wait again until auto-stop's count arms;
-/// batch dictation does not auto-stop, and `silence_timeout_ms = 0` turns the
-/// timeout off too.
-async fn collect_batch_dictation(
-    mut audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
-    daemon_state: Arc<Mutex<DaemonState>>,
-    context: Arc<DaemonContext>,
-) -> Vec<i16> {
-    // Timeout 0: it only tells whether a voice was heard.
-    let mut heard =
-        AutoStopDetector::with_vad(VadConfig::close(context.config.audio.vad()), 0, SAMPLE_RATE);
-    let mut no_speech =
-        NoSpeechTimeout::new(context.config.general.silence_timeout_ms, "dictation");
-    let mut samples = Vec::new();
-    while let Some(chunk) = audio_rx.recv().await {
-        samples.extend_from_slice(&chunk);
-        heard.feed(&chunk);
-        if no_speech.feed(chunk.len(), Heard::by(&heard))
-            && stop_hearing_nothing(&daemon_state, &context, heard.too_quiet()).await
-        {
-            // Discarded: the gate never runs, so this is the turn's line.
-            info!(
-                "dictation audio: {}, {}",
-                describe_levels(&heard.levels()),
-                no_speech.heard_label()
-            );
-            return Vec::new();
-        }
-    }
-    // The levels line is the batch gate's, after this; what was heard is here.
-    info!("dictation capture ended: {}", no_speech.heard_label());
-    samples
-}
-
-/// The no-speech stop of [`collect_batch_dictation`], run on its task: true
-/// when it ended the session. A stop press or cancel that got the lock
-/// first owns the session (the slot no longer holds this task), and then
-/// nothing changes. `too_quiet`: the voice heard was one the level floors
-/// rejected, which the toast names.
-async fn stop_hearing_nothing(
-    daemon_state: &Mutex<DaemonState>,
-    context: &DaemonContext,
-    too_quiet: Option<Levels>,
-) -> bool {
-    let mut ds = daemon_state.lock().await;
-    let ours = ds
-        .batch_audio
-        .as_ref()
-        .zip(tokio::task::try_id())
-        .is_some_and(|(task, id)| task.id() == id);
-    if !ours || ds.state_machine.transition(Action::Cancel).is_err() {
-        return false;
-    }
-    // Detach this task before the teardown, which would abort it.
-    ds.batch_audio = None;
-    discard_recording_session(&mut ds);
-    context.state_tx.publish(&ds);
-    if let Some(level_tx) = &context.overlay_level_tx {
-        let _ = level_tx.send(0.0);
-    }
-    drop(ds);
-    report_nothing_heard(context, &BatchOrigin::Dictation, too_quiet.as_ref());
-    true
 }
 
 /// Take every command-session context slot (command mode, llm-command and
@@ -646,158 +536,6 @@ fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, 
 mod tests {
     use super::*;
     use whisrs::Config;
-
-    /// A backend the collector tests never reach.
-    struct NoBackend;
-
-    #[async_trait::async_trait]
-    impl whisrs::transcription::TranscriptionBackend for NoBackend {
-        async fn transcribe(
-            &self,
-            _audio: &[u8],
-            _config: &whisrs::transcription::TranscriptionConfig,
-        ) -> anyhow::Result<String> {
-            unreachable!("collecting audio never transcribes")
-        }
-
-        fn sends_prompt(&self, _config: &whisrs::transcription::TranscriptionConfig) -> bool {
-            false
-        }
-
-        fn stream_text(&self) -> whisrs::transcription::StreamText {
-            whisrs::transcription::StreamText::Phrases
-        }
-
-        async fn transcribe_segments(
-            &self,
-            _audio: &[u8],
-            _config: &whisrs::transcription::TranscriptionConfig,
-        ) -> anyhow::Result<whisrs::transcription::Transcript> {
-            unreachable!("collecting audio never transcribes")
-        }
-
-        fn max_segment_chunk_secs(
-            &self,
-            _config: &whisrs::transcription::TranscriptionConfig,
-        ) -> Option<u32> {
-            None
-        }
-    }
-
-    /// A context on `toml_text` with notifications off.
-    fn context(toml_text: &str) -> Arc<DaemonContext> {
-        context_with(toml_text, false)
-    }
-
-    /// A context on `toml_text`, notifications as `notify` says (the overlay
-    /// off, so dictation's skip toasts show).
-    fn context_with(toml_text: &str, notify: bool) -> Arc<DaemonContext> {
-        Arc::new(DaemonContext {
-            config: toml::from_str(toml_text).unwrap(),
-            window_tracker: Arc::new(whisrs::window::NoopTracker),
-            transcription_backend: Arc::new(NoBackend),
-            notify,
-            state_tx: crate::context::StateBus::new(),
-            overlay_level_tx: None,
-            overlay_enabled: false,
-            #[cfg(feature = "recording")]
-            recording: crate::recording::RecordingRuntime::new().0,
-            agents: crate::agent::AgentRuntime::disabled(),
-            agent_board: tokio::sync::watch::channel(Vec::new()).0,
-            agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    /// A batch dictation recording `secs` seconds of digital silence in
-    /// 50 ms chunks, its collector started as `handle_toggle` starts it.
-    /// With `stop_first`, a stop press takes the session after 5 s.
-    async fn batch_dictation(toml_text: &str, secs: usize, stop_first: bool) -> (usize, State) {
-        let samples = vec![0i16; secs * 16_000];
-        batch_dictation_of(context(toml_text), &samples, stop_first).await
-    }
-
-    /// [`batch_dictation`] over `audio`, on `context`.
-    async fn batch_dictation_of(
-        context: Arc<DaemonContext>,
-        audio: &[i16],
-        stop_first: bool,
-    ) -> (usize, State) {
-        let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        {
-            let mut ds = daemon_state.lock().await;
-            ds.state_machine.transition(Action::Toggle).unwrap();
-            ds.batch_audio = Some(tokio::spawn(collect_batch_dictation(
-                rx,
-                Arc::clone(&daemon_state),
-                Arc::clone(&context),
-            )));
-        }
-        let mut collector = None;
-        for (c, chunk) in audio.chunks(800).enumerate() {
-            if stop_first && c == 5 * 20 {
-                let mut ds = daemon_state.lock().await;
-                ds.state_machine.transition(Action::Toggle).unwrap();
-                collector = ds.batch_audio.take();
-            }
-            if tx.send(chunk.to_vec()).is_err() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        drop(tx);
-        // Let the collector take every chunk sent before looking.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        let collector = match collector {
-            Some(task) => Some(task),
-            None => daemon_state.lock().await.batch_audio.take(),
-        };
-        let samples = match collector {
-            Some(task) => task.await.unwrap().len(),
-            // The collector ended the session and detached itself.
-            None => 0,
-        };
-        // Let a detached collector finish.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        let state = daemon_state.lock().await.state_machine.state();
-        (samples, state)
-    }
-
-    /// Nothing heard for 10 s: the collector ends the session itself and
-    /// the audio is discarded. Off with `silence_timeout_ms = 0`, and a stop
-    /// press that came first keeps every sample.
-    #[tokio::test]
-    async fn batch_dictation_stops_when_nothing_is_heard() {
-        let (samples, state) = batch_dictation("", 12, false).await;
-        assert_eq!((samples, state), (0, State::Idle));
-
-        let off = "[general]\nsilence_timeout_ms = 0\n";
-        let (samples, state) = batch_dictation(off, 12, false).await;
-        assert_eq!((samples, state), (12 * 16_000, State::Recording));
-
-        let (samples, state) = batch_dictation("", 12, true).await;
-        assert_eq!((samples, state), (12 * 16_000, State::Transcribing));
-    }
-
-    /// A voice the level floors reject for 3 s, then nothing: the collector
-    /// stops the session 10 s after the voice was last heard, discards the
-    /// audio, and the toast calls what it heard too quiet.
-    #[tokio::test]
-    async fn batch_dictation_that_heard_a_too_quiet_voice_says_so() {
-        crate::notify::take_sent_toasts();
-        let mut audio = crate::pipeline::tests::quiet_voice(3, -70.0);
-        audio.extend(vec![0i16; 12 * 16_000]);
-        let (samples, state) = batch_dictation_of(context_with("", true), &audio, false).await;
-        assert_eq!((samples, state), (0, State::Idle));
-        assert_eq!(
-            crate::notify::take_sent_toasts(),
-            ["Stopped: the audio was too quiet (speech at -68 dB)"]
-        );
-    }
 
     #[test]
     fn resolve_language_prefers_override() {

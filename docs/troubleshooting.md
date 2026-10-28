@@ -65,7 +65,7 @@ A streaming dictation that typed nothing because its audio held no speech says "
 
 With the overlay on (`[general] overlay`), the dictation and `[[llm_commands]]` skip notifications and "Nothing typed" do not show; command mode and agent turns always show theirs. Every skip is in the daemon log either way: `journalctl --user -u whisrs`.
 
-Each dictation, command and agent turn also logs its levels there: the speech level, the background, the SNR (signal-to-noise ratio: how far the speech is above the background, in dB), the peak and the share of clipped samples. Speech recognition copes down to about 10 dB of SNR and gets worse below about 6 dB.
+Each dictation, command and agent turn also logs its levels there: the speech level, the background, the SNR (signal-to-noise ratio: how far the speech is above the background, in dB), the peak and the share of clipped samples, then when the speech detector first and last heard something ("heard at 0.35 to 8.20 s", or "heard nothing"), a hint for a session that stopped or skipped unexpectedly. Speech recognition copes down to about 10 dB of SNR and gets worse below about 6 dB.
 
 If the speech detector itself misjudges your mic, `[audio] vad = "rms"` brings back the plain loudness test of whisrs 0.1.31 ([Speech detection](configuration.md#speech-detection)).
 

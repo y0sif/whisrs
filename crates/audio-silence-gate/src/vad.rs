@@ -714,7 +714,12 @@ impl SpeechDetector {
         } else {
             Some(GateReason::NoSpeech)
         };
-        GateOutcome { reason, levels }
+        GateOutcome {
+            reason,
+            levels,
+            first_heard: self.first_heard,
+            last_heard: self.last_heard,
+        }
     }
 
     /// Power mean (dBFS) of the frames that would be voiced without the
@@ -748,6 +753,11 @@ pub struct GateOutcome {
     /// The buffer's levels. With [`GateReason::TooQuiet`], `speech_dbfs`
     /// (and `snr_db`) describe the voice the level floor rejected.
     pub levels: Levels,
+    /// The first and the latest frame the detector heard a voice in
+    /// ([`SpeechDetector::first_heard`], [`SpeechDetector::last_heard`]);
+    /// `None` when it did not run (digital silence, too short).
+    pub first_heard: Option<HeardFrame>,
+    pub last_heard: Option<HeardFrame>,
 }
 
 /// Decide whether a recorded buffer carries speech worth sending to a
@@ -782,6 +792,8 @@ pub fn speech_gate(
         return GateOutcome {
             reason,
             levels: detector.levels(),
+            first_heard: detector.first_heard(),
+            last_heard: detector.last_heard(),
         };
     }
     gate_with(
@@ -807,6 +819,8 @@ fn gate_with(samples: &[i16], min_duration_ms: u64, mut detector: SpeechDetector
         return GateOutcome {
             reason: Some(reason),
             levels: meter.levels(),
+            first_heard: None,
+            last_heard: None,
         };
     }
 
@@ -1334,9 +1348,14 @@ mod tests {
         fires_at(&mut stop, &quiet);
         assert!(stop.heard_voice());
         assert!(!stop.has_speech());
+        let outcome = gate(&quiet, scorer(vec![1.0; 60]));
+        assert_eq!(outcome.reason, Some(GateReason::TooQuiet));
+        // The gate reports the frames it heard, as the detector keeps them.
+        let onset = ((WARM + 1) * VAD_FRAME) as u64;
+        assert_eq!(outcome.first_heard.map(|f| f.start_sample), Some(onset));
         assert_eq!(
-            gate(&quiet, scorer(vec![1.0; 60])).reason,
-            Some(GateReason::TooQuiet)
+            outcome.last_heard.map(|f| f.start_sample),
+            Some(59 * VAD_FRAME as u64)
         );
 
         // Three strong frames: heard on the second, never armed.

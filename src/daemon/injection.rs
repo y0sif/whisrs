@@ -2809,7 +2809,6 @@ mod tests {
                     text_rx,
                     whisrs::transcription::StreamText::Phrases,
                     Arc::clone(&cancel),
-                    Arc::new(crate::pipeline::TextLatch::default()),
                     None,
                     None,
                     |text| {
