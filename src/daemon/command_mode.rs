@@ -1544,11 +1544,17 @@ mod tests {
     }
 
     fn instruction_context(toml_text: &str) -> DaemonContext {
+        instruction_context_with(toml_text, false)
+    }
+
+    /// [`instruction_context`] with notifications as `notify` says (the
+    /// overlay off, so every skip toast shows).
+    fn instruction_context_with(toml_text: &str, notify: bool) -> DaemonContext {
         DaemonContext {
             config: toml::from_str(toml_text).unwrap(),
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(NoBackend),
-            notify: false,
+            notify,
             state_tx: crate::context::StateBus::new(),
             overlay_level_tx: None,
             overlay_enabled: false,
@@ -1627,5 +1633,61 @@ mod tests {
                 .nothing_heard_message(std::time::Duration::from_secs(10), Some(&levels)),
             "Command mode: the audio was too quiet (speech at -68 dB), stopped"
         );
+    }
+
+    /// End to end through the handlers: command mode and an
+    /// `[[llm_commands]]` press that heard only a voice the level floors
+    /// reject stop on their own, toast that it was too quiet, transcribe
+    /// nothing and end in Idle.
+    #[tokio::test]
+    async fn command_mode_and_llm_commands_toast_a_too_quiet_voice() {
+        let mut audio = crate::pipeline::tests::quiet_voice(3, -70.0);
+        audio.extend(vec![0i16; 12 * 16_000]);
+        let context = Arc::new(instruction_context_with("", true));
+        let feed = |audio: &[i16]| {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            for chunk in audio.chunks(800) {
+                tx.send(chunk.to_vec()).unwrap();
+            }
+            (tx, rx)
+        };
+
+        crate::notify::take_sent_toasts();
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let mut g = ds.lock().await;
+            g.state_machine.transition(Action::Toggle).unwrap();
+            g.command_mode = Some(CommandModeContext {
+                selected_text: "some text".into(),
+                llm_config: llm::LlmConfig::default(),
+            });
+        }
+        let (tx, rx) = feed(&audio);
+        command_mode_background(Some(rx), Arc::clone(&ds), Arc::clone(&context)).await;
+        drop(tx);
+        assert_eq!(
+            crate::notify::take_sent_toasts(),
+            ["Command mode: the audio was too quiet (speech at -68 dB), stopped"]
+        );
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let mut g = ds.lock().await;
+            g.state_machine.transition(Action::Toggle).unwrap();
+            g.llm_command = Some(LlmCommandContext {
+                name: "proofread".into(),
+                instruction: "Fix the grammar.".into(),
+                llm_config: llm::LlmConfig::default(),
+            });
+        }
+        let (tx, rx) = feed(&audio);
+        llm_command_background(Some(rx), Arc::clone(&ds), Arc::clone(&context)).await;
+        drop(tx);
+        assert_eq!(
+            crate::notify::take_sent_toasts(),
+            ["Stopped: the audio was too quiet (speech at -68 dB)"]
+        );
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
     }
 }

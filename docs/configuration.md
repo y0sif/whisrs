@@ -21,10 +21,12 @@ silence_timeout_ms = 2000   # auto-stop after this much silence once you spoke: 
                             # then stops and throws the audio away: "Stopped:
                             # nothing heard for 10 s". Anything heard starts the
                             # wait again: a voice from its first word, even one too
-                            # quiet to auto-stop on, but also a sound switching on
-                            # (a fan, dishes, a knock). When what it heard was a
-                            # voice under the level floor (-65 dBFS), it says the
-                            # audio was too quiet.
+                            # quiet to auto-stop on, but with the default speech
+                            # detector also a sound switching on (a fan, dishes, a
+                            # knock), and with [audio] vad = "rms" any sound over
+                            # about -50 dBFS, a key click too. When what it heard
+                            # was a voice under the level floor (-65 dBFS), it says
+                            # the audio was too quiet.
                             # Once a streaming backend has typed text, this stop
                             # never fires: auto-stop or a second press ends it.
                             # 0 = off, both (stop with a second press)
