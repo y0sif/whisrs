@@ -51,7 +51,7 @@ whisrs measures the audio of every dictation, command and agent turn, and every 
 
 - **"Skipped: the audio was silent (peak -120 dB). Is the mic muted?"** Only digital silence reached whisrs: a muted mic or the wrong device (see [No microphone detected](#no-microphone-detected)). With `[audio] vad = "rms"`, "silent" means the whole recording stayed under about -50 dBFS, which a quiet room does too, so the muted-mic question then comes only when it was digital silence.
 - **"... the audio was too quiet (speech at -68 dB)"** A voice was heard, but too faint to send (under -65 dBFS). Move closer or raise the mic gain, for example `wpctl set-volume @DEFAULT_SOURCE@ 80%`.
-- **"... the audio was without speech (background at -48 dB)"** There was sound but no speech. If you did speak, the background is drowning you out: try the noise filter below.
+- **"... the audio was without speech (background at -48 dB)"** There was sound but no speech. If you did speak, either the background is drowning you out (try the noise filter below) or your voice was too faint or short even to count as too quiet: move closer or raise the gain.
 - **Recording warnings**, each at most once per recording:
   - "too quiet": your speech is under -55 dBFS. Move closer or raise the gain.
   - "clipping": the mic hit its limit. Lower the gain.

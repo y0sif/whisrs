@@ -719,8 +719,10 @@ pub(crate) fn no_speech_timeout(silence_timeout_ms: u64) -> Option<Duration> {
 /// before its level floors and the count that arms auto-stop, so a voice
 /// too quiet to arm it counts, and under `[audio] vad = "rms"` any 16 ms over
 /// -50.5 dBFS), and on the streaming path also the first transcript text
-/// the backend sends. Then it never fires: a voice too quiet for the gate
-/// records to the stop press, which says so.
+/// the backend sends. Then it never fires: a voice too quiet to arm records
+/// to the stop press, which calls it too quiet when the level floor
+/// rejected it, else without speech. A noise switching on can count as
+/// heard too.
 pub(crate) struct NoSpeechTimeout {
     /// Samples after which it fires; `None` when off.
     limit: Option<u64>,
@@ -731,8 +733,11 @@ pub(crate) struct NoSpeechTimeout {
 
 impl NoSpeechTimeout {
     pub(crate) fn new(silence_timeout_ms: u64) -> Self {
+        // Saturating, as `AutoStopDetector` counts its own timeout: a huge
+        // `silence_timeout_ms` must not wrap to a limit the first chunk
+        // reaches.
         let limit = no_speech_timeout(silence_timeout_ms)
-            .map(|after| after.as_millis() as u64 * u64::from(SAMPLE_RATE) / 1000);
+            .map(|after| (after.as_millis() as u64).saturating_mul(u64::from(SAMPLE_RATE)) / 1000);
         Self {
             limit,
             fed: 0,
@@ -2165,23 +2170,46 @@ mod tests {
     /// calls it speech at -40 dBFS; at -62 dBFS it calls a frame here and
     /// there speech, never enough to arm auto-stop.
     fn synthetic_voice(secs: usize, dbfs: f64) -> Vec<i16> {
+        formant_voice(secs, dbfs, 3, 0.25, 0.5)
+    }
+
+    /// [`synthetic_voice`] with F4 and F5 too, in 0.2 s syllables held at
+    /// full level between ramps. earshot hears this one under close's
+    /// -65 dBFS floor: at -70 dBFS the gate calls it too quiet, its voiced
+    /// frames at -68 dBFS (too quiet from -68 to -73 dBFS, never armed).
+    fn quiet_voice(secs: usize, dbfs: f64) -> Vec<i16> {
+        formant_voice(secs, dbfs, 5, 0.2, 0.15)
+    }
+
+    /// A 120 Hz pulse train through the first `formants` (3 to 5) formants
+    /// of four vowels in turn, in syllables of `syllable_secs` voiced for
+    /// 80% of it, scaled to an RMS of `dbfs`. Each syllable rises and falls
+    /// over `ramp` of its voiced part (0.5: a sine bump).
+    fn formant_voice(
+        secs: usize,
+        dbfs: f64,
+        formants: usize,
+        syllable_secs: f64,
+        ramp: f64,
+    ) -> Vec<i16> {
         use std::f64::consts::PI;
         let rate = f64::from(SAMPLE_RATE);
         let vowels = [
-            (700.0, 1220.0, 2600.0),
-            (300.0, 2300.0, 3000.0),
-            (500.0, 1000.0, 2500.0),
-            (400.0, 2000.0, 2600.0),
+            [700.0, 1220.0, 2600.0, 3300.0, 3750.0],
+            [300.0, 2300.0, 3000.0, 3500.0, 4200.0],
+            [500.0, 1000.0, 2500.0, 3400.0, 3900.0],
+            [400.0, 2000.0, 2600.0, 3300.0, 4000.0],
         ];
+        let bandwidths = [80.0, 100.0, 150.0, 250.0, 300.0];
         let mut phase = 0.0;
-        let mut state = [[0.0f64; 2]; 3];
+        let mut state = [[0.0f64; 2]; 5];
         let voice: Vec<f64> = (0..secs * SAMPLE_RATE as usize)
             .map(|i| {
                 let t = i as f64 / rate;
-                let syllable = (t / 0.25) as usize;
-                let within = (t % 0.25) / 0.25;
-                let envelope = if within < 0.8 {
-                    (PI * within / 0.8).sin()
+                let syllable = (t / syllable_secs) as usize;
+                let within = (t % syllable_secs) / syllable_secs / 0.8;
+                let envelope = if within < 1.0 {
+                    (PI / 2.0 * (within.min(1.0 - within) / ramp).min(1.0)).sin()
                 } else {
                     0.0
                 };
@@ -2192,15 +2220,13 @@ mod tests {
                 } else {
                     0.0
                 };
-                let (f1, f2, f3) = vowels[syllable % vowels.len()];
-                for (k, (f, bandwidth)) in [(f1, 80.0), (f2, 100.0), (f3, 150.0)]
-                    .into_iter()
-                    .enumerate()
+                let vowel = vowels[syllable % vowels.len()];
+                for ((past, f), bandwidth) in
+                    state.iter_mut().zip(vowel).zip(bandwidths).take(formants)
                 {
                     let r: f64 = (-PI * bandwidth / rate).exp();
-                    let v = y + 2.0 * r * (2.0 * PI * f / rate).cos() * state[k][0]
-                        - r * r * state[k][1];
-                    state[k] = [v, state[k][0]];
+                    let v = y + 2.0 * r * (2.0 * PI * f / rate).cos() * past[0] - r * r * past[1];
+                    *past = [v, past[0]];
                     y = v;
                 }
                 y
@@ -2326,6 +2352,18 @@ mod tests {
         assert!(timeout.feed(1, false));
     }
 
+    /// A huge `silence_timeout_ms` saturates the limit in samples: 2^60 ms
+    /// times 16 kHz would wrap to exactly 0 (a stop on the first chunk), and
+    /// a debug build would panic.
+    #[test]
+    fn no_speech_timeout_saturates_a_huge_auto_stop_timeout() {
+        for ms in [1 << 60, u64::MAX] {
+            let mut timeout = NoSpeechTimeout::new(ms);
+            assert!(!timeout.feed(800, false), "{ms}");
+            assert!(!timeout.feed(30 * 16_000, false), "{ms}");
+        }
+    }
+
     #[test]
     fn nothing_heard_message_per_origin() {
         let ten = Duration::from_secs(10);
@@ -2425,17 +2463,39 @@ mod tests {
         done_cues: usize,
     }
 
-    /// A streaming dictation over `secs` s of digital silence in 50 ms
-    /// chunks, paced in (paused) real time, on [`ScriptedStream`]. Toasts,
-    /// history and the done cue are on (recorded, not shown, by the test
-    /// seams), the overlay off, and nothing is typed (`clipboard_only`). A
-    /// session still recording at the end is stopped and then cancelled
-    /// while it drains (#154), so nothing reaches the clipboard.
+    /// How [`streaming_run`] ends a session still recording after its audio.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum End {
+        /// The stop press, then `whisrs cancel` while it drains (#154), so
+        /// nothing reaches the clipboard.
+        Cancel,
+        /// The stop press alone. Only for a session the backend sends no
+        /// text: under `clipboard_only` its text would reach the clipboard.
+        Stop,
+    }
+
+    /// `secs` s of digital silence.
+    fn silence(secs: usize) -> Vec<i16> {
+        vec![0; secs * SAMPLE_RATE as usize]
+    }
+
+    /// A streaming dictation over `samples` in 50 ms chunks, paced in
+    /// (paused) real time, on [`ScriptedStream`]. Toasts, history and the
+    /// done cue are on (recorded, not shown, by the test seams), the overlay
+    /// off, and nothing is typed (`clipboard_only`). A session still
+    /// recording at the end is ended as `end` says.
     async fn streaming_run(
         text_after: Option<(usize, &'static str)>,
         silence_timeout_ms: u64,
-        secs: usize,
+        samples: &[i16],
+        end: End,
     ) -> StreamingRun {
+        if end == End::Stop {
+            assert!(
+                text_after.is_none(),
+                "a stop without the cancel sends no text"
+            );
+        }
         crate::notify::take_sent_toasts();
         take_saved_history();
         take_done_cues();
@@ -2475,8 +2535,8 @@ mod tests {
             history: true,
         }));
         let mut stopped = None;
-        for c in 0..secs * 20 {
-            tx.send(vec![0i16; 800]).unwrap();
+        for (c, chunk) in samples.chunks(800).enumerate() {
+            tx.send(chunk.to_vec()).unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
             let state = daemon_state.lock().await.state_machine.state();
             if state != State::Recording {
@@ -2485,13 +2545,16 @@ mod tests {
             }
         }
         if stopped.is_none() {
-            // The stop press, then `whisrs cancel` while it drains.
+            // The stop press, then (`End::Cancel`) `whisrs cancel` while it
+            // drains.
             let mut ds = daemon_state.lock().await;
             ds.state_machine.transition(Action::Toggle).unwrap();
-            ds.streaming_cancel
-                .take()
-                .unwrap()
-                .store(true, Ordering::SeqCst);
+            if end == End::Cancel {
+                ds.streaming_cancel
+                    .take()
+                    .unwrap()
+                    .store(true, Ordering::SeqCst);
+            }
         }
         // The capture's channel closes, as a stopped capture's does.
         drop(tx);
@@ -2514,7 +2577,7 @@ mod tests {
     /// says so, saves nothing, plays no done cue and ends in Idle.
     #[tokio::test(start_paused = true)]
     async fn a_streaming_dictation_that_hears_nothing_stops_at_10_s() {
-        let run = streaming_run(None, 2000, 15).await;
+        let run = streaming_run(None, 2000, &silence(15), End::Cancel).await;
         assert_eq!(run.stopped, Some((200, State::Transcribing)), "{run:?}");
         assert!(run.cancelled && run.released, "{run:?}");
         assert_eq!(run.toasts, ["Stopped: nothing heard for 10 s"]);
@@ -2527,7 +2590,7 @@ mod tests {
     /// with nothing the detector calls speech, keeps the session recording.
     #[tokio::test(start_paused = true)]
     async fn a_streaming_delta_before_10_s_holds_the_timeout_off() {
-        let run = streaming_run(Some((152_000, "hello")), 2000, 15).await;
+        let run = streaming_run(Some((152_000, "hello")), 2000, &silence(15), End::Cancel).await;
         assert_eq!(run.stopped, None, "{run:?}");
         assert!(run.toasts.is_empty(), "{:?}", run.toasts);
         // Ended by the cancel: discarded.
@@ -2535,7 +2598,7 @@ mod tests {
         assert!(run.history.is_empty());
 
         // Without it, the same session stops at 10 s.
-        let run = streaming_run(Some((200_000, "hello")), 2000, 15).await;
+        let run = streaming_run(Some((200_000, "hello")), 2000, &silence(15), End::Cancel).await;
         assert_eq!(run.stopped, Some((200, State::Transcribing)), "{run:?}");
     }
 
@@ -2543,10 +2606,28 @@ mod tests {
     /// before it stops, and the toast says 20 s.
     #[tokio::test(start_paused = true)]
     async fn a_longer_auto_stop_timeout_lengthens_the_no_speech_timeout() {
-        let run = streaming_run(None, 20_000, 25).await;
+        let run = streaming_run(None, 20_000, &silence(25), End::Cancel).await;
         assert_eq!(run.stopped, Some((400, State::Transcribing)), "{run:?}");
         assert_eq!(run.toasts, ["Stopped: nothing heard for 20 s"]);
         assert_eq!(run.state, State::Idle);
+    }
+
+    /// A voice the level floor rejects all of (12 s of [`quiet_voice`] at
+    /// -70 dBFS) is heard, so the session records past 10 s to the stop
+    /// press, never armed; then the toast calls it too quiet with the
+    /// voice's level, as the batch gate would. The stream's own levels say
+    /// only "without speech", which a too-quiet voice outranks.
+    #[tokio::test(start_paused = true)]
+    async fn a_too_quiet_streaming_dictation_says_too_quiet() {
+        let run = streaming_run(None, 2000, &quiet_voice(12, -70.0), End::Stop).await;
+        assert_eq!(run.stopped, None, "{run:?}");
+        assert!(!run.cancelled && run.released, "{run:?}");
+        assert_eq!(
+            run.toasts,
+            ["Nothing typed: the audio was too quiet (speech at -68 dB)"]
+        );
+        assert!(run.history.is_empty());
+        assert_eq!((run.state, run.text.as_str()), (State::Idle, ""));
     }
 
     /// Per-origin gate-skip toast wording: command mode announces itself,

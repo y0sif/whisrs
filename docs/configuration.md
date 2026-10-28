@@ -20,9 +20,14 @@ silence_timeout_ms = 2000   # auto-stop after this much silence once you spoke: 
                             # dictation too) stops and throws the audio away:
                             # "Stopped: nothing heard for 10 s". A voice counts
                             # from its first word, even one too quiet to auto-stop
-                            # on (it records to a second press, which says it was
-                            # too quiet), and so does the first text a streaming
-                            # backend types. Once heard, it never applies.
+                            # on. It then records to a second press, which says
+                            # the audio was too quiet when the voice was under
+                            # the level floor (-65 dBFS), or without speech when
+                            # it was fainter or shorter still. The first text a
+                            # streaming backend types counts too. So can a noise
+                            # switching on, which then keeps this stop from
+                            # firing; the second press still ends it. Once
+                            # heard, it never applies.
                             # 0 = off, both (stop with a second press)
 notify = true               # desktop notifications
 history = true              # save dictations to ~/.local/share/whisrs/history.jsonl for

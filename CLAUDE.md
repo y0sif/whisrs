@@ -437,8 +437,12 @@ the origin's skip-toast wording and rule ("Stopped: nothing heard for 10 s", `re
 Heard is the earliest sign of a voice, never auto-stop's arming: `AutoStopDetector::heard_voice` (any
 frame voiced before the level floors and the arming count, so a voice too quiet to arm counts; under
 `rms` any 16 ms over -50.5 dBFS), or on the streaming path the first transcript text reaching
-`run_typing_batcher` (`text_heard`). A too-quiet voice so records to the stop press and gets the gate's
-"too quiet" skip. `silence_timeout_ms = 0` turns it off too, and recordings never use it.
+`run_typing_batcher` (`text_heard`). A voice too quiet to arm so records to the stop press, which says
+"too quiet" only when the floor-rejected voice still reached 160 ms of evidence before the floors
+(`unfloored_evidence`), else "without speech" (`synthetic_voice` at -60 to -66 dBFS is heard, never
+armed, `NoSpeech`). A noise switching on can count as heard too (40 of 102 clips of `check-vad.sh`'s
+noise-burst row), and then keeps the timeout off until the press. `silence_timeout_ms = 0` turns it off
+too, and recordings never use it.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 

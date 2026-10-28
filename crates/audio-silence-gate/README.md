@@ -95,7 +95,8 @@ through the soft threshold, within one run of speech), so a short noise onset
 cannot arm it while a lone "yes" or soft talk does. `heard_voice()` turns true
 earlier, on the first frame the detector calls speech before the level floors
 and that count: a sign that someone spoke even when the voice is too quiet to
-arm it. `AutoStopDetector::new(threshold, ..)` keeps the 0.1 RMS rule.
+arm it, though a noise switching on can turn it true too.
+`AutoStopDetector::new(threshold, ..)` keeps the 0.1 RMS rule.
 
 ## Batch gate
 
