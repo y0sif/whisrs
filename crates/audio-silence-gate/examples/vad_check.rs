@@ -325,6 +325,29 @@ fn auto_stop(samples: &[i16], cfg: VadConfig) -> Stop {
     }
 }
 
+/// whisrs's no-speech stop (`pipeline::NoSpeechTimeout`): 10 s with
+/// nothing heard, counted from the start or from the end of the latest
+/// heard frame ([`AutoStopDetector::last_heard`]), while auto-stop is not
+/// armed. Without transcript text, which holds it off in whisrs.
+const NO_SPEECH_S: f64 = 10.0;
+
+/// When whisrs's no-speech stop would end `samples` ([`NO_SPEECH_S`]), in
+/// seconds from the clip start.
+fn no_speech_stop(samples: &[i16], cfg: VadConfig) -> Option<f64> {
+    let mut stop = AutoStopDetector::with_vad(cfg, TIMEOUT_MS, VAD_SAMPLE_RATE);
+    let limit = (NO_SPEECH_S * SR as f64) as u64;
+    let mut fed = 0u64;
+    for chunk in samples.chunks(CHUNK) {
+        stop.feed(chunk);
+        fed += chunk.len() as u64;
+        let since = stop.last_heard().map_or(0, |f| f.end_sample());
+        if !stop.has_speech() && fed - since >= limit {
+            return Some(fed as f64 / SR as f64);
+        }
+    }
+    None
+}
+
 /// When a voice was first heard ([`AutoStopDetector::heard_voice`]) and
 /// when auto-stop armed, in seconds from the clip start.
 fn heard_and_armed(samples: &[i16], cfg: VadConfig) -> (Option<f64>, Option<f64>) {
@@ -615,14 +638,15 @@ struct Bursts {
 const BURSTS: usize = 4;
 
 /// Noise that comes and goes before anyone speaks (a fan cycling, dishes,
-/// a tap): [`BURSTS`] bursts over the room, the first 1 s in, then 3 s of
-/// the room. Edges are abrupt, the hardest case for earshot's onset score.
-/// A burst of the room's own noise comes from later in the bed.
-fn noise_bursts(clips: &Clips, case: Bursts) -> Vec<i16> {
+/// a tap): [`BURSTS`] bursts over the room, the first 1 s in, then `tail_s`
+/// of the room. Edges are abrupt, the hardest case for earshot's onset
+/// score. A burst of the room's own noise comes from later in the bed, the
+/// same stretch whatever the tail.
+fn noise_bursts(clips: &Clips, case: Bursts, tail_s: usize) -> Vec<i16> {
     let (len, gap) = (case.len_ms * SR / 1000, case.gap_ms * SR / 1000);
     let n = SR + BURSTS * len + (BURSTS - 1) * gap + 3 * SR;
     let (room_noise, room_dbfs) = case.room;
-    let room = room_noise.samples(clips, 0, n);
+    let room = room_noise.samples(clips, 0, n - 3 * SR + tail_s * SR);
     let room_gain = db_to_rms(room_dbfs) / rms_f(&room);
     let mut out: Vec<f64> = room.iter().map(|x| x * room_gain).collect();
     let source = case.noise.samples(clips, n, n);
@@ -634,6 +658,11 @@ fn noise_bursts(clips: &Clips, case: Bursts) -> Vec<i16> {
         }
     }
     to_i16(&out)
+}
+
+/// Where the last burst of a [`noise_bursts`] clip ends, in seconds.
+fn bursts_end(case: Bursts) -> f64 {
+    (1000 + BURSTS * case.len_ms + (BURSTS - 1) * case.gap_ms) as f64 / 1000.0
 }
 
 /// Seconds of the first and past the last labelled frame.
@@ -924,8 +953,9 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
     );
 
     // Quieter still, the floor rejects nearly all of it: auto-stop arms
-    // late or never, so "heard" (what keeps whisrs's 10 s no-speech
-    // timeout off) must come from the voice itself, on its first words.
+    // late or never, so "heard" (what starts whisrs's 10 s no-speech wait
+    // again, so a voice that goes on is never cut off) must come from the
+    // voice itself, on its first words.
     {
         let mut labels = Vec::new();
         let mut rms_labels = Vec::new();
@@ -1159,7 +1189,7 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
                 "not armed"
             }
         };
-        // Printed: heard noise keeps whisrs's no-speech timeout off.
+        // Printed: heard noise starts whisrs's no-speech wait again.
         let heard = |cfg| match heard_and_armed(&noise, cfg).0 {
             Some(_) => "heard",
             None => "not heard",
@@ -1282,9 +1312,17 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
         ] {
             let (mut armed, mut passed, mut rms_armed, mut rms_passed) = (0, 0, 0, 0);
             let mut heard = 0;
+            // whisrs's no-speech stop, on the clip with 11 s of the room
+            // after the last burst: how many end, and the latest.
+            let (mut stopped, mut latest) = (0, 0.0f64);
             let mut failures = Vec::new();
             for case in &cases {
-                let clip = noise_bursts(clips, *case);
+                let clip = noise_bursts(clips, *case, 3);
+                let long = noise_bursts(clips, *case, 11);
+                let stop_at = no_speech_stop(&long, close(Vad::Earshot));
+                let in_time = stop_at.is_some_and(|t| t <= bursts_end(*case) + NO_SPEECH_S + 0.1);
+                stopped += in_time as usize;
+                latest = latest.max(stop_at.unwrap_or(0.0));
                 let e = auto_stop(&clip, close(Vad::Earshot));
                 let rms = auto_stop(&clip, close(Vad::Rms));
                 let gate = |vad| speech_gate(&clip, VAD_SAMPLE_RATE, GATE_MIN_MS, &close(vad)).reason;
@@ -1294,10 +1332,14 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
                 heard += heard_and_armed(&clip, close(Vad::Earshot)).0.is_some() as usize;
                 rms_armed += rms.armed_s.is_some() as usize;
                 rms_passed += gate_r.is_none() as usize;
-                if pass && (e.armed_s.is_some() || gate_e != Some(GateReason::NoSpeech)) {
+                if pass
+                    && (e.armed_s.is_some() || gate_e != Some(GateReason::NoSpeech) || !in_time)
+                {
                     let at = e.armed_s.map_or("-".to_string(), |t| format!("{t:.2} s"));
+                    let stop = stop_at.map_or("never".to_string(), |t| format!("{t:.2} s"));
                     failures.push(format!(
-                        "{} {:+.0} dB over {} {:.0} dBFS, {}/{} ms: armed {at}, gate {}",
+                        "{} {:+.0} dB over {} {:.0} dBFS, {}/{} ms: armed {at}, gate {}, \
+                         no-speech stop {stop}",
                         case.noise.name(),
                         case.over_db,
                         case.room.0.name(),
@@ -1313,6 +1355,14 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
                 "armed in {armed} of {n}; gate not \"without speech\" in {passed} of {n}; \
                  heard in {heard} of {n}"
             );
+            // Bursts that arm are auto-stop's to end, not the no-speech stop's.
+            if pass {
+                let _ = write!(
+                    earshot,
+                    "; no-speech stop within 10 s of the last burst in {stopped} of {n} \
+                     (latest {latest:.2} s)"
+                );
+            }
             if !failures.is_empty() {
                 let _ = write!(earshot, " ({})", failures.join("; "));
             }
@@ -1322,8 +1372,8 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
                     &name,
                     earshot,
                     rms,
-                    "never arms; gate without speech",
-                    Some(armed == 0 && passed == 0),
+                    "never arms; gate without speech; the no-speech stop ends every clip",
+                    Some(armed == 0 && passed == 0 && stopped == n),
                 );
             } else {
                 r.row(&name, earshot, rms, "-", None);

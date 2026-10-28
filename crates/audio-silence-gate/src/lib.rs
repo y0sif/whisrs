@@ -22,8 +22,8 @@ mod vad;
 
 pub use level::{LevelMeter, Levels};
 pub use vad::{
-    speech_gate, speech_mask, FrameDecision, GateOutcome, SpeechDetector, SpeechMask, Vad,
-    VadConfig, VAD_FRAME, VAD_SAMPLE_RATE,
+    speech_gate, speech_mask, FrameDecision, GateOutcome, HeardFrame, SpeechDetector, SpeechMask,
+    Vad, VadConfig, VAD_FRAME, VAD_SAMPLE_RATE,
 };
 
 /// Normalized RMS threshold below which audio is considered silence.
@@ -343,6 +343,28 @@ impl AutoStopDetector {
                 ..
             } => *speech_detected || meter.heard_voice(),
             StopMode::Vad { detector, .. } => detector.heard_voice(),
+        }
+    }
+
+    /// The first frame [`heard_voice`](Self::heard_voice) counted
+    /// ([`SpeechDetector::first_heard`]). With the RMS test it can be `None`
+    /// while `heard_voice` is true: a chunk over the threshold whose 16 ms
+    /// frames are each under it. That chunk arms auto-stop too.
+    pub fn first_heard(&self) -> Option<HeardFrame> {
+        self.detector().first_heard()
+    }
+
+    /// The latest frame [`heard_voice`](Self::heard_voice) counted
+    /// ([`SpeechDetector::last_heard`]), with the same caveat.
+    pub fn last_heard(&self) -> Option<HeardFrame> {
+        self.detector().last_heard()
+    }
+
+    /// The detector that meters (RMS) or decides (earshot).
+    fn detector(&self) -> &SpeechDetector {
+        match &self.mode {
+            StopMode::Rms { meter, .. } => meter,
+            StopMode::Vad { detector, .. } => detector,
         }
     }
 

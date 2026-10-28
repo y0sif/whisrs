@@ -15,19 +15,17 @@ silence_timeout_ms = 2000   # auto-stop after this much silence once you spoke: 
                             # turns on every backend. Batch dictation (groq, openai,
                             # deepgram, asr-sidecar, and local-whisper with
                             # segmentation = "none") stops on a second press.
-                            # If no voice is heard at all for 10 s (or for this
-                            # timeout, when it is longer), every one of these (batch
-                            # dictation too) stops and throws the audio away:
-                            # "Stopped: nothing heard for 10 s". A voice counts
-                            # from its first word, even one too quiet to auto-stop
-                            # on. It then records to a second press, which says
-                            # the audio was too quiet when the voice was under
-                            # the level floor (-65 dBFS), or without speech when
-                            # it was fainter or shorter still. The first text a
-                            # streaming backend types counts too. So can a noise
-                            # switching on, which then keeps this stop from
-                            # firing; the second press still ends it. Once
-                            # heard, it never applies.
+                            # Until auto-stop has heard enough of you to arm, every
+                            # one of these (batch dictation too) waits for 10 s (or
+                            # this timeout, when it is longer) with nothing heard,
+                            # then stops and throws the audio away: "Stopped:
+                            # nothing heard for 10 s". Anything heard starts the
+                            # wait again: a voice from its first word, even one too
+                            # quiet to auto-stop on, but also a key click or a
+                            # knock. When what it heard was a voice under the level
+                            # floor (-65 dBFS), it says the audio was too quiet.
+                            # Once a streaming backend has typed text, this stop
+                            # never fires: auto-stop or a second press ends it.
                             # 0 = off, both (stop with a second press)
 notify = true               # desktop notifications
 history = true              # save dictations to ~/.local/share/whisrs/history.jsonl for

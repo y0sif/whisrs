@@ -429,19 +429,29 @@ with no voiced frame forgets them, `vad::Evidence`), so separate noise onsets ne
 "silent (peak -82 dB)", "too quiet (speech at -68 dB)", "without speech (background at -48 dB)"), and
 adds "Is the mic muted?" only at a peak of digital silence (`skip_hint`); a streaming dictation whose
 audio held no speech says "Nothing typed: the audio was ..." (`notify_state`). Each turn logs one info
-line of levels. No-speech timeout (`pipeline::NoSpeechTimeout`): dictation (streaming in
+line of levels, ending in what was heard (`NoSpeechTimeout::heard_label`: "heard at 0.35 to 8.20 s",
+"heard nothing", ", text at 9.50 s"; batch dictation logs it as "dictation capture ended: ..."). No-speech
+timeout (`pipeline::NoSpeechTimeout`, fed a `Heard` by all four capture loops): dictation (streaming in
 `run_streaming_pipeline`, batch on its `collect_batch_dictation` task, `DaemonState::batch_audio`),
-command mode, `[[llm_commands]]` and agent turns (`collect_instruction_audio`) stop and discard after
-`no_speech_timeout` (10 s, or `silence_timeout_ms` when longer) of capture with nothing heard, with
-the origin's skip-toast wording and rule ("Stopped: nothing heard for 10 s", `report_nothing_heard`).
-Heard is the earliest sign of a voice, never auto-stop's arming: `AutoStopDetector::heard_voice` (any
-frame voiced before the level floors and the arming count, so a voice too quiet to arm counts; under
-`rms` any 16 ms over -50.5 dBFS), or on the streaming path the first transcript text reaching
-`run_typing_batcher` (`text_heard`). A voice too quiet to arm so records to the stop press, which says
-"too quiet" only when the floor-rejected voice still reached 160 ms of evidence before the floors
-(`unfloored_evidence`), else "without speech" (`synthetic_voice` at -60 to -66 dBFS is heard, never
-armed, `NoSpeech`). A noise switching on can count as heard too (40 of 102 clips of `check-vad.sh`'s
-noise-burst row), and then keeps the timeout off until the press. `silence_timeout_ms = 0` turns it off
+command mode, `[[llm_commands]]` and agent turns (`collect_instruction_audio`) stop and discard once
+`no_speech_timeout` (10 s, or `silence_timeout_ms` when longer) passes with nothing heard, counted from
+the start or from the end of the latest heard frame (`AutoStopDetector::last_heard`), while auto-stop
+is not armed, with the origin's skip-toast wording and rule ("Stopped: nothing heard for 10 s",
+`report_nothing_heard`). Heard is the earliest sign of a voice, never auto-stop's arming:
+`AutoStopDetector::heard_voice` (any frame voiced before the level floors and the arming count, so a
+voice too quiet to arm counts; under `rms` any 16 ms over -50.5 dBFS). A key click, a knock or a noise
+switching on counts too (40 of 102 clips of `check-vad.sh`'s noise-burst row are heard), but only
+starts the wait again: the row asserts every clip stops within 10 s of its last burst (17.2 s at the
+latest). On the streaming path the first transcript text reaching `run_typing_batcher` (`text_heard`)
+turns the stop off for good: once text is typed, only auto-stop or the press ends the session. Each
+capture logs the first thing heard once at info ("heard at 4.15 s (detector, soft rule, score 0.31,
+-48.6 dBFS)" or "(transcript)"). A voice too quiet to arm keeps starting the wait again while it lasts;
+when the stop then fires, `AutoStopDetector::too_quiet` names it ("Stopped: the audio was too quiet
+(speech at -68 dB)"; command mode and agents "..., stopped"; agents still say "I didn't catch that."),
+and a press before that says "too quiet" only when the floor-rejected voice still reached 160 ms of
+evidence before the floors (`unfloored_evidence`), else "without speech" (`synthetic_voice` at -60 to
+-66 dBFS is heard, never armed, `NoSpeech`). On the batch paths nothing it discards would have been sent:
+the gate uses the same detector, so a buffer that never armed fails it. `silence_timeout_ms = 0` turns it off
 too, and recordings never use it.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).

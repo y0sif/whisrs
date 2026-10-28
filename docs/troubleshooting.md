@@ -59,6 +59,7 @@ whisrs measures the audio of every dictation, command and agent turn, and every 
   - "nothing has played on the system track yet": in a call, check `[recording] system_device`.
 
   "Too quiet" and "noisy" judge only your own speech, what the mic records while nothing plays on the system track, so the echo of a lecture on your speakers is not judged as your voice. Each track's levels are kept in `recording.json` and the transcript's front matter ([Recording](configuration.md#recording)).
+- **Your soft voice is missing from a recording while a video played on the laptop speakers.** whisrs removes the speakers' echo from the mic track, and a soft voice under that echo goes with it, as in 0.1.31. Use headphones, or speak up.
 
 A streaming dictation that typed nothing because its audio held no speech says "Nothing typed: the audio was ..." with one of the reasons above.
 

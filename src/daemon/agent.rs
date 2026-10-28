@@ -2610,7 +2610,11 @@ async fn voice_turn_background(
 
     let transcript = if audio.nothing_heard {
         // Nothing heard: discarded, with no stop cue (as a cancel).
-        report_nothing_heard(&context, &BatchOrigin::Agent { name: &agent.name });
+        report_nothing_heard(
+            &context,
+            &BatchOrigin::Agent { name: &agent.name },
+            audio.too_quiet.as_ref(),
+        );
         Ok(String::new())
     } else {
         if context.config.general.audio_feedback {

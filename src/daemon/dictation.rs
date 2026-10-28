@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use audio_silence_gate::{AutoStopDetector, VadConfig};
+use audio_silence_gate::{AutoStopDetector, Levels, VadConfig};
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
 use whisrs::audio::feedback;
 use whisrs::state::Action;
@@ -16,7 +16,8 @@ use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     build_transcription_config, format_no_microphone_error, history_backend_tag,
     process_batch_samples, process_recording_batch, report_nothing_heard, run_streaming_pipeline,
-    save_history_entry, BatchOrigin, DictationOutcome, NoSpeechTimeout, StreamingPipelineParams,
+    save_history_entry, BatchOrigin, DictationOutcome, Heard, NoSpeechTimeout,
+    StreamingPipelineParams,
 };
 #[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
@@ -520,11 +521,12 @@ fn discard_recording_session(ds: &mut DaemonState) {
 
 /// Collect a batch dictation's audio until the channel closes (the stop
 /// press stops the capture), and stop the session when nothing was heard
-/// ([`no_speech_timeout`](crate::pipeline::no_speech_timeout)): back to
-/// Idle with the audio discarded, as a cancel does, and the dictation's skip
-/// toast. A voice is the close profile of `[audio] vad`, as for auto-stop,
-/// heard on its first frame ([`AutoStopDetector::heard_voice`]); batch
-/// dictation does not auto-stop, and `silence_timeout_ms = 0` turns the
+/// for the timeout ([`no_speech_timeout`](crate::pipeline::no_speech_timeout)):
+/// back to Idle with the audio discarded, as a cancel does, and the
+/// dictation's skip toast. A voice is the close profile of `[audio] vad`, as
+/// for auto-stop, heard on its first frame ([`AutoStopDetector::heard_voice`]),
+/// and every heard frame starts the wait again until auto-stop's count arms;
+/// batch dictation does not auto-stop, and `silence_timeout_ms = 0` turns the
 /// timeout off too.
 async fn collect_batch_dictation(
     mut audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
@@ -534,25 +536,33 @@ async fn collect_batch_dictation(
     // Timeout 0: it only tells whether a voice was heard.
     let mut heard =
         AutoStopDetector::with_vad(VadConfig::close(context.config.audio.vad()), 0, SAMPLE_RATE);
-    let mut no_speech = NoSpeechTimeout::new(context.config.general.silence_timeout_ms);
+    let mut no_speech =
+        NoSpeechTimeout::new(context.config.general.silence_timeout_ms, "dictation");
     let mut samples = Vec::new();
     while let Some(chunk) = audio_rx.recv().await {
         samples.extend_from_slice(&chunk);
         heard.feed(&chunk);
-        if no_speech.feed(chunk.len(), heard.heard_voice())
-            && stop_hearing_nothing(&daemon_state, &context).await
+        if no_speech.feed(chunk.len(), Heard::by(&heard))
+            && stop_hearing_nothing(&daemon_state, &context, heard.too_quiet()).await
         {
             return Vec::new();
         }
     }
+    // The levels line is the batch gate's, after this; what was heard is here.
+    info!("dictation capture ended: {}", no_speech.heard_label());
     samples
 }
 
 /// The no-speech stop of [`collect_batch_dictation`], run on its task: true
 /// when it ended the session. A stop press or cancel that got the lock
 /// first owns the session (the slot no longer holds this task), and then
-/// nothing changes.
-async fn stop_hearing_nothing(daemon_state: &Mutex<DaemonState>, context: &DaemonContext) -> bool {
+/// nothing changes. `too_quiet`: the voice heard was one the level floors
+/// rejected, which the toast names.
+async fn stop_hearing_nothing(
+    daemon_state: &Mutex<DaemonState>,
+    context: &DaemonContext,
+    too_quiet: Option<Levels>,
+) -> bool {
     let mut ds = daemon_state.lock().await;
     let ours = ds
         .batch_audio
@@ -570,7 +580,7 @@ async fn stop_hearing_nothing(daemon_state: &Mutex<DaemonState>, context: &Daemo
         let _ = level_tx.send(0.0);
     }
     drop(ds);
-    report_nothing_heard(context, &BatchOrigin::Dictation);
+    report_nothing_heard(context, &BatchOrigin::Dictation, too_quiet.as_ref());
     true
 }
 

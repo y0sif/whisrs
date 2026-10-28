@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use audio_silence_gate::{AutoStopDetector, VadConfig};
+use audio_silence_gate::{AutoStopDetector, Levels, VadConfig};
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
 use whisrs::audio::feedback;
 use whisrs::llm;
@@ -19,7 +19,7 @@ use crate::injection::{
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     describe_levels, format_api_error, format_no_microphone_error, report_nothing_heard,
-    save_history_entry, transcribe_batch_audio, BatchOptions, BatchOrigin, NoSpeechTimeout,
+    save_history_entry, transcribe_batch_audio, BatchOptions, BatchOrigin, Heard, NoSpeechTimeout,
 };
 #[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
@@ -96,6 +96,10 @@ pub(crate) struct InstructionAudio {
     /// ([`no_speech_timeout`](crate::pipeline::no_speech_timeout)): the
     /// samples are to be discarded, not transcribed.
     pub(crate) nothing_heard: bool,
+    /// With `nothing_heard`: the voice heard before was one the level
+    /// floors rejected ([`AutoStopDetector::too_quiet`]), which the toast
+    /// names.
+    pub(crate) too_quiet: Option<Levels>,
 }
 
 /// Collect a recorded instruction until the silence auto-stop fires, nothing
@@ -106,7 +110,8 @@ pub(crate) struct InstructionAudio {
 ///
 /// Auto-stop decides speech with `[audio] vad` (the close profile: one user
 /// near the mic); a voice counts as heard on its first frame, before
-/// auto-stop arms ([`AutoStopDetector::heard_voice`]).
+/// auto-stop arms ([`AutoStopDetector::heard_voice`]), and every heard frame
+/// starts the no-speech wait again until it arms.
 /// `silence_timeout_ms = 0` never fires (#178) and turns the no-speech
 /// timeout off too, so the instruction records until the channel closes.
 ///
@@ -124,14 +129,14 @@ pub(crate) async fn collect_instruction_audio(
         silence_timeout,
         SAMPLE_RATE,
     );
-    let mut no_speech = NoSpeechTimeout::new(silence_timeout);
+    let mut no_speech = NoSpeechTimeout::new(silence_timeout, label);
     let mut all_samples: Vec<i16> = Vec::new();
     let mut nothing_heard = false;
     if let Some(mut rx) = audio_rx {
         while let Some(chunk) = rx.recv().await {
             all_samples.extend_from_slice(&chunk);
             let silence_reached = auto_stop.feed(&chunk);
-            nothing_heard = no_speech.feed(chunk.len(), auto_stop.heard_voice());
+            nothing_heard = no_speech.feed(chunk.len(), Heard::by(&auto_stop));
             if silence_reached || nothing_heard {
                 if nothing_heard {
                     info!("{label}: nothing heard, stopping");
@@ -147,10 +152,15 @@ pub(crate) async fn collect_instruction_audio(
             }
         }
     }
-    info!("{label} audio: {}", describe_levels(&auto_stop.levels()));
+    info!(
+        "{label} audio: {}, {}",
+        describe_levels(&auto_stop.levels()),
+        no_speech.heard_label()
+    );
     InstructionAudio {
         samples: all_samples,
         nothing_heard,
+        too_quiet: nothing_heard.then(|| auto_stop.too_quiet()).flatten(),
     }
 }
 
@@ -400,7 +410,11 @@ async fn command_mode_background(
     };
 
     if audio.nothing_heard {
-        report_nothing_heard(&context, &BatchOrigin::CommandMode);
+        report_nothing_heard(
+            &context,
+            &BatchOrigin::CommandMode,
+            audio.too_quiet.as_ref(),
+        );
     } else if let Err(e) =
         command_mode_background_inner(&audio.samples, cmd_ctx, recording_started_at, &context).await
     {
@@ -903,7 +917,11 @@ async fn llm_command_background(
 
     let name = cmd_ctx.name.clone();
     if audio.nothing_heard {
-        report_nothing_heard(&context, &BatchOrigin::LlmCommand { name: &name });
+        report_nothing_heard(
+            &context,
+            &BatchOrigin::LlmCommand { name: &name },
+            audio.too_quiet.as_ref(),
+        );
     } else if let Err(e) = llm_command_background_inner(
         &audio.samples,
         cmd_ctx,

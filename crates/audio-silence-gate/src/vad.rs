@@ -170,6 +170,31 @@ pub struct FrameDecision {
     pub dbfs: f32,
 }
 
+/// A frame [`SpeechDetector::heard_voice`] counted: when, and on which
+/// rule. The first and the last of a stream are kept
+/// ([`SpeechDetector::first_heard`], [`SpeechDetector::last_heard`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeardFrame {
+    /// The frame's first sample, counted from `new` or the last `reset`.
+    pub start_sample: u64,
+    /// Samples in the frame: it ends at `start_sample + len`.
+    pub len: u64,
+    /// The earshot score (1.0 for a frame the RMS test calls speech).
+    pub score: f32,
+    /// The frame's RMS level in dBFS.
+    pub dbfs: f32,
+    /// Voiced only through [`VadConfig::soft_threshold`], under the full
+    /// threshold.
+    pub soft: bool,
+}
+
+impl HeardFrame {
+    /// The sample after the frame.
+    pub fn end_sample(&self) -> u64 {
+        self.start_sample + self.len
+    }
+}
+
 /// A source of per-frame speech scores: earshot, or a script in tests.
 trait FrameScorer: Send {
     fn score(&mut self, frame: &[i16]) -> f32;
@@ -454,9 +479,10 @@ pub struct SpeechDetector {
     unfloored_evidence: Evidence,
     unfloored_frames: u64,
     unfloored_sum_squares: f64,
-    /// Any frame was voiced before the level floors and the evidence count
-    /// ([`heard_voice`](Self::heard_voice)).
-    heard: bool,
+    /// The first and the last frame voiced before the level floors and the
+    /// evidence count ([`heard_voice`](Self::heard_voice)).
+    first_heard: Option<HeardFrame>,
+    last_heard: Option<HeardFrame>,
     meter: LevelMeter,
 }
 
@@ -490,7 +516,8 @@ impl SpeechDetector {
             unfloored_evidence: Evidence::default(),
             unfloored_frames: 0,
             unfloored_sum_squares: 0.0,
-            heard: false,
+            first_heard: None,
+            last_heard: None,
             meter: LevelMeter::new(sample_rate),
         }
     }
@@ -532,8 +559,8 @@ impl SpeechDetector {
         let (score, verdict) = match self.scorer.as_mut() {
             None => {
                 let speech = stats.rms() >= self.cfg.rms_threshold;
-                self.heard |= speech;
                 if speech {
+                    self.hear(index, 1.0, frame_dbfs, false);
                     (1.0, Verdict::Voiced)
                 } else {
                     (0.0, Verdict::Silence)
@@ -568,7 +595,7 @@ impl SpeechDetector {
                     let unfloored = self.unfloored.step(true, score, bar) == Verdict::Voiced;
                     self.unfloored_evidence.add(unfloored, unfloored_soft);
                     if unfloored {
-                        self.heard = true;
+                        self.hear(index, score, frame_dbfs, unfloored_soft);
                         self.unfloored_frames += 1;
                         self.unfloored_sum_squares += stats.rms() * stats.rms();
                     }
@@ -611,7 +638,8 @@ impl SpeechDetector {
         self.unfloored_evidence = Evidence::default();
         self.unfloored_frames = 0;
         self.unfloored_sum_squares = 0.0;
-        self.heard = false;
+        self.first_heard = None;
+        self.last_heard = None;
         self.meter.reset();
     }
 
@@ -624,7 +652,32 @@ impl SpeechDetector {
     /// it comes before auto-stop arms, and for a voice too quiet to arm it
     /// at all. A noise onset can count too.
     pub fn heard_voice(&self) -> bool {
-        self.heard
+        self.first_heard.is_some()
+    }
+
+    /// The first frame [`heard_voice`](Self::heard_voice) counted.
+    pub fn first_heard(&self) -> Option<HeardFrame> {
+        self.first_heard
+    }
+
+    /// The latest frame [`heard_voice`](Self::heard_voice) counted: how
+    /// long ago anything was heard.
+    pub fn last_heard(&self) -> Option<HeardFrame> {
+        self.last_heard
+    }
+
+    /// Keep frame `index` as heard.
+    fn hear(&mut self, index: u64, score: f32, dbfs: f32, soft: bool) {
+        let len = self.frame_len as u64;
+        let frame = HeardFrame {
+            start_sample: index * len,
+            len,
+            score,
+            dbfs,
+            soft,
+        };
+        self.first_heard.get_or_insert(frame);
+        self.last_heard = Some(frame);
     }
 
     /// The meter's figures for the stream so far.
@@ -1295,11 +1348,34 @@ mod tests {
         stop.feed(&samples[(WARM + 1) * VAD_FRAME..]);
         assert!(stop.heard_voice());
         assert!(!stop.has_speech());
+        // The onset frame first, the last voiced one last (the hangover
+        // after it is not heard), each on the full threshold.
+        let heard = |at: usize| HeardFrame {
+            start_sample: (at * VAD_FRAME) as u64,
+            len: VAD_FRAME as u64,
+            score: 0.9,
+            dbfs: -30.0,
+            soft: false,
+        };
+        let round = |f: Option<HeardFrame>| {
+            f.map(|f| HeardFrame {
+                dbfs: f.dbfs.round(),
+                ..f
+            })
+        };
+        assert_eq!(round(stop.first_heard()), Some(heard(WARM + 1)));
+        assert_eq!(round(stop.last_heard()), Some(heard(WARM + 2)));
+        assert_eq!(
+            heard(WARM + 2).end_sample(),
+            ((WARM + 3) * VAD_FRAME) as u64
+        );
 
-        // Soft frames clear of the background count too.
+        // Soft frames clear of the background count too, as soft.
         let mut detector = scripted(close(), vec![0.3; 70]);
         detector.feed(&soft_bursts(4, 30)[..40 * VAD_FRAME], |_| {});
         assert!(detector.heard_voice());
+        assert!(detector.first_heard().is_some_and(|f| f.soft));
+        assert!(detector.last_heard().is_some_and(|f| f.soft));
 
         // A score under both thresholds, and warm-up, never do.
         let mut detector = scripted(close(), vec![0.2; 60]);
@@ -1315,6 +1391,10 @@ mod tests {
         assert!(detector.heard_voice());
         detector.reset();
         assert!(!detector.heard_voice());
+        assert_eq!(
+            (detector.first_heard(), detector.last_heard()),
+            (None, None)
+        );
     }
 
     /// A stream the gate would call too quiet says so, with the level of
@@ -1364,6 +1444,11 @@ mod tests {
             stop.feed(&chunk);
             assert!(stop.heard_voice());
             assert!(!stop.has_speech());
+            // Frame 3 (samples 768 to 1024) holds 224 of the loud samples,
+            // enough on its own, scored 1.0.
+            let heard = stop.first_heard().unwrap();
+            assert_eq!((heard.start_sample, heard.score), (768, 1.0));
+            assert_eq!(stop.last_heard(), Some(heard));
         }
         let mut stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, 2000, VAD_SAMPLE_RATE);
         stop.feed(&at_level(-30.0, 4));
