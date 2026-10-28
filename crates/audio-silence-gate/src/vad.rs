@@ -177,8 +177,6 @@ pub struct FrameDecision {
 pub struct HeardFrame {
     /// The frame's first sample, counted from `new` or the last `reset`.
     pub start_sample: u64,
-    /// Samples in the frame: it ends at `start_sample + len`.
-    pub len: u64,
     /// The earshot score (1.0 for a frame the RMS test calls speech).
     pub score: f32,
     /// The frame's RMS level in dBFS.
@@ -186,13 +184,6 @@ pub struct HeardFrame {
     /// Voiced only through [`VadConfig::soft_threshold`], under the full
     /// threshold.
     pub soft: bool,
-}
-
-impl HeardFrame {
-    /// The sample after the frame.
-    pub fn end_sample(&self) -> u64 {
-        self.start_sample + self.len
-    }
 }
 
 /// A source of per-frame speech scores: earshot, or a script in tests.
@@ -660,18 +651,15 @@ impl SpeechDetector {
         self.first_heard
     }
 
-    /// The latest frame [`heard_voice`](Self::heard_voice) counted: how
-    /// long ago anything was heard.
+    /// The latest frame [`heard_voice`](Self::heard_voice) counted.
     pub fn last_heard(&self) -> Option<HeardFrame> {
         self.last_heard
     }
 
     /// Keep frame `index` as heard.
     fn hear(&mut self, index: u64, score: f32, dbfs: f32, soft: bool) {
-        let len = self.frame_len as u64;
         let frame = HeardFrame {
-            start_sample: index * len,
-            len,
+            start_sample: index * self.frame_len as u64,
             score,
             dbfs,
             soft,
@@ -754,8 +742,11 @@ pub struct GateOutcome {
     /// (and `snr_db`) describe the voice the level floor rejected.
     pub levels: Levels,
     /// The first and the latest frame the detector heard a voice in
-    /// ([`SpeechDetector::first_heard`], [`SpeechDetector::last_heard`]);
-    /// `None` when it did not run (digital silence, too short).
+    /// ([`SpeechDetector::first_heard`], [`SpeechDetector::last_heard`]).
+    /// With [`Vad::Earshot`] they come from the model's run over the
+    /// buffer, so they are `None` when it did not run (empty, too short,
+    /// digital silence). The RMS test always runs over the buffer and
+    /// reports its frames, even when the reason is `TooShort` or `Silent`.
     pub first_heard: Option<HeardFrame>,
     pub last_heard: Option<HeardFrame>,
 }
@@ -1371,7 +1362,6 @@ mod tests {
         // after it is not heard), each on the full threshold.
         let heard = |at: usize| HeardFrame {
             start_sample: (at * VAD_FRAME) as u64,
-            len: VAD_FRAME as u64,
             score: 0.9,
             dbfs: -30.0,
             soft: false,
@@ -1384,10 +1374,6 @@ mod tests {
         };
         assert_eq!(round(stop.first_heard()), Some(heard(WARM + 1)));
         assert_eq!(round(stop.last_heard()), Some(heard(WARM + 2)));
-        assert_eq!(
-            heard(WARM + 2).end_sample(),
-            ((WARM + 3) * VAD_FRAME) as u64
-        );
 
         // Soft frames clear of the background count too, as soft.
         let mut detector = scripted(close(), vec![0.3; 70]);

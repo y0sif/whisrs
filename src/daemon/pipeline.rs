@@ -13,6 +13,7 @@ use audio_silence_gate::{
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
+use whisrs::audio::feedback;
 use whisrs::audio::quality;
 use whisrs::history::HistoryEntry;
 use whisrs::llm;
@@ -474,7 +475,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         ds.session_language = None;
         state_tx.publish(&ds);
         if audio_feedback && !cancelled {
-            play_done_cue(audio_feedback_volume);
+            feedback::play_done(audio_feedback_volume);
         }
         if notify_state && !cancelled {
             let preview = truncate_preview(&full_text, 77);
@@ -1380,12 +1381,13 @@ pub(crate) fn format_api_error(err: &anyhow::Error) -> String {
     msg
 }
 
-/// One line of a stream's measured levels, for the log.
 /// What the detector heard, the end of a turn's levels line (a diagnostic,
 /// it decides nothing): "heard at 0.35 to 8.20 s", the first and the latest
 /// frame it heard a voice in before its level floors and arming
-/// ([`AutoStopDetector::first_heard`], [`AutoStopDetector::last_heard`]),
-/// "heard at 4.15 s" for one, or "heard nothing".
+/// ([`AutoStopDetector::first_heard`], [`AutoStopDetector::last_heard`], or
+/// the batch gate's [`GateOutcome::first_heard`],
+/// [`GateOutcome::last_heard`]), "heard at 4.15 s" for one, or "heard
+/// nothing".
 pub(crate) fn heard_label(first: Option<HeardFrame>, last: Option<HeardFrame>) -> String {
     let at = |frame: HeardFrame| frame.start_sample as f64 / f64::from(SAMPLE_RATE);
     match (first, last) {
@@ -1397,6 +1399,7 @@ pub(crate) fn heard_label(first: Option<HeardFrame>, last: Option<HeardFrame>) -
     }
 }
 
+/// One line of a stream's measured levels, for the log.
 pub(crate) fn describe_levels(levels: &Levels) -> String {
     let db = |v: Option<f32>| v.map_or_else(|| "none".to_string(), |v| format!("{v:.1}"));
     format!(
@@ -1480,34 +1483,16 @@ pub(crate) fn save_history_entry(
 
 #[cfg(test)]
 thread_local! {
-    /// Test seams: the history entries this thread saved and the done cues
-    /// it played, neither written to the real history nor played.
+    /// Test seam: the history entries this thread saved, never written to
+    /// the real history.
     static SAVED_HISTORY: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static DONE_CUES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The texts this thread saved to history since the last call.
 #[cfg(test)]
 pub(crate) fn take_saved_history() -> Vec<String> {
     SAVED_HISTORY.with(|saved| std::mem::take(&mut *saved.borrow_mut()))
-}
-
-/// The done cues this thread played since the last call.
-#[cfg(test)]
-pub(crate) fn take_done_cues() -> usize {
-    DONE_CUES.with(|cues| cues.replace(0))
-}
-
-/// The done cue of a dictation; test builds count it instead.
-fn play_done_cue(volume: f32) {
-    #[cfg(not(test))]
-    whisrs::audio::feedback::play_done(volume);
-    #[cfg(test)]
-    {
-        let _ = volume;
-        DONE_CUES.with(|cues| cues.set(cues.get() + 1));
-    }
 }
 
 /// Returns `true` when the first character of `text` is a punctuation mark
@@ -2022,23 +2007,12 @@ mod tests {
     /// five formants of four vowels in turn, in 0.2 s syllables held at full
     /// level between ramps. earshot hears it under close's -65 dBFS floor:
     /// at -70 dBFS the gate calls it too quiet, its voiced frames at -68 dBFS
-    /// (too quiet from -68 to -73 dBFS, never armed).
+    /// (too quiet from -68 to -73 dBFS, never armed). Each syllable is voiced
+    /// for 80% of it, rising and falling over 15% of that.
     fn quiet_voice(secs: usize, dbfs: f64) -> Vec<i16> {
-        formant_voice(secs, dbfs, 5, 0.2, 0.15)
-    }
-
-    /// A 120 Hz pulse train through the first `formants` (3 to 5) formants
-    /// of four vowels in turn, in syllables of `syllable_secs` voiced for
-    /// 80% of it, scaled to an RMS of `dbfs`. Each syllable rises and falls
-    /// over `ramp` of its voiced part (0.5: a sine bump).
-    fn formant_voice(
-        secs: usize,
-        dbfs: f64,
-        formants: usize,
-        syllable_secs: f64,
-        ramp: f64,
-    ) -> Vec<i16> {
         use std::f64::consts::PI;
+        const SYLLABLE_SECS: f64 = 0.2;
+        const RAMP: f64 = 0.15;
         let rate = f64::from(SAMPLE_RATE);
         let vowels = [
             [700.0, 1220.0, 2600.0, 3300.0, 3750.0],
@@ -2052,10 +2026,10 @@ mod tests {
         let voice: Vec<f64> = (0..secs * SAMPLE_RATE as usize)
             .map(|i| {
                 let t = i as f64 / rate;
-                let syllable = (t / syllable_secs) as usize;
-                let within = (t % syllable_secs) / syllable_secs / 0.8;
+                let syllable = (t / SYLLABLE_SECS) as usize;
+                let within = (t % SYLLABLE_SECS) / SYLLABLE_SECS / 0.8;
                 let envelope = if within < 1.0 {
-                    (PI / 2.0 * (within.min(1.0 - within) / ramp).min(1.0)).sin()
+                    (PI / 2.0 * (within.min(1.0 - within) / RAMP).min(1.0)).sin()
                 } else {
                     0.0
                 };
@@ -2067,9 +2041,7 @@ mod tests {
                     0.0
                 };
                 let vowel = vowels[syllable % vowels.len()];
-                for ((past, f), bandwidth) in
-                    state.iter_mut().zip(vowel).zip(bandwidths).take(formants)
-                {
+                for ((past, f), bandwidth) in state.iter_mut().zip(vowel).zip(bandwidths) {
                     let r: f64 = (-PI * bandwidth / rate).exp();
                     let v = y + 2.0 * r * (2.0 * PI * f / rate).cos() * past[0] - r * r * past[1];
                     *past = [v, past[0]];
@@ -2142,14 +2114,14 @@ mod tests {
     }
 
     /// A streaming dictation over `samples` in 50 ms chunks, paced in
-    /// (paused) real time, on [`SilentStream`]. Toasts, history and the done
-    /// cue are on (recorded, not shown, by the test seams), the overlay off,
-    /// and nothing is typed (`clipboard_only`). A session still recording at
-    /// the end gets the stop press.
-    async fn streaming_run(silence_timeout_ms: u64, samples: &[i16]) -> StreamingRun {
+    /// (paused) real time, on [`SilentStream`], auto-stop after 2 s. Toasts
+    /// and history are on (recorded, not shown or written, by the test
+    /// seams), the done cue and the overlay off, and nothing is typed
+    /// (`clipboard_only`). A session still recording at the end gets the
+    /// stop press.
+    async fn streaming_run(samples: &[i16]) -> StreamingRun {
         crate::notify::take_sent_toasts();
         take_saved_history();
-        take_done_cues();
         let config: Config = toml::from_str("").unwrap();
         let daemon_state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -2172,11 +2144,11 @@ mod tests {
             language: "en".into(),
             notify: true,
             overlay_enabled: false,
-            silence_timeout_ms,
+            silence_timeout_ms: 2000,
             filler_enabled: false,
             filler_words: Vec::new(),
             replacements: Default::default(),
-            audio_feedback: true,
+            audio_feedback: false,
             audio_feedback_volume: 0.5,
             backend_name: "test".into(),
             keys: KeystrokeSettings::from_config(&config.input),
@@ -2225,7 +2197,7 @@ mod tests {
     /// speech", which a too-quiet voice outranks.
     #[tokio::test(start_paused = true)]
     async fn a_too_quiet_streaming_dictation_says_too_quiet() {
-        let run = streaming_run(2000, &quiet_voice(12, -70.0)).await;
+        let run = streaming_run(&quiet_voice(12, -70.0)).await;
         assert_eq!(run.stopped, None, "{run:?}");
         assert!(!run.cancelled && run.released, "{run:?}");
         assert_eq!(
@@ -2241,7 +2213,6 @@ mod tests {
     fn heard_label_names_the_first_and_latest_heard_frames() {
         let frame = |start_sample| HeardFrame {
             start_sample,
-            len: 256,
             score: 0.31,
             dbfs: -48.6,
             soft: true,
