@@ -2753,6 +2753,11 @@ mod tests {
     /// A context whose runtime drives `names` with the Claude driver and TTS
     /// on, its store in `dir`, nothing notified and no audio cue played.
     fn test_context(names: &[&str], dir: &Path) -> Arc<DaemonContext> {
+        test_context_with(names, dir, false)
+    }
+
+    /// [`test_context`] with `[general] notify` as given.
+    fn test_context_with(names: &[&str], dir: &Path, notify: bool) -> Arc<DaemonContext> {
         let mut rt = AgentRuntime::disabled();
         rt.speak = true;
         rt.agents = names.iter().map(|n| Arc::new(test_agent(n))).collect();
@@ -2771,7 +2776,7 @@ mod tests {
                 .unwrap(),
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(UnreachableBackend),
-            notify: false,
+            notify,
             state_tx: crate::context::StateBus::new(),
             overlay_level_tx: None,
             overlay_enabled: false,
@@ -2982,6 +2987,43 @@ mod tests {
         assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
         // No turn was started.
         assert!(context.agents.inner.lock().await.store.agents.is_empty());
+    }
+
+    /// A voice turn that hears nothing for 10 s stops itself: the toast,
+    /// "I didn't catch that." spoken, back to Idle, and nothing sent.
+    #[tokio::test]
+    async fn a_voice_turn_that_hears_nothing_stops_and_says_so() {
+        crate::notify::take_sent_toasts();
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context_with(&["jarvis"], dir.path(), true);
+        let agent = Arc::clone(&context.agents.agents[0]);
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let mut g = ds.lock().await;
+            g.state_machine.transition(Action::Toggle).unwrap();
+            g.agent_recording = Some(AgentRecordingContext {
+                name: "jarvis".into(),
+                new_session: false,
+            });
+        }
+        // 12 s of digital silence; the turn stops at 10 s on its own.
+        let (tx, rx) = mpsc::unbounded_channel();
+        for _ in 0..240 {
+            tx.send(vec![0i16; 800]).unwrap();
+        }
+        voice_turn_background(Some(rx), Arc::clone(&ds), Arc::clone(&context), agent).await;
+        assert_eq!(
+            crate::notify::take_sent_toasts(),
+            ["Agent 'jarvis': nothing heard for 10 s, stopped"]
+        );
+        assert_eq!(queued(&context.agents), [DIDNT_CATCH]);
+        let g = ds.lock().await;
+        assert_eq!(g.state_machine.state(), State::Idle);
+        assert!(g.agent_recording.is_none() && g.agent_transcribing.is_none());
+        drop(g);
+        // No turn was started.
+        assert!(context.agents.inner.lock().await.store.agents.is_empty());
+        drop(tx);
     }
 
     /// A hold (a command press capturing its selection) keeps the reply

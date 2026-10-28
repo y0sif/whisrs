@@ -26,6 +26,7 @@ use tracing::debug;
 use crate::audio::capture::SAMPLE_RATE;
 use crate::audio::quality::{Check, QualityMeter, QualityReport, Verdict};
 use crate::audio::AudioChunk;
+use crate::recording::TrackKind;
 
 /// Loudest sample of a chunk that is still digital silence: a muted mic,
 /// not a quiet room. On real recordings the quietest 100 ms of a room peak at
@@ -309,7 +310,8 @@ pub fn spawn_track_writer(
 }
 
 /// [`spawn_track_writer`] for the mic, which also measures its quality with
-/// `vad`, raises `alarm.on_silence` when the mic sends only digital silence
+/// `vad` ([`TrackKind::vad_config`]), raises `alarm.on_silence` when the mic
+/// sends only digital silence
 /// and `alarm.on_warning` for each live quality warning. Never used for the
 /// system track: a paused video is silent too.
 pub fn spawn_mic_writer(
@@ -322,7 +324,7 @@ pub fn spawn_mic_writer(
     let monitor = Monitor::Mic {
         silence: SilenceDetector::new(alarm.silence_after),
         live: Box::new(LiveQuality::new(
-            QualityMeter::new(vad),
+            QualityMeter::with_config(TrackKind::Mic.vad_config(vad)),
             Arc::clone(&alarm.system),
         )),
         alarm,
@@ -331,8 +333,9 @@ pub fn spawn_mic_writer(
 }
 
 /// [`spawn_track_writer`] for the system track, which also measures its
-/// quality with `vad` and tells `system` of every chunk that is more than
-/// digital silence ([`SystemSignal::sound`]).
+/// quality with `vad` (without the soft threshold, [`TrackKind::vad_config`])
+/// and tells `system` of every chunk that is more than digital silence
+/// ([`SystemSignal::sound`]).
 pub fn spawn_system_writer(
     rx: mpsc::UnboundedReceiver<AudioChunk>,
     path: PathBuf,
@@ -341,7 +344,7 @@ pub fn spawn_system_writer(
     system: Arc<SystemSignal>,
 ) -> JoinHandle<anyhow::Result<TrackStats>> {
     let monitor = Monitor::System {
-        meter: Box::new(QualityMeter::new(vad)),
+        meter: Box::new(QualityMeter::with_config(TrackKind::System.vad_config(vad))),
         system,
     };
     tokio::task::spawn_blocking(move || write_track(rx, &path, flush_every, monitor))
@@ -971,6 +974,32 @@ mod tests {
             signal,
         );
         assert_eq!(system.await.unwrap().unwrap().quality, None);
+    }
+
+    /// The system writer measures without the soft threshold: a drum loop
+    /// holds no speech there, while the mic's profile finds some in it.
+    #[tokio::test]
+    async fn the_system_writer_measures_without_the_soft_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let drums = crate::audio::test_audio::drum_loop(10, -30.0);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let system = spawn_system_writer(
+            rx,
+            dir.path().join("system.wav"),
+            Duration::from_secs(2),
+            Vad::Earshot,
+            Arc::new(SystemSignal::new()),
+        );
+        for chunk in drums.chunks(1600) {
+            tx.send(chunk.to_vec()).unwrap();
+        }
+        drop(tx);
+        let quality = system.await.unwrap().unwrap().quality.unwrap();
+        assert_eq!(quality.levels.speech_dbfs, None);
+
+        let mut mic = QualityMeter::with_config(TrackKind::Mic.vad_config(Vad::Earshot));
+        mic.feed(&drums);
+        assert!(mic.report().levels.speech_dbfs.is_some());
     }
 
     #[tokio::test]

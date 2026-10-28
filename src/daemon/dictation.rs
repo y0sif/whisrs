@@ -520,17 +520,18 @@ fn discard_recording_session(ds: &mut DaemonState) {
 
 /// Collect a batch dictation's audio until the channel closes (the stop
 /// press stops the capture), and stop the session when nothing was heard
-/// for [`NO_SPEECH_TIMEOUT`](crate::pipeline::NO_SPEECH_TIMEOUT): back to
+/// ([`no_speech_timeout`](crate::pipeline::no_speech_timeout)): back to
 /// Idle with the audio discarded, as a cancel does, and the dictation's skip
-/// toast. Speech is the close profile of `[audio] vad`, as for auto-stop;
-/// batch dictation does not auto-stop, and `silence_timeout_ms = 0` turns
-/// the timeout off too.
+/// toast. A voice is the close profile of `[audio] vad`, as for auto-stop,
+/// heard on its first frame ([`AutoStopDetector::heard_voice`]); batch
+/// dictation does not auto-stop, and `silence_timeout_ms = 0` turns the
+/// timeout off too.
 async fn collect_batch_dictation(
     mut audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) -> Vec<i16> {
-    // Timeout 0: it only tells whether speech was heard.
+    // Timeout 0: it only tells whether a voice was heard.
     let mut heard =
         AutoStopDetector::with_vad(VadConfig::close(context.config.audio.vad()), 0, SAMPLE_RATE);
     let mut no_speech = NoSpeechTimeout::new(context.config.general.silence_timeout_ms);
@@ -538,7 +539,7 @@ async fn collect_batch_dictation(
     while let Some(chunk) = audio_rx.recv().await {
         samples.extend_from_slice(&chunk);
         heard.feed(&chunk);
-        if no_speech.feed(chunk.len(), heard.has_speech())
+        if no_speech.feed(chunk.len(), heard.heard_voice())
             && stop_hearing_nothing(&daemon_state, &context).await
         {
             return Vec::new();

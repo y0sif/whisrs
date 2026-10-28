@@ -15,9 +15,14 @@ silence_timeout_ms = 2000   # auto-stop after this much silence once you spoke: 
                             # turns on every backend. Batch dictation (groq, openai,
                             # deepgram, asr-sidecar, and local-whisper with
                             # segmentation = "none") stops on a second press.
-                            # If nothing is heard at all in the first 10 s, every one
-                            # of these (batch dictation too) stops and throws the
-                            # audio away: "Stopped: nothing heard for 10 s".
+                            # If no voice is heard at all for 10 s (or for this
+                            # timeout, when it is longer), every one of these (batch
+                            # dictation too) stops and throws the audio away:
+                            # "Stopped: nothing heard for 10 s". A voice counts
+                            # from its first word, even one too quiet to auto-stop
+                            # on (it records to a second press, which says it was
+                            # too quiet), and so does the first text a streaming
+                            # backend types. Once heard, it never applies.
                             # 0 = off, both (stop with a second press)
 notify = true               # desktop notifications
 history = true              # save dictations to ~/.local/share/whisrs/history.jsonl for
@@ -1309,7 +1314,7 @@ PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matc
 
 `[audio] vad` decides what counts as speech: when auto-stop fires, whether a batch dictation, command or agent turn is worth sending, where local-whisper cuts a dictation into phrases, where a recording is cut into phrases for a backend that returns no timestamps, and where a recording track holds speech. Levels are in dBFS, decibels relative to full scale: 0 is the loudest a sample can be, and a normal speaking voice near the mic sits around -40.
 
-- `"earshot"` (the default): a small learned voice activity detector that scores every 16 ms of audio. A steady fan or hum does not count as speech, and a quiet voice still does. A soft voice the model is unsure of counts too when it stands clearly above the room's background (measured with the low rumble turned down), so soft talk arms auto-stop and is sent from a recording; a key click or a noise switching on does not. During dictation, command mode, `[[llm_commands]]` and agent turns, a voice far under yours (a TV, a colleague behind you) does not count either, unless it is louder than about -50 dBFS, the level `"rms"` calls speech. With a loud mic (your speech above about -32 dBFS), a TV in the room can still count. A recording counts every voice.
+- `"earshot"` (the default): a small learned voice activity detector that scores every 16 ms of audio. A steady fan or hum does not count as speech, and a quiet voice still does. A soft voice the model is unsure of counts too when it stands clearly above the room's background (measured with the low rumble turned down), so soft talk arms auto-stop and is sent from a recording. A key click does not count. A noise that switches on can count for about 0.3 s, but that alone does not arm auto-stop or get a dictation sent, and neither do several such noises before you speak (a fan cycling, dishes). A loud hiss or clatter well above a quiet, rumbly room can still sound like speech to the model itself. During dictation, command mode, `[[llm_commands]]` and agent turns, a voice far under yours (a TV, a colleague behind you) does not count either, unless it is louder than about -50 dBFS, the level `"rms"` calls speech. With a loud mic (your speech above about -32 dBFS), a TV in the room can still count. A recording counts every voice, a soft one on your mic as above; the system track leaves the soft-voice rule out, since it lets music through (about a quarter of a drum loop), and Whisper makes up text over music.
 - `"rms"`: the loudness test of whisrs 0.1.31 (a block is speech when it is louder than about -50 dBFS). Use it if the model handles your mic badly. In a noisy room it may never auto-stop.
 
 An unknown value warns at startup and uses `"earshot"`. Restart the daemon after a change.

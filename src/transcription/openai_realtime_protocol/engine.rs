@@ -1103,6 +1103,7 @@ mod stream_lifecycle_tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         }
     }
 

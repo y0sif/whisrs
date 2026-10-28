@@ -325,6 +325,24 @@ fn auto_stop(samples: &[i16], cfg: VadConfig) -> Stop {
     }
 }
 
+/// When a voice was first heard ([`AutoStopDetector::heard_voice`]) and
+/// when auto-stop armed, in seconds from the clip start.
+fn heard_and_armed(samples: &[i16], cfg: VadConfig) -> (Option<f64>, Option<f64>) {
+    let mut stop = AutoStopDetector::with_vad(cfg, TIMEOUT_MS, VAD_SAMPLE_RATE);
+    let (mut heard, mut armed) = (None, None);
+    for (c, chunk) in samples.chunks(CHUNK).enumerate() {
+        stop.feed(chunk);
+        let t = ((c * CHUNK + chunk.len()) as f64) / SR as f64;
+        if heard.is_none() && stop.heard_voice() {
+            heard = Some(t);
+        }
+        if armed.is_none() && stop.has_speech() {
+            armed = Some(t);
+        }
+    }
+    (heard, armed)
+}
+
 impl Stop {
     /// Seconds after `speech_end` it fired.
     fn after(&self, speech_end: f64) -> Option<f64> {
@@ -540,6 +558,80 @@ fn key_clicks(pink: &[f64], seconds: usize, peak_dbfs: f64) -> Vec<i16> {
             }
         }
         t += 2000 + (uniform() * 3000.0) as usize;
+    }
+    to_i16(&out)
+}
+
+/// A noise of the [`noise_bursts`] rows: a room or a burst.
+#[derive(Clone, Copy, PartialEq)]
+enum Noise {
+    Pink,
+    Brown,
+    White,
+}
+
+impl Noise {
+    fn name(self) -> &'static str {
+        match self {
+            Noise::Pink => "pink",
+            Noise::Brown => "brown",
+            Noise::White => "white",
+        }
+    }
+
+    /// `n` samples of it from `offset` on (any RMS).
+    fn samples(self, clips: &Clips, offset: usize, n: usize) -> Vec<f64> {
+        match self {
+            Noise::Pink => clips.beds[0].1[offset..offset + n].to_vec(),
+            Noise::Brown => clips.beds[1].1[offset..offset + n].to_vec(),
+            Noise::White => {
+                let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ offset as u64;
+                (0..n)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        2.0 * ((state >> 11) as f64 / (1u64 << 53) as f64) - 1.0
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// One [`noise_bursts`] case: the room (its noise and level), the burst
+/// noise, how far the burst alone stands over the room (full band), and
+/// the burst length and the pause after it.
+#[derive(Clone, Copy)]
+struct Bursts {
+    room: (Noise, f64),
+    noise: Noise,
+    over_db: f64,
+    len_ms: usize,
+    gap_ms: usize,
+}
+
+/// Bursts in each [`noise_bursts`] case.
+const BURSTS: usize = 4;
+
+/// Noise that comes and goes before anyone speaks (a fan cycling, dishes,
+/// a tap): [`BURSTS`] bursts over the room, the first 1 s in, then 3 s of
+/// the room. Edges are abrupt, the hardest case for earshot's onset score.
+/// A burst of the room's own noise comes from later in the bed.
+fn noise_bursts(clips: &Clips, case: Bursts) -> Vec<i16> {
+    let (len, gap) = (case.len_ms * SR / 1000, case.gap_ms * SR / 1000);
+    let n = SR + BURSTS * len + (BURSTS - 1) * gap + 3 * SR;
+    let (room_noise, room_dbfs) = case.room;
+    let room = room_noise.samples(clips, 0, n);
+    let room_gain = db_to_rms(room_dbfs) / rms_f(&room);
+    let mut out: Vec<f64> = room.iter().map(|x| x * room_gain).collect();
+    let source = case.noise.samples(clips, n, n);
+    let gain = db_to_rms(room_dbfs + case.over_db) / rms_f(&source);
+    for b in 0..BURSTS {
+        let start = SR + b * (len + gap);
+        for i in start..start + len {
+            out[i] += gain * source[i];
+        }
     }
     to_i16(&out)
 }
@@ -831,6 +923,46 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
         Some(m.gate_earshot == Some(GateReason::TooQuiet)),
     );
 
+    // Quieter still, the floor rejects nearly all of it: auto-stop arms
+    // late or never, so "heard" (what keeps whisrs's 10 s no-speech
+    // timeout off) must come from the voice itself, on its first words.
+    {
+        let mut labels = Vec::new();
+        let mut rms_labels = Vec::new();
+        let mut pass = true;
+        for db in [-36.0, -38.0] {
+            let (_, quiet_auto) = quiet(db);
+            let auto = to_i16(&quiet_auto);
+            let (heard, armed) = heard_and_armed(&auto, close(Vad::Earshot));
+            let (rms_heard, rms_armed) = heard_and_armed(&auto, close(Vad::Rms));
+            let gate =
+                speech_gate(&auto, VAD_SAMPLE_RATE, GATE_MIN_MS, &close(Vad::Earshot)).reason;
+            let at = |t: Option<f64>| t.map_or("never".to_string(), |t| format!("{t:.2} s"));
+            labels.push(format!(
+                "{:.0} dBFS: heard {}, armed {}, gate {}",
+                -40.0 + db,
+                at(heard),
+                at(armed),
+                gate_label(gate)
+            ));
+            rms_labels.push(format!(
+                "{:.0} dBFS: heard {}, armed {}",
+                -40.0 + db,
+                at(rms_heard),
+                at(rms_armed)
+            ));
+            pass &= heard.is_some_and(|t| t <= clips.auto_start + 1.0)
+                && gate == Some(GateReason::TooQuiet);
+        }
+        r.row(
+            "too quiet to arm (speech -76 and -78 dBFS, from 2.05 s)",
+            labels.join("; "),
+            rms_labels.join("; "),
+            "heard within 1 s of the first word; gate too quiet",
+            Some(pass),
+        );
+    }
+
     // Noise beds.
     let ten_s = 10 * SR;
     for (name, bed) in &clips.beds {
@@ -1027,10 +1159,25 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
                 "not armed"
             }
         };
+        // Printed: heard noise keeps whisrs's no-speech timeout off.
+        let heard = |cfg| match heard_and_armed(&noise, cfg).0 {
+            Some(_) => "heard",
+            None => "not heard",
+        };
         r.row(
             "pink only, -40 dBFS, 10 s",
-            format!("gate {}; {}", gate_label(gate_e), armed(&e)),
-            format!("gate {}; {}", gate_label(gate_r), armed(&rms)),
+            format!(
+                "gate {}; {}; {}",
+                gate_label(gate_e),
+                armed(&e),
+                heard(close(Vad::Earshot))
+            ),
+            format!(
+                "gate {}; {}; {}",
+                gate_label(gate_r),
+                armed(&rms),
+                heard(close(Vad::Rms))
+            ),
             "gate without speech; never arms",
             Some(gate_e == Some(GateReason::NoSpeech) && e.armed_s.is_none()),
         );
@@ -1055,8 +1202,12 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
                     "not armed"
                 }
             };
+            let heard = match heard_and_armed(&clicks, close(Vad::Earshot)).0 {
+                Some(t) => format!("heard {t:.2} s"),
+                None => "not heard".into(),
+            };
             labels.push(format!(
-                "{peak:.0} dBFS: gate {}, {}",
+                "{peak:.0} dBFS: gate {}, {}, {heard}",
                 gate_label(gate_e),
                 armed(&e)
             ));
@@ -1074,6 +1225,110 @@ fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
             "gate without speech; never arms",
             Some(pass),
         );
+    }
+
+    // Noise that comes and goes before the first word: soft evidence must
+    // not add up across separate bursts. A rumble-heavy room (brown, like
+    // the maintainer's) is where a broadband burst stands clear.
+    {
+        let rooms = [(Noise::Pink, -60.0), (Noise::Brown, -54.0)];
+        // Burst and pause: 0.7 to 1.5 s between bursts, or between onsets.
+        let shapes = [
+            (300, 700),
+            (400, 1000),
+            (500, 1500),
+            (300, 400),
+            (400, 600),
+            (500, 1000),
+        ];
+        // White bursts 12 dB over a rumble room: earshot itself scores them
+        // 0.55 to 0.58, so they are speech to it (printed below).
+        let limit =
+            |c: &Bursts| c.room.0 == Noise::Brown && c.noise == Noise::White && c.over_db > 9.0;
+        let mut cases = Vec::new();
+        for room in rooms {
+            for noise in [Noise::Pink, Noise::Brown, Noise::White] {
+                for over_db in [6.0, 9.0, 12.0] {
+                    for (len_ms, gap_ms) in shapes {
+                        cases.push(Bursts {
+                            room,
+                            noise,
+                            over_db,
+                            len_ms,
+                            gap_ms,
+                        });
+                    }
+                }
+            }
+        }
+        let (gated, limits): (Vec<Bursts>, Vec<Bursts>) =
+            cases.into_iter().partition(|c| !limit(c));
+        for (name, cases, pass) in [
+            (
+                format!(
+                    "{BURSTS} noise bursts, no speech (pink, brown, white at +6/+9/+12 dB over \
+                     pink -60 dBFS and brown -54 dBFS; 300 to 500 ms; 0.4 to 1.5 s pauses)"
+                ),
+                gated,
+                true,
+            ),
+            (
+                format!(
+                    "{BURSTS} white bursts +12 dB over brown -54 dBFS (earshot scores them as speech)"
+                ),
+                limits,
+                false,
+            ),
+        ] {
+            let (mut armed, mut passed, mut rms_armed, mut rms_passed) = (0, 0, 0, 0);
+            let mut heard = 0;
+            let mut failures = Vec::new();
+            for case in &cases {
+                let clip = noise_bursts(clips, *case);
+                let e = auto_stop(&clip, close(Vad::Earshot));
+                let rms = auto_stop(&clip, close(Vad::Rms));
+                let gate = |vad| speech_gate(&clip, VAD_SAMPLE_RATE, GATE_MIN_MS, &close(vad)).reason;
+                let (gate_e, gate_r) = (gate(Vad::Earshot), gate(Vad::Rms));
+                armed += e.armed_s.is_some() as usize;
+                passed += (gate_e != Some(GateReason::NoSpeech)) as usize;
+                heard += heard_and_armed(&clip, close(Vad::Earshot)).0.is_some() as usize;
+                rms_armed += rms.armed_s.is_some() as usize;
+                rms_passed += gate_r.is_none() as usize;
+                if pass && (e.armed_s.is_some() || gate_e != Some(GateReason::NoSpeech)) {
+                    let at = e.armed_s.map_or("-".to_string(), |t| format!("{t:.2} s"));
+                    failures.push(format!(
+                        "{} {:+.0} dB over {} {:.0} dBFS, {}/{} ms: armed {at}, gate {}",
+                        case.noise.name(),
+                        case.over_db,
+                        case.room.0.name(),
+                        case.room.1,
+                        case.len_ms,
+                        case.gap_ms,
+                        gate_label(gate_e)
+                    ));
+                }
+            }
+            let n = cases.len();
+            let mut earshot = format!(
+                "armed in {armed} of {n}; gate not \"without speech\" in {passed} of {n}; \
+                 heard in {heard} of {n}"
+            );
+            if !failures.is_empty() {
+                let _ = write!(earshot, " ({})", failures.join("; "));
+            }
+            let rms = format!("armed in {rms_armed} of {n}; gate passes in {rms_passed} of {n}");
+            if pass {
+                r.row(
+                    &name,
+                    earshot,
+                    rms,
+                    "never arms; gate without speech",
+                    Some(armed == 0 && passed == 0),
+                );
+            } else {
+                r.row(&name, earshot, rms, "-", None);
+            }
+        }
     }
 
     real_soft_rows(r, dir);

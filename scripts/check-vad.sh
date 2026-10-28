@@ -18,12 +18,19 @@
 #   then two sentences       recall of the sentences >= 0.80
 #   pink only, -40 dBFS      gate "without speech"; auto-stop never arms
 #   key clicks, -20/-30 dBFS gate "without speech"; auto-stop never arms
+#   4 noise bursts, no       gate "without speech"; auto-stop never arms (pink,
+#   speech                   brown, white at +6/+9/+12 dB over pink -60 and
+#                            brown -54 dBFS rooms, 300 to 500 ms, 0.4 to 1.5 s
+#                            apart; white +12 dB over brown, which earshot
+#                            scores as speech itself, is printed)
 #   real soft voice          only with the local fixtures/vad/real-soft.wav (the
 #                            maintainer's take, never committed; skipped without
 #                            it): recording recall of the labelled soft speech
 #                            >= 0.70 and >= 0.90 of it sent; three dictation cuts
 #                            arm and stop +1.8 to +2.6 s after the last soft word
 #   quiet, speech -70 dBFS   gate "too quiet"
+#   too quiet to arm,        heard (what keeps whisrs's no-speech timeout off)
+#   speech -76/-78 dBFS      within 1 s of the first word; gate "too quiet"
 #   CPU                      earshot faster than 100x real time
 #
 # Run it before accepting a new earshot version (the crate pins ~1.2.2) or

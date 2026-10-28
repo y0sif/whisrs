@@ -219,6 +219,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         keyterms: Vec::new(),
         diarize: false,
         vad,
+        soft_voices: true,
     };
 
     let wav = whisrs::audio::wav::encode_wav(&samples)?;

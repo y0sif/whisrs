@@ -122,7 +122,7 @@ async fn process_with_timing(
     let plan = speakers::plan(config, &name, meta.shared_mic.unwrap_or(false));
     let request = |kind| {
         let speakers = plan.requests_speakers(kind);
-        TrackRequest::new(&name, config, &language(kind), speakers, dir)
+        TrackRequest::new(kind, &name, config, &language(kind), speakers, dir)
     };
     let mic_request = request(TrackKind::Mic);
     let system_request = request(TrackKind::System);
@@ -363,7 +363,8 @@ async fn fill_track_quality(dir: &Path, meta: &mut RecordingMeta, vad: Vad) {
         if !path.exists() {
             continue;
         }
-        match blocking(move || measure_track(&path, vad)).await {
+        let cfg = track.kind.vad_config(vad);
+        match blocking(move || measure_track(&path, cfg)).await {
             Ok(report) => {
                 let measured = TrackQuality::from_report(track.kind, &report);
                 track.quality = Some(measured.measured_over(track.quality.take()));
@@ -509,18 +510,27 @@ fn finish_track(
 }
 
 /// One track's request and the cache of its finished chunks. The two
-/// tracks' requests differ only in their language and whether they ask for
-/// speakers, which the fingerprint covers: a change to one track's leaves
-/// the other track's cached chunks valid.
+/// tracks' requests differ only in their language, whether they ask for
+/// speakers and whether soft voices count
+/// ([`TrackKind::soft_voices`]), which the fingerprint covers: a change to
+/// one track's leaves the other track's cached chunks valid.
 struct TrackRequest {
     tcfg: TranscriptionConfig,
     cache: ChunkCache,
 }
 
 impl TrackRequest {
-    fn new(name: &str, config: &Config, language: &str, diarize: bool, dir: &Path) -> Self {
+    fn new(
+        kind: TrackKind,
+        name: &str,
+        config: &Config,
+        language: &str,
+        diarize: bool,
+        dir: &Path,
+    ) -> Self {
         let mut tcfg = recording_transcription_config(name, config, language);
         tcfg.diarize = diarize;
+        tcfg.soft_voices = kind.soft_voices();
         let cache = ChunkCache {
             dir: dir.join(CACHE_DIR),
             fingerprint: cache_fingerprint(name, config, &tcfg),
@@ -730,11 +740,11 @@ pub(super) fn open_track(
     Ok(reader)
 }
 
-/// A track's quality from its file ([`QualityMeter`], the open profile of
-/// `vad`), read in one-second pieces. Blocking.
-fn measure_track(path: &Path, vad: Vad) -> anyhow::Result<QualityReport> {
+/// A track's quality from its file ([`QualityMeter`] on `cfg`, the track's
+/// [`TrackKind::vad_config`]), read in one-second pieces. Blocking.
+fn measure_track(path: &Path, cfg: VadConfig) -> anyhow::Result<QualityReport> {
     let mut reader = open_track(path)?;
-    let mut meter = QualityMeter::new(vad);
+    let mut meter = QualityMeter::with_config(cfg);
     let piece = SAMPLE_RATE as usize;
     let mut buf = Vec::with_capacity(piece);
     for sample in reader.samples::<i16>() {
@@ -759,19 +769,20 @@ struct TrackScan {
     /// and what [`speech::pack`] picks the quietest cut by.
     energies: Vec<f64>,
     /// Whether each of those frames holds speech, by `[audio] vad` with the
-    /// open profile (any voice counts on a recording track): the activity
-    /// of every track, and where [`speech::pack`] cuts long regions.
+    /// track's open profile ([`TrackKind::vad_config`]: any voice counts on
+    /// a recording track, and a soft one only on the mic): the activity of
+    /// every track, and where [`speech::pack`] cuts long regions.
     speech: Vec<bool>,
 }
 
 /// Read a track once, computing its length, energies and speech mask
-/// (`vad`). Blocking.
-fn scan_track(path: &Path, vad: Vad) -> anyhow::Result<TrackScan> {
+/// (`cfg`). Blocking.
+fn scan_track(path: &Path, cfg: VadConfig) -> anyhow::Result<TrackScan> {
     let mut reader = open_track(path)?;
     let frame = frame_len(SAMPLE_RATE as usize);
     let mut buf = Vec::with_capacity(frame);
     let mut energies = Vec::new();
-    let mut mask = SpeechMask::new(VadConfig::open(vad), frame);
+    let mut mask = SpeechMask::new(cfg, frame);
     let mut len = 0usize;
     for sample in reader.samples::<i16>() {
         let sample = sample.with_context(|| format!("failed to read {}", path.display()))?;
@@ -927,8 +938,8 @@ async fn transcribe_track(
     let path: PathBuf = job.path.to_path_buf();
     let scan = {
         let path = path.clone();
-        let vad = tcfg.vad;
-        blocking(move || scan_track(&path, vad)).await?
+        let cfg = job.kind.vad_config(tcfg.vad);
+        blocking(move || scan_track(&path, cfg)).await?
     };
     let stem = job.kind.file_stem();
     let active = speech_activity(job.near_end, &scan.speech, stem);
@@ -1096,6 +1107,10 @@ fn cache_fingerprint(name: &str, config: &Config, tcfg: &TranscriptionConfig) ->
     // 0.1.31 did, so a chunk cached before still matches.
     if tcfg.vad != Vad::Rms {
         key["vad"] = serde_json::json!(crate::vad_name(tcfg.vad));
+        // The system track's phrases go without the soft threshold.
+        if !tcfg.soft_voices {
+            key["soft_voices"] = serde_json::json!(false);
+        }
     }
     format!("{:016x}", fnv1a64(key.to_string().as_bytes()))
 }
@@ -1974,7 +1989,7 @@ mod tests {
     /// speech, found by `near_end` when given, else by frame energy, packed
     /// into one condensed chunk.
     fn condensed(path: &Path, near_end: Option<&[bool]>) -> Vec<i16> {
-        let scan = scan_track(path, Vad::Rms).unwrap();
+        let scan = scan_track(path, TrackKind::Mic.vad_config(Vad::Rms)).unwrap();
         let active = speech_activity(near_end, &scan.speech, "test");
         let regions = speech::regions(&active, scan.len);
         let chunks = speech::pack(&regions, &scan.energies, &scan.speech, None);
@@ -2566,7 +2581,7 @@ mod tests {
         };
         println!("{done:?} in {:.2?}", started.elapsed());
 
-        let scan = scan_track(&out, Vad::Earshot).unwrap();
+        let scan = scan_track(&out, TrackKind::Mic.vad_config(Vad::Earshot)).unwrap();
         let active = speech_activity(Some(&done.near_end), &scan.speech, "mic");
         let regions = speech::regions(&active, scan.len);
         let mut words: Vec<(f64, f64)> = labels["results"]["utterances"]
@@ -2626,7 +2641,7 @@ mod tests {
 
         // The user over the far side: word frames where the system track,
         // shifted by the lag, holds speech.
-        let system_scan = scan_track(&system, Vad::Earshot).unwrap();
+        let system_scan = scan_track(&system, TrackKind::System.vad_config(Vad::Earshot)).unwrap();
         let far_active = |at: usize| {
             let at = at as i64 - done.report.lag;
             at >= 0
@@ -3819,6 +3834,41 @@ mod tests {
         );
     }
 
+    /// The system track decides speech without the soft threshold in every
+    /// pass over it: the scan behind its regions and chunk cuts, the stored
+    /// quality, and the request whose phrases a backend cuts. A drum loop is
+    /// a quarter speech on the mic's profile and none on the system's.
+    #[test]
+    fn the_system_track_goes_without_the_soft_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("drums.wav");
+        write_wav(&path, &crate::audio::test_audio::drum_loop(20, -30.0));
+        let share = |kind: TrackKind| {
+            let scan = scan_track(&path, kind.vad_config(Vad::Earshot)).unwrap();
+            let regions = speech::regions(&scan.speech, scan.len);
+            let speech = scan.speech.iter().filter(|&&s| s).count();
+            (speech as f64 / scan.speech.len() as f64, regions.len())
+        };
+        let (mic, mic_regions) = share(TrackKind::Mic);
+        let (system, system_regions) = share(TrackKind::System);
+        assert!(mic > 0.2 && mic_regions > 0, "mic {mic} in {mic_regions}");
+        assert_eq!((system, system_regions), (0.0, 0));
+
+        let speech_level =
+            |kind: TrackKind| measure_track(&path, kind.vad_config(Vad::Earshot)).unwrap();
+        assert!(speech_level(TrackKind::Mic).levels.speech_dbfs.is_some());
+        assert_eq!(speech_level(TrackKind::System).levels.speech_dbfs, None);
+
+        // The requests: the system's phrases go without it too, and the
+        // backend's open profile is the scan's.
+        let config: Config = toml::from_str("[general]\nbackend = \"groq\"\n").unwrap();
+        for kind in [TrackKind::Mic, TrackKind::System] {
+            let request = TrackRequest::new(kind, "groq", &config, "en", false, tmp.path());
+            assert_eq!(request.tcfg.soft_voices, kind == TrackKind::Mic);
+            assert_eq!(request.tcfg.open_vad(), kind.vad_config(request.tcfg.vad));
+        }
+    }
+
     fn fingerprint_of(toml_text: &str) -> String {
         let config: Config = toml::from_str(toml_text).unwrap();
         let name = recording_backend_name(&config).unwrap();
@@ -3874,6 +3924,20 @@ mod tests {
         let mut tcfg = recording_transcription_config(&name, &config, "en");
         tcfg.diarize = true;
         assert_ne!(fp, cache_fingerprint(&name, &config, &tcfg));
+
+        // So is the system track's phrase cut without the soft threshold,
+        // under earshot; the RMS test has no soft threshold to leave out.
+        let mut tcfg = recording_transcription_config(&name, &config, "en");
+        tcfg.soft_voices = false;
+        assert_ne!(fp, cache_fingerprint(&name, &config, &tcfg));
+        let rms = format!("{base}[audio]\nvad = \"rms\"\n");
+        let config: Config = toml::from_str(&rms).unwrap();
+        let mut tcfg = recording_transcription_config(&name, &config, "en");
+        tcfg.soft_voices = false;
+        assert_eq!(
+            fingerprint_of(&rms),
+            cache_fingerprint(&name, &config, &tcfg)
+        );
 
         // The sidecar URL is part of its identity.
         let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\
@@ -4167,7 +4231,7 @@ mod tests {
         samples.extend([9i16; 123]); // a partial last frame
         write_wav(&path, &samples);
 
-        let scan = scan_track(&path, Vad::Rms).unwrap();
+        let scan = scan_track(&path, TrackKind::Mic.vad_config(Vad::Rms)).unwrap();
         assert_eq!(scan.len, samples.len());
         // Every frame, the partial last one included.
         assert_eq!(scan.energies.len(), speech::frame_count(samples.len()));

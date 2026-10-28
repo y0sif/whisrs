@@ -49,7 +49,7 @@ const EMPHASIS: f64 = 0.95;
 
 /// Frames of sound the background is the quietest of (240 ms). A noise that
 /// switches on is the background after this long, so it stands clear of it
-/// for at most 240 ms, which at half weight (see [`Step::soft`]) is 120 ms
+/// for at most 240 ms, which at half weight (see [`Evidence`]) is 120 ms
 /// of the 160 ms that arm auto-stop. Longer let noise steps arm it; shorter
 /// lost the soft talk after a sentence at normal volume.
 const BACKGROUND_FRAMES: usize = 15;
@@ -58,6 +58,13 @@ const BACKGROUND_FRAMES: usize = 15;
 /// before the soft threshold applies, so a key click or a tap (one or two
 /// frames) never does.
 const CLEAR_FRAMES: u32 = 2;
+
+/// Frames without a voiced frame (304 ms) after which the soft
+/// frames of a run stop counting toward arming and the gate (see
+/// [`Evidence`]). Noise that comes and goes (a fan cycling, dishes) stands
+/// clear for up to 240 ms each time, and pauses between them are longer;
+/// the pauses inside soft talk are shorter.
+const SOFT_RUN_GAP_FRAMES: u32 = 19;
 
 /// Which test decides speech.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -107,7 +114,7 @@ pub struct VadConfig {
     /// under [`threshold`](Self::threshold), while the noise it lifts after
     /// speech to 0.37 or more sits at the background, so it never qualifies.
     /// A frame voiced only through it counts half toward arming auto-stop
-    /// and passing the gate.
+    /// and passing the gate, and only within its run of speech.
     pub soft_threshold: f32,
 }
 
@@ -346,18 +353,57 @@ impl SpeechLevel {
     }
 }
 
-/// One frame's decision plus what auto-stop and the gate need beyond it.
+/// The speech evidence that arms auto-stop and passes the gate: 160 ms of
+/// voiced frames (speech on their own score, not only through the
+/// hangover), counted in half frames.
+///
+/// A frame voiced on the full threshold counts 2 and always stays counted.
+/// A frame voiced only through [`VadConfig::soft_threshold`] counts 1, and
+/// only while its run lasts: [`SOFT_RUN_GAP_FRAMES`] without a voiced frame
+/// forget the soft frames gathered so far. A noise that switches on stands
+/// clear of the background for up to 240 ms and earshot scores its onset
+/// about 0.5, so at full weight one onset alone could arm auto-stop; and
+/// summed over separate onsets (a fan cycling, dishes before the first
+/// word) half weight did, over a room whose energy is mostly rumble.
+#[derive(Debug, Clone, Copy, Default)]
+struct Evidence {
+    full_halves: u64,
+    /// Soft frames of the current run.
+    soft_halves: u32,
+    /// Frames since the last voiced one.
+    since_voiced: u32,
+    /// 160 ms was reached at some point (it stays reached).
+    reached: bool,
+}
+
+impl Evidence {
+    /// Count one frame. `soft`: voiced only through the soft threshold.
+    fn add(&mut self, voiced: bool, soft: bool) {
+        if voiced {
+            self.since_voiced = 0;
+            if soft {
+                self.soft_halves += 1;
+            } else {
+                self.full_halves += 2;
+            }
+        } else {
+            self.since_voiced = self.since_voiced.saturating_add(1);
+            if self.since_voiced >= SOFT_RUN_GAP_FRAMES {
+                self.soft_halves = 0;
+            }
+        }
+        let halves = self.full_halves + u64::from(self.soft_halves);
+        self.reached |= halves >= 2 * (MIN_SPEECH_MS / FRAME_MS);
+    }
+}
+
+/// One frame's decision plus what auto-stop needs beyond it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Step {
     pub(crate) decision: FrameDecision,
-    /// Speech on its own score, not only through the hangover: what arms
+    /// The stream so far holds 160 ms of speech ([`Evidence`]): what arms
     /// auto-stop and passes the gate.
-    pub(crate) voiced: bool,
-    /// Voiced only through [`VadConfig::soft_threshold`]: it counts half
-    /// toward arming and the gate. A noise that switches on stands clear of
-    /// the background for up to 240 ms and earshot scores its onset about
-    /// 0.5, so at full weight it alone could arm auto-stop.
-    pub(crate) soft: bool,
+    pub(crate) enough: bool,
 }
 
 /// Streaming speech detector: feed it audio in chunks of any size and it
@@ -379,7 +425,7 @@ pub(crate) struct Step {
 ///    (pre-emphasized, the quietest frame of the last 240 ms of sound), as
 ///    the frame before it did, needs only [`VadConfig::soft_threshold`] in 4
 ///    and 5. Voiced that way it counts half toward arming auto-stop and
-///    passing the gate.
+///    passing the gate, and only until 304 ms pass with no voiced frame.
 ///
 /// With [`Vad::Rms`], or at any rate other than 16 kHz (a documented
 /// fallback, never a panic), a 16 ms frame is speech when its RMS reaches
@@ -403,11 +449,14 @@ pub struct SpeechDetector {
     background: Background,
     /// Consecutive frames clear of the background.
     clear_run: u32,
-    /// Voiced frames, a soft one counting half: in half frames.
-    voiced_halves: u64,
-    unfloored_halves: u64,
+    evidence: Evidence,
+    /// The same without the level floors.
+    unfloored_evidence: Evidence,
     unfloored_frames: u64,
     unfloored_sum_squares: f64,
+    /// Any frame was voiced before the level floors and the evidence count
+    /// ([`heard_voice`](Self::heard_voice)).
+    heard: bool,
     meter: LevelMeter,
 }
 
@@ -437,10 +486,11 @@ impl SpeechDetector {
             level: SpeechLevel::default(),
             background: Background::default(),
             clear_run: 0,
-            voiced_halves: 0,
-            unfloored_halves: 0,
+            evidence: Evidence::default(),
+            unfloored_evidence: Evidence::default(),
             unfloored_frames: 0,
             unfloored_sum_squares: 0.0,
+            heard: false,
             meter: LevelMeter::new(sample_rate),
         }
     }
@@ -482,6 +532,7 @@ impl SpeechDetector {
         let (score, verdict) = match self.scorer.as_mut() {
             None => {
                 let speech = stats.rms() >= self.cfg.rms_threshold;
+                self.heard |= speech;
                 if speech {
                     (1.0, Verdict::Voiced)
                 } else {
@@ -501,6 +552,7 @@ impl SpeechDetector {
                     self.background.follow(emphasized);
                 }
                 if index < WARMUP_FRAMES {
+                    self.unfloored_evidence.add(false, false);
                     (score, Verdict::Silence)
                 } else {
                     let loud = frame_dbfs >= self.cfg.min_speech_dbfs;
@@ -513,8 +565,10 @@ impl SpeechDetector {
                     soft = full.misses(score, &self.hysteresis);
                     let unfloored_soft = full.misses(score, &self.unfloored);
                     let verdict = self.hysteresis.step(loud && above_level, score, bar);
-                    if self.unfloored.step(true, score, bar) == Verdict::Voiced {
-                        self.unfloored_halves += if unfloored_soft { 1 } else { 2 };
+                    let unfloored = self.unfloored.step(true, score, bar) == Verdict::Voiced;
+                    self.unfloored_evidence.add(unfloored, unfloored_soft);
+                    if unfloored {
+                        self.heard = true;
                         self.unfloored_frames += 1;
                         self.unfloored_sum_squares += stats.rms() * stats.rms();
                     }
@@ -526,10 +580,7 @@ impl SpeechDetector {
             }
         };
         let voiced = verdict == Verdict::Voiced;
-        let soft = voiced && soft;
-        if voiced {
-            self.voiced_halves += if soft { 1 } else { 2 };
-        }
+        self.evidence.add(voiced, voiced && soft);
         let speech = verdict != Verdict::Silence;
         self.meter.record(stats, speech);
         Step {
@@ -539,8 +590,7 @@ impl SpeechDetector {
                 score,
                 dbfs: frame_dbfs,
             },
-            voiced,
-            soft,
+            enough: self.evidence.reached,
         }
     }
 
@@ -557,11 +607,24 @@ impl SpeechDetector {
         self.level = SpeechLevel::default();
         self.background = Background::default();
         self.clear_run = 0;
-        self.voiced_halves = 0;
-        self.unfloored_halves = 0;
+        self.evidence = Evidence::default();
+        self.unfloored_evidence = Evidence::default();
         self.unfloored_frames = 0;
         self.unfloored_sum_squares = 0.0;
+        self.heard = false;
         self.meter.reset();
+    }
+
+    /// Whether any frame so far was speech before the level floors and the
+    /// evidence count that arms auto-stop: with [`Vad::Earshot`], a frame
+    /// voiced on the full or the soft threshold (warm-up, onset
+    /// confirmation and hysteresis still apply), a voice the floors reject
+    /// as too quiet included; with [`Vad::Rms`], a frame at or above
+    /// [`VadConfig::rms_threshold`]. The earliest sign that someone spoke:
+    /// it comes before auto-stop arms, and for a voice too quiet to arm it
+    /// at all. A noise onset can count too.
+    pub fn heard_voice(&self) -> bool {
+        self.heard
     }
 
     /// The meter's figures for the stream so far.
@@ -577,6 +640,28 @@ impl SpeechDetector {
     /// Whether earshot decides (else the RMS test does).
     pub(crate) fn uses_model(&self) -> bool {
         self.scorer.is_some()
+    }
+
+    /// The gate's verdict on what was fed so far, past its length and
+    /// digital-silence checks: sent with 160 ms of accepted speech at a
+    /// level over [`VadConfig::min_speech_dbfs`], else [`GateReason::TooQuiet`]
+    /// when the voice the floors rejected would have been enough (its level
+    /// in `speech_dbfs` and `snr_db`), else [`GateReason::NoSpeech`].
+    pub(crate) fn verdict(&self) -> GateOutcome {
+        let mut levels = self.levels();
+        let heard_dbfs = self.unfloored_dbfs();
+        let quiet = heard_dbfs.is_some_and(|level| level < self.cfg.min_speech_dbfs);
+        let reason = if self.evidence.reached && !quiet {
+            None
+        } else if self.unfloored_evidence.reached {
+            // A voice, but the floor rejected it, all of it or on average.
+            levels.speech_dbfs = heard_dbfs;
+            levels.snr_db = heard_dbfs.zip(levels.noise_dbfs).map(|(s, n)| s - n);
+            Some(GateReason::TooQuiet)
+        } else {
+            Some(GateReason::NoSpeech)
+        };
+        GateOutcome { reason, levels }
     }
 
     /// Power mean (dBFS) of the frames that would be voiced without the
@@ -673,21 +758,7 @@ fn gate_with(samples: &[i16], min_duration_ms: u64, mut detector: SpeechDetector
     }
 
     detector.feed(samples, |_| {});
-    let min_halves = 2 * (MIN_SPEECH_MS / FRAME_MS);
-    let mut levels = detector.levels();
-    let heard_dbfs = detector.unfloored_dbfs();
-    let quiet = heard_dbfs.is_some_and(|level| level < detector.cfg.min_speech_dbfs);
-    let reason = if detector.voiced_halves >= min_halves && !quiet {
-        None
-    } else if detector.unfloored_halves >= min_halves {
-        // A voice, but the floor rejected it, all of it or on average.
-        levels.speech_dbfs = heard_dbfs;
-        levels.snr_db = heard_dbfs.zip(levels.noise_dbfs).map(|(s, n)| s - n);
-        Some(GateReason::TooQuiet)
-    } else {
-        Some(GateReason::NoSpeech)
-    };
-    GateOutcome { reason, levels }
+    detector.verdict()
 }
 
 /// Per-frame speech flags for a 16 kHz stream: one flag per `frame_len`
@@ -1108,39 +1179,197 @@ mod tests {
         assert!(speech_at(&run(&mut detector, &samples)).is_empty());
     }
 
-    /// Two -40 dBFS bursts of `frames` frames over -60 dBFS, each voiced
-    /// only through the soft threshold from its third frame.
-    fn soft_bursts(frames: usize) -> Vec<i16> {
+    /// Two -40 dBFS bursts of `frames` frames over -60 dBFS, `pause` frames
+    /// apart, each voiced only through the soft threshold from its third
+    /// frame.
+    fn soft_bursts(frames: usize, pause: usize) -> Vec<i16> {
         concat(&[
             (-60.0, 30),
             (-40.0, frames),
-            (-60.0, 30),
+            (-60.0, pause),
             (-40.0, frames),
             (-60.0, 30),
         ])
     }
 
-    /// 20 soft frames (320 ms) do what 10 strong ones do; 18 do not.
+    fn frames(samples: &[i16]) -> usize {
+        samples.len() / VAD_FRAME
+    }
+
+    /// The gate's reason, and whether auto-stop armed, on `samples` scored
+    /// by `script`.
+    fn evidence_of(samples: &[i16], script: Vec<f32>) -> (Option<GateReason>, bool) {
+        let reason = gate(samples, scorer(script.clone())).reason;
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), script), 2000);
+        fires_at(&mut stop, samples);
+        (reason, stop.has_speech())
+    }
+
+    /// `samples` scored 0.3 throughout: only frames clear of the background
+    /// are voiced, and only through the soft threshold.
+    fn soft_evidence(samples: &[i16]) -> (Option<GateReason>, bool) {
+        evidence_of(samples, vec![0.3; frames(samples)])
+    }
+
+    /// 20 soft frames (320 ms) in one run of speech do what 10 strong ones
+    /// do; 18 do not. A 192 ms pause (12 frames, the hangover 6 of them)
+    /// keeps the run.
     #[test]
     fn soft_frames_count_half_toward_the_gate_and_arming() {
-        let frames = |samples: &[i16]| samples.len() / VAD_FRAME;
-        let (enough, short) = (soft_bursts(12), soft_bursts(11));
-        let soft_gate = |samples: &[i16]| gate(samples, scorer(vec![0.3; frames(samples)])).reason;
-        assert_eq!(soft_gate(&enough), None);
-        assert_eq!(soft_gate(&short), Some(GateReason::NoSpeech));
+        assert_eq!(soft_evidence(&soft_bursts(12, 12)), (None, true));
+        assert_eq!(
+            soft_evidence(&soft_bursts(11, 12)),
+            (Some(GateReason::NoSpeech), false)
+        );
         // One burst on a strong score is enough: 11 voiced frames.
         let strong = scorer(scores(&[(0.0, 30), (0.9, 12)]));
         let one_burst = concat(&[(-60.0, 30), (-40.0, 12)]);
         assert_eq!(gate(&one_burst, strong).reason, None);
+    }
 
-        let armed = |samples: &[i16]| {
-            let detector = scripted(close(), vec![0.3; frames(samples)]);
-            let mut stop = AutoStopDetector::from_detector(detector, 2000);
-            fires_at(&mut stop, samples);
-            stop.has_speech()
-        };
-        assert!(armed(&enough));
-        assert!(!armed(&short));
+    /// Soft frames separated by 304 ms with no voiced frame (19 frames, a
+    /// 30-frame pause here) do not add up: separate noise onsets before the
+    /// first word never arm auto-stop or pass the gate. Strong frames still
+    /// add up across the same pause.
+    #[test]
+    fn soft_frames_count_only_within_their_run() {
+        assert_eq!(
+            soft_evidence(&soft_bursts(12, 30)),
+            (Some(GateReason::NoSpeech), false)
+        );
+        // Four separate soft bursts, 40 soft frames in all.
+        let four = concat(&[
+            (-60.0, 30),
+            (-40.0, 12),
+            (-60.0, 30),
+            (-40.0, 12),
+            (-60.0, 30),
+            (-40.0, 12),
+            (-60.0, 30),
+            (-40.0, 12),
+            (-60.0, 30),
+        ]);
+        assert_eq!(soft_evidence(&four), (Some(GateReason::NoSpeech), false));
+        // Strong bursts of 6 voiced frames each: 12 across the pause.
+        let script = scores(&[(0.0, 30), (0.9, 7), (0.0, 30), (0.9, 7), (0.0, 30)]);
+        assert_eq!(evidence_of(&soft_bursts(7, 30), script), (None, true));
+        // A 15-frame pause keeps the run: 17 frames without a voiced one
+        // (the hangover among them) before the next burst's first voiced
+        // frame.
+        assert_eq!(soft_evidence(&soft_bursts(12, 15)), (None, true));
+    }
+
+    /// A voice the level floor rejects is heard all the same, before
+    /// anything is speech or armed, and so is a voice before it arms.
+    /// Noise is not.
+    #[test]
+    fn heard_voice_counts_any_frame_before_the_floors_and_arming() {
+        // -70 dBFS, under close's -65: no speech, never armed, gate too
+        // quiet, but heard from the onset frame on.
+        let quiet = at_level(-70.0, 60);
+        let mut detector = scripted(close(), vec![1.0; 60]);
+        let mut heard_at = None;
+        let mut speech = 0;
+        for (i, frame) in quiet.chunks(VAD_FRAME).enumerate() {
+            detector.feed(frame, |d| speech += d.speech as usize);
+            if heard_at.is_none() && detector.heard_voice() {
+                heard_at = Some(i);
+            }
+        }
+        assert_eq!((heard_at, speech), (Some(WARM + 1), 0));
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), vec![1.0; 60]), 2000);
+        fires_at(&mut stop, &quiet);
+        assert!(stop.heard_voice());
+        assert!(!stop.has_speech());
+        assert_eq!(
+            gate(&quiet, scorer(vec![1.0; 60])).reason,
+            Some(GateReason::TooQuiet)
+        );
+
+        // Three strong frames: heard on the second, never armed.
+        let script = scores(&[(0.0, WARM), (0.9, 3)]);
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), script), 2000);
+        let samples = at_level(-30.0, WARM + 40);
+        assert!(!stop.feed(&samples[..(WARM + 1) * VAD_FRAME]));
+        assert!(!stop.heard_voice(), "one frame is not an onset");
+        stop.feed(&samples[(WARM + 1) * VAD_FRAME..]);
+        assert!(stop.heard_voice());
+        assert!(!stop.has_speech());
+
+        // Soft frames clear of the background count too.
+        let mut detector = scripted(close(), vec![0.3; 70]);
+        detector.feed(&soft_bursts(4, 30)[..40 * VAD_FRAME], |_| {});
+        assert!(detector.heard_voice());
+
+        // A score under both thresholds, and warm-up, never do.
+        let mut detector = scripted(close(), vec![0.2; 60]);
+        detector.feed(&at_level(-30.0, 60), |_| {});
+        assert!(!detector.heard_voice());
+        let mut detector = scripted(close(), vec![1.0; WARM]);
+        detector.feed(&at_level(-30.0, WARM), |_| {});
+        assert!(!detector.heard_voice());
+
+        // Reset forgets it.
+        let mut detector = scripted(close(), vec![1.0; 30]);
+        detector.feed(&at_level(-30.0, 30), |_| {});
+        assert!(detector.heard_voice());
+        detector.reset();
+        assert!(!detector.heard_voice());
+    }
+
+    /// A stream the gate would call too quiet says so, with the level of
+    /// the voice the floor rejected; a loud one or noise does not.
+    #[test]
+    fn auto_stop_names_a_too_quiet_stream() {
+        let quiet = at_level(-70.0, 60);
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), vec![1.0; 60]), 2000);
+        stop.feed(&quiet);
+        let levels = stop.too_quiet().expect("too quiet");
+        assert!(
+            (levels.speech_dbfs.unwrap() + 70.0).abs() < 0.5,
+            "{levels:?}"
+        );
+        assert_eq!(levels, gate(&quiet, scorer(vec![1.0; 60])).levels);
+
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), vec![1.0; 60]), 2000);
+        stop.feed(&at_level(-30.0, 60));
+        assert_eq!(stop.too_quiet(), None);
+        let mut stop = AutoStopDetector::from_detector(scripted(close(), vec![0.1; 60]), 2000);
+        stop.feed(&at_level(-30.0, 60));
+        assert_eq!(stop.too_quiet(), None);
+        let mut stop = AutoStopDetector::with_vad(VadConfig::close(Vad::Rms), 2000, 16_000);
+        stop.feed(&at_level(-70.0, 60));
+        assert_eq!(stop.too_quiet(), None);
+    }
+
+    /// With the RMS test any 16 ms frame at or over the threshold is heard,
+    /// even in a 50 ms chunk whose own RMS is under it (so it does not arm).
+    #[test]
+    fn heard_voice_with_rms_is_any_frame_over_the_threshold() {
+        // -48 dBFS (RMS 0.004 >= 0.003) for one frame, then digital silence:
+        // the chunk's RMS is 0.0023.
+        let mut chunk = at_level(-48.0, 1);
+        chunk.resize(800, 0);
+        for cfg in [close(), open()] {
+            let mut stop = AutoStopDetector::with_vad(
+                VadConfig {
+                    vad: Vad::Rms,
+                    ..cfg
+                },
+                2000,
+                VAD_SAMPLE_RATE,
+            );
+            stop.feed(&vec![0; 800]);
+            assert!(!stop.heard_voice());
+            stop.feed(&chunk);
+            assert!(stop.heard_voice());
+            assert!(!stop.has_speech());
+        }
+        let mut stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, 2000, VAD_SAMPLE_RATE);
+        stop.feed(&at_level(-30.0, 4));
+        assert!(stop.has_speech() && stop.heard_voice());
+        stop.reset();
+        assert!(!stop.heard_voice());
     }
 
     /// Frames of varying level with varying scores, plus a partial frame.

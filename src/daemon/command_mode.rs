@@ -92,22 +92,23 @@ pub(crate) fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Optio
 /// A recorded instruction.
 pub(crate) struct InstructionAudio {
     pub(crate) samples: Vec<i16>,
-    /// Stopped because nothing was heard for
-    /// [`NO_SPEECH_TIMEOUT`](crate::pipeline::NO_SPEECH_TIMEOUT): the samples
-    /// are to be discarded, not transcribed.
+    /// Stopped because nothing was heard
+    /// ([`no_speech_timeout`](crate::pipeline::no_speech_timeout)): the
+    /// samples are to be discarded, not transcribed.
     pub(crate) nothing_heard: bool,
 }
 
 /// Collect a recorded instruction until the silence auto-stop fires, nothing
-/// was heard for [`NO_SPEECH_TIMEOUT`](crate::pipeline::NO_SPEECH_TIMEOUT),
+/// was heard ([`no_speech_timeout`](crate::pipeline::no_speech_timeout)),
 /// or the audio channel closes (a manual stop, a cancel, or a vanished
 /// device). On either stop the capture is stopped here. `label` names the
 /// flow in the log.
 ///
 /// Auto-stop decides speech with `[audio] vad` (the close profile: one user
-/// near the mic). `silence_timeout_ms = 0` never fires (#178) and turns the
-/// no-speech timeout off too, so the instruction records until the channel
-/// closes.
+/// near the mic); a voice counts as heard on its first frame, before
+/// auto-stop arms ([`AutoStopDetector::heard_voice`]).
+/// `silence_timeout_ms = 0` never fires (#178) and turns the no-speech
+/// timeout off too, so the instruction records until the channel closes.
 ///
 /// Shared by command mode, `[[llm_commands]]` and agent voice turns, which
 /// all record a whole instruction before transcribing it.
@@ -130,7 +131,7 @@ pub(crate) async fn collect_instruction_audio(
         while let Some(chunk) = rx.recv().await {
             all_samples.extend_from_slice(&chunk);
             let silence_reached = auto_stop.feed(&chunk);
-            nothing_heard = no_speech.feed(chunk.len(), auto_stop.has_speech());
+            nothing_heard = no_speech.feed(chunk.len(), auto_stop.heard_voice());
             if silence_reached || nothing_heard {
                 if nothing_heard {
                     info!("{label}: nothing heard, stopping");

@@ -405,9 +405,14 @@ impl LocalWhisperBackend {
     /// `no_context(true)`: the repetition loop of #55. `phrase_silence_ms` is
     /// capped ([`super::recording_phrase_silence_ms`]), so every join between
     /// the chunk's speech regions ends a phrase. A long batch dictation is cut
-    /// the same way ([`batch_windows`]).
-    fn recording_phrases(&self, samples: &[i16], vad: Vad) -> Vec<super::phrase_split::Phrase> {
-        capped_phrases(samples, self.phrase_silence_ms, None, vad)
+    /// the same way ([`batch_windows`]). `cfg` is the track's open profile
+    /// ([`TranscriptionConfig::open_vad`]).
+    fn recording_phrases(
+        &self,
+        samples: &[i16],
+        cfg: VadConfig,
+    ) -> Vec<super::phrase_split::Phrase> {
+        capped_phrases(samples, self.phrase_silence_ms, None, cfg)
     }
 }
 
@@ -427,18 +432,18 @@ fn holds_speech(samples: &[i16], vad: Vad) -> bool {
 /// or, with `feed_len`, that many samples at a time. Both give the same
 /// phrases. A free function, so a blocking task can run it.
 ///
-/// Speech is decided by `vad` with the open profile: these are cut points
-/// (a recording track may carry voices at any level), so a quiet voice must
+/// Speech is decided by `cfg`, an open profile: these are cut points (a
+/// recording track may carry voices at any level), so a quiet voice must
 /// not be dropped.
 fn capped_phrases(
     samples: &[i16],
     phrase_silence_ms: u64,
     feed_len: Option<usize>,
-    vad: Vad,
+    cfg: VadConfig,
 ) -> Vec<super::phrase_split::Phrase> {
     let mut splitter = PhraseSplitter::new(
         SAMPLE_RATE,
-        VadConfig::open(vad),
+        cfg,
         super::recording_phrase_silence_ms(phrase_silence_ms),
     );
     let mut phrases = match feed_len {
@@ -470,7 +475,12 @@ fn fits_one_decode_window(samples: usize) -> bool {
 /// moves the rest of the buffer. It still runs in the blocking task with
 /// the decode, not on the async thread.
 fn batch_windows(samples: &[i16], phrase_silence_ms: u64, vad: Vad) -> Vec<DecodeWindow> {
-    let phrases = capped_phrases(samples, phrase_silence_ms, Some(SAMPLE_RATE), vad);
+    let phrases = capped_phrases(
+        samples,
+        phrase_silence_ms,
+        Some(SAMPLE_RATE),
+        VadConfig::open(vad),
+    );
     let windows = dictation_windows(&phrases, SAMPLE_RATE);
     debug!(
         "local whisper: {} phrase(s) in {} decode window(s) (whisper full() calls) \
@@ -1015,7 +1025,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
         let samples = decode_wav_samples(audio)?;
         // Minutes of audio per chunk: run the detector off the async worker.
         let phrases =
-            crate::audio::block_off_runtime(|| self.recording_phrases(&samples, config.vad));
+            crate::audio::block_off_runtime(|| self.recording_phrases(&samples, config.open_vad()));
         let windows = decode_windows(&samples, &phrases, SAMPLE_RATE);
         debug!(
             "local whisper: {} phrase(s) in {} decode window(s) (whisper full() calls) \
@@ -1055,6 +1065,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         };
         let err = backend.transcribe(&[1, 2, 3], &config).await.unwrap_err();
         let msg = err.to_string();
@@ -1149,7 +1160,7 @@ mod tests {
         for mode in ["none", "silence", "window"] {
             let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
                 .with_segmentation(mode, 400);
-            let phrases = backend.recording_phrases(&speech, Vad::Rms);
+            let phrases = backend.recording_phrases(&speech, VadConfig::open(Vad::Rms));
             assert!(phrases.len() >= 3, "{mode}: {} phrase(s)", phrases.len());
             for phrase in &phrases {
                 assert!(
@@ -1233,7 +1244,7 @@ mod tests {
         for silence_ms in [400, 900, 1000, 5000] {
             let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
                 .with_segmentation("silence", silence_ms);
-            let phrases = backend.recording_phrases(&chunk, Vad::Rms);
+            let phrases = backend.recording_phrases(&chunk, VadConfig::open(Vad::Rms));
             assert_eq!(phrases.len(), 2, "phrase_silence_ms = {silence_ms}");
             assert!(phrases[1].start_sample as usize >= region.len() + join / 2);
         }
@@ -1261,7 +1272,7 @@ mod tests {
         assert!(!batch_windows(&audio[..cap + 1], 400, Vad::Rms).is_empty());
 
         let windows = batch_windows(&audio, 400, Vad::Rms);
-        let phrases = capped_phrases(&audio, 400, Some(SAMPLE_RATE), Vad::Rms);
+        let phrases = capped_phrases(&audio, 400, Some(SAMPLE_RATE), VadConfig::open(Vad::Rms));
         assert!(windows.len() >= 3, "{windows:?}");
         assert_eq!(
             windows.iter().map(|w| w.phrases).sum::<usize>(),
@@ -1336,10 +1347,10 @@ mod tests {
         audio.extend(room_noise(SAMPLE_RATE));
         audio.extend(voice(SAMPLE_RATE + 777));
 
-        let whole = capped_phrases(&audio, 400, None, Vad::Rms);
+        let whole = capped_phrases(&audio, 400, None, VadConfig::open(Vad::Rms));
         assert!(whole.iter().any(|p| p.continuation), "no forced cut");
         assert_eq!(
-            capped_phrases(&audio, 400, Some(SAMPLE_RATE), Vad::Rms),
+            capped_phrases(&audio, 400, Some(SAMPLE_RATE), VadConfig::open(Vad::Rms)),
             whole
         );
     }

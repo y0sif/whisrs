@@ -26,8 +26,6 @@ pub use vad::{
     VadConfig, VAD_FRAME, VAD_SAMPLE_RATE,
 };
 
-use vad::MIN_SPEECH_MS;
-
 /// Normalized RMS threshold below which audio is considered silence.
 ///
 /// Shared between [`AutoStopDetector`] and [`audio_gate_reason`] so the gate
@@ -169,8 +167,6 @@ enum StopMode {
         detector: SpeechDetector,
         /// Samples since the last speech frame.
         silent_samples: u64,
-        /// Speech frames on their own score (no hangover), in samples.
-        voiced_samples: u64,
         armed: bool,
     },
 }
@@ -227,9 +223,10 @@ impl AutoStopDetector {
     /// [`SpeechDetector`] and fires when that count reaches the timeout,
     /// once armed: [`has_speech`](Self::has_speech) turns true after 160 ms
     /// of accepted speech in total (a frame accepted only through
-    /// [`VadConfig::soft_threshold`] counting half), so a short noise onset
-    /// cannot arm it while a lone "yes" or soft talk does. A `timeout_ms` of
-    /// 0 never fires.
+    /// [`VadConfig::soft_threshold`] counting half, and only within its run
+    /// of speech: a pause of 300 ms forgets the soft frames before it), so
+    /// a short noise onset, or several apart, cannot arm it while a lone
+    /// "yes" or soft talk does. A `timeout_ms` of 0 never fires.
     pub fn with_vad(cfg: VadConfig, timeout_ms: u64, sample_rate: u32) -> Self {
         if cfg.vad == Vad::Rms || sample_rate != VAD_SAMPLE_RATE {
             return Self::new(cfg.rms_threshold, timeout_ms, sample_rate);
@@ -243,7 +240,6 @@ impl AutoStopDetector {
             mode: StopMode::Vad {
                 detector,
                 silent_samples: 0,
-                voiced_samples: 0,
                 armed: false,
             },
             timeout_samples: timeout_samples(timeout_ms, VAD_SAMPLE_RATE),
@@ -276,11 +272,9 @@ impl AutoStopDetector {
             StopMode::Vad {
                 detector,
                 silent_samples,
-                voiced_samples,
                 armed,
             } => {
                 let frame_len = detector.frame_len() as u64;
-                let arm_at = MIN_SPEECH_MS * VAD_SAMPLE_RATE as u64 / 1000;
                 // Fires on the frame that reaches the timeout, even when
                 // speech resumes later in the same chunk.
                 let mut fired = None;
@@ -290,11 +284,7 @@ impl AutoStopDetector {
                     } else {
                         *silent_samples += frame_len;
                     }
-                    if step.voiced {
-                        // A soft frame counts half (see `Step::soft`).
-                        *voiced_samples += if step.soft { frame_len / 2 } else { frame_len };
-                        *armed |= *voiced_samples >= arm_at;
-                    }
+                    *armed |= step.enough;
                     fired = Some(fired == Some(true) || reached(*armed, *silent_samples));
                 });
                 fired.unwrap_or_else(|| reached(*armed, *silent_samples))
@@ -318,20 +308,18 @@ impl AutoStopDetector {
             StopMode::Vad {
                 detector,
                 silent_samples,
-                voiced_samples,
                 armed,
             } => {
                 detector.reset();
                 *silent_samples = 0;
-                *voiced_samples = 0;
                 *armed = false;
             }
         }
     }
 
     /// Whether any speech has been detected since creation or last reset
-    /// (with earshot: 160 ms of it, soft frames counting half, which is what
-    /// arms auto-stop).
+    /// (with earshot: 160 ms of it, soft frames counting half and only
+    /// within their run, which is what arms auto-stop).
     pub fn has_speech(&self) -> bool {
         match &self.mode {
             StopMode::Rms {
@@ -341,11 +329,43 @@ impl AutoStopDetector {
         }
     }
 
+    /// Whether any voice has been heard since creation or last reset, armed
+    /// or not ([`SpeechDetector::heard_voice`]): with earshot any frame
+    /// voiced before the level floors and the arming count, so it comes
+    /// before [`has_speech`](Self::has_speech) and also for a voice too
+    /// quiet to arm; with the RMS test any 16 ms frame (or chunk) at or
+    /// above the threshold.
+    pub fn heard_voice(&self) -> bool {
+        match &self.mode {
+            StopMode::Rms {
+                speech_detected,
+                meter,
+                ..
+            } => *speech_detected || meter.heard_voice(),
+            StopMode::Vad { detector, .. } => detector.heard_voice(),
+        }
+    }
+
     /// The meter's figures for the stream so far.
     pub fn levels(&self) -> Levels {
         match &self.mode {
             StopMode::Rms { meter, .. } => meter.levels(),
             StopMode::Vad { detector, .. } => detector.levels(),
+        }
+    }
+
+    /// With earshot, when the stream so far is what [`speech_gate`] calls
+    /// [`GateReason::TooQuiet`] (a voice the level floors rejected): its
+    /// levels, `speech_dbfs` and `snr_db` that voice's, as the gate reports
+    /// them. `None` otherwise, and always with the RMS test, which has no
+    /// such verdict.
+    pub fn too_quiet(&self) -> Option<Levels> {
+        match &self.mode {
+            StopMode::Rms { .. } => None,
+            StopMode::Vad { detector, .. } => {
+                let verdict = detector.verdict();
+                (verdict.reason == Some(GateReason::TooQuiet)).then_some(verdict.levels)
+            }
         }
     }
 }

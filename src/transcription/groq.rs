@@ -415,6 +415,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         };
 
         assert!(GroqBackend::new(String::new()).sends_prompt(&request));
@@ -493,6 +494,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -508,6 +510,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         };
         let huge = vec![0u8; MAX_FILE_SIZE + 1];
         let err = backend.transcribe(&huge, &config).await.unwrap_err();
@@ -524,6 +527,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         }
     }
 
@@ -557,6 +561,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         };
         let secs = backend.max_segment_chunk_secs(&config).unwrap() as usize;
         // 16 kHz mono i16 plus a 44-byte header.
@@ -582,6 +587,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         };
         let wav = encode_wav(&[300i16; 16_000]).unwrap();
 
@@ -609,6 +615,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         };
         let wav = encode_wav(&[300i16; 16_000]).unwrap();
 
@@ -638,6 +645,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         };
         (encode_wav(&[300i16; 16_000]).unwrap(), config)
     }

@@ -293,6 +293,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         });
 
         assert_eq!(request.model, "Whisper-Tiny");
@@ -368,6 +369,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         }
     }
 

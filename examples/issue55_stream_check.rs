@@ -251,6 +251,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         keyterms: Vec::new(),
         diarize: false,
         vad,
+        soft_voices: true,
     };
 
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(256);

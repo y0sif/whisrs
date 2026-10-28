@@ -11,9 +11,8 @@ use audio_silence_gate::{speech_gate, AutoStopDetector, GateReason, Levels, VadC
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
-use whisrs::audio::feedback;
 use whisrs::audio::quality;
-use whisrs::history::{self, HistoryEntry};
+use whisrs::history::HistoryEntry;
 use whisrs::llm;
 use whisrs::replacements::Replacer;
 use whisrs::state::Action;
@@ -165,6 +164,10 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     // timeout below.
     let modifier_waits = Arc::new(ModifierWaitTracker::default());
     let sink_modifier_waits = Arc::clone(&modifier_waits);
+    // Set by the batcher on the first transcript text: a voice the backend
+    // heard, which the no-speech timeout below counts.
+    let text_heard = Arc::new(AtomicBool::new(false));
+    let batcher_heard = Arc::clone(&text_heard);
     let typing_task = tokio::spawn(async move {
         // Focus the original window before the first batch (only once).
         // Sequenced by the batcher awaiting each sink call, so a plain
@@ -180,6 +183,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
             text_rx,
             stream_text,
             typing_cancel,
+            batcher_heard,
             filler_filter,
             replacer,
             move |text_to_type| {
@@ -279,11 +283,13 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 
     while let Some(chunk) = audio_rx.recv().await {
         let silence_reached = auto_stop.feed(&chunk);
-        // Nothing heard for `NO_SPEECH_TIMEOUT`: stop, and discard the
-        // session as a cancel does (the flag keeps the typing loop from
-        // typing whatever the backend still sends, and the tail below drops
-        // the transcript). A stop press that got here first owns the session.
-        if no_speech.feed(chunk.len(), auto_stop.has_speech()) {
+        // Nothing heard (`no_speech_timeout`): not a frame of voice, and no
+        // transcript text yet. Stop, and discard the session as a cancel
+        // does (the flag keeps the typing loop from typing whatever the
+        // backend still sends, and the tail below drops the transcript). A
+        // stop press that got here first owns the session.
+        let heard = auto_stop.heard_voice() || text_heard.load(Ordering::SeqCst);
+        if no_speech.feed(chunk.len(), heard) {
             let mut ds = daemon_state.lock().await;
             if ds.state_machine.state() == State::Recording {
                 if let Some(flag) = &ds.streaming_cancel {
@@ -341,6 +347,8 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     // chunks.
     let stream_levels = auto_stop.levels();
     let heard_speech = auto_stop.has_speech();
+    // A voice the level floors rejected: named as the batch gate names it.
+    let too_quiet = auto_stop.too_quiet();
     info!("dictation audio: {}", describe_levels(&stream_levels));
 
     // Drain remaining audio from the capture channel into the backend.
@@ -441,7 +449,8 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     };
 
     if nothing_heard {
-        let message = BatchOrigin::Dictation.nothing_heard_message();
+        let after = no_speech_timeout(silence_timeout_ms).unwrap_or(NO_SPEECH_TIMEOUT);
+        let message = BatchOrigin::Dictation.nothing_heard_message(after);
         info!("{message}: the dictation is discarded");
         if notify_state {
             send_notification("whisrs", &message);
@@ -464,12 +473,18 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     }
 
     // Nothing typed, and no error or cancel to say why: name what the audio
-    // was, as a batch skip does. Audio the detector heard speech in is not
+    // was, as a batch skip does (a voice the level floors rejected is "too
+    // quiet", with its level). Audio the detector accepted speech in is not
     // why, so that stays a log line.
     if full_text.is_empty() && stream_error.is_none() && !cancelled {
-        match quality::stream_skip_reason(config.vad, &stream_levels, heard_speech) {
-            Some(reason) => {
-                let message = nothing_typed_message(reason, &stream_levels);
+        let skip = match too_quiet {
+            Some(levels) => Some((GateReason::TooQuiet, levels)),
+            None => quality::stream_skip_reason(config.vad, &stream_levels, heard_speech)
+                .map(|reason| (reason, stream_levels)),
+        };
+        match skip {
+            Some((reason, levels)) => {
+                let message = nothing_typed_message(reason, &levels);
                 info!("{message}");
                 if notify_state {
                     send_notification("whisrs", &message);
@@ -498,7 +513,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         ds.session_language = None;
         state_tx.publish(&ds);
         if audio_feedback && !cancelled {
-            feedback::play_done(audio_feedback_volume);
+            play_done_cue(audio_feedback_volume);
         }
         if notify_state && !cancelled {
             let preview = truncate_preview(&full_text, 77);
@@ -529,6 +544,10 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 /// so they hold exactly what was typed. Exits when the text channel closes or
 /// `cancel` is set.
 ///
+/// `text_heard` is set when the first delta with any text arrives: the
+/// audio loop's no-speech timeout counts it as a voice heard
+/// ([`NoSpeechTimeout`]), since the backend heard one.
+///
 /// The cancel flag is checked when a delta arrives and again right before a
 /// batch reaches the sink, so a cancelled recording never types the text the
 /// backend flushes on shutdown (a batch already inside the sink still
@@ -544,6 +563,7 @@ pub(crate) async fn run_typing_batcher<F, Fut>(
     mut text_rx: tokio::sync::mpsc::Receiver<String>,
     stream_text: StreamText,
     cancel: Arc<AtomicBool>,
+    text_heard: Arc<AtomicBool>,
     filler_filter: Option<FillerFilter>,
     replacer: Option<Replacer>,
     mut sink: F,
@@ -554,11 +574,17 @@ where
 {
     let mut full_text = String::new();
     let batch_delay = std::time::Duration::from_millis(150);
+    let heard = |delta: &str| {
+        if !delta.trim().is_empty() {
+            text_heard.store(true, Ordering::SeqCst);
+        }
+    };
 
     loop {
         // Wait for the first delta (blocking).
         let first = text_rx.recv().await;
         let Some(first) = first else { break };
+        heard(&first);
 
         // Cancelled while we were waiting: discard everything from here on.
         if cancel.load(Ordering::SeqCst) {
@@ -568,6 +594,7 @@ where
         // Collect this delta and any others that arrive within the batch window.
         let mut batch = first;
         while let Ok(Some(more)) = tokio::time::timeout(batch_delay, text_rx.recv()).await {
+            heard(&more);
             if stream_text == StreamText::Phrases && needs_space_between(&batch, &more) {
                 batch.push(' ');
             }
@@ -672,17 +699,28 @@ async fn write_streaming_clipboard(
     }
 }
 
-/// A capture that hears no speech at all for this long stops and is
+/// A capture that hears no voice at all for this long, or for
+/// `[general] silence_timeout_ms` when that is longer, stops and is
 /// discarded: dictation (both paths), command mode, `[[llm_commands]]` and
-/// agent voice turns, never a recording. Once speech was heard it never
-/// applies, and `[general] silence_timeout_ms = 0` (auto-stop off) turns it
-/// off too.
+/// agent voice turns, never a recording. Once a voice was heard it never
+/// applies, and `silence_timeout_ms = 0` (auto-stop off) turns it off too.
 pub(crate) const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a capture may hear nothing before it stops ([`NO_SPEECH_TIMEOUT`]
+/// or the auto-stop timeout, the longer), `None` with auto-stop off.
+pub(crate) fn no_speech_timeout(silence_timeout_ms: u64) -> Option<Duration> {
+    (silence_timeout_ms != 0)
+        .then(|| NO_SPEECH_TIMEOUT.max(Duration::from_millis(silence_timeout_ms)))
+}
+
 /// The no-speech timeout of one capture, counted in its audio from the first
-/// chunk until the detector hears speech (`AutoStopDetector::has_speech`, so
-/// under `[audio] vad = "rms"` anything over -50.5 dBFS counts, as it armed
-/// auto-stop in 0.1.31).
+/// chunk until anything is heard. Heard is the earliest sign of a voice
+/// ([`AutoStopDetector::heard_voice`]: any frame the detector calls speech
+/// before its level floors and the count that arms auto-stop, so a voice
+/// too quiet to arm it counts, and under `[audio] vad = "rms"` any 16 ms over
+/// -50.5 dBFS), and on the streaming path also the first transcript text
+/// the backend sends. Then it never fires: a voice too quiet for the gate
+/// records to the stop press, which says so.
 pub(crate) struct NoSpeechTimeout {
     /// Samples after which it fires; `None` when off.
     limit: Option<u64>,
@@ -693,24 +731,35 @@ pub(crate) struct NoSpeechTimeout {
 
 impl NoSpeechTimeout {
     pub(crate) fn new(silence_timeout_ms: u64) -> Self {
-        let limit = NO_SPEECH_TIMEOUT.as_secs() * u64::from(SAMPLE_RATE);
+        let limit = no_speech_timeout(silence_timeout_ms)
+            .map(|after| after.as_millis() as u64 * u64::from(SAMPLE_RATE) / 1000);
         Self {
-            limit: (silence_timeout_ms != 0).then_some(limit),
+            limit,
             fed: 0,
             heard: false,
             fired: false,
         }
     }
 
-    /// Count `samples` more of the capture; `heard`: whether the detector has
-    /// heard speech by the end of them. True once, on the chunk that reaches
-    /// [`NO_SPEECH_TIMEOUT`] with nothing heard.
+    /// Count `samples` more of the capture; `heard`: whether a voice has
+    /// been heard by the end of them. True once, on the chunk that reaches
+    /// the timeout with nothing heard.
     pub(crate) fn feed(&mut self, samples: usize, heard: bool) -> bool {
         self.fed += samples as u64;
         self.heard |= heard;
         let reached = !self.heard && !self.fired && self.limit.is_some_and(|l| self.fed >= l);
         self.fired |= reached;
         reached
+    }
+}
+
+/// `after` for a toast: whole seconds, else one decimal ("12.5 s").
+fn seconds_label(after: Duration) -> String {
+    let ms = after.as_millis();
+    if ms.is_multiple_of(1000) {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{:.1} s", after.as_secs_f64())
     }
 }
 
@@ -768,18 +817,19 @@ impl BatchOrigin<'_> {
     }
 
     /// Toast text when a capture stopped because nothing was heard for
-    /// [`NO_SPEECH_TIMEOUT`], worded as the origin's skip toasts are.
-    fn nothing_heard_message(&self) -> String {
-        let secs = NO_SPEECH_TIMEOUT.as_secs();
+    /// `after` ([`no_speech_timeout`]), worded as the origin's skip toasts
+    /// are.
+    pub(crate) fn nothing_heard_message(&self, after: Duration) -> String {
+        let secs = seconds_label(after);
         match self {
             BatchOrigin::Dictation | BatchOrigin::LlmCommand { .. } => {
-                format!("Stopped: nothing heard for {secs} s")
+                format!("Stopped: nothing heard for {secs}")
             }
             BatchOrigin::CommandMode => {
-                format!("Command mode: nothing heard for {secs} s, stopped")
+                format!("Command mode: nothing heard for {secs}, stopped")
             }
             BatchOrigin::Agent { name } => {
-                format!("Agent '{name}': nothing heard for {secs} s, stopped")
+                format!("Agent '{name}': nothing heard for {secs}, stopped")
             }
         }
     }
@@ -830,10 +880,12 @@ impl BatchOrigin<'_> {
     }
 }
 
-/// Say that a capture stopped with nothing heard for [`NO_SPEECH_TIMEOUT`]:
+/// Say that a capture stopped with nothing heard ([`no_speech_timeout`]):
 /// a log line, and the toast under the origin's skip-toast rule.
 pub(crate) fn report_nothing_heard(context: &DaemonContext, origin: &BatchOrigin<'_>) {
-    let message = origin.nothing_heard_message();
+    let after =
+        no_speech_timeout(context.config.general.silence_timeout_ms).unwrap_or(NO_SPEECH_TIMEOUT);
+    let message = origin.nothing_heard_message(after);
     info!("{message}: the audio is discarded");
     if origin.notifies_skips(context) {
         send_notification("whisrs", &message);
@@ -1492,6 +1544,7 @@ pub(crate) fn build_transcription_config(config: &Config, language: &str) -> Tra
         keyterms: config.general.vocabulary.clone(),
         diarize: false,
         vad: config.audio.vad(),
+        soft_voices: true,
     }
 }
 
@@ -1517,6 +1570,7 @@ fn batch_transcription_config(
             keyterms: Vec::new(),
             diarize: false,
             vad: config.audio.vad(),
+            soft_voices: true,
         }
     }
 }
@@ -1540,8 +1594,43 @@ pub(crate) fn save_history_entry(
         language: language.to_string(),
         duration_secs,
     };
-    if let Err(e) = history::append_entry(&entry) {
+    #[cfg(not(test))]
+    if let Err(e) = whisrs::history::append_entry(&entry) {
         warn!("failed to save history entry: {e}");
+    }
+    #[cfg(test)]
+    SAVED_HISTORY.with(|saved| saved.borrow_mut().push(entry.text));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seams: the history entries this thread saved and the done cues
+    /// it played, neither written to the real history nor played.
+    static SAVED_HISTORY: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static DONE_CUES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The texts this thread saved to history since the last call.
+#[cfg(test)]
+pub(crate) fn take_saved_history() -> Vec<String> {
+    SAVED_HISTORY.with(|saved| std::mem::take(&mut *saved.borrow_mut()))
+}
+
+/// The done cues this thread played since the last call.
+#[cfg(test)]
+pub(crate) fn take_done_cues() -> usize {
+    DONE_CUES.with(|cues| cues.replace(0))
+}
+
+/// The done cue of a dictation; test builds count it instead.
+fn play_done_cue(volume: f32) {
+    #[cfg(not(test))]
+    whisrs::audio::feedback::play_done(volume);
+    #[cfg(test)]
+    {
+        let _ = volume;
+        DONE_CUES.with(|cues| cues.set(cues.get() + 1));
     }
 }
 
@@ -1782,6 +1871,7 @@ mod tests {
             text_rx,
             stream_text,
             Arc::clone(&cancel),
+            Arc::new(AtomicBool::new(false)),
             None,
             None,
             move |text| {
@@ -1876,6 +1966,7 @@ mod tests {
             text_rx,
             StreamText::Phrases,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             None,
             replacer,
             |text| async move { text },
@@ -1962,6 +2053,7 @@ mod tests {
         let batcher = tokio::spawn(run_typing_batcher(
             text_rx,
             StreamText::Phrases,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             None,
             None,
@@ -2068,8 +2160,63 @@ mod tests {
             .collect()
     }
 
+    /// A synthetic voice at an RMS of `dbfs`: a 120 Hz pulse train through
+    /// three formants of four vowels in turn, in 0.25 s syllables. earshot
+    /// calls it speech at -40 dBFS; at -62 dBFS it calls a frame here and
+    /// there speech, never enough to arm auto-stop.
+    fn synthetic_voice(secs: usize, dbfs: f64) -> Vec<i16> {
+        use std::f64::consts::PI;
+        let rate = f64::from(SAMPLE_RATE);
+        let vowels = [
+            (700.0, 1220.0, 2600.0),
+            (300.0, 2300.0, 3000.0),
+            (500.0, 1000.0, 2500.0),
+            (400.0, 2000.0, 2600.0),
+        ];
+        let mut phase = 0.0;
+        let mut state = [[0.0f64; 2]; 3];
+        let voice: Vec<f64> = (0..secs * SAMPLE_RATE as usize)
+            .map(|i| {
+                let t = i as f64 / rate;
+                let syllable = (t / 0.25) as usize;
+                let within = (t % 0.25) / 0.25;
+                let envelope = if within < 0.8 {
+                    (PI * within / 0.8).sin()
+                } else {
+                    0.0
+                };
+                phase += (120.0 + 15.0 * (2.0 * PI * 0.7 * t).sin()) / rate;
+                let mut y = if phase >= 1.0 {
+                    phase -= 1.0;
+                    envelope
+                } else {
+                    0.0
+                };
+                let (f1, f2, f3) = vowels[syllable % vowels.len()];
+                for (k, (f, bandwidth)) in [(f1, 80.0), (f2, 100.0), (f3, 150.0)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let r: f64 = (-PI * bandwidth / rate).exp();
+                    let v = y + 2.0 * r * (2.0 * PI * f / rate).cos() * state[k][0]
+                        - r * r * state[k][1];
+                    state[k] = [v, state[k][0]];
+                    y = v;
+                }
+                y
+            })
+            .collect();
+        let rms = (voice.iter().map(|x| x * x).sum::<f64>() / voice.len() as f64).sqrt();
+        let gain = 10f64.powf(dbfs / 20.0) * f64::from(i16::MAX) / rms;
+        voice
+            .iter()
+            .map(|x| (x * gain).round().clamp(-32768.0, 32767.0) as i16)
+            .collect()
+    }
+
     /// The chunks the no-speech timeout fires on, fed as the capture loops
-    /// feed it (the auto-stop detector first).
+    /// feed it (the auto-stop detector first, then whether it heard a
+    /// voice).
     fn no_speech_fires(vad: Vad, silence_timeout_ms: u64, chunks: &[Vec<i16>]) -> Vec<usize> {
         let mut auto_stop =
             AutoStopDetector::with_vad(VadConfig::close(vad), silence_timeout_ms, SAMPLE_RATE);
@@ -2077,7 +2224,7 @@ mod tests {
         (0..chunks.len())
             .filter(|&c| {
                 auto_stop.feed(&chunks[c]);
-                no_speech.feed(chunks[c].len(), auto_stop.has_speech())
+                no_speech.feed(chunks[c].len(), auto_stop.heard_voice())
             })
             .collect()
     }
@@ -2116,16 +2263,72 @@ mod tests {
         assert!(!timeout.feed(30 * 16_000, false));
     }
 
+    /// A voice earshot hears but never long enough to arm auto-stop (soft,
+    /// or under the level floor) is heard all the same: the timeout never
+    /// cuts it off. Arming, the rule before, would have fired at 10 s.
+    #[test]
+    fn a_voice_too_quiet_to_arm_auto_stop_holds_the_timeout_off() {
+        let voice = synthetic_voice(12, -62.0);
+        let chunks: Vec<Vec<i16>> = voice.chunks(800).map(<[i16]>::to_vec).collect();
+        assert!(no_speech_fires(Vad::Earshot, 2000, &chunks).is_empty());
+
+        let mut auto_stop =
+            AutoStopDetector::with_vad(VadConfig::close(Vad::Earshot), 2000, SAMPLE_RATE);
+        let mut heard_at = None;
+        for (c, chunk) in chunks.iter().enumerate() {
+            auto_stop.feed(chunk);
+            if heard_at.is_none() && auto_stop.heard_voice() {
+                heard_at = Some(c);
+            }
+        }
+        assert!(!auto_stop.has_speech(), "it never arms");
+        assert!(
+            heard_at.is_some_and(|c| c < 20),
+            "heard at chunk {heard_at:?}"
+        );
+
+        // The same voice at -40 dBFS arms (the generator is a voice to it).
+        let mut auto_stop =
+            AutoStopDetector::with_vad(VadConfig::close(Vad::Earshot), 2000, SAMPLE_RATE);
+        auto_stop.feed(&synthetic_voice(2, -40.0));
+        assert!(auto_stop.has_speech());
+    }
+
     /// `silence_timeout_ms = 0` turns auto-stop off, and this with it.
     #[test]
     fn no_speech_timeout_is_off_with_auto_stop_off() {
         for vad in [Vad::Earshot, Vad::Rms] {
             assert!(no_speech_fires(vad, 0, &capture_chunks(60, None)).is_empty());
         }
+        assert_eq!(no_speech_timeout(0), None);
+    }
+
+    /// The timeout is 10 s, or the auto-stop timeout when that is longer:
+    /// `silence_timeout_ms = 20000` gives 20 s (the 400th chunk).
+    #[test]
+    fn no_speech_timeout_is_at_least_the_auto_stop_timeout() {
+        assert_eq!(no_speech_timeout(2000), Some(Duration::from_secs(10)));
+        assert_eq!(no_speech_timeout(10_000), Some(Duration::from_secs(10)));
+        assert_eq!(no_speech_timeout(20_000), Some(Duration::from_secs(20)));
+        assert_eq!(
+            no_speech_timeout(12_500),
+            Some(Duration::from_millis(12_500))
+        );
+        for vad in [Vad::Earshot, Vad::Rms] {
+            assert_eq!(
+                no_speech_fires(vad, 20_000, &capture_chunks(30, None)),
+                [399],
+                "{vad:?}"
+            );
+        }
+        let mut timeout = NoSpeechTimeout::new(12_500);
+        assert!(!timeout.feed(199_999, false));
+        assert!(timeout.feed(1, false));
     }
 
     #[test]
     fn nothing_heard_message_per_origin() {
+        let ten = Duration::from_secs(10);
         let cases = [
             (BatchOrigin::Dictation, "Stopped: nothing heard for 10 s"),
             (
@@ -2142,8 +2345,208 @@ mod tests {
             ),
         ];
         for (origin, expected) in cases {
-            assert_eq!(origin.nothing_heard_message(), expected, "{origin:?}");
+            assert_eq!(origin.nothing_heard_message(ten), expected, "{origin:?}");
         }
+        // The length is the one that applied.
+        assert_eq!(
+            BatchOrigin::Dictation.nothing_heard_message(Duration::from_secs(20)),
+            "Stopped: nothing heard for 20 s"
+        );
+        assert_eq!(
+            BatchOrigin::CommandMode.nothing_heard_message(Duration::from_millis(12_500)),
+            "Command mode: nothing heard for 12.5 s, stopped"
+        );
+    }
+
+    /// A streaming backend that sends `text` once it has received `after`
+    /// samples, and no other text.
+    struct ScriptedStream {
+        text_after: Option<(usize, &'static str)>,
+    }
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for ScriptedStream {
+        async fn transcribe(&self, _audio: &[u8], _config: &TranscriptionConfig) -> Result<String> {
+            unreachable!("a streaming session never sends a file")
+        }
+
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
+        }
+
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> Result<whisrs::transcription::Transcript> {
+            unreachable!("a streaming session never sends a file")
+        }
+
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+
+        async fn transcribe_stream(
+            &self,
+            mut audio_rx: tokio::sync::mpsc::Receiver<whisrs::audio::AudioChunk>,
+            text_tx: tokio::sync::mpsc::Sender<String>,
+            _config: &TranscriptionConfig,
+        ) -> Result<()> {
+            let mut received = 0;
+            let mut pending = self.text_after;
+            while let Some(chunk) = audio_rx.recv().await {
+                received += chunk.len();
+                if let Some((_, text)) = pending.filter(|&(after, _)| received >= after) {
+                    pending = None;
+                    let _ = text_tx.send(text.to_string()).await;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// What [`streaming_run`] saw.
+    #[derive(Debug)]
+    struct StreamingRun {
+        /// The chunks sent before the session left Recording on its own, and
+        /// the state it went to.
+        stopped: Option<(usize, State)>,
+        text: String,
+        cancelled: bool,
+        /// The pipeline released its cancel slot.
+        released: bool,
+        state: State,
+        toasts: Vec<String>,
+        history: Vec<String>,
+        done_cues: usize,
+    }
+
+    /// A streaming dictation over `secs` s of digital silence in 50 ms
+    /// chunks, paced in (paused) real time, on [`ScriptedStream`]. Toasts,
+    /// history and the done cue are on (recorded, not shown, by the test
+    /// seams), the overlay off, and nothing is typed (`clipboard_only`). A
+    /// session still recording at the end is stopped and then cancelled
+    /// while it drains (#154), so nothing reaches the clipboard.
+    async fn streaming_run(
+        text_after: Option<(usize, &'static str)>,
+        silence_timeout_ms: u64,
+        secs: usize,
+    ) -> StreamingRun {
+        crate::notify::take_sent_toasts();
+        take_saved_history();
+        take_done_cues();
+        let config: Config = toml::from_str("").unwrap();
+        let daemon_state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut ds = daemon_state.lock().await;
+            ds.state_machine.transition(Action::Toggle).unwrap();
+            ds.streaming_cancel = Some(Arc::clone(&cancel_flag));
+            ds.session_language = Some("en".into());
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let pipeline = tokio::spawn(run_streaming_pipeline(StreamingPipelineParams {
+            audio_rx: rx,
+            backend: Arc::new(ScriptedStream { text_after }),
+            daemon_state: Arc::clone(&daemon_state),
+            window_tracker: Arc::new(whisrs::window::NoopTracker),
+            state_tx: StateBus::new(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            config: build_transcription_config(&config, "en"),
+            window_id: None,
+            language: "en".into(),
+            notify: true,
+            overlay_enabled: false,
+            silence_timeout_ms,
+            filler_enabled: false,
+            filler_words: Vec::new(),
+            replacements: Default::default(),
+            audio_feedback: true,
+            audio_feedback_volume: 0.5,
+            backend_name: "test".into(),
+            keys: KeystrokeSettings::from_config(&config.input),
+            clipboard_fallback: false,
+            clipboard_only: true,
+            terminal_classes: Vec::new(),
+            history: true,
+        }));
+        let mut stopped = None;
+        for c in 0..secs * 20 {
+            tx.send(vec![0i16; 800]).unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let state = daemon_state.lock().await.state_machine.state();
+            if state != State::Recording {
+                stopped = Some((c + 1, state));
+                break;
+            }
+        }
+        if stopped.is_none() {
+            // The stop press, then `whisrs cancel` while it drains.
+            let mut ds = daemon_state.lock().await;
+            ds.state_machine.transition(Action::Toggle).unwrap();
+            ds.streaming_cancel
+                .take()
+                .unwrap()
+                .store(true, Ordering::SeqCst);
+        }
+        // The capture's channel closes, as a stopped capture's does.
+        drop(tx);
+        let text = pipeline.await.unwrap().unwrap();
+        let ds = daemon_state.lock().await;
+        StreamingRun {
+            stopped,
+            text,
+            cancelled: cancel_flag.load(Ordering::SeqCst),
+            released: ds.streaming_cancel.is_none(),
+            state: ds.state_machine.state(),
+            toasts: crate::notify::take_sent_toasts(),
+            history: take_saved_history(),
+            done_cues: take_done_cues(),
+        }
+    }
+
+    /// Nothing heard for 10 s: the pipeline stops the session itself
+    /// (Recording to Transcribing on the 200th chunk), sets its cancel flag,
+    /// says so, saves nothing, plays no done cue and ends in Idle.
+    #[tokio::test(start_paused = true)]
+    async fn a_streaming_dictation_that_hears_nothing_stops_at_10_s() {
+        let run = streaming_run(None, 2000, 15).await;
+        assert_eq!(run.stopped, Some((200, State::Transcribing)), "{run:?}");
+        assert!(run.cancelled && run.released, "{run:?}");
+        assert_eq!(run.toasts, ["Stopped: nothing heard for 10 s"]);
+        assert!(run.history.is_empty());
+        assert_eq!(run.done_cues, 0);
+        assert_eq!((run.state, run.text.as_str()), (State::Idle, ""));
+    }
+
+    /// The first transcript text counts as a voice heard: a delta at 9.5 s,
+    /// with nothing the detector calls speech, keeps the session recording.
+    #[tokio::test(start_paused = true)]
+    async fn a_streaming_delta_before_10_s_holds_the_timeout_off() {
+        let run = streaming_run(Some((152_000, "hello")), 2000, 15).await;
+        assert_eq!(run.stopped, None, "{run:?}");
+        assert!(run.toasts.is_empty(), "{:?}", run.toasts);
+        // Ended by the cancel: discarded.
+        assert_eq!((run.state, run.text.as_str()), (State::Idle, ""));
+        assert!(run.history.is_empty());
+
+        // Without it, the same session stops at 10 s.
+        let run = streaming_run(Some((200_000, "hello")), 2000, 15).await;
+        assert_eq!(run.stopped, Some((200, State::Transcribing)), "{run:?}");
+    }
+
+    /// `silence_timeout_ms = 20000`: the session hears nothing for 20 s
+    /// before it stops, and the toast says 20 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_longer_auto_stop_timeout_lengthens_the_no_speech_timeout() {
+        let run = streaming_run(None, 20_000, 25).await;
+        assert_eq!(run.stopped, Some((400, State::Transcribing)), "{run:?}");
+        assert_eq!(run.toasts, ["Stopped: nothing heard for 20 s"]);
+        assert_eq!(run.state, State::Idle);
     }
 
     /// Per-origin gate-skip toast wording: command mode announces itself,

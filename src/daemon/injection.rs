@@ -2809,6 +2809,7 @@ mod tests {
                     text_rx,
                     whisrs::transcription::StreamText::Phrases,
                     Arc::clone(&cancel),
+                    Arc::new(AtomicBool::new(false)),
                     None,
                     None,
                     |text| {

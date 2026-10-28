@@ -417,21 +417,28 @@ Speech detection: `[audio] vad` = `earshot` (default) | `rms` (the 0.1.31 loudne
 `AudioConfig::vad()` (an unknown value warns and uses earshot). Every speech decision on both
 transcription paths goes through `audio-silence-gate`: `close` for dictation, command mode,
 `[[llm_commands]]` and agent turns (auto-stop, the batch gate, local-whisper's streaming phrase splits),
-`open` for recording tracks and cut points (`capped_phrases`, the segment fallback). The `close` relative
+`open` for recording tracks and cut points (`capped_phrases`, the segment fallback); on a recording's
+system track `open` goes without the soft threshold (`TrackKind::vad_config`, `TranscriptionConfig::soft_voices`:
+its mask, chunk cuts, meters and a backend's phrases), since it passes music. The `close` relative
 floor never rises above the RMS threshold (-50.5 dBFS), so a loud burst cannot bury the speech after it
 (`check-vad.sh`'s "Oh!" rows). A frame 6 dB over the background (pre-emphasized, the quietest frame of
 the last 240 ms of sound) two frames running needs only score 0.25 (`soft_threshold`), so a soft voice
-counts; such frames count half toward arming and the gate (`check-vad.sh`'s real-voice rows need the
-local `fixtures/vad/real-soft.wav`). A skip toast names its reason with a level (`audio::quality::skip_label`:
+counts; such frames count half toward arming and the gate, and only within their run of speech (304 ms
+with no voiced frame forgets them, `vad::Evidence`), so separate noise onsets never add up
+(`check-vad.sh`'s noise-burst row; its real-voice rows need the local `fixtures/vad/real-soft.wav`). A skip toast names its reason with a level (`audio::quality::skip_label`:
 "silent (peak -82 dB)", "too quiet (speech at -68 dB)", "without speech (background at -48 dB)"), and
 adds "Is the mic muted?" only at a peak of digital silence (`skip_hint`); a streaming dictation whose
 audio held no speech says "Nothing typed: the audio was ..." (`notify_state`). Each turn logs one info
 line of levels. No-speech timeout (`pipeline::NoSpeechTimeout`): dictation (streaming in
 `run_streaming_pipeline`, batch on its `collect_batch_dictation` task, `DaemonState::batch_audio`),
 command mode, `[[llm_commands]]` and agent turns (`collect_instruction_audio`) stop and discard after
-10 s of capture in which the auto-stop detector never heard speech, with the origin's skip-toast
-wording and rule ("Stopped: nothing heard for 10 s", `report_nothing_heard`); `silence_timeout_ms = 0`
-turns it off too, and recordings never use it.
+`no_speech_timeout` (10 s, or `silence_timeout_ms` when longer) of capture with nothing heard, with
+the origin's skip-toast wording and rule ("Stopped: nothing heard for 10 s", `report_nothing_heard`).
+Heard is the earliest sign of a voice, never auto-stop's arming: `AutoStopDetector::heard_voice` (any
+frame voiced before the level floors and the arming count, so a voice too quiet to arm counts; under
+`rms` any 16 ms over -50.5 dBFS), or on the streaming path the first transcript text reaching
+`run_typing_batcher` (`text_heard`). A too-quiet voice so records to the stop press and gets the gate's
+"too quiet" skip. `silence_timeout_ms = 0` turns it off too, and recordings never use it.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 
@@ -470,7 +477,7 @@ of speech while `SystemSignal::heard` is false), each once per recording, throug
 each chunk above digital silence on the shared `SystemSignal`; mic chunks taken within
 `PLAYBACK_HANGOVER` (300 ms) of one are left out of the mic's speech level, background and SNR
 (`QualityMeter::feed_marked`, live and stored; clipping and DC offset count everything), and once any
-were, a stored speech level needs 30 s of own speech. Too quiet, noisy, clipping, DC offset and strong
+were, a stored speech level needs 10 s of own speech (`OWN_SPEECH_FOR_LEVEL`). Too quiet, noisy, clipping, DC offset and strong
 echo are mic-only warnings (`TrackQuality::from_report(kind, ..)`); the system track's one is
 `system-silent`, stored by `apply_outcomes` on an unmeasured quality (`TrackQuality::unmeasured`) when
 its writer measured nothing, and kept when the worker measures the WAV.

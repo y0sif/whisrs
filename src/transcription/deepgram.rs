@@ -901,6 +901,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         };
 
         assert!(!DeepgramRestBackend::new(String::new()).sends_prompt(&request));
@@ -1017,6 +1018,7 @@ mod tests {
             keyterms: keyterms.iter().map(|t| t.to_string()).collect(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         }
     }
 
@@ -1029,6 +1031,7 @@ mod tests {
             keyterms: keyterms.to_vec(),
             diarize: false,
             vad: Default::default(),
+            soft_voices: true,
         }
     }
 

@@ -257,12 +257,13 @@ where
 
     let samples = decode_wav_samples(audio)?;
     // The open profile: a recording track carries voices at any level, and a
-    // phrase the splitter drops is transcript lost. Minutes of audio per
-    // chunk, so the detector runs off the async worker.
+    // phrase the splitter drops is transcript lost (without the soft
+    // threshold on the system track). Minutes of audio per chunk, so the
+    // detector runs off the async worker.
     let phrases = crate::audio::block_off_runtime(|| {
         let mut splitter = phrase_split::PhraseSplitter::new(
             SEGMENT_SAMPLE_RATE,
-            audio_silence_gate::VadConfig::open(config.vad),
+            config.open_vad(),
             FALLBACK_PHRASE_SILENCE_MS,
         );
         let mut phrases = splitter.feed(&samples);
@@ -337,6 +338,39 @@ pub struct TranscriptionConfig {
     /// `[audio] vad`: what decides speech where a backend cuts audio at
     /// pauses (local whisper's phrases and windows, [`segments_by_phrase`]).
     pub vad: audio_silence_gate::Vad,
+    /// Whether a soft voice counts where a backend cuts a recording chunk
+    /// at pauses ([`open_vad`](Self::open_vad)). True everywhere but a
+    /// recording's system track
+    /// ([`TrackKind::soft_voices`](crate::recording::TrackKind::soft_voices)).
+    pub soft_voices: bool,
+}
+
+impl TranscriptionConfig {
+    /// The open profile of [`vad`](Self::vad) ([`open_profile`]): what cuts
+    /// a recording chunk into phrases, where a voice at any level counts.
+    pub fn open_vad(&self) -> audio_silence_gate::VadConfig {
+        open_profile(self.vad, self.soft_voices)
+    }
+}
+
+/// The open profile of `vad` (any voice counts: a recording track), with
+/// the soft threshold ([`audio_silence_gate::VadConfig::soft_snr_db`]) only
+/// when `soft_voices`. The one place a recording's detector settings are
+/// made: [`TrackKind::vad_config`](crate::recording::TrackKind::vad_config)
+/// and [`TranscriptionConfig::open_vad`] both call it.
+pub fn open_profile(
+    vad: audio_silence_gate::Vad,
+    soft_voices: bool,
+) -> audio_silence_gate::VadConfig {
+    let open = audio_silence_gate::VadConfig::open(vad);
+    if soft_voices {
+        open
+    } else {
+        audio_silence_gate::VadConfig {
+            soft_snr_db: None,
+            ..open
+        }
+    }
 }
 
 /// How the pieces of text a backend sends on `text_tx` in
@@ -566,6 +600,7 @@ mod tests {
             keyterms: Vec::new(),
             diarize: false,
             vad: audio_silence_gate::Vad::Rms,
+            soft_voices: true,
         }
     }
 
@@ -644,6 +679,29 @@ mod tests {
             .transcribe_segments(&wav, &earshot)
             .await
             .unwrap();
+        assert!(t.segments.is_empty(), "{t:?}");
+    }
+
+    /// A recording's system track cuts its chunks without the soft
+    /// threshold (`soft_voices` off): a drum loop gives phrases to the
+    /// mic's profile and none to the system track's.
+    #[tokio::test]
+    async fn phrase_fallback_on_a_system_track_goes_without_soft_voices() {
+        let wav =
+            crate::audio::wav::encode_wav(&crate::audio::test_audio::drum_loop(10, -30.0)).unwrap();
+        let mic = TranscriptionConfig {
+            vad: audio_silence_gate::Vad::Earshot,
+            ..cfg()
+        };
+        let system = TranscriptionConfig {
+            soft_voices: false,
+            ..mic.clone()
+        };
+        assert_eq!(system.open_vad().soft_snr_db, None);
+        assert_eq!(mic.open_vad(), audio_silence_gate::VadConfig::open(mic.vad));
+        let t = EchoLength.transcribe_segments(&wav, &mic).await.unwrap();
+        assert!(!t.segments.is_empty(), "{t:?}");
+        let t = EchoLength.transcribe_segments(&wav, &system).await.unwrap();
         assert!(t.segments.is_empty(), "{t:?}");
     }
 

@@ -28,8 +28,12 @@ sits around -40):
    (0.25) in 3 and 4. earshot scores a soft voice 0.2 to 0.5, under 0.55, while
    steady noise never stands that clear and a key click never does twice in a
    row. Speech voiced only that way counts half toward arming auto-stop and
-   passing the gate, so a noise switching on (clear of the background for at
-   most 240 ms) cannot arm it.
+   passing the gate, and only within its run of speech (304 ms without a
+   voiced frame forgets it). A noise switching on stands clear of the
+   background for at most 240 ms, so it can mark about 300 ms as speech, but
+   on that rule alone it cannot arm auto-stop or pass the gate, and neither
+   can several such onsets apart (a fan cycling). A noise earshot itself
+   scores as speech still counts in full.
 
 Feed it chunks of any size; it calls back once per completed frame.
 
@@ -87,9 +91,11 @@ detector.reset(); // ready for next utterance
 ```
 
 It arms once 160 ms of speech was accepted in total (320 ms if accepted only
-through the soft threshold), so a short noise onset cannot arm it while a lone
-"yes" or soft talk does. `AutoStopDetector::new(threshold, ..)`
-keeps the 0.1 RMS rule.
+through the soft threshold, within one run of speech), so a short noise onset
+cannot arm it while a lone "yes" or soft talk does. `heard_voice()` turns true
+earlier, on the first frame the detector calls speech before the level floors
+and that count: a sign that someone spoke even when the voice is too quiet to
+arm it. `AutoStopDetector::new(threshold, ..)` keeps the 0.1 RMS rule.
 
 ## Batch gate
 

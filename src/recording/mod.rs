@@ -288,6 +288,30 @@ impl TrackKind {
             TrackKind::System => "system",
         }
     }
+
+    /// Whether the soft threshold
+    /// ([`VadConfig::soft_snr_db`](audio_silence_gate::VadConfig::soft_snr_db))
+    /// decides speech on this track: on the mic, where a soft voice is the
+    /// user's, never on the system track, where it passes music (a drum
+    /// loop: about a quarter of the open mask) to a backend that makes up
+    /// text over a music bed. The system track decides as it did before the
+    /// rule.
+    pub fn soft_voices(self) -> bool {
+        match self {
+            TrackKind::Mic => true,
+            TrackKind::System => false,
+        }
+    }
+
+    /// The detector settings of every speech decision on this track: its
+    /// speech mask (the regions sent and where long ones are cut), its
+    /// quality meters, live and stored, and the phrases a backend cuts its
+    /// chunks into ([`TranscriptionConfig::soft_voices`](crate::transcription::TranscriptionConfig::soft_voices)).
+    /// The open profile of `vad` (any voice counts), without the soft
+    /// threshold where [`soft_voices`](Self::soft_voices) is off.
+    pub fn vad_config(self, vad: audio_silence_gate::Vad) -> audio_silence_gate::VadConfig {
+        crate::transcription::open_profile(vad, self.soft_voices())
+    }
 }
 
 /// Why a recording ended.
@@ -866,6 +890,27 @@ mod tests {
             r#""waiting""#
         );
         assert_eq!(RecordingStatus::default().phase, RecordingPhase::Idle);
+    }
+
+    /// The mic takes the open profile as it is; the system track the same
+    /// without the soft threshold, with either detector.
+    #[test]
+    fn the_system_track_profile_has_no_soft_threshold() {
+        use audio_silence_gate::{Vad, VadConfig};
+        for vad in [Vad::Earshot, Vad::Rms] {
+            assert_eq!(TrackKind::Mic.vad_config(vad), VadConfig::open(vad));
+            let system = TrackKind::System.vad_config(vad);
+            assert_eq!(system.soft_snr_db, None);
+            assert_eq!(
+                VadConfig {
+                    soft_snr_db: VadConfig::open(vad).soft_snr_db,
+                    ..system
+                },
+                VadConfig::open(vad)
+            );
+        }
+        assert!(TrackKind::Mic.soft_voices());
+        assert!(!TrackKind::System.soft_voices());
     }
 
     #[test]
