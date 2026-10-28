@@ -419,11 +419,19 @@ transcription paths goes through `audio-silence-gate`: `close` for dictation, co
 `[[llm_commands]]` and agent turns (auto-stop, the batch gate, local-whisper's streaming phrase splits),
 `open` for recording tracks and cut points (`capped_phrases`, the segment fallback). The `close` relative
 floor never rises above the RMS threshold (-50.5 dBFS), so a loud burst cannot bury the speech after it
-(`check-vad.sh`'s "Oh!" rows). A skip toast names its reason with a level (`audio::quality::skip_label`:
+(`check-vad.sh`'s "Oh!" rows). A frame 6 dB over the background (pre-emphasized, the quietest frame of
+the last 240 ms of sound) two frames running needs only score 0.25 (`soft_threshold`), so a soft voice
+counts; such frames count half toward arming and the gate (`check-vad.sh`'s real-voice rows need the
+local `fixtures/vad/real-soft.wav`). A skip toast names its reason with a level (`audio::quality::skip_label`:
 "silent (peak -82 dB)", "too quiet (speech at -68 dB)", "without speech (background at -48 dB)"), and
 adds "Is the mic muted?" only at a peak of digital silence (`skip_hint`); a streaming dictation whose
 audio held no speech says "Nothing typed: the audio was ..." (`notify_state`). Each turn logs one info
-line of levels.
+line of levels. No-speech timeout (`pipeline::NoSpeechTimeout`): dictation (streaming in
+`run_streaming_pipeline`, batch on its `collect_batch_dictation` task, `DaemonState::batch_audio`),
+command mode, `[[llm_commands]]` and agent turns (`collect_instruction_audio`) stop and discard after
+10 s of capture in which the auto-stop detector never heard speech, with the origin's skip-toast
+wording and rule ("Stopped: nothing heard for 10 s", `report_nothing_heard`); `silence_timeout_ms = 0`
+turns it off too, and recordings never use it.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 

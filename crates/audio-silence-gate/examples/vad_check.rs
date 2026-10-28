@@ -50,6 +50,72 @@ fn close(vad: Vad) -> VadConfig {
     VadConfig::close(vad)
 }
 
+fn open(vad: Vad) -> VadConfig {
+    VadConfig::open(vad)
+}
+
+/// The maintainer's soft-voice take (16 kHz mono, his mic, room at -54
+/// dBFS): about 15 s of soft talk, a pause, a sentence at normal volume
+/// (about -32 dBFS), about 20 s of soft talk. Local only (`fixtures/` is
+/// gitignored, and a real voice is never committed): the rows are skipped
+/// without it, and for any other file of that name.
+const REAL_SOFT: &str = "real-soft.wav";
+const REAL_SOFT_SAMPLES: usize = 972_000;
+
+/// Its soft speech, hand labelled in 100 ms windows (`[start, end)` window
+/// indices). A whisper transcript of the whole take (medium.en) hears soft
+/// talk without a break from 1.4 to 17.0 s and from 39.0 to 59.0 s; the
+/// recording's own Deepgram segments agree where they exist ("I'm speaking
+/// very soft." at 1.77 to 3.47 s, "Now I'm back to the soft speaking." at
+/// 39.12 to 41.37 s). Inside those two passages a window is speech when its
+/// 500 to 6000 Hz energy (Hann-windowed FFT) is at least 6 dB over the
+/// median of the 18 to 23 s silence: the band where the voice stands clear
+/// of the mic's rumble. 126 windows, 12.6 s.
+#[rustfmt::skip]
+const REAL_SOFT_LABELS: &[(usize, usize)] = &[
+    (15, 20), (25, 26), (27, 31), (44, 48), (52, 54), (58, 61), (63, 64), (74, 77),
+    (86, 87), (88, 89), (90, 92), (93, 98), (99, 101), (103, 105), (106, 107), (108, 110),
+    (116, 121), (122, 123), (124, 129), (139, 140), (141, 142), (150, 153), (154, 155),
+    (156, 158), (159, 161), (162, 164), (167, 170), (390, 396), (397, 402), (416, 418),
+    (424, 425), (426, 428), (430, 432), (433, 435), (436, 437), (440, 442), (446, 447),
+    (460, 462), (475, 476), (491, 493), (496, 497), (505, 507), (508, 509), (513, 516),
+    (525, 526), (527, 529), (530, 531), (532, 533), (534, 535), (537, 540), (545, 548),
+    (560, 562), (564, 565), (566, 569), (570, 572), (573, 575), (587, 590),
+];
+
+/// The take's silences (100 ms windows): no speech at all.
+const REAL_SOFT_SILENCES: &[(usize, usize)] = &[(172, 232), (353, 389)];
+
+/// Dictations cut from the take: its pieces (100 ms windows, played back to
+/// back) and where its last soft word ends, in seconds into the cut. The
+/// second passage ends with the take, so 3.5 s of the first silence follow
+/// it. Gated.
+type Cut = (&'static str, &'static [(usize, usize)], f64);
+const REAL_SOFT_DICTATIONS: [Cut; 3] = [
+    ("first passage from 9.0 s", &[(90, 233)], 8.0),
+    ("second passage", &[(390, 607), (175, 210)], 20.0),
+    (
+        "normal sentence, then the second passage",
+        &[(233, 274), (390, 607), (175, 210)],
+        24.1,
+    ),
+];
+
+/// The first passage from its start: printed, not gated. From 6.1 to 9.0 s
+/// the only sound is one breathy 0.24 s syllable (7.38 s) that earshot
+/// scores 0.20 to 0.27, its own score for his room, so auto-stop fires in
+/// it at about 8.5 s (0.1.31's RMS test fired there too, at 7.85 s).
+const REAL_SOFT_WHOLE_PASSAGE: Cut = ("first passage from 0 s", &[(0, 233)], 17.0);
+
+/// The labels are 100 ms windows, so the stop window opens 0.1 s before
+/// [`STOP_WINDOW`]'s.
+const REAL_STOP_WINDOW: (f64, f64) = (1.8, 2.6);
+
+/// Recall of the soft speech the open profile's mask must reach, and the
+/// share of it inside the regions a recording sends.
+const REAL_SOFT_RECALL: f64 = 0.70;
+const REAL_SOFT_SENT: f64 = 0.90;
+
 /// 16-bit PCM mono 16 kHz samples of a WAV, at most `max` of them. A data
 /// chunk whose size a crash left unwritten is read to the end of the file.
 fn read_wav(path: &str, max: Option<usize>) -> Result<Vec<i16>, String> {
@@ -304,6 +370,180 @@ struct Clips {
     speech_rms: f64,
 }
 
+/// `recording::speech::regions` on a 100 ms mask: each run of active
+/// windows padded 300 ms, regions less than 1 s apart merged, regions with
+/// under 300 ms of active windows dropped. `[start, end)` window ranges.
+fn regions(active: &[bool]) -> Vec<(usize, usize)> {
+    let mut merged: Vec<((usize, usize), usize)> = Vec::new();
+    let mut i = 0;
+    while i < active.len() {
+        if !active[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < active.len() && active[i] {
+            i += 1;
+        }
+        let padded = (start.saturating_sub(3), (i + 3).min(active.len()));
+        match merged.last_mut() {
+            Some((last, count)) if padded.0 < last.1 + 10 => {
+                last.1 = padded.1;
+                *count += i - start;
+            }
+            _ => merged.push((padded, i - start)),
+        }
+    }
+    merged
+        .into_iter()
+        .filter(|(_, count)| count * 100 >= 300)
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// What a recording makes of the take's mic track under one rule: the
+/// share of the labelled windows the mask flags, the share inside the sent
+/// regions, the sent seconds and regions, and the flagged silence windows.
+struct Sent {
+    recall: f64,
+    sent: f64,
+    seconds: f64,
+    regions: usize,
+    false_windows: usize,
+}
+
+fn sent(mask: &[bool], labels: &[bool]) -> Sent {
+    let total = labels.iter().filter(|&&l| l).count().max(1) as f64;
+    let hit = labels.iter().zip(mask).filter(|(&l, &m)| l && m).count();
+    let regions = regions(mask);
+    let mut inside = vec![false; mask.len()];
+    for &(a, b) in &regions {
+        inside[a..b].fill(true);
+    }
+    let covered = labels.iter().zip(&inside).filter(|(&l, &m)| l && m).count();
+    Sent {
+        recall: hit as f64 / total,
+        sent: covered as f64 / total,
+        seconds: regions.iter().map(|r| r.1 - r.0).sum::<usize>() as f64 / 10.0,
+        regions: regions.len(),
+        false_windows: REAL_SOFT_SILENCES
+            .iter()
+            .map(|&(a, b)| mask[a..b].iter().filter(|&&m| m).count())
+            .sum(),
+    }
+}
+
+impl Sent {
+    fn label(&self) -> String {
+        format!(
+            "soft recall {:.3}, sent {:.3} ({:.1} s in {} regions), silence windows flagged {}",
+            self.recall, self.sent, self.seconds, self.regions, self.false_windows
+        )
+    }
+}
+
+/// The soft-voice rows, when `fixtures/vad/real-soft.wav` is there.
+fn real_soft_rows(r: &mut Report, dir: &str) {
+    let name = "real soft voice (local fixture)";
+    let path = format!("{dir}/{REAL_SOFT}");
+    if !std::path::Path::new(&path).exists() {
+        let skipped = "skipped (local fixture missing)".to_string();
+        r.row(name, skipped, "-".into(), "-", None);
+        return;
+    }
+    let samples = match read_wav(&path, None) {
+        Ok(s) if s.len() == REAL_SOFT_SAMPLES => s,
+        Ok(s) => {
+            let skipped = format!("skipped (not the labelled take: {} samples)", s.len());
+            r.row(name, skipped, "-".into(), "-", None);
+            return;
+        }
+        Err(e) => {
+            r.row(name, format!("skipped ({e})"), "-".into(), "-", None);
+            return;
+        }
+    };
+
+    // The recording: the mic track's mask (open profile) and its regions.
+    let mut labels = vec![false; samples.len().div_ceil(RMS_FRAME)];
+    for &(a, b) in REAL_SOFT_LABELS {
+        labels[a..b].fill(true);
+    }
+    let mask = |vad| speech_mask(&samples, &open(vad), RMS_FRAME);
+    let e = sent(&mask(Vad::Earshot), &labels);
+    let rms = sent(&mask(Vad::Rms), &labels);
+    r.row(
+        "real soft voice, recording (open)",
+        e.label(),
+        rms.label(),
+        "soft recall >= 0.70; sent >= 0.90",
+        Some(e.recall >= REAL_SOFT_RECALL && e.sent >= REAL_SOFT_SENT),
+    );
+
+    // Dictations: auto-stop (close profile) on cuts of the take.
+    let dictate = |(label, pieces, last_word): Cut| {
+        let clip: Vec<i16> = pieces
+            .iter()
+            .flat_map(|&(a, b)| samples[a * RMS_FRAME..b * RMS_FRAME].iter().copied())
+            .collect();
+        let stop = |vad| auto_stop(&clip, close(vad));
+        let (e, rms) = (stop(Vad::Earshot), stop(Vad::Rms));
+        let show = |s: &Stop| {
+            let armed = s
+                .armed_s
+                .map_or("not armed".into(), |t| format!("armed {t:.2} s"));
+            format!("{label}: {armed}, stop {}", s.label(last_word))
+        };
+        let pass = e.armed_s.is_some() && e.within(last_word, REAL_STOP_WINDOW);
+        (show(&e), show(&rms), pass)
+    };
+    let cuts: Vec<_> = REAL_SOFT_DICTATIONS.into_iter().map(dictate).collect();
+    let join = |pick: fn(&(String, String, bool)) -> &String| {
+        cuts.iter()
+            .map(pick)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    r.row(
+        "real soft voice, dictations (close)",
+        join(|c| &c.0),
+        join(|c| &c.1),
+        "each arms; stop +1.8 to +2.6 s after its last soft word",
+        Some(cuts.iter().all(|c| c.2)),
+    );
+    let (e, rms, _) = dictate(REAL_SOFT_WHOLE_PASSAGE);
+    r.row("real soft voice, a known limit", e, rms, "-", None);
+}
+
+/// Key clicks over a quiet room: `seconds` of pink noise at -60 dBFS with a
+/// key press and its release (80 ms later, half as loud) every 125 to 315
+/// ms, each a burst of seeded noise peaking at `peak_dbfs` and decaying in
+/// 3 ms.
+fn key_clicks(pink: &[f64], seconds: usize, peak_dbfs: f64) -> Vec<i16> {
+    let n = seconds * SR;
+    let gain = db_to_rms(-60.0) / rms_f(pink);
+    let mut out: Vec<f64> = pink[..n].iter().map(|x| x * gain).collect();
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let peak = db_to_rms(peak_dbfs);
+    let mut t = SR / 2;
+    while t + 2 * SR / 10 < n {
+        for (start, a) in [(t, peak), (t + 1300, peak / 2.0)] {
+            for k in 0..240 {
+                out[start + k] += a * (2.0 * uniform() - 1.0) * (-(k as f64) / 50.0).exp();
+            }
+        }
+        t += 2000 + (uniform() * 3000.0) as usize;
+    }
+    to_i16(&out)
+}
+
 /// Seconds of the first and past the last labelled frame.
 fn speech_span(labels: &[bool]) -> (f64, f64) {
     let first = labels.iter().position(|&l| l).unwrap_or(0);
@@ -507,7 +747,7 @@ fn prf_label(m: &Prf) -> String {
     format!("P/R/F1 {:.3}/{:.3}/{:.3}", m.precision, m.recall, m.f1)
 }
 
-fn run(clips: &Clips, real: &[String]) -> Report {
+fn run(clips: &Clips, dir: &str, real: &[String]) -> Report {
     let mut report = Report {
         md: String::new(),
         failed: Vec::new(),
@@ -678,6 +918,36 @@ fn run(clips: &Clips, real: &[String]) -> Report {
         );
     }
 
+    // Pink noise switching from -60 to -40 dBFS 1 s into the dead air: the
+    // background is known when the noise rises.
+    {
+        let (_, pink) = &clips.beds[0];
+        let low = db_to_rms(-60.0) / rms_f(pink);
+        let high = clips.speech_rms / rms_f(pink);
+        let stepped: Vec<f64> = clips
+            .auto
+            .iter()
+            .enumerate()
+            .map(|(i, x)| x + pink[i] * if i < SR { low } else { high })
+            .collect();
+        let auto = to_i16(&stepped);
+        let e = auto_stop(&auto, close(Vad::Earshot));
+        let rms = auto_stop(&auto, close(Vad::Rms));
+        let armed = |s: &Stop| match s.armed_s {
+            Some(t) => format!("armed {t:.2} s"),
+            None => "not armed".into(),
+        };
+        let early =
+            e.fired_s.is_some_and(|t| t < end) || e.armed_s.is_some_and(|t| t < clips.auto_start);
+        r.row(
+            "pink -60 dBFS rising to 0 dB SNR at 1 s (speech from 2 s)",
+            format!("{}; stop {}", armed(&e), e.label(end)),
+            format!("{}; stop {}", armed(&rms), rms.label(end)),
+            "not armed before the speech, never fires early",
+            Some(!early),
+        );
+    }
+
     // A lone "yes".
     {
         let yes = to_i16(&clips.yes);
@@ -765,6 +1035,48 @@ fn run(clips: &Clips, real: &[String]) -> Report {
             Some(gate_e == Some(GateReason::NoSpeech) && e.armed_s.is_none()),
         );
     }
+
+    // Typing near the mic: never speech.
+    {
+        let (_, pink) = &clips.beds[0];
+        let mut labels = Vec::new();
+        let mut pass = true;
+        let mut rms_labels = Vec::new();
+        for peak in [-20.0, -30.0] {
+            let clicks = key_clicks(pink, 12, peak);
+            let e = auto_stop(&clicks, close(Vad::Earshot));
+            let rms = auto_stop(&clicks, close(Vad::Rms));
+            let gate = |vad| speech_gate(&clicks, VAD_SAMPLE_RATE, GATE_MIN_MS, &close(vad)).reason;
+            let (gate_e, gate_r) = (gate(Vad::Earshot), gate(Vad::Rms));
+            let armed = |s: &Stop| {
+                if s.armed_s.is_some() {
+                    "armed"
+                } else {
+                    "not armed"
+                }
+            };
+            labels.push(format!(
+                "{peak:.0} dBFS: gate {}, {}",
+                gate_label(gate_e),
+                armed(&e)
+            ));
+            rms_labels.push(format!(
+                "{peak:.0} dBFS: gate {}, {}",
+                gate_label(gate_r),
+                armed(&rms)
+            ));
+            pass &= gate_e == Some(GateReason::NoSpeech) && e.armed_s.is_none();
+        }
+        r.row(
+            "key clicks over pink -60 dBFS, 12 s",
+            labels.join("; "),
+            rms_labels.join("; "),
+            "gate without speech; never arms",
+            Some(pass),
+        );
+    }
+
+    real_soft_rows(r, dir);
 
     // CPU: the whole detector, as whisrs feeds it.
     {
@@ -878,7 +1190,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let report = run(&clips, &real);
+    let report = run(&clips, &dir, &real);
     print!("{}", report.md);
     if report.failed.is_empty() {
         println!("\nall gated rows pass");

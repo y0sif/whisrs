@@ -65,7 +65,8 @@ use crate::command_mode::{claim_session, collect_instruction_audio};
 use crate::context::{AgentRecordingContext, AgentVoice, DaemonContext, DaemonState};
 use crate::notify::{send_notification, send_notification_for, truncate_preview};
 use crate::pipeline::{
-    format_api_error, format_no_microphone_error, transcribe_batch_audio, BatchOptions,
+    format_api_error, format_no_microphone_error, report_nothing_heard, transcribe_batch_audio,
+    BatchOptions, BatchOrigin,
 };
 #[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
@@ -2584,7 +2585,7 @@ async fn voice_turn_background(
     agent: Arc<Agent>,
 ) {
     let label = format!("agent '{}'", agent.name);
-    let samples = collect_instruction_audio(audio_rx, &daemon_state, &context, &label).await;
+    let audio = collect_instruction_audio(audio_rx, &daemon_state, &context, &label).await;
 
     // Same claim as command mode: `whisrs cancel` (or a plain toggle taking
     // the recording over as dictation) takes the context under this lock,
@@ -2607,16 +2608,22 @@ async fn voice_turn_background(
         return;
     };
 
-    if context.config.general.audio_feedback {
-        feedback::play_stop(context.config.general.audio_feedback_volume);
-    }
-    let transcript = transcribe_batch_audio(
-        &samples,
-        &context,
-        &context.config.general.language,
-        &BatchOptions::agent(&agent.name),
-    )
-    .await;
+    let transcript = if audio.nothing_heard {
+        // Nothing heard: discarded, with no stop cue (as a cancel).
+        report_nothing_heard(&context, &BatchOrigin::Agent { name: &agent.name });
+        Ok(String::new())
+    } else {
+        if context.config.general.audio_feedback {
+            feedback::play_stop(context.config.general.audio_feedback_volume);
+        }
+        transcribe_batch_audio(
+            &audio.samples,
+            &context,
+            &context.config.general.language,
+            &BatchOptions::agent(&agent.name),
+        )
+        .await
+    };
 
     // Back to Idle at once: the turn runs on its own task.
     {

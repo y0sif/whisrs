@@ -268,16 +268,45 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 
     // Forward audio from capture to backend, with auto-stop detection
     // (`[audio] vad`, the close profile: one user near the mic). A timeout of
-    // 0 never fires (#178).
+    // 0 never fires (#178), and turns the no-speech timeout off too.
     let mut auto_stop = AutoStopDetector::with_vad(
         VadConfig::close(config.vad),
         silence_timeout_ms,
         SAMPLE_RATE,
     );
+    let mut no_speech = NoSpeechTimeout::new(silence_timeout_ms);
+    let mut nothing_heard = false;
 
     while let Some(chunk) = audio_rx.recv().await {
+        let silence_reached = auto_stop.feed(&chunk);
+        // Nothing heard for `NO_SPEECH_TIMEOUT`: stop, and discard the
+        // session as a cancel does (the flag keeps the typing loop from
+        // typing whatever the backend still sends, and the tail below drops
+        // the transcript). A stop press that got here first owns the session.
+        if no_speech.feed(chunk.len(), auto_stop.has_speech()) {
+            let mut ds = daemon_state.lock().await;
+            if ds.state_machine.state() == State::Recording {
+                if let Some(flag) = &ds.streaming_cancel {
+                    if Arc::ptr_eq(flag, &cancel_flag) {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
+                if let Some(mut capture) = ds.audio_capture.take() {
+                    capture.stop();
+                    tokio::task::spawn_blocking(move || drop(capture));
+                }
+                if let Err(e) = ds.state_machine.transition(Action::Toggle) {
+                    warn!("no-speech stop state transition failed: {e}");
+                } else {
+                    state_tx.publish(&ds);
+                }
+                nothing_heard = true;
+                break;
+            }
+        }
+
         // Check for auto-stop.
-        if auto_stop.feed(&chunk) {
+        if silence_reached {
             info!("silence auto-stop triggered after {silence_timeout_ms}ms");
             if notify_state {
                 send_notification("whisrs", "Auto-stopped (silence detected)");
@@ -410,6 +439,14 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     } else {
         full_text
     };
+
+    if nothing_heard {
+        let message = BatchOrigin::Dictation.nothing_heard_message();
+        info!("{message}: the dictation is discarded");
+        if notify_state {
+            send_notification("whisrs", &message);
+        }
+    }
 
     // Notify user about streaming errors. Errors always pop, even with the
     // overlay on — the overlay can't carry the failure detail.
@@ -635,6 +672,48 @@ async fn write_streaming_clipboard(
     }
 }
 
+/// A capture that hears no speech at all for this long stops and is
+/// discarded: dictation (both paths), command mode, `[[llm_commands]]` and
+/// agent voice turns, never a recording. Once speech was heard it never
+/// applies, and `[general] silence_timeout_ms = 0` (auto-stop off) turns it
+/// off too.
+pub(crate) const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The no-speech timeout of one capture, counted in its audio from the first
+/// chunk until the detector hears speech (`AutoStopDetector::has_speech`, so
+/// under `[audio] vad = "rms"` anything over -50.5 dBFS counts, as it armed
+/// auto-stop in 0.1.31).
+pub(crate) struct NoSpeechTimeout {
+    /// Samples after which it fires; `None` when off.
+    limit: Option<u64>,
+    fed: u64,
+    heard: bool,
+    fired: bool,
+}
+
+impl NoSpeechTimeout {
+    pub(crate) fn new(silence_timeout_ms: u64) -> Self {
+        let limit = NO_SPEECH_TIMEOUT.as_secs() * u64::from(SAMPLE_RATE);
+        Self {
+            limit: (silence_timeout_ms != 0).then_some(limit),
+            fed: 0,
+            heard: false,
+            fired: false,
+        }
+    }
+
+    /// Count `samples` more of the capture; `heard`: whether the detector has
+    /// heard speech by the end of them. True once, on the chunk that reaches
+    /// [`NO_SPEECH_TIMEOUT`] with nothing heard.
+    pub(crate) fn feed(&mut self, samples: usize, heard: bool) -> bool {
+        self.fed += samples as u64;
+        self.heard |= heard;
+        let reached = !self.heard && !self.fired && self.limit.is_some_and(|l| self.fed >= l);
+        self.fired |= reached;
+        reached
+    }
+}
+
 /// Where a batch transcription request originated. Selects the per-path
 /// notification/log wording inside [`transcribe_batch_audio`]; the behavior
 /// toggles live in [`BatchOptions`].
@@ -688,6 +767,33 @@ impl BatchOrigin<'_> {
         }
     }
 
+    /// Toast text when a capture stopped because nothing was heard for
+    /// [`NO_SPEECH_TIMEOUT`], worded as the origin's skip toasts are.
+    fn nothing_heard_message(&self) -> String {
+        let secs = NO_SPEECH_TIMEOUT.as_secs();
+        match self {
+            BatchOrigin::Dictation | BatchOrigin::LlmCommand { .. } => {
+                format!("Stopped: nothing heard for {secs} s")
+            }
+            BatchOrigin::CommandMode => {
+                format!("Command mode: nothing heard for {secs} s, stopped")
+            }
+            BatchOrigin::Agent { name } => {
+                format!("Agent '{name}': nothing heard for {secs} s, stopped")
+            }
+        }
+    }
+
+    /// Whether this origin's skip toasts show: dictation's and
+    /// `[[llm_commands]]`' only without the overlay (they are progress),
+    /// command mode's and agents' always (the turn was asked for).
+    fn notifies_skips(&self, context: &DaemonContext) -> bool {
+        match self {
+            BatchOrigin::Dictation | BatchOrigin::LlmCommand { .. } => context.notify_state(),
+            BatchOrigin::CommandMode | BatchOrigin::Agent { .. } => context.notify_error(),
+        }
+    }
+
     /// The skip toast for `reason`: [`Self::gate_skip_message`] with the level
     /// that explains it ([`quality::skip_label`]), and for silent audio the
     /// advice after it.
@@ -721,6 +827,16 @@ impl BatchOrigin<'_> {
                 Some("Could not understand the instruction, nothing was sent. Try again.")
             }
         }
+    }
+}
+
+/// Say that a capture stopped with nothing heard for [`NO_SPEECH_TIMEOUT`]:
+/// a log line, and the toast under the origin's skip-toast rule.
+pub(crate) fn report_nothing_heard(context: &DaemonContext, origin: &BatchOrigin<'_>) {
+    let message = origin.nothing_heard_message();
+    info!("{message}: the audio is discarded");
+    if origin.notifies_skips(context) {
+        send_notification("whisrs", &message);
     }
 }
 
@@ -868,42 +984,25 @@ pub(crate) async fn transcribe_batch_audio(
         let label = quality::skip_label(reason, &gate.levels);
         let toast = opts.origin.gate_skip_toast(reason, &gate.levels);
         match &opts.origin {
-            BatchOrigin::Dictation => {
-                info!(
-                    "skipping transcription: recording was {label} ({} samples)",
-                    samples.len()
-                );
-                if context.notify_state() {
-                    send_notification("whisrs", &toast);
-                }
-            }
-            BatchOrigin::CommandMode => {
-                info!(
-                    "command mode: skipping (recording was {label}, {} samples)",
-                    samples.len()
-                );
-                if context.notify_error() {
-                    send_notification("whisrs", &toast);
-                }
-            }
-            BatchOrigin::LlmCommand { name } => {
-                info!(
-                    "llm-command '{name}': skipping (recording was {label}, {} samples)",
-                    samples.len()
-                );
-                if context.notify_state() {
-                    send_notification("whisrs", &toast);
-                }
-            }
-            BatchOrigin::Agent { name } => {
-                info!(
-                    "agent '{name}': skipping (recording was {label}, {} samples)",
-                    samples.len()
-                );
-                if context.notify_error() {
-                    send_notification("whisrs", &toast);
-                }
-            }
+            BatchOrigin::Dictation => info!(
+                "skipping transcription: recording was {label} ({} samples)",
+                samples.len()
+            ),
+            BatchOrigin::CommandMode => info!(
+                "command mode: skipping (recording was {label}, {} samples)",
+                samples.len()
+            ),
+            BatchOrigin::LlmCommand { name } => info!(
+                "llm-command '{name}': skipping (recording was {label}, {} samples)",
+                samples.len()
+            ),
+            BatchOrigin::Agent { name } => info!(
+                "agent '{name}': skipping (recording was {label}, {} samples)",
+                samples.len()
+            ),
+        }
+        if opts.origin.notifies_skips(context) {
+            send_notification("whisrs", &toast);
         }
         return Ok(String::new());
     }
@@ -1198,7 +1297,17 @@ pub(crate) async fn process_recording_batch(
         Some(cap) => cap.stop_and_collect().await?,
         None => anyhow::bail!("no audio capture to collect"),
     };
+    process_batch_samples(samples, window_id, context, language).await
+}
 
+/// [`process_recording_batch`] on audio already collected (batch dictation
+/// collects on its own task, which watches for nothing heard).
+pub(crate) async fn process_batch_samples(
+    samples: Vec<i16>,
+    window_id: Option<&str>,
+    context: &DaemonContext,
+    language: &str,
+) -> Result<DictationOutcome> {
     if samples.is_empty() {
         anyhow::bail!("no audio samples captured");
     }
@@ -1468,6 +1577,7 @@ fn needs_space_between(before: &str, next: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audio_silence_gate::Vad;
     use std::sync::Mutex as StdMutex;
 
     #[test]
@@ -1941,6 +2051,98 @@ mod tests {
         ];
         for (name, actual, expected) in cases {
             assert_eq!(actual, expected, "option set for {name}");
+        }
+    }
+
+    /// `secs` seconds of 50 ms capture chunks of digital silence, a loud
+    /// square wave (speech to the RMS test) from `speech_at` seconds on.
+    fn capture_chunks(secs: usize, speech_at: Option<usize>) -> Vec<Vec<i16>> {
+        let loud: Vec<i16> = (0..800)
+            .map(|i| if i % 2 == 0 { 8_000 } else { -8_000 })
+            .collect();
+        (0..secs * 20)
+            .map(|c| match speech_at {
+                Some(at) if c >= at * 20 => loud.clone(),
+                _ => vec![0; 800],
+            })
+            .collect()
+    }
+
+    /// The chunks the no-speech timeout fires on, fed as the capture loops
+    /// feed it (the auto-stop detector first).
+    fn no_speech_fires(vad: Vad, silence_timeout_ms: u64, chunks: &[Vec<i16>]) -> Vec<usize> {
+        let mut auto_stop =
+            AutoStopDetector::with_vad(VadConfig::close(vad), silence_timeout_ms, SAMPLE_RATE);
+        let mut no_speech = NoSpeechTimeout::new(silence_timeout_ms);
+        (0..chunks.len())
+            .filter(|&c| {
+                auto_stop.feed(&chunks[c]);
+                no_speech.feed(chunks[c].len(), auto_stop.has_speech())
+            })
+            .collect()
+    }
+
+    /// Nothing heard: it fires once, on the chunk that completes 10 s (the
+    /// 200th), with either detector.
+    #[test]
+    fn no_speech_timeout_fires_at_10_s_with_no_speech() {
+        for vad in [Vad::Earshot, Vad::Rms] {
+            assert_eq!(
+                no_speech_fires(vad, 2000, &capture_chunks(30, None)),
+                [199],
+                "{vad:?}"
+            );
+        }
+        let mut timeout = NoSpeechTimeout::new(2000);
+        assert!(!timeout.feed(159_999, false));
+        assert!(timeout.feed(1, false));
+        assert!(!timeout.feed(800, false), "once");
+    }
+
+    /// Speech heard at 9 s: it never fires, however long the silence after.
+    #[test]
+    fn no_speech_timeout_never_fires_once_speech_was_heard() {
+        let mut chunks = capture_chunks(9, None);
+        chunks.extend(capture_chunks(1, Some(0)));
+        chunks.extend(capture_chunks(30, None));
+        assert_eq!(
+            no_speech_fires(Vad::Rms, 2000, &chunks),
+            Vec::<usize>::new()
+        );
+
+        let mut timeout = NoSpeechTimeout::new(2000);
+        assert!(!timeout.feed(9 * 16_000, false));
+        assert!(!timeout.feed(800, true));
+        assert!(!timeout.feed(30 * 16_000, false));
+    }
+
+    /// `silence_timeout_ms = 0` turns auto-stop off, and this with it.
+    #[test]
+    fn no_speech_timeout_is_off_with_auto_stop_off() {
+        for vad in [Vad::Earshot, Vad::Rms] {
+            assert!(no_speech_fires(vad, 0, &capture_chunks(60, None)).is_empty());
+        }
+    }
+
+    #[test]
+    fn nothing_heard_message_per_origin() {
+        let cases = [
+            (BatchOrigin::Dictation, "Stopped: nothing heard for 10 s"),
+            (
+                BatchOrigin::CommandMode,
+                "Command mode: nothing heard for 10 s, stopped",
+            ),
+            (
+                BatchOrigin::LlmCommand { name: "proofread" },
+                "Stopped: nothing heard for 10 s",
+            ),
+            (
+                BatchOrigin::Agent { name: "jarvis" },
+                "Agent 'jarvis': nothing heard for 10 s, stopped",
+            ),
+        ];
+        for (origin, expected) in cases {
+            assert_eq!(origin.nothing_heard_message(), expected, "{origin:?}");
         }
     }
 

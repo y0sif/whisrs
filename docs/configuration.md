@@ -15,7 +15,10 @@ silence_timeout_ms = 2000   # auto-stop after this much silence once you spoke: 
                             # turns on every backend. Batch dictation (groq, openai,
                             # deepgram, asr-sidecar, and local-whisper with
                             # segmentation = "none") stops on a second press.
-                            # 0 = off (stop with a second press)
+                            # If nothing is heard at all in the first 10 s, every one
+                            # of these (batch dictation too) stops and throws the
+                            # audio away: "Stopped: nothing heard for 10 s".
+                            # 0 = off, both (stop with a second press)
 notify = true               # desktop notifications
 history = true              # save dictations to ~/.local/share/whisrs/history.jsonl for
                             # `whisrs log`. false stops new writes only: existing
@@ -1306,7 +1309,7 @@ PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matc
 
 `[audio] vad` decides what counts as speech: when auto-stop fires, whether a batch dictation, command or agent turn is worth sending, where local-whisper cuts a dictation into phrases, where a recording is cut into phrases for a backend that returns no timestamps, and where a recording track holds speech. Levels are in dBFS, decibels relative to full scale: 0 is the loudest a sample can be, and a normal speaking voice near the mic sits around -40.
 
-- `"earshot"` (the default): a small learned voice activity detector that scores every 16 ms of audio. A steady fan or hum does not count as speech, and a quiet voice still does. During dictation, command mode, `[[llm_commands]]` and agent turns, a voice far under yours (a TV, a colleague behind you) does not count either, unless it is louder than about -50 dBFS, the level `"rms"` calls speech. With a loud mic (your speech above about -32 dBFS), a TV in the room can still count. A recording counts every voice.
+- `"earshot"` (the default): a small learned voice activity detector that scores every 16 ms of audio. A steady fan or hum does not count as speech, and a quiet voice still does. A soft voice the model is unsure of counts too when it stands clearly above the room's background (measured with the low rumble turned down), so soft talk arms auto-stop and is sent from a recording; a key click or a noise switching on does not. During dictation, command mode, `[[llm_commands]]` and agent turns, a voice far under yours (a TV, a colleague behind you) does not count either, unless it is louder than about -50 dBFS, the level `"rms"` calls speech. With a loud mic (your speech above about -32 dBFS), a TV in the room can still count. A recording counts every voice.
 - `"rms"`: the loudness test of whisrs 0.1.31 (a block is speech when it is louder than about -50 dBFS). Use it if the model handles your mic badly. In a noisy room it may never auto-stop.
 
 An unknown value warns at startup and uses `"earshot"`. Restart the daemon after a change.
@@ -1813,7 +1816,7 @@ removal: the speech level, the background level, the SNR (how far the speech
 is above the background), the share of clipped samples and any DC offset (a
 constant shift some mics add to the signal). On the mic, the speech level,
 the background and the SNR count only your own speech, as above; when the
-speakers played and left under 30 seconds of it, the speech level and the SNR
+speakers played and left under 10 seconds of it, the speech level and the SNR
 are not measured, rather than measured on the echo. A recording measured
 after the fact (recovered after a crash, or a retry of one made before
 whisrs 0.2.0) is measured from its WAV, echo included. `recording.json` keeps

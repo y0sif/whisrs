@@ -21,7 +21,15 @@ sits around -40):
    a one-frame click never starts it;
 4. once in speech, frames at or above the release score keep it;
 5. speech ends only after 96 ms under the release score, which bridges the dips
-   inside words.
+   inside words;
+6. a frame that stands 6 dB or more over the background (the quietest frame of
+   the last 240 ms of sound, both measured after a pre-emphasis that turns down
+   a mic's rumble), as the frame before it did, needs only the soft threshold
+   (0.25) in 3 and 4. earshot scores a soft voice 0.2 to 0.5, under 0.55, while
+   steady noise never stands that clear and a key click never does twice in a
+   row. Speech voiced only that way counts half toward arming auto-stop and
+   passing the gate, so a noise switching on (clear of the background for at
+   most 240 ms) cannot arm it.
 
 Feed it chunks of any size; it calls back once per completed frame.
 
@@ -78,8 +86,9 @@ loop {
 detector.reset(); // ready for next utterance
 ```
 
-It arms once 160 ms of speech was accepted in total, so a short noise onset
-cannot arm it while a lone "yes" does. `AutoStopDetector::new(threshold, ..)`
+It arms once 160 ms of speech was accepted in total (320 ms if accepted only
+through the soft threshold), so a short noise onset cannot arm it while a lone
+"yes" or soft talk does. `AutoStopDetector::new(threshold, ..)`
 keeps the 0.1 RMS rule.
 
 ## Batch gate

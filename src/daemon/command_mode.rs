@@ -18,8 +18,8 @@ use crate::injection::{
 };
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
-    describe_levels, format_api_error, format_no_microphone_error, save_history_entry,
-    transcribe_batch_audio, BatchOptions,
+    describe_levels, format_api_error, format_no_microphone_error, report_nothing_heard,
+    save_history_entry, transcribe_batch_audio, BatchOptions, BatchOrigin, NoSpeechTimeout,
 };
 #[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
@@ -89,13 +89,25 @@ pub(crate) fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Optio
     ctx.take()
 }
 
-/// Collect a recorded instruction until the silence auto-stop fires or the
-/// audio channel closes (a manual stop, a cancel, or a vanished device). On
-/// auto-stop the capture is stopped here. `label` names the flow in the log.
+/// A recorded instruction.
+pub(crate) struct InstructionAudio {
+    pub(crate) samples: Vec<i16>,
+    /// Stopped because nothing was heard for
+    /// [`NO_SPEECH_TIMEOUT`](crate::pipeline::NO_SPEECH_TIMEOUT): the samples
+    /// are to be discarded, not transcribed.
+    pub(crate) nothing_heard: bool,
+}
+
+/// Collect a recorded instruction until the silence auto-stop fires, nothing
+/// was heard for [`NO_SPEECH_TIMEOUT`](crate::pipeline::NO_SPEECH_TIMEOUT),
+/// or the audio channel closes (a manual stop, a cancel, or a vanished
+/// device). On either stop the capture is stopped here. `label` names the
+/// flow in the log.
 ///
 /// Auto-stop decides speech with `[audio] vad` (the close profile: one user
-/// near the mic). `silence_timeout_ms = 0` never fires (#178), so the
-/// instruction records until the channel closes.
+/// near the mic). `silence_timeout_ms = 0` never fires (#178) and turns the
+/// no-speech timeout off too, so the instruction records until the channel
+/// closes.
 ///
 /// Shared by command mode, `[[llm_commands]]` and agent voice turns, which
 /// all record a whole instruction before transcribing it.
@@ -104,19 +116,27 @@ pub(crate) async fn collect_instruction_audio(
     daemon_state: &Mutex<DaemonState>,
     context: &DaemonContext,
     label: &str,
-) -> Vec<i16> {
+) -> InstructionAudio {
     let silence_timeout = context.config.general.silence_timeout_ms;
     let mut auto_stop = AutoStopDetector::with_vad(
         VadConfig::close(context.config.audio.vad()),
         silence_timeout,
         SAMPLE_RATE,
     );
+    let mut no_speech = NoSpeechTimeout::new(silence_timeout);
     let mut all_samples: Vec<i16> = Vec::new();
+    let mut nothing_heard = false;
     if let Some(mut rx) = audio_rx {
         while let Some(chunk) = rx.recv().await {
             all_samples.extend_from_slice(&chunk);
-            if auto_stop.feed(&chunk) {
-                info!("{label}: silence auto-stop");
+            let silence_reached = auto_stop.feed(&chunk);
+            nothing_heard = no_speech.feed(chunk.len(), auto_stop.has_speech());
+            if silence_reached || nothing_heard {
+                if nothing_heard {
+                    info!("{label}: nothing heard, stopping");
+                } else {
+                    info!("{label}: silence auto-stop");
+                }
                 let mut ds = daemon_state.lock().await;
                 if let Some(mut capture) = ds.audio_capture.take() {
                     capture.stop();
@@ -127,7 +147,10 @@ pub(crate) async fn collect_instruction_audio(
         }
     }
     info!("{label} audio: {}", describe_levels(&auto_stop.levels()));
-    all_samples
+    InstructionAudio {
+        samples: all_samples,
+        nothing_heard,
+    }
 }
 
 /// The claim block of [`command_mode_background`]: claim the session via
@@ -349,9 +372,9 @@ async fn command_mode_background(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) {
-    // Collect audio until silence auto-stop or channel close (manual stop).
-    let all_samples =
-        collect_instruction_audio(audio_rx, &daemon_state, &context, "command mode").await;
+    // Collect audio until silence auto-stop, nothing heard, or channel
+    // close (manual stop).
+    let audio = collect_instruction_audio(audio_rx, &daemon_state, &context, "command mode").await;
 
     // Claim the session context and enter Transcribing. `handle_cancel`
     // takes the context under this same lock, so whoever locks first wins:
@@ -375,8 +398,10 @@ async fn command_mode_background(
         return;
     };
 
-    if let Err(e) =
-        command_mode_background_inner(&all_samples, cmd_ctx, recording_started_at, &context).await
+    if audio.nothing_heard {
+        report_nothing_heard(&context, &BatchOrigin::CommandMode);
+    } else if let Err(e) =
+        command_mode_background_inner(&audio.samples, cmd_ctx, recording_started_at, &context).await
     {
         let friendly = format_api_error(&e);
         error!("command mode: {e:#}");
@@ -851,8 +876,7 @@ async fn llm_command_background(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) {
-    let all_samples =
-        collect_instruction_audio(audio_rx, &daemon_state, &context, "llm-command").await;
+    let audio = collect_instruction_audio(audio_rx, &daemon_state, &context, "llm-command").await;
 
     // Claim the session context and enter Transcribing. `handle_cancel`
     // takes the context under this same lock, so whoever locks first wins:
@@ -877,8 +901,10 @@ async fn llm_command_background(
     };
 
     let name = cmd_ctx.name.clone();
-    if let Err(e) = llm_command_background_inner(
-        &all_samples,
+    if audio.nothing_heard {
+        report_nothing_heard(&context, &BatchOrigin::LlmCommand { name: &name });
+    } else if let Err(e) = llm_command_background_inner(
+        &audio.samples,
         cmd_ctx,
         window_id,
         recording_started_at,
@@ -1517,7 +1543,7 @@ mod tests {
 
     /// Collect 1 s of a loud square wave (speech to the RMS test) and then
     /// 10 s of digital silence, in 50 ms chunks, then close the channel.
-    async fn collect(toml_text: &str) -> usize {
+    async fn collect(toml_text: &str) -> (usize, bool) {
         let context = instruction_context(toml_text);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let loud: Vec<i16> = (0..800)
@@ -1531,9 +1557,8 @@ mod tests {
         }
         drop(tx);
         let daemon_state = Mutex::new(DaemonState::new());
-        collect_instruction_audio(Some(rx), &daemon_state, &context, "test")
-            .await
-            .len()
+        let audio = collect_instruction_audio(Some(rx), &daemon_state, &context, "test").await;
+        (audio.samples.len(), audio.nothing_heard)
     }
 
     /// Command mode, `[[llm_commands]]` and agent turns auto-stop by
@@ -1545,13 +1570,15 @@ mod tests {
         let rms = "[audio]\nvad = \"rms\"\n[general]\n";
         // 2 s of silence after the speech: stopped on the chunk reaching it.
         let stopped = collect(&format!("{rms}silence_timeout_ms = 2000\n")).await;
-        assert_eq!(stopped, 60 * 800);
-        // Off: everything up to the close.
+        assert_eq!(stopped, (60 * 800, false));
+        // Off: everything up to the close, the no-speech timeout too.
         let all = collect(&format!("{rms}silence_timeout_ms = 0\n")).await;
-        assert_eq!(all, 220 * 800);
+        assert_eq!(all, (220 * 800, false));
         // The default detector never calls a square wave speech, so it
-        // never arms and records to the close too.
+        // never arms: nothing heard, stopped at 10 s.
         let earshot = collect("[general]\nsilence_timeout_ms = 2000\n").await;
-        assert_eq!(earshot, 220 * 800);
+        assert_eq!(earshot, (200 * 800, true));
+        let off = collect("[general]\nsilence_timeout_ms = 0\n").await;
+        assert_eq!(off, (220 * 800, false));
     }
 }

@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::audio::capture::SAMPLE_RATE;
-use crate::audio::quality::{Check, QualityMeter, QualityReport, Verdict, OWN_SPEECH_FOR_LEVEL};
+use crate::audio::quality::{Check, QualityMeter, QualityReport, Verdict};
 use crate::audio::AudioChunk;
 
 /// Loudest sample of a chunk that is still digital silence: a muted mic,
@@ -78,7 +78,7 @@ pub const LIVE_CHECK_EVERY: Duration = Duration::from_secs(30);
 /// Speech the mic must have heard before the live checks start (30 s): less
 /// is too little to judge a mic or a room by. The speech level and the room
 /// count only the user's own speech ([`SystemSignal::playing`]).
-pub const LIVE_SPEECH_BEFORE: Duration = OWN_SPEECH_FOR_LEVEL;
+pub const LIVE_SPEECH_BEFORE: Duration = Duration::from_secs(30);
 
 /// Mic speech after which a system track that has sent only digital silence
 /// is warned about (2 minutes).
@@ -860,24 +860,33 @@ mod tests {
         assert!(report.warnings().iter().any(|v| v.check == Check::TooQuiet));
     }
 
-    /// Too little of the user's own speech for a stored verdict once the
-    /// speakers played: none, rather than one from 10 s. Without a system
-    /// track the same 10 s still gives one, as before.
+    /// Once the speakers played, a stored verdict needs 10 s of the user's
+    /// own speech: none from 8 s, one from 12 s, while the live checks,
+    /// which wait for 30 s of it, say nothing. Without a system track 8 s
+    /// gives one, as before.
     #[test]
-    fn a_stored_level_needs_30_seconds_of_own_speech() {
-        let system = Arc::new(SystemSignal::new());
-        let mut live = LiveQuality::new(quiet_meter(), Arc::clone(&system));
-        assert!(raised(&mut live, &quiet_voice(20)).is_empty());
-        assert!(raised_while_playing(&mut live, &system, &quiet_voice(10)).is_empty());
-        let report = live.report();
+    fn a_stored_level_needs_10_seconds_of_own_speech() {
+        // `own` seconds of the user's speech (the voice speaks half the
+        // time), then 10 s of audio while the speakers play.
+        let stored = |own: usize| {
+            let system = Arc::new(SystemSignal::new());
+            let mut live = LiveQuality::new(quiet_meter(), Arc::clone(&system));
+            assert!(raised(&mut live, &quiet_voice(2 * own)).is_empty());
+            assert!(raised_while_playing(&mut live, &system, &quiet_voice(10)).is_empty());
+            live.report()
+        };
+        let report = stored(8);
         assert_eq!(report.levels.speech_dbfs, None);
         assert!(report.levels.noise_dbfs.is_some(), "the room is measured");
         assert!(report.warnings().is_empty());
 
+        let codes: Vec<&str> = stored(12).warnings().iter().map(|v| v.code()).collect();
+        assert_eq!(codes, ["too-quiet"]);
+
         let none = Arc::new(SystemSignal::new());
         none.no_system_track();
         let mut live = LiveQuality::new(quiet_meter(), none);
-        assert!(raised(&mut live, &quiet_voice(20)).is_empty());
+        assert!(raised(&mut live, &quiet_voice(16)).is_empty());
         let codes: Vec<&str> = live.report().warnings().iter().map(|v| v.code()).collect();
         assert_eq!(codes, ["too-quiet"]);
     }

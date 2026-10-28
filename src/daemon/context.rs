@@ -62,6 +62,10 @@ pub(crate) struct DaemonState {
     /// phrase). Setting this flag makes the typing loop discard everything
     /// instead, so `cancel` never types text. Created per recording.
     pub(crate) streaming_cancel: Option<Arc<AtomicBool>>,
+    /// Batch dictation's audio, collected on its own task (which also stops
+    /// a capture that hears nothing, `pipeline::NO_SPEECH_TIMEOUT`); the
+    /// stop press stops the capture and awaits it for the samples.
+    pub(crate) batch_audio: Option<tokio::task::JoinHandle<Vec<i16>>>,
     /// When recording started (for duration tracking).
     pub(crate) recording_started_at: Option<std::time::Instant>,
     /// The language for the active dictation session, resolved at the
@@ -113,6 +117,7 @@ impl DaemonState {
             recording_window_id: None,
             streaming_task: None,
             streaming_cancel: None,
+            batch_audio: None,
             recording_started_at: None,
             session_language: None,
             command_mode: None,

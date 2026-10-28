@@ -226,8 +226,10 @@ impl AutoStopDetector {
     /// counts the samples since the last speech frame of a
     /// [`SpeechDetector`] and fires when that count reaches the timeout,
     /// once armed: [`has_speech`](Self::has_speech) turns true after 160 ms
-    /// of accepted speech in total, so a short noise onset cannot arm it
-    /// while a lone "yes" does. A `timeout_ms` of 0 never fires.
+    /// of accepted speech in total (a frame accepted only through
+    /// [`VadConfig::soft_threshold`] counting half), so a short noise onset
+    /// cannot arm it while a lone "yes" or soft talk does. A `timeout_ms` of
+    /// 0 never fires.
     pub fn with_vad(cfg: VadConfig, timeout_ms: u64, sample_rate: u32) -> Self {
         if cfg.vad == Vad::Rms || sample_rate != VAD_SAMPLE_RATE {
             return Self::new(cfg.rms_threshold, timeout_ms, sample_rate);
@@ -289,7 +291,8 @@ impl AutoStopDetector {
                         *silent_samples += frame_len;
                     }
                     if step.voiced {
-                        *voiced_samples += frame_len;
+                        // A soft frame counts half (see `Step::soft`).
+                        *voiced_samples += if step.soft { frame_len / 2 } else { frame_len };
                         *armed |= *voiced_samples >= arm_at;
                     }
                     fired = Some(fired == Some(true) || reached(*armed, *silent_samples));
@@ -327,7 +330,8 @@ impl AutoStopDetector {
     }
 
     /// Whether any speech has been detected since creation or last reset
-    /// (with earshot: 160 ms of it, which is what arms auto-stop).
+    /// (with earshot: 160 ms of it, soft frames counting half, which is what
+    /// arms auto-stop).
     pub fn has_speech(&self) -> bool {
         match &self.mode {
             StopMode::Rms {

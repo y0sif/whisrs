@@ -40,10 +40,11 @@ pub const STRONG_ECHO_DB: f32 = -15.0;
 const DIGITAL_SILENCE_DBFS: f32 = -77.3;
 
 /// Own speech a stream needs for a speech level (and so an SNR) once part of
-/// it was set aside ([`QualityMeter::feed_marked`]): 30 s, what a
-/// recording's live checks wait for too. Less is too little to judge a mic
-/// or a room by.
-pub const OWN_SPEECH_FOR_LEVEL: Duration = Duration::from_secs(30);
+/// it was set aside ([`QualityMeter::feed_marked`]): 10 s. Less is too little
+/// to judge a mic or a room by. A recording's live checks wait for 30 s of
+/// it (`recording::recorder::LIVE_SPEECH_BEFORE`), the stored whole-track
+/// figures for this.
+pub const OWN_SPEECH_FOR_LEVEL: Duration = Duration::from_secs(10);
 
 /// What a stream measured: its levels by the detector that decided what was
 /// speech, and the speaker echo path when echo removal ran on it.
@@ -633,20 +634,30 @@ mod tests {
         assert_eq!(meter.report(), alone);
     }
 
-    /// Once some audio was set aside, a speech level needs 30 s of own
+    /// Once some audio was set aside, a speech level needs 10 s of own
     /// speech; the background does not.
     #[test]
-    fn a_level_set_aside_needs_30_seconds_of_own_speech() {
-        let mut meter = QualityMeter::new(Vad::Rms);
-        // 20 s of own speech.
-        meter.feed_marked(&alternating(2500, 184, 82), true);
-        meter.feed_marked(&alternating(100, 3000, 1500), false);
-        let report = meter.report();
+    fn a_level_set_aside_needs_10_seconds_of_own_speech() {
+        let set_aside_after = |frames| {
+            let mut meter = QualityMeter::new(Vad::Rms);
+            meter.feed_marked(&alternating(frames, 184, 82), true);
+            meter.feed_marked(&alternating(100, 3000, 1500), false);
+            meter.report()
+        };
+        // 8 s of own speech.
+        let report = set_aside_after(1000);
         assert_eq!(report.levels.speech_dbfs, None);
         assert_eq!(report.levels.snr_db, None);
         assert!(report.levels.noise_dbfs.is_some());
         assert_eq!(verdict(&report, Check::TooQuiet), None);
         assert_eq!(verdict(&report, Check::Noisy), None);
+
+        // 12 s: measured on the own speech alone (-45 dBFS, 7 dB over the
+        // room), not on the louder audio set aside.
+        let report = set_aside_after(1500);
+        let speech = report.levels.speech_dbfs.unwrap();
+        assert!((speech + 45.0).abs() < 0.5, "{speech}");
+        assert!(verdict(&report, Check::Noisy).unwrap().warn);
     }
 
     #[test]

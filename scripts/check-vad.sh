@@ -10,12 +10,19 @@
 #   pink, brown at +10/+5/0  noise-only frames flagged <= 2%; auto-stop
 #                            +1.9 to +2.6 s in each of 6 noise draws
 #   pink switching on at 1 s auto-stop not armed before the speech, never early
+#                            (from digital silence, and from pink at -60 dBFS)
 #   babble +20 dB SNR        auto-stop +1.9 to +3.0 s in each of 6 draws
 #                            (babble at +10 dB and louder is printed, not gated)
 #   lone "yes"               gate passes; auto-stop arms and fires
 #   "Oh!" +20 and +26 dB,    auto-stop never before the sentences end;
 #   then two sentences       recall of the sentences >= 0.80
 #   pink only, -40 dBFS      gate "without speech"; auto-stop never arms
+#   key clicks, -20/-30 dBFS gate "without speech"; auto-stop never arms
+#   real soft voice          only with the local fixtures/vad/real-soft.wav (the
+#                            maintainer's take, never committed; skipped without
+#                            it): recording recall of the labelled soft speech
+#                            >= 0.70 and >= 0.90 of it sent; three dictation cuts
+#                            arm and stop +1.8 to +2.6 s after the last soft word
 #   quiet, speech -70 dBFS   gate "too quiet"
 #   CPU                      earshot faster than 100x real time
 #
