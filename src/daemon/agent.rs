@@ -2762,6 +2762,23 @@ mod tests {
 
     /// [`test_context`] with `[general] notify` as given.
     fn test_context_with(names: &[&str], dir: &Path, notify: bool) -> Arc<DaemonContext> {
+        // The RMS test: the voice turns' test audio is a square wave, loud
+        // but no voice, which earshot would gate.
+        test_context_on(
+            names,
+            dir,
+            notify,
+            "[audio]\nvad = \"rms\"\n[general]\naudio_feedback = false\n",
+        )
+    }
+
+    /// [`test_context_with`] on the config `toml_text`.
+    fn test_context_on(
+        names: &[&str],
+        dir: &Path,
+        notify: bool,
+        toml_text: &str,
+    ) -> Arc<DaemonContext> {
         let mut rt = AgentRuntime::disabled();
         rt.speak = true;
         rt.agents = names.iter().map(|n| Arc::new(test_agent(n))).collect();
@@ -2774,10 +2791,7 @@ mod tests {
         );
         rt.store_path = dir.join("agents.json");
         Arc::new(DaemonContext {
-            // The RMS test: the voice turns' test audio is a square wave,
-            // loud but no voice, which earshot would gate.
-            config: toml::from_str("[audio]\nvad = \"rms\"\n[general]\naudio_feedback = false\n")
-                .unwrap(),
+            config: toml::from_str(toml_text).unwrap(),
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(UnreachableBackend),
             notify,
@@ -3026,6 +3040,47 @@ mod tests {
         assert!(g.agent_recording.is_none() && g.agent_transcribing.is_none());
         drop(g);
         // No turn was started.
+        assert!(context.agents.inner.lock().await.store.agents.is_empty());
+        drop(tx);
+    }
+
+    /// A voice turn that hears only a voice the level floors reject, then
+    /// nothing, stops 10 s after it last heard it: the toast calls it too
+    /// quiet, "I didn't catch that." is spoken, and nothing is sent.
+    #[tokio::test]
+    async fn a_voice_turn_that_hears_a_too_quiet_voice_stops_and_says_so() {
+        crate::notify::take_sent_toasts();
+        let dir = tempfile::tempdir().unwrap();
+        // earshot, the default: the RMS test has no "too quiet".
+        let context = test_context_on(
+            &["jarvis"],
+            dir.path(),
+            true,
+            "[general]\naudio_feedback = false\n",
+        );
+        let agent = Arc::clone(&context.agents.agents[0]);
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let mut g = ds.lock().await;
+            g.state_machine.transition(Action::Toggle).unwrap();
+            g.agent_recording = Some(AgentRecordingContext {
+                name: "jarvis".into(),
+                new_session: false,
+            });
+        }
+        let mut audio = crate::pipeline::tests::quiet_voice(3, -70.0);
+        audio.extend(vec![0i16; 15 * 16_000]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        for chunk in audio.chunks(800) {
+            tx.send(chunk.to_vec()).unwrap();
+        }
+        voice_turn_background(Some(rx), Arc::clone(&ds), Arc::clone(&context), agent).await;
+        assert_eq!(
+            crate::notify::take_sent_toasts(),
+            ["Agent 'jarvis': the audio was too quiet (speech at -68 dB), stopped"]
+        );
+        assert_eq!(queued(&context.agents), [DIDNT_CATCH]);
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
         assert!(context.agents.inner.lock().await.store.agents.is_empty());
         drop(tx);
     }

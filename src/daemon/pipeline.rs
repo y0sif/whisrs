@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -166,10 +166,10 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     // timeout below.
     let modifier_waits = Arc::new(ModifierWaitTracker::default());
     let sink_modifier_waits = Arc::clone(&modifier_waits);
-    // Set by the batcher on the first transcript text: a voice the backend
-    // heard, which the no-speech timeout below counts.
-    let text_heard = Arc::new(AtomicBool::new(false));
-    let batcher_heard = Arc::clone(&text_heard);
+    // Marked by the batcher before it types the first text: from then on
+    // the no-speech timeout below never fires.
+    let text_typed = Arc::new(TextLatch::default());
+    let batcher_typed = Arc::clone(&text_typed);
     let typing_task = tokio::spawn(async move {
         // Focus the original window before the first batch (only once).
         // Sequenced by the batcher awaiting each sink call, so a plain
@@ -185,7 +185,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
             text_rx,
             stream_text,
             typing_cancel,
-            batcher_heard,
+            batcher_typed,
             filler_filter,
             replacer,
             move |text_to_type| {
@@ -286,15 +286,16 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     while let Some(chunk) = audio_rx.recv().await {
         let silence_reached = auto_stop.feed(&chunk);
         // Nothing heard (`no_speech_timeout`): not a frame of voice for that
-        // long, auto-stop not armed, and no transcript text yet. Stop, and
-        // discard the session as a cancel does (the flag keeps the typing
-        // loop from typing whatever the backend still sends, and the tail
-        // below drops the transcript). A stop press that got here first owns
-        // the session.
-        let heard = Heard::by(&auto_stop).with_text(text_heard.load(Ordering::SeqCst));
+        // long, auto-stop not armed, and no text typed yet. Stop, and discard
+        // the session as a cancel does (the flag keeps the typing loop from
+        // typing whatever the backend still sends, and the tail below drops
+        // the transcript). A stop press that got here first owns the session,
+        // and text typed while this waited for the lock keeps it: the latch
+        // decides that once, against the typing loop.
+        let heard = Heard::by(&auto_stop).with_text(text_typed.is_typed());
         if no_speech.feed(chunk.len(), heard) {
             let mut ds = daemon_state.lock().await;
-            if ds.state_machine.state() == State::Recording {
+            if ds.state_machine.state() == State::Recording && text_typed.close() {
                 if let Some(flag) = &ds.streaming_cancel {
                     if Arc::ptr_eq(flag, &cancel_flag) {
                         flag.store(true, Ordering::SeqCst);
@@ -551,9 +552,11 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 /// so they hold exactly what was typed. Exits when the text channel closes or
 /// `cancel` is set.
 ///
-/// `text_heard` is set when the first delta with any text arrives: from
-/// then on the audio loop's no-speech timeout never fires
-/// ([`NoSpeechTimeout`]), since the backend heard a voice and typed it.
+/// `text_typed` is marked ([`TextLatch::mark_typed`]) before the sink types
+/// the first non-blank batch, after filler removal, `[replacements]` and
+/// sanitizing: from then on the audio loop's no-speech timeout never fires
+/// ([`NoSpeechTimeout`]). A delta those leave nothing of (a lone "um") marks
+/// nothing. When the timeout claimed the session first, nothing is typed.
 ///
 /// The cancel flag is checked when a delta arrives and again right before a
 /// batch reaches the sink, so a cancelled recording never types the text the
@@ -570,7 +573,7 @@ pub(crate) async fn run_typing_batcher<F, Fut>(
     mut text_rx: tokio::sync::mpsc::Receiver<String>,
     stream_text: StreamText,
     cancel: Arc<AtomicBool>,
-    text_heard: Arc<AtomicBool>,
+    text_typed: Arc<TextLatch>,
     filler_filter: Option<FillerFilter>,
     replacer: Option<Replacer>,
     mut sink: F,
@@ -581,17 +584,11 @@ where
 {
     let mut full_text = String::new();
     let batch_delay = std::time::Duration::from_millis(150);
-    let heard = |delta: &str| {
-        if !delta.trim().is_empty() {
-            text_heard.store(true, Ordering::SeqCst);
-        }
-    };
 
     loop {
         // Wait for the first delta (blocking).
         let first = text_rx.recv().await;
         let Some(first) = first else { break };
-        heard(&first);
 
         // Cancelled while we were waiting: discard everything from here on.
         if cancel.load(Ordering::SeqCst) {
@@ -601,7 +598,6 @@ where
         // Collect this delta and any others that arrive within the batch window.
         let mut batch = first;
         while let Ok(Some(more)) = tokio::time::timeout(batch_delay, text_rx.recv()).await {
-            heard(&more);
             if stream_text == StreamText::Phrases && needs_space_between(&batch, &more) {
                 batch.push(' ');
             }
@@ -650,6 +646,13 @@ where
         // Last gate before the sink: cancel may have arrived while this
         // batch was being collected.
         if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        // Typed text holds the no-speech timeout off for good, marked before
+        // the sink types it so the timeout never fires after a typed word.
+        // Refused once the timeout claimed the session (it sets `cancel` as
+        // well): nothing more is typed.
+        if !text_to_type.trim().is_empty() && !text_typed.mark_typed() {
             break;
         }
 
@@ -722,6 +725,44 @@ pub(crate) fn no_speech_timeout(silence_timeout_ms: u64) -> Option<Duration> {
         .then(|| NO_SPEECH_TIMEOUT.max(Duration::from_millis(silence_timeout_ms)))
 }
 
+/// Whether a streaming session has typed text, shared by its typing loop
+/// ([`run_typing_batcher`]) and its audio loop's no-speech stop. One atomic
+/// decides between them: the loop marks text typed before its sink types it,
+/// and the stop claims the session only while nothing was, so no batch is
+/// typed into a session the stop then discards, and the stop never fires
+/// after a typed word.
+#[derive(Debug, Default)]
+pub(crate) struct TextLatch(AtomicU8);
+
+impl TextLatch {
+    const OPEN: u8 = 0;
+    const TYPED: u8 = 1;
+    const CLOSED: u8 = 2;
+
+    /// The typing loop, before its sink types non-blank text: true when it
+    /// may type, false once the no-speech stop claimed the session.
+    pub(crate) fn mark_typed(&self) -> bool {
+        matches!(
+            self.0
+                .compare_exchange(Self::OPEN, Self::TYPED, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(_) | Err(Self::TYPED)
+        )
+    }
+
+    /// Text was typed (or is being typed): the no-speech stop is off.
+    pub(crate) fn is_typed(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == Self::TYPED
+    }
+
+    /// The no-speech stop, under the daemon lock: true when it may discard
+    /// the session, nothing having been typed, and from then on nothing is.
+    pub(crate) fn close(&self) -> bool {
+        self.0
+            .compare_exchange(Self::OPEN, Self::CLOSED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+}
+
 /// What a capture has heard by the end of the samples fed to
 /// [`NoSpeechTimeout::feed`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -732,7 +773,7 @@ pub(crate) struct Heard {
     pub(crate) last: Option<HeardFrame>,
     /// Auto-stop armed: from then on it, not this, ends the capture.
     pub(crate) armed: bool,
-    /// Transcript text reached the typing loop (streaming only).
+    /// Transcript text was typed (streaming only, [`TextLatch::is_typed`]).
     pub(crate) text: bool,
 }
 
@@ -772,11 +813,11 @@ fn seconds_at(at: u64) -> f64 {
 /// heard a voice in ([`AutoStopDetector::heard_voice`]: any frame it calls
 /// speech before its level floors and the count that arms auto-stop, so a
 /// voice too quiet to arm it counts, and under `[audio] vad = "rms"` any
-/// 16 ms over -50.5 dBFS). A noise switching on or a key click can count as
-/// heard too; it only starts the wait again. The timeout never fires once
-/// auto-stop armed, nor once the first transcript text arrived (streaming):
-/// typed text keeps the session to the stop press or to auto-stop. Each
-/// capture logs the first thing it heard, once.
+/// 16 ms over -50.5 dBFS). A sound switching on (a fan, dishes, a knock) can
+/// count as heard too; it only starts the wait again. The timeout never fires
+/// once auto-stop armed, nor once transcript text is typed (streaming,
+/// [`TextLatch`]): typed text keeps the session to the stop press or to
+/// auto-stop. Each capture logs the first thing it heard, once.
 pub(crate) struct NoSpeechTimeout {
     /// Samples after which it fires; `None` when off.
     limit: Option<u64>,
@@ -1805,7 +1846,7 @@ fn needs_space_between(before: &str, next: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use audio_silence_gate::Vad;
     use std::sync::Mutex as StdMutex;
@@ -2012,7 +2053,7 @@ mod tests {
             text_rx,
             stream_text,
             Arc::clone(&cancel),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(TextLatch::default()),
             None,
             None,
             move |text| {
@@ -2098,6 +2139,44 @@ mod tests {
 
     /// `[replacements]` reach the streaming path: the sink, and so the
     /// clipboard copy and history, get the replaced text.
+    /// The batcher marks text typed only for a batch it hands to the sink,
+    /// after filler removal: a lone "um" marks nothing, "hello" does. Once
+    /// the no-speech stop closed the latch, nothing is typed.
+    #[tokio::test]
+    async fn typing_batcher_marks_only_typed_text() {
+        let run = |latch: Arc<TextLatch>, deltas: &'static [&'static str]| async move {
+            let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
+            let batcher = tokio::spawn(run_typing_batcher(
+                text_rx,
+                StreamText::Phrases,
+                Arc::new(AtomicBool::new(false)),
+                Arc::clone(&latch),
+                Some(FillerFilter::new::<&str>(&[]).unwrap()),
+                None,
+                |text| async move { text },
+            ));
+            for delta in deltas {
+                text_tx.send(delta.to_string()).await.unwrap();
+            }
+            drop(text_tx);
+            batcher.await.unwrap()
+        };
+        let latch = Arc::new(TextLatch::default());
+        assert_eq!(run(Arc::clone(&latch), &["um"]).await, "");
+        assert!(!latch.is_typed(), "a filler alone is not typed text");
+        assert!(latch.close(), "the stop may still claim the session");
+
+        let latch = Arc::new(TextLatch::default());
+        assert_eq!(run(Arc::clone(&latch), &["um", "hello"]).await, "hello");
+        assert!(latch.is_typed());
+        assert!(!latch.close(), "typed text holds the stop off");
+
+        let latch = Arc::new(TextLatch::default());
+        assert!(latch.close());
+        assert_eq!(run(Arc::clone(&latch), &["hello"]).await, "");
+        assert!(!latch.is_typed());
+    }
+
     #[tokio::test]
     async fn typing_batcher_applies_replacements() {
         let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -2107,7 +2186,7 @@ mod tests {
             text_rx,
             StreamText::Phrases,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(TextLatch::default()),
             None,
             replacer,
             |text| async move { text },
@@ -2195,7 +2274,7 @@ mod tests {
             text_rx,
             StreamText::Phrases,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(TextLatch::default()),
             None,
             None,
             move |text| {
@@ -2313,7 +2392,7 @@ mod tests {
     /// full level between ramps. earshot hears this one under close's
     /// -65 dBFS floor: at -70 dBFS the gate calls it too quiet, its voiced
     /// frames at -68 dBFS (too quiet from -68 to -73 dBFS, never armed).
-    fn quiet_voice(secs: usize, dbfs: f64) -> Vec<i16> {
+    pub(crate) fn quiet_voice(secs: usize, dbfs: f64) -> Vec<i16> {
         formant_voice(secs, dbfs, 5, 0.2, 0.15)
     }
 
@@ -2438,15 +2517,15 @@ mod tests {
         noise.iter().map(|x| (x * gain).round() as i16).collect()
     }
 
-    /// `secs` s of digital silence with a click at each of `at` (seconds):
+    /// `secs` s of digital silence with a knock at each of `at` (seconds):
     /// 32 ms at -49.4 dBFS, inside one 50 ms chunk. The RMS test hears a
     /// 16 ms frame of it, while the chunk stays under the threshold, so
-    /// auto-stop never arms: a key press, or a knock on the desk.
-    fn clicks(secs: usize, at: &[f64]) -> Vec<Vec<i16>> {
+    /// auto-stop never arms: a knock on the desk, or a door.
+    fn knocks(secs: usize, at: &[f64]) -> Vec<Vec<i16>> {
         let mut samples = vec![0i16; secs * SAMPLE_RATE as usize];
         for &t in at {
             let start = (t * f64::from(SAMPLE_RATE)) as usize;
-            assert_eq!(start % 800, 0, "a click starts a chunk");
+            assert_eq!(start % 800, 0, "a knock starts a chunk");
             for (i, s) in samples[start..start + 512].iter_mut().enumerate() {
                 *s = if i % 2 == 0 { 111 } else { -111 };
             }
@@ -2474,7 +2553,7 @@ mod tests {
         assert!(!timeout.feed(800, NOTHING), "once");
     }
 
-    /// Every heard frame starts the wait again: clicks at 0.2, 4 and 8 s,
+    /// Every heard frame starts the wait again: knocks at 0.2, 4 and 8 s,
     /// each heard and none arming, stop the session 10 s after the last
     /// one (its frame ends at 8.03 s), on the chunk that completes 18.05 s.
     /// Heard as a latch, the rule before, they kept it recording to the
@@ -2482,11 +2561,11 @@ mod tests {
     #[test]
     fn heard_sounds_slide_the_no_speech_timeout() {
         assert_eq!(
-            no_speech_fires(Vad::Rms, 2000, &clicks(30, &[0.2, 4.0, 8.0])),
+            no_speech_fires(Vad::Rms, 2000, &knocks(30, &[0.2, 4.0, 8.0])),
             [360]
         );
-        // One click at 4 s: 14.05 s.
-        assert_eq!(no_speech_fires(Vad::Rms, 2000, &clicks(30, &[4.0])), [280]);
+        // One knock at 4 s: 14.05 s.
+        assert_eq!(no_speech_fires(Vad::Rms, 2000, &knocks(30, &[4.0])), [280]);
 
         // Counted from the end of the latest heard frame.
         let mut timeout = NoSpeechTimeout::new(2000, "test");
@@ -2821,6 +2900,35 @@ mod tests {
         samples: &[i16],
         end: End,
     ) -> StreamingRun {
+        streaming_run_with(
+            text_after,
+            silence_timeout_ms,
+            samples,
+            end,
+            RunOpts::default(),
+        )
+        .await
+    }
+
+    /// What else a [`streaming_run_with`] does.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct RunOpts {
+        /// Filler removal on (the default list).
+        filler: bool,
+        /// Hold the daemon-state lock over sending this chunk (index) and
+        /// 300 ms after it: a no-speech stop it completes waits for the lock
+        /// while the typing loop goes on.
+        hold_lock_at: Option<usize>,
+    }
+
+    /// [`streaming_run`] with `opts`.
+    async fn streaming_run_with(
+        text_after: Option<(usize, &'static str)>,
+        silence_timeout_ms: u64,
+        samples: &[i16],
+        end: End,
+        opts: RunOpts,
+    ) -> StreamingRun {
         if end == End::Stop {
             assert!(
                 text_after.is_none(),
@@ -2853,7 +2961,7 @@ mod tests {
             notify: true,
             overlay_enabled: false,
             silence_timeout_ms,
-            filler_enabled: false,
+            filler_enabled: opts.filler,
             filler_words: Vec::new(),
             replacements: Default::default(),
             audio_feedback: true,
@@ -2867,7 +2975,14 @@ mod tests {
         }));
         let mut stopped = None;
         for (c, chunk) in samples.chunks(800).enumerate() {
-            tx.send(chunk.to_vec()).unwrap();
+            if opts.hold_lock_at == Some(c) {
+                let held = daemon_state.lock().await;
+                tx.send(chunk.to_vec()).unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                drop(held);
+            } else {
+                tx.send(chunk.to_vec()).unwrap();
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
             let state = daemon_state.lock().await.state_machine.state();
             if state != State::Recording {
@@ -2932,6 +3047,59 @@ mod tests {
         // Without it, the same session stops at 10 s.
         let run = streaming_run(Some((200_000, "hello")), 2000, &silence(15), End::Cancel).await;
         assert_eq!(run.stopped, Some((200, State::Transcribing)), "{run:?}");
+    }
+
+    /// Only text that is typed counts: a lone "um" at 9.5 s, which filler
+    /// removal leaves nothing of, keeps nothing on, and the session stops
+    /// at 10 s as if no text had come. "hello" there keeps it recording.
+    #[tokio::test(start_paused = true)]
+    async fn a_delta_filler_removal_empties_does_not_hold_the_timeout_off() {
+        let filler = RunOpts {
+            filler: true,
+            ..RunOpts::default()
+        };
+        let run = streaming_run_with(
+            Some((152_000, "um")),
+            2000,
+            &silence(15),
+            End::Cancel,
+            filler,
+        )
+        .await;
+        assert_eq!(run.stopped, Some((200, State::Transcribing)), "{run:?}");
+        assert_eq!(run.toasts, ["Stopped: nothing heard for 10 s"]);
+        let run = streaming_run_with(
+            Some((152_000, "hello")),
+            2000,
+            &silence(15),
+            End::Cancel,
+            filler,
+        )
+        .await;
+        assert_eq!(run.stopped, None, "{run:?}");
+    }
+
+    /// Text typed while the no-speech stop waits for the daemon-state lock
+    /// keeps the session: the stop completes on the 200th chunk, but the
+    /// lock is held while the typing loop types "hello" (sent after the
+    /// 199th), and under it the stop finds the text typed. It never
+    /// discards a typed word.
+    #[tokio::test(start_paused = true)]
+    async fn text_typed_while_the_stop_waits_for_the_lock_keeps_the_session() {
+        let held = RunOpts {
+            hold_lock_at: Some(199),
+            ..RunOpts::default()
+        };
+        let run = streaming_run_with(
+            Some((159_200, "hello")),
+            2000,
+            &silence(15),
+            End::Cancel,
+            held,
+        )
+        .await;
+        assert_eq!(run.stopped, None, "{run:?}");
+        assert!(run.toasts.is_empty(), "{:?}", run.toasts);
     }
 
     /// `silence_timeout_ms = 20000`: the session hears nothing for 20 s

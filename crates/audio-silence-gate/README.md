@@ -95,12 +95,13 @@ through the soft threshold, within one run of speech), so a short noise onset
 cannot arm it while a lone "yes" or soft talk does. `heard_voice()` turns true
 earlier, on the first frame the detector calls speech before the level floors
 and that count: a sign that someone spoke even when the voice is too quiet to
-arm it, though a noise switching on or a key click can turn it true too.
-`first_heard()` and `last_heard()` give the first and the latest such frame
-(`HeardFrame`: where it starts, its score and level, and whether only the soft
-threshold voiced it). whisrs stops a capture once 10 s pass after the latest
-one (or after the start, with none) before auto-stop arms, so a click only
-delays that stop while a voice that goes on is never cut off.
+arm it, though a noise switching on (a fan, dishes, a knock) can turn it true
+too. `first_heard()` and `last_heard()` give the first and the latest such
+frame (`HeardFrame`: where it starts, its score and level, and whether only
+the soft threshold voiced it). whisrs stops a capture once 10 s pass after the
+latest one (or after the start, with none) before auto-stop arms, so such a
+noise only delays that stop, and a voice it keeps hearing at least every 10 s
+is never cut off.
 `AutoStopDetector::new(threshold, ..)` keeps the 0.1 RMS rule.
 
 ## Batch gate

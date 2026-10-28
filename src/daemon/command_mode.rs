@@ -1600,4 +1600,32 @@ mod tests {
         let off = collect("[general]\nsilence_timeout_ms = 0\n").await;
         assert_eq!(off, (220 * 800, false));
     }
+
+    /// A voice the level floors reject for 3 s, then nothing: the
+    /// instruction stops 10 s after the voice was last heard (past the 10 s
+    /// a capture that heard nothing gets), to be discarded, and names it too
+    /// quiet for the toast. Command mode, `[[llm_commands]]` and agent turns
+    /// all collect this way.
+    #[tokio::test]
+    async fn an_instruction_that_heard_a_too_quiet_voice_says_so() {
+        let context = instruction_context("");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut audio = crate::pipeline::tests::quiet_voice(3, -70.0);
+        audio.extend(vec![0i16; 12 * 16_000]);
+        for chunk in audio.chunks(800) {
+            tx.send(chunk.to_vec()).unwrap();
+        }
+        drop(tx);
+        let daemon_state = Mutex::new(DaemonState::new());
+        let audio = collect_instruction_audio(Some(rx), &daemon_state, &context, "test").await;
+        assert!(audio.nothing_heard);
+        let secs = audio.samples.len() as f64 / 16_000.0;
+        assert!(secs > 10.0 && secs <= 13.1, "stopped at {secs:.2} s");
+        let levels = audio.too_quiet.expect("too quiet");
+        assert_eq!(
+            BatchOrigin::CommandMode
+                .nothing_heard_message(std::time::Duration::from_secs(10), Some(&levels)),
+            "Command mode: the audio was too quiet (speech at -68 dB), stopped"
+        );
+    }
 }

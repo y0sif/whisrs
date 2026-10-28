@@ -439,11 +439,15 @@ the start or from the end of the latest heard frame (`AutoStopDetector::last_hea
 is not armed, with the origin's skip-toast wording and rule ("Stopped: nothing heard for 10 s",
 `report_nothing_heard`). Heard is the earliest sign of a voice, never auto-stop's arming:
 `AutoStopDetector::heard_voice` (any frame voiced before the level floors and the arming count, so a
-voice too quiet to arm counts; under `rms` any 16 ms over -50.5 dBFS). A key click, a knock or a noise
-switching on counts too (40 of 102 clips of `check-vad.sh`'s noise-burst row are heard), but only
-starts the wait again: the row asserts every clip stops within 10 s of its last burst (17.2 s at the
-latest). On the streaming path the first transcript text reaching `run_typing_batcher` (`text_heard`)
-turns the stop off for good: once text is typed, only auto-stop or the press ends the session. Each
+voice too quiet to arm counts; under `rms` any 16 ms over -50.5 dBFS). A sound switching on (a fan,
+dishes, a knock) counts too: 40 of 102 clips of `check-vad.sh`'s noise-burst row are heard, and so were
+20 of 24 placements of real room sounds from his recordings in the 2026-10-28 diagnosis (DESIGN.md);
+check-vad's synthetic key clicks are not. It only starts the wait again: the burst row asserts every
+clip stops within 10 s of its last burst (17.2 s at the latest). On the streaming path the first
+non-blank text `run_typing_batcher` hands to its sink, after filler removal, `[replacements]` and
+sanitizing (`TextLatch::typed`, before the sink types it), turns the stop off for good: once text is
+typed, only auto-stop or the press ends the session; the stop claims the latch under the daemon lock
+(`TextLatch::close`), so a batch typed while it waits for the lock keeps the session. Each
 capture logs the first thing heard once at info ("heard at 4.15 s (detector, soft rule, score 0.31,
 -48.6 dBFS)" or "(transcript)"). A voice too quiet to arm keeps starting the wait again while it lasts;
 when the stop then fires, `AutoStopDetector::too_quiet` names it ("Stopped: the audio was too quiet

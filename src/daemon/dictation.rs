@@ -14,7 +14,7 @@ use crate::context::{DaemonContext, DaemonState};
 use crate::injection::KeystrokeSettings;
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
-    build_transcription_config, format_no_microphone_error, history_backend_tag,
+    build_transcription_config, describe_levels, format_no_microphone_error, history_backend_tag,
     process_batch_samples, process_recording_batch, report_nothing_heard, run_streaming_pipeline,
     save_history_entry, BatchOrigin, DictationOutcome, Heard, NoSpeechTimeout,
     StreamingPipelineParams,
@@ -545,6 +545,12 @@ async fn collect_batch_dictation(
         if no_speech.feed(chunk.len(), Heard::by(&heard))
             && stop_hearing_nothing(&daemon_state, &context, heard.too_quiet()).await
         {
+            // Discarded: the gate never runs, so this is the turn's line.
+            info!(
+                "dictation audio: {}, {}",
+                describe_levels(&heard.levels()),
+                no_speech.heard_label()
+            );
             return Vec::new();
         }
     }
@@ -680,11 +686,17 @@ mod tests {
 
     /// A context on `toml_text` with notifications off.
     fn context(toml_text: &str) -> Arc<DaemonContext> {
+        context_with(toml_text, false)
+    }
+
+    /// A context on `toml_text`, notifications as `notify` says (the overlay
+    /// off, so dictation's skip toasts show).
+    fn context_with(toml_text: &str, notify: bool) -> Arc<DaemonContext> {
         Arc::new(DaemonContext {
             config: toml::from_str(toml_text).unwrap(),
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(NoBackend),
-            notify: false,
+            notify,
             state_tx: crate::context::StateBus::new(),
             overlay_level_tx: None,
             overlay_enabled: false,
@@ -700,7 +712,16 @@ mod tests {
     /// 50 ms chunks, its collector started as `handle_toggle` starts it.
     /// With `stop_first`, a stop press takes the session after 5 s.
     async fn batch_dictation(toml_text: &str, secs: usize, stop_first: bool) -> (usize, State) {
-        let context = context(toml_text);
+        let samples = vec![0i16; secs * 16_000];
+        batch_dictation_of(context(toml_text), &samples, stop_first).await
+    }
+
+    /// [`batch_dictation`] over `audio`, on `context`.
+    async fn batch_dictation_of(
+        context: Arc<DaemonContext>,
+        audio: &[i16],
+        stop_first: bool,
+    ) -> (usize, State) {
         let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         {
@@ -713,13 +734,13 @@ mod tests {
             )));
         }
         let mut collector = None;
-        for c in 0..secs * 20 {
+        for (c, chunk) in audio.chunks(800).enumerate() {
             if stop_first && c == 5 * 20 {
                 let mut ds = daemon_state.lock().await;
                 ds.state_machine.transition(Action::Toggle).unwrap();
                 collector = ds.batch_audio.take();
             }
-            if tx.send(vec![0i16; 800]).is_err() {
+            if tx.send(chunk.to_vec()).is_err() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -760,6 +781,22 @@ mod tests {
 
         let (samples, state) = batch_dictation("", 12, true).await;
         assert_eq!((samples, state), (12 * 16_000, State::Transcribing));
+    }
+
+    /// A voice the level floors reject for 3 s, then nothing: the collector
+    /// stops the session 10 s after the voice was last heard, discards the
+    /// audio, and the toast calls what it heard too quiet.
+    #[tokio::test]
+    async fn batch_dictation_that_heard_a_too_quiet_voice_says_so() {
+        crate::notify::take_sent_toasts();
+        let mut audio = crate::pipeline::tests::quiet_voice(3, -70.0);
+        audio.extend(vec![0i16; 12 * 16_000]);
+        let (samples, state) = batch_dictation_of(context_with("", true), &audio, false).await;
+        assert_eq!((samples, state), (0, State::Idle));
+        assert_eq!(
+            crate::notify::take_sent_toasts(),
+            ["Stopped: the audio was too quiet (speech at -68 dB)"]
+        );
     }
 
     #[test]
