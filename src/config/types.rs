@@ -551,8 +551,15 @@ impl AgentOverlayCorner {
 /// overlay renderer's color format. Accepts `#RGB`, `#RRGGBB`, `#RRGGBBAA`.
 /// Returns `None` for malformed input so callers can fall back to a theme
 /// default.
+///
+/// Every byte is checked to be a hex digit before the string is sliced: a
+/// multi-byte character (`#é1`) made the byte slices below panic, and a `+`
+/// passed `from_str_radix`.
 pub fn parse_hex_color(s: &str) -> Option<[u8; 4]> {
     let s = s.trim().trim_start_matches('#');
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let (r, g, b, a) = match s.len() {
         3 => {
             let r = u8::from_str_radix(&s[0..1].repeat(2), 16).ok()?;
@@ -1826,6 +1833,12 @@ const RECORDING_BATCH_BACKENDS: &str = "groq, openai, deepgram, asr-sidecar, loc
 #[cfg(feature = "recording")]
 fn is_realtime_backend(backend: &str) -> bool {
     matches!(backend, "openai-realtime" | "openai-compatible-realtime")
+}
+
+/// The backends [`Config::validate`] routes, aliases and stubs left out, in
+/// [`BACKEND_NAMES`] order: what a backend picker offers.
+pub fn primary_backend_names() -> Vec<&'static str> {
+    backend_names_of(BackendNameKind::Primary)
 }
 
 /// The names of every [`BACKEND_NAMES`] entry of one kind, in order.
@@ -3298,6 +3311,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_colors_parse_in_every_form() {
+        assert_eq!(parse_hex_color("#F97316"), Some([255, 0xF9, 0x73, 0x16]));
+        assert_eq!(parse_hex_color(" 456 "), Some([255, 0x44, 0x55, 0x66]));
+        assert_eq!(parse_hex_color("#11223380"), Some([0x80, 0x11, 0x22, 0x33]));
+    }
+
+    /// A multi-byte character used to panic the byte slicing; it is not a
+    /// color, and neither is a sign `from_str_radix` would take.
+    #[test]
+    fn a_hex_color_with_a_non_hex_character_is_none() {
+        for input in ["#é1", "#é12", "#1é", "#ab€", "#+12345", "#12345g", "", "#"] {
+            assert_eq!(parse_hex_color(input), None, "{input:?}");
+        }
+    }
 
     #[test]
     fn config_input_clipboard_fallback_roundtrip() {

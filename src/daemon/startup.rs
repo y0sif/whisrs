@@ -515,7 +515,7 @@ mod tests {
     /// This deliberately does *not* prove that a deleted term cannot come back.
     /// That property belongs to the editor's save path, which blanks
     /// `[general] vocabulary` in the same save that writes the file — see
-    /// `a_deleted_term_cannot_resurrect_from_config_toml` in `src/config/edit.rs`.
+    /// `a_deleted_term_cannot_resurrect_from_config_toml` in `src/config/vocabulary.rs`.
     /// If config.toml still held the term, the merge below would happily
     /// resurrect it, which is exactly why the save blanks it.
     #[test]

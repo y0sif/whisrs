@@ -1,5 +1,7 @@
 use std::process;
 
+mod tui;
+
 #[cfg(feature = "recording")]
 use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
@@ -386,7 +388,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         SubCmd::Config => {
-            if let Err(e) = whisrs::config::edit::run_config_menu() {
+            let result = tokio::task::spawn_blocking(|| tui::run(tui::Entry::Config)).await?;
+            if let Err(e) = result {
+                // Its own whole message, not a failure of the config.
+                if let Some(refusal) = e.downcast_ref::<tui::NotATerminal>() {
+                    eprintln!("{refusal}");
+                    process::exit(1);
+                }
                 if is_tty() {
                     eprintln!("{RED}config failed:{RESET} {e:#}");
                 } else {
@@ -567,18 +575,21 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
             println!("{}", format_recording_status(&recording, use_color));
         }
         Response::Agents { agents } => print_agents(&agents, use_color),
-        Response::Info { info } => println!("{}", format_state(info.state, use_color)),
+        Response::Info { info } => match info.state {
+            Some(state) => println!("{}", format_state(state, use_color)),
+            None => println!("unknown"),
+        },
         Response::Error { message } => exit_with_error(&message),
     }
 
     Ok(())
 }
 
-/// `whisrs status`: the state, from `info`, or from `status` when the daemon
-/// is older than `info` and hangs up on it. No timeout, as before `info`.
+/// `whisrs status`: the state, asked with `status` and never `info`, which a
+/// daemon older than `info` logs an error for. No timeout, as before.
 async fn cmd_status() -> anyhow::Result<()> {
-    match tokio::task::spawn_blocking(|| whisrs::request_info_blocking(None)).await? {
-        Ok(answer) => println!("{}", format_state(answer.state(), is_tty())),
+    match tokio::task::spawn_blocking(|| whisrs::request_status_blocking(None)).await? {
+        Ok(state) => println!("{}", format_state(state, is_tty())),
         Err(RequestError::NotRunning(_)) => exit_not_running(),
         Err(RequestError::Daemon(message)) => exit_with_error(&message),
         Err(e) => return Err(e.into()),

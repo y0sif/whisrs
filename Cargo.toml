@@ -95,6 +95,9 @@ futures-util = "0.3"
 hound = "3"
 libc = "0.2"
 notify-rust = "4"
+# The `whisrs config` TUI, in the CLI binary only (whisrsd never uses it).
+# Default features off: no calendar widget, macros or layout cache.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 # Echo removal on a recording's mic track (feature `recording`).
 realfft = { version = "3.5", optional = true }
 regex = "1"
@@ -103,6 +106,9 @@ reqwest = { version = "0.12", default-features = false, features = ["multipart",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 swayipc = "3"
+# Asks the terminal for its colours (OSC 10/11) before the TUI starts: a
+# light or dark background, and the real fg and bg the faint roles blend.
+terminal-colorsaurus = "1.0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }

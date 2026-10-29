@@ -2660,9 +2660,8 @@ mod tests {
     }
 
     /// `run_setup` is pure dialoguer IO and cannot be unit tested, so pin the
-    /// one line that matters the way `edit.rs` pins its hotkey prompts
-    /// (`edit_hotkeys_prompts_for_every_field`). Issue #116 was exactly this
-    /// call being absent.
+    /// one line that matters in its source. Issue #116 was exactly this call
+    /// being absent.
     #[test]
     fn run_setup_warns_about_unknown_keys_before_prompting() {
         let body = function_body(include_str!("setup.rs"), "pub fn run_setup(");

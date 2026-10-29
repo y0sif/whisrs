@@ -243,6 +243,14 @@ impl StateBus {
         });
     }
 
+    /// The raw state as last published. Every transition is published
+    /// under the dictation lock before the command that made it answers, so
+    /// this is the state any client can have seen, read without waiting for
+    /// that lock (which `handle_toggle` holds through the mic open).
+    pub(crate) fn raw(&self) -> State {
+        *self.raw.borrow()
+    }
+
     pub(crate) fn subscribe_raw(&self) -> watch::Receiver<State> {
         self.raw.subscribe()
     }

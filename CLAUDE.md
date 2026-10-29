@@ -42,7 +42,8 @@ whisrs status    # query daemon state
 whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
-whisrs config    # interactive config editor
+whisrs config    # full-screen config editor (TUI): every key by section, w saves (comments kept)
+                 # and restarts the daemon, e opens config.toml in $EDITOR. Refuses off a terminal
 whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
 whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once
@@ -89,6 +90,20 @@ src/
 ├── mcp.rs                  # whisrs mcp (feature mcp): read-only rmcp server, 4 tools over the recordings folder
 ├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
+├── cli/tui/                # whisrs config TUI (ratatui; in the CLI binary only, whisrsd never links it)
+│   ├── mod.rs              #   run(): tty refusal, load (#134 refusals), colour probe, init/restore,
+│   │                       #   the event loop, effects (save, restart, $EDITOR suspend)
+│   ├── app.rs              #   App: screen stack, dialogs, pure update(Msg) -> Effect
+│   ├── keys.rs             #   key -> Action (pure)
+│   ├── theme.rs            #   colour roles from the overlay theme; 16-colour map, light remap, NO_COLOR
+│   ├── glyphs.rs           #   Unicode and ASCII glyph sets (one char, one column each)
+│   ├── schema.rs           #   every config key as a row (kind, help, feature gate) + coverage test
+│   ├── form.rs             #   the edit buffer: dotted-path get/set over a toml::Table, checked by serde
+│   ├── worker.rs           #   threads: the 2 s info poll (status for an older daemon), the restart
+│   ├── widgets/            #   frame + footer, row, text input, dialog
+│   ├── screens/            #   home.rs (the hub), config.rs (sections, rows, list/map/entry editors, save)
+│   ├── testing.rs, render_tests.rs  #   fixtures; snapshots, styles, layouts (tests only)
+│   └── snapshots/          #   TestBackend row-string snapshots (WHISRS_UPDATE_SNAPSHOTS=1 rewrites)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
 ├── daemon/recording.rs     # Recording sessions, processing queue/worker, recovery, shutdown (feature recording)
 ├── daemon/agent.rs         # Agent runtime: slots, turns, reply FIFO (spoken when Idle), IPC handlers,
@@ -168,8 +183,7 @@ src/
     ├── write.rs            # Load (ExistingConfig, refusals) and the format-preserving write
     ├── vocabulary.rs       # vocabulary.txt, and the save that splits terms between the two stores
     ├── keys.rs             # mask_api_key, the key summary (env var wins), the masked TOML
-    ├── setup.rs            # Interactive onboarding (whisrs setup)
-    └── edit.rs             # whisrs config interactive editor
+    └── setup.rs            # Interactive onboarding (whisrs setup)
 ```
 
 Injection **policy** lives in the daemon: `type_text_at_cursor`, `paste_via_keyboard`
@@ -284,8 +298,9 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "cancel"}
 {"cmd": "status"}
 {"cmd": "info"}                      // version, state, recording phase, backend, built features,
-                                     // started_at (Unix ms); an older daemon hangs up on it, so
-                                     // `whisrs status` (ipc::request_info_blocking) then asks status
+                                     // started_at (Unix ms); read without the dictation lock. An
+                                     // older daemon hangs up on it (and logs an error), so the TUI
+                                     // then asks status and remembers; `whisrs status` asks status only
 {"cmd": "log", "limit": 20}
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
@@ -311,11 +326,13 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 ```
 
 Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": "..."}`,
-a `History` variant carrying log entries, a `Recording` variant carrying the recording status, and
+a `History` variant carrying log entries, a `Recording` variant carrying the recording status,
 an `Agents` variant carrying agent rows (`{"status": "agents", "agents": [...]}`), and an
 `Info` variant (`{"status": "info", "info": {...}}`, `DaemonInfo`, every field defaulted so
-later ones are additive). `ipc::request_blocking(cmd, timeout)` is the same framing on a blocking
-socket, for callers without a tokio runtime.
+later ones are additive; an unknown `state` or `recording` is `None`). `ipc::request_blocking(cmd,
+timeout)` is the same framing on a blocking socket, for callers without a tokio runtime; its
+connect is not bounded, so the TUI only calls it from a worker thread. `status`, `info` and `log`
+skip the state broadcast after the command (they change nothing).
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
 `src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
@@ -323,6 +340,10 @@ list/show/path` read the recordings folder directly, which keeps transcript bodi
 (as does the speaker list `whisrs recording name` prints after the daemon renamed one).
 `whisrs mcp` reads it too, but its logic is in the library (`src/mcp.rs`); the CLI only
 starts it with `store::configured_recordings_dir()`.
+The `whisrs config` TUI (`src/cli/tui/`) lives in the CLI so whisrsd never links ratatui; it
+reads and writes config.toml through the library (`config::write`, `config::vocabulary`,
+`config::keys`), asks the daemon only `info` (or `status`), and restarts it after a save through
+`ServiceManager::restart`, as the old editor did.
 `whisrs agent-hook` (hidden, run by the hooks whisrs puts in the Claude sessions it starts)
 only forwards its stdin to the daemon as `agent-event`, and always exits 0 within two seconds.
 

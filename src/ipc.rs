@@ -148,10 +148,15 @@ pub enum Response {
 pub struct DaemonInfo {
     /// The whisrsd version.
     pub version: String,
-    /// The dictation state, as `status` answers it.
-    pub state: State,
+    /// The dictation state, as `status` answers it. `None` when a later
+    /// daemon names a state this client does not know: the rest of the
+    /// answer still parses.
+    #[serde(deserialize_with = "known_variant")]
+    pub state: Option<State>,
     /// The recording feature's phase: always idle in a build without it.
-    pub recording: RecordingPhase,
+    /// `None` for a phase this client does not know, as `state`.
+    #[serde(deserialize_with = "known_variant")]
+    pub recording: Option<RecordingPhase>,
     /// `[general] backend` as configured.
     pub backend: String,
     /// The cargo features this whisrsd was built with ([`built_features`]).
@@ -159,6 +164,18 @@ pub struct DaemonInfo {
     /// When this whisrsd started, in Unix milliseconds: a client that sees
     /// it change knows the daemon restarted.
     pub started_at: u64,
+}
+
+/// A field of [`DaemonInfo`] that an enum fills: its variant, or `None` for
+/// one this client does not know. A later daemon's new state or phase must
+/// not fail the whole answer, which `info` exists to keep additive.
+fn known_variant<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 /// Every cargo feature of whisrs and whether this build has it, in
@@ -384,6 +401,11 @@ impl RequestError {
 /// a caller without a tokio runtime. Same framing as [`encode_message`] and
 /// [`read_message`]. `timeout` bounds each read and write; `None` waits as
 /// long as the daemon takes.
+///
+/// The connect is not bounded: a daemon that stopped accepting, with its
+/// listen backlog full, blocks it for good. A caller that must stay
+/// responsive (the TUI) calls this from a thread of its own, never from the
+/// loop that draws and reads keys.
 pub fn request_blocking(
     cmd: &Command,
     timeout: Option<Duration>,
@@ -449,12 +471,35 @@ pub enum InfoAnswer {
 }
 
 impl InfoAnswer {
-    /// The dictation state, which every daemon reports.
-    pub fn state(&self) -> State {
+    /// The dictation state, which every daemon reports: `None` only for a
+    /// state this client does not know ([`DaemonInfo::state`]).
+    pub fn state(&self) -> Option<State> {
         match self {
             Self::Info(info) => info.state,
-            Self::Older(state) => *state,
+            Self::Older(state) => Some(*state),
         }
+    }
+}
+
+/// Ask the daemon for its dictation state with `status`, which every daemon
+/// knows. `whisrs status` uses this rather than `info`: a daemon older than
+/// `info` logs an error for each `info` it cannot parse.
+pub fn request_status_blocking(timeout: Option<Duration>) -> Result<State, RequestError> {
+    request_status_blocking_at(&socket_path(), timeout)
+}
+
+/// [`request_status_blocking`] against an explicit socket (testable).
+pub fn request_status_blocking_at(
+    path: &Path,
+    timeout: Option<Duration>,
+) -> Result<State, RequestError> {
+    match request_blocking_at(path, &Command::Status, timeout)? {
+        Response::Ok { state } => Ok(state),
+        Response::Error { message } => Err(RequestError::Daemon(message)),
+        _ => Err(RequestError::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            "unexpected answer to status",
+        ))),
     }
 }
 
@@ -1060,8 +1105,8 @@ mod tests {
     fn sample_info() -> DaemonInfo {
         DaemonInfo {
             version: "0.2.0".to_string(),
-            state: State::Recording,
-            recording: RecordingPhase::Processing,
+            state: Some(State::Recording),
+            recording: Some(RecordingPhase::Processing),
             backend: "deepgram-streaming".to_string(),
             features: vec!["tray".to_string(), "recording".to_string()],
             started_at: 1_793_000_000_000,
@@ -1105,8 +1150,30 @@ mod tests {
         let Response::Info { info } = later else {
             panic!("not an info response: {later:?}");
         };
-        assert_eq!(info.state, State::Speaking);
-        assert_eq!(info.recording, RecordingPhase::Idle);
+        assert_eq!(info.state, Some(State::Speaking));
+        assert_eq!(info.recording, None);
+    }
+
+    /// A state or phase this client does not know (a later daemon's) is
+    /// `None`, and the rest of the answer still parses: `info` stays
+    /// additive for its enum fields too.
+    #[test]
+    fn an_unknown_state_or_phase_is_none() {
+        let later: Response = serde_json::from_str(
+            r#"{"status":"info","info":{"version":"9.0.0","state":"dancing","recording":"paused","backend":"groq"}}"#,
+        )
+        .unwrap();
+        let Response::Info { info } = later else {
+            panic!("not an info response: {later:?}");
+        };
+        assert_eq!(info.version, "9.0.0");
+        assert_eq!(info.state, None);
+        assert_eq!(info.recording, None);
+        assert_eq!(info.backend, "groq");
+        assert_eq!(InfoAnswer::Info(info).state(), None);
+
+        let null: DaemonInfo = serde_json::from_str(r#"{"state":null,"recording":7}"#).unwrap();
+        assert_eq!((null.state, null.recording), (None, None));
     }
 
     /// The feature list names every feature in `Cargo.toml`, so one added
@@ -1179,7 +1246,7 @@ mod tests {
         })]);
         let answer = request_info_blocking_at(&path, TIMEOUT).unwrap();
         assert_eq!(answer, InfoAnswer::Info(sample_info()));
-        assert_eq!(answer.state(), State::Recording);
+        assert_eq!(answer.state(), Some(State::Recording));
         assert_eq!(daemon.join().unwrap(), vec!["info"]);
     }
 
@@ -1195,8 +1262,31 @@ mod tests {
         ]);
         let answer = request_info_blocking_at(&path, TIMEOUT).unwrap();
         assert_eq!(answer, InfoAnswer::Older(State::Transcribing));
-        assert_eq!(answer.state(), State::Transcribing);
+        assert_eq!(answer.state(), Some(State::Transcribing));
         assert_eq!(daemon.join().unwrap(), vec!["info", "status"]);
+    }
+
+    /// `whisrs status` asks `status` alone, never `info`: a daemon older
+    /// than `info` would log an error for each one.
+    #[test]
+    fn status_asks_status_only() {
+        let (_dir, path, daemon) = fake_daemon(vec![Some(Response::Ok {
+            state: State::Recording,
+        })]);
+        assert_eq!(
+            request_status_blocking_at(&path, TIMEOUT).unwrap(),
+            State::Recording
+        );
+        assert_eq!(daemon.join().unwrap(), vec!["status"]);
+
+        let (_dir, path, daemon) = fake_daemon(vec![Some(Response::Error {
+            message: "busy".to_string(),
+        })]);
+        assert!(matches!(
+            request_status_blocking_at(&path, TIMEOUT),
+            Err(RequestError::Daemon(message)) if message == "busy"
+        ));
+        daemon.join().unwrap();
     }
 
     /// The hang-up is told apart from the other failures, which are what the

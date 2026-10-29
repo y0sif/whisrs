@@ -227,7 +227,7 @@ For the full reference (overlay, `[input]`, `[tts]`, `[llm]`, `[hotkeys]`, `[hoo
 
 ```
 whisrs setup     # Interactive onboarding
-whisrs config    # Interactive editor for ~/.config/whisrs/config.toml
+whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml; restarts the daemon on save
 whisrs toggle    # Start/stop dictation (uses general.language)
 whisrs toggle -l en  # Start/stop dictation, overriding the language for this session
 whisrs cancel    # Cancel dictation, discard audio

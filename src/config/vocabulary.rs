@@ -223,9 +223,9 @@ fn vocabulary_save_plan(vocab: &VocabularyBaseline, current: &[String]) -> Vocab
 
 /// Execute a [`VocabularySavePlan`] and write config.toml, in that order.
 ///
-/// The only place either store is written on save. `save_and_restart` calls
-/// this and does nothing else with the vocabulary, so there is no second copy
-/// of the decision for a call-site edit to get wrong.
+/// The only place either store is written on save. The Config screen's save
+/// calls this and does nothing else with the vocabulary, so there is no second
+/// copy of the decision for a call-site edit to get wrong.
 ///
 /// Ordering: `vocabulary.txt` goes first because it is the direction that
 /// cannot lose a term. If config.toml then fails to write, every term the user
@@ -424,8 +424,8 @@ NixOS
     /// Nothing downstream wants them either. `usable_keyterms`
     /// (`src/transcription/deepgram.rs`) trims and drops blanks before any
     /// counting or budgeting, so `Config::validate` and the request builder
-    /// both ignore them; the `whisrs config` editor drops them in
-    /// `parse_csv_list`. A blank entry is not a term anywhere in whisrs.
+    /// both ignore them; the `whisrs config` list editor drops a blank item.
+    /// A blank entry is not a term anywhere in whisrs.
     #[test]
     fn empty_and_whitespace_only_terms_are_dropped_not_round_tripped() {
         let dir = tempfile::tempdir().unwrap();

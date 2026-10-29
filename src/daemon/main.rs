@@ -5,7 +5,7 @@ use clap::Parser;
 use tokio::io::AsyncWriteExt;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use whisrs::history;
 use whisrs::window::{self, WindowTracker};
@@ -400,17 +400,34 @@ async fn handle_connection(
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let cmd: Command = read_message(&mut reader).await?;
-    info!("received command: {}", cmd.log_summary());
+    // The TUI asks `info` every 2 s while it is open.
+    if matches!(cmd, Command::Info) {
+        debug!("received command: {}", cmd.log_summary());
+    } else {
+        info!("received command: {}", cmd.log_summary());
+    }
 
+    let read_only = is_read_only(&cmd);
     let response = handle_command(cmd, Arc::clone(&daemon_state), Arc::clone(&context)).await;
 
-    // Broadcast state for tray updates.
-    context.state_tx.publish(&*daemon_state.lock().await);
+    // Broadcast state for tray updates. A read-only command changed nothing
+    // to broadcast, and the TUI's `info` poll must not wait for the
+    // dictation lock here either.
+    if !read_only {
+        context.state_tx.publish(&*daemon_state.lock().await);
+    }
 
     let encoded = encode_message(&response)?;
     writer.write_all(&encoded).await?;
     writer.shutdown().await?;
     Ok(())
+}
+
+/// Whether `cmd` only reads: no state change follows it, so there is
+/// nothing to broadcast after it. Nothing relies on that broadcast: every
+/// transition publishes itself, or is published by the command that made it.
+fn is_read_only(cmd: &Command) -> bool {
+    matches!(cmd, Command::Status | Command::Info | Command::Log { .. })
 }
 
 async fn handle_command(
@@ -427,12 +444,11 @@ async fn handle_command(
                 state: ds.state_machine.state(),
             }
         }
-        Command::Info => {
-            let state = daemon_state.lock().await.state_machine.state();
-            Response::Info {
-                info: daemon_info(state, &context),
-            }
-        }
+        // The published state, not the lock: a poll every 2 s would
+        // otherwise time out on each dictation start.
+        Command::Info => Response::Info {
+            info: daemon_info(context.state_tx.raw(), &context),
+        },
         Command::Log { limit } => match history::read_entries(limit) {
             Ok(entries) => Response::History { entries },
             Err(e) => Response::Error {
@@ -497,8 +513,8 @@ fn daemon_info(state: whisrs::State, context: &DaemonContext) -> DaemonInfo {
     let recording = whisrs::recording::RecordingPhase::Idle;
     DaemonInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        state,
-        recording,
+        state: Some(state),
+        recording: Some(recording),
         backend: context.config.general.backend.clone(),
         features: whisrs::built_features(),
         started_at: context.started_at,
@@ -566,11 +582,9 @@ mod tests {
         assert!(Args::try_parse_from(["whisrsd"]).is_ok());
     }
 
-    /// `info` names this whisrsd, its build and its config's backend, beside
-    /// the state `status` reports.
-    #[tokio::test]
-    async fn info_reports_this_daemon() {
-        let context = Arc::new(DaemonContext {
+    /// A daemon context for the `info` tests, its backend `deepgram`.
+    fn info_context() -> Arc<DaemonContext> {
+        Arc::new(DaemonContext {
             config: toml::from_str("[general]\nbackend = \"deepgram\"\n").expect("fixture parses"),
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             // Never called: nothing is transcribed.
@@ -587,9 +601,15 @@ mod tests {
             agent_board: tokio::sync::watch::channel(Vec::new()).0,
             agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
             started_at: 1_793_000_000_000,
-        });
+        })
+    }
+
+    /// `info` names this whisrsd, its build and its config's backend, beside
+    /// the state `status` reports.
+    #[tokio::test]
+    async fn info_reports_this_daemon() {
         let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
-        let response = handle_command(Command::Info, daemon_state, context).await;
+        let response = handle_command(Command::Info, daemon_state, info_context()).await;
         let Response::Info { info } = response else {
             panic!("expected an info response, got {response:?}");
         };
@@ -597,13 +617,55 @@ mod tests {
             info,
             DaemonInfo {
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                state: whisrs::State::Idle,
-                recording: whisrs::recording::RecordingPhase::Idle,
+                state: Some(whisrs::State::Idle),
+                recording: Some(whisrs::recording::RecordingPhase::Idle),
                 backend: "deepgram".to_string(),
                 features: whisrs::built_features(),
                 started_at: 1_793_000_000_000,
             }
         );
+    }
+
+    /// `info` answers while the dictation lock is held (`handle_toggle` holds
+    /// it through the mic open), with the state last published.
+    #[tokio::test]
+    async fn info_answers_while_the_dictation_lock_is_held() {
+        use whisrs::state::Action;
+
+        let context = info_context();
+        let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut held = daemon_state.lock().await;
+        held.state_machine.transition(Action::Toggle).unwrap();
+        context.state_tx.publish(&held);
+
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_command(Command::Info, Arc::clone(&daemon_state), context),
+        )
+        .await
+        .expect("info waited for the dictation lock");
+        drop(held);
+        let Response::Info { info } = answer else {
+            panic!("expected an info response, got {answer:?}");
+        };
+        assert_eq!(info.state, Some(whisrs::State::Recording));
+    }
+
+    /// Only the commands that change nothing skip the broadcast after them.
+    #[test]
+    fn only_reads_skip_the_broadcast() {
+        assert!(is_read_only(&Command::Status));
+        assert!(is_read_only(&Command::Info));
+        assert!(is_read_only(&Command::Log { limit: 5 }));
+        for changes in [
+            Command::Toggle { language: None },
+            Command::Cancel,
+            Command::ClearHistory,
+            Command::CommandMode,
+            Command::Speak,
+        ] {
+            assert!(!is_read_only(&changes), "{}", changes.log_summary());
+        }
     }
 
     /// Built without the recording feature, every `recording` command,

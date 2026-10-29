@@ -1,0 +1,30 @@
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                         config · ●  │
+   │                                                                                  │
+   │   General                 backend           deepgram-streaming                   │
+   │   Backend & keys        ▌ deepgram api_key  set ****9f2c                         │
+   │   Audio                   deepgram model    nova-3                               │
+   │   Vocabulary              groq api_key      WHISRS_GROQ_API_KEY (this shell)     │
+   │   Replacements            groq model        whisper-large-v3-turbo               │
+   │   Typing                  openai api_key    not set                              │
+   │   Hotkeys                 openai model      gpt-4o-mini-transcribe               │
+   │   Overlay                 openai languages  none                                 │
+   │   Read aloud (TTS)        whisper model     ~/.local/share/whisrs/models/ggml-…  │
+   │   Agents                  segmentation      silence                              │
+   │   LLM                     phrase silence    400                                  │
+   │   LLM commands            flash_attn        off                                  │
+   │   Recording               sidecar url       http://127.0.0.1:8765/transcribe     │
+   │   Hooks                   sidecar model     microsoft/VibeVoice-ASR-HF           │
+   │                           sidecar api_key   not set, optional                    │
+   │                           realtime url      empty                                │
+   │                           realtime model    Whisper-Tiny                         │
+   │                           realtime profile  lemonade                             │
+   │                           turn detection    server-vad                           │
+   │                           realtime api_key  not set, optional                    │
+   │                                                                                  │
+   │                           API key for the deepgram backends.                     │
+   │                           WHISRS_DEEPGRAM_API_KEY wins over it.                  │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k move · tab pane · enter edit · w save · e $EDITOR · / filter · ? help

@@ -250,8 +250,8 @@ mod tests {
             // deleted `[openai]` arm pass this test.
             assert!(
                 body.contains(&format!("clone.{field}.")),
-                "render_masked_toml never masks `[{field}] api_key`, so \
-                 `whisrs config` prints it in cleartext under \"Current config (masked)\""
+                "render_masked_toml never masks `[{field}] api_key`, so the masked \
+                 render shows it in cleartext"
             );
         }
         assert_eq!(
