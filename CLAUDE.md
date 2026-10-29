@@ -150,6 +150,7 @@ src/
 ├── overlay/                # Recording pill + agent overlay (feature-gated), each on its own thread
 │   ├── service.rs          #   Overlay service: picks and drives a backend for each
 │   ├── render.rs           #   Pill rendering: theme, animation state, frame drawing
+│   ├── palette.rs          #   Theme palettes (carbon, ember, cyan, custom): every build, for the TUI too
 │   ├── wayland.rs          #   Pill Wayland layer-shell backend
 │   ├── x11.rs              #   Pill X11 override-redirect backend (placement/shape helpers shared)
 │   ├── layer.rs            #   Shared layer-shell bits: create_layer, layer_action, ARGB copy
@@ -164,6 +165,9 @@ src/
 │   └── gnome.rs            #   GNOME overlay D-Bus broadcaster (pill state + AgentsChanged JSON)
 └── config/
     ├── types.rs            # Config structs, defaults, validation (config.toml)
+    ├── write.rs            # Load (ExistingConfig, refusals) and the format-preserving write
+    ├── vocabulary.rs       # vocabulary.txt, and the save that splits terms between the two stores
+    ├── keys.rs             # mask_api_key, the key summary (env var wins), the masked TOML
     ├── setup.rs            # Interactive onboarding (whisrs setup)
     └── edit.rs             # whisrs config interactive editor
 ```
@@ -279,6 +283,9 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "toggle"}                    // optional "language" overrides general.language for one session
 {"cmd": "cancel"}
 {"cmd": "status"}
+{"cmd": "info"}                      // version, state, recording phase, backend, built features,
+                                     // started_at (Unix ms); an older daemon hangs up on it, so
+                                     // `whisrs status` (ipc::request_info_blocking) then asks status
 {"cmd": "log", "limit": 20}
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
@@ -305,7 +312,10 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 
 Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": "..."}`,
 a `History` variant carrying log entries, a `Recording` variant carrying the recording status, and
-an `Agents` variant carrying agent rows (`{"status": "agents", "agents": [...]}`).
+an `Agents` variant carrying agent rows (`{"status": "agents", "agents": [...]}`), and an
+`Info` variant (`{"status": "info", "info": {...}}`, `DaemonInfo`, every field defaulted so
+later ones are additive). `ipc::request_blocking(cmd, timeout)` is the same framing on a blocking
+socket, for callers without a tokio runtime.
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
 `src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording

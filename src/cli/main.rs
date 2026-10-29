@@ -11,8 +11,8 @@ use whisrs::history::HistoryEntry;
 use whisrs::recording::{store, RecordingAction, RecordingMeta, RecordingOptions, RecordingState};
 use whisrs::recording::{RecordingPhase, RecordingStatus};
 use whisrs::{
-    encode_message, read_message, service::ServiceManager, socket_path, Command, Response,
-    RestartOutcome, State,
+    encode_message, read_message, service::ServiceManager, socket_path, Command, RequestError,
+    Response, RestartOutcome, State,
 };
 
 const ASCII_BANNER: &str = concat!(
@@ -401,9 +401,7 @@ async fn main() -> anyhow::Result<()> {
         SubCmd::Cancel => {
             send_command(Command::Cancel).await?;
         }
-        SubCmd::Status => {
-            send_command(Command::Status).await?;
-        }
+        SubCmd::Status => cmd_status().await?,
         SubCmd::Log { limit, clear } => {
             if clear {
                 send_command(Command::ClearHistory).await?;
@@ -569,9 +567,22 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
             println!("{}", format_recording_status(&recording, use_color));
         }
         Response::Agents { agents } => print_agents(&agents, use_color),
+        Response::Info { info } => println!("{}", format_state(info.state, use_color)),
         Response::Error { message } => exit_with_error(&message),
     }
 
+    Ok(())
+}
+
+/// `whisrs status`: the state, from `info`, or from `status` when the daemon
+/// is older than `info` and hangs up on it. No timeout, as before `info`.
+async fn cmd_status() -> anyhow::Result<()> {
+    match tokio::task::spawn_blocking(|| whisrs::request_info_blocking(None)).await? {
+        Ok(answer) => println!("{}", format_state(answer.state(), is_tty())),
+        Err(RequestError::NotRunning(_)) => exit_not_running(),
+        Err(RequestError::Daemon(message)) => exit_with_error(&message),
+        Err(e) => return Err(e.into()),
+    }
     Ok(())
 }
 
@@ -711,39 +722,38 @@ fn exit_with_error(message: &str) -> ! {
     process::exit(1);
 }
 
+/// Print how to start the daemon and exit 1.
+fn exit_not_running() -> ! {
+    // Name the command that actually exists on this machine: telling
+    // an OpenRC user to run systemctl is a dead end.
+    let service_hint = match ServiceManager::detect().enable_hint() {
+        Some(enable) => format!(
+            "\n\
+             \n\
+             Or enable the service:\n\
+             \n\
+             \x20 {enable}"
+        ),
+        None => String::new(),
+    };
+    let msg = format!(
+        "whisrsd is not running. Start it with:\n\
+         \n\
+         \x20 whisrsd &{service_hint}"
+    );
+    if is_tty() {
+        eprintln!("{RED}{msg}{RESET}");
+    } else {
+        eprintln!("{msg}");
+    }
+    process::exit(1);
+}
+
 /// Connect to the daemon, send a command and return its response.
 /// Exits with a hint when the daemon is not running.
 async fn request(cmd: Command) -> anyhow::Result<Response> {
-    let path = socket_path();
-    let use_color = is_tty();
-
-    let stream = match UnixStream::connect(&path).await {
-        Ok(s) => s,
-        Err(_) => {
-            // Name the command that actually exists on this machine — telling
-            // an OpenRC user to run systemctl is a dead end.
-            let service_hint = match ServiceManager::detect().enable_hint() {
-                Some(enable) => format!(
-                    "\n\
-                     \n\
-                     Or enable the service:\n\
-                     \n\
-                     \x20 {enable}"
-                ),
-                None => String::new(),
-            };
-            let msg = format!(
-                "whisrsd is not running. Start it with:\n\
-                 \n\
-                 \x20 whisrsd &{service_hint}"
-            );
-            if use_color {
-                eprintln!("{RED}{msg}{RESET}");
-            } else {
-                eprintln!("{msg}");
-            }
-            process::exit(1);
-        }
+    let Ok(stream) = UnixStream::connect(socket_path()).await else {
+        exit_not_running();
     };
 
     let (mut reader, mut writer) = stream.into_split();
@@ -767,12 +777,15 @@ async fn request(cmd: Command) -> anyhow::Result<Response> {
     }
 }
 
-/// Whether a daemon older than agent mode cannot parse `cmd`: `speak-text`,
-/// `agent` and `agent-event` are new with it.
+/// Whether a daemon older than this whisrs may not parse `cmd`: `speak-text`,
+/// `agent` and `agent-event` are new with agent mode, `info` after it.
 fn older_daemon_cannot_parse(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::SpeakText { .. } | Command::Agent { .. } | Command::AgentEvent { .. }
+        Command::SpeakText { .. }
+            | Command::Agent { .. }
+            | Command::AgentEvent { .. }
+            | Command::Info
     )
 }
 
@@ -1176,6 +1189,7 @@ mod tests {
         assert!(older_daemon_cannot_parse(&Command::AgentEvent {
             payload: serde_json::json!({}),
         }));
+        assert!(older_daemon_cannot_parse(&Command::Info));
         for old in [
             Command::Toggle { language: None },
             Command::Cancel,

@@ -3,7 +3,8 @@
 //!
 //! Both are optional and have native Wayland layer-shell and X11 backends,
 //! each on its own thread and display connection. The agent overlay's
-//! drawing ([`AgentScene`]) is headless and lives beside the pill's.
+//! drawing ([`AgentScene`]) is headless and lives beside the pill's. The
+//! pill's theme colors ([`palette`]) are in every build, for the TUI.
 
 use tokio::sync::watch;
 
@@ -26,6 +27,7 @@ mod agent_x11;
 mod gnome;
 #[cfg(feature = "overlay")]
 mod layer;
+pub mod palette;
 #[cfg(feature = "overlay")]
 mod render;
 #[cfg(feature = "overlay")]

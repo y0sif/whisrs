@@ -464,6 +464,11 @@ impl RecordingRuntime {
         self.view.lock().unwrap_or_else(|e| e.into_inner()).status()
     }
 
+    /// The recording phase, for `info`. Reads the view, so it answers at once.
+    pub(crate) fn phase(&self) -> RecordingPhase {
+        self.status().phase
+    }
+
     /// The recording status, for a task that waits for a recording to stop
     /// (agent replies are held while one captures).
     pub(crate) fn subscribe(&self) -> watch::Receiver<RecordingStatus> {
@@ -2860,6 +2865,7 @@ mod tests {
             agents: crate::agent::AgentRuntime::disabled(),
             agent_board: watch::channel(Vec::new()).0,
             agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
+            started_at: 0,
         };
         (Arc::new(context), queue_rx)
     }

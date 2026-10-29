@@ -2090,6 +2090,7 @@ mod tests {
             agents: crate::agent::AgentRuntime::disabled(),
             agent_board: tokio::sync::watch::channel(Vec::new()).0,
             agent_overlay_shown: AtomicBool::new(false),
+            started_at: 0,
         }
     }
 

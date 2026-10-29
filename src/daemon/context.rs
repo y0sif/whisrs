@@ -290,6 +290,8 @@ pub(crate) struct DaemonContext {
     /// An agent overlay is on screen (set by its host once it shows): the
     /// agent's progress toasts are then left out ([`Self::notify_agent_state`]).
     pub(crate) agent_overlay_shown: AtomicBool,
+    /// When this whisrsd started, in Unix milliseconds, for `info`.
+    pub(crate) started_at: u64,
 }
 
 impl DaemonContext {

@@ -289,8 +289,9 @@ pub struct HooksConfig {
 /// is set, those override the theme.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayConfig {
-    /// Theme name: `"ember"` (default), `"carbon"`, `"cyan"`, or `"custom"`.
-    /// Unknown values fall back to `"ember"` with a warning.
+    /// Theme name: `"carbon"` (default), `"ember"`, `"cyan"`, or `"custom"`.
+    /// Unknown values fall back to `"ember"` with a warning, and so do the
+    /// colors `"custom"` leaves unset.
     #[serde(default = "default_overlay_theme")]
     pub theme: String,
     /// Pill width in pixels (clamped to 90..=120).
@@ -1414,7 +1415,7 @@ impl PreservedKeys {
     /// keeping a whole table matters only when the table is *absent from the
     /// fresh serialization*, and this module cannot see the fresh document.
     /// So the answer is recorded here and consulted there, in
-    /// `setup::is_preserved`, which by construction runs only for keys `fresh`
+    /// `write::is_preserved`, which by construction runs only for keys `fresh`
     /// does not carry. Deciding it eagerly here instead is what made the guard
     /// eat `[hooks]`, `[hotkeys]` and `[overlay.colors]` — sections `fresh`
     /// *does* carry, where the whole-table question never comes up.

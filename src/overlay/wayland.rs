@@ -27,7 +27,8 @@ use crate::{OverlayConfig, OverlayHAlign, OverlayPosition, State};
 use super::layer::{
     copy_pixmap_to_argb8888, create_layer, layer_action, LayerAction, LayerEvent, LayerStatus,
 };
-use super::render::{OverlayRenderer, Theme, FRAME_MS};
+use super::palette::Palette;
+use super::render::{OverlayRenderer, FRAME_MS};
 use super::service::OverlayError;
 
 pub(super) fn run_overlay(
@@ -37,7 +38,7 @@ pub(super) fn run_overlay(
 ) -> Result<(), OverlayError> {
     let width = config.clamped_width();
     let height = config.clamped_height();
-    let theme = Theme::from_config(&config);
+    let theme = Palette::from_config(&config);
     let position = config.position();
 
     let conn = WaylandConnection::connect_to_env()?;

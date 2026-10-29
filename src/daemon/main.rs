@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use whisrs::history;
 use whisrs::window::{self, WindowTracker};
-use whisrs::{encode_message, read_message, socket_path, Command, Response};
+use whisrs::{encode_message, read_message, socket_path, Command, DaemonInfo, Response};
 
 mod agent;
 mod command_mode;
@@ -68,6 +68,10 @@ fn log_directives(rust_log: Option<&str>) -> String {
 async fn main() -> Result<()> {
     // Not dead code: this call is what makes the flags above exit.
     Args::parse();
+    // Taken first, so `info` says when this process started.
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -155,6 +159,7 @@ async fn main() -> Result<()> {
         agents,
         agent_board: tokio::sync::watch::channel(Vec::new()).0,
         agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
+        started_at,
     });
 
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
@@ -422,6 +427,12 @@ async fn handle_command(
                 state: ds.state_machine.state(),
             }
         }
+        Command::Info => {
+            let state = daemon_state.lock().await.state_machine.state();
+            Response::Info {
+                info: daemon_info(state, &context),
+            }
+        }
         Command::Log { limit } => match history::read_entries(limit) {
             Ok(entries) => Response::History { entries },
             Err(e) => Response::Error {
@@ -474,6 +485,23 @@ async fn handle_command(
                 message: RECORDING_MISSING.to_string(),
             }
         }
+    }
+}
+
+/// The answer to `info`: this whisrsd, its build, and what it does now
+/// (`state` is the dictation state).
+fn daemon_info(state: whisrs::State, context: &DaemonContext) -> DaemonInfo {
+    #[cfg(feature = "recording")]
+    let recording = context.recording.phase();
+    #[cfg(not(feature = "recording"))]
+    let recording = whisrs::recording::RecordingPhase::Idle;
+    DaemonInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        state,
+        recording,
+        backend: context.config.general.backend.clone(),
+        features: whisrs::built_features(),
+        started_at: context.started_at,
     }
 }
 
@@ -538,6 +566,46 @@ mod tests {
         assert!(Args::try_parse_from(["whisrsd"]).is_ok());
     }
 
+    /// `info` names this whisrsd, its build and its config's backend, beside
+    /// the state `status` reports.
+    #[tokio::test]
+    async fn info_reports_this_daemon() {
+        let context = Arc::new(DaemonContext {
+            config: toml::from_str("[general]\nbackend = \"deepgram\"\n").expect("fixture parses"),
+            window_tracker: Arc::new(whisrs::window::NoopTracker),
+            // Never called: nothing is transcribed.
+            transcription_backend: Arc::new(whisrs::transcription::groq::GroqBackend::new(
+                String::new(),
+            )),
+            notify: false,
+            state_tx: crate::context::StateBus::new(),
+            overlay_level_tx: None,
+            overlay_enabled: false,
+            #[cfg(feature = "recording")]
+            recording: crate::recording::RecordingRuntime::new().0,
+            agents: crate::agent::AgentRuntime::disabled(),
+            agent_board: tokio::sync::watch::channel(Vec::new()).0,
+            agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
+            started_at: 1_793_000_000_000,
+        });
+        let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
+        let response = handle_command(Command::Info, daemon_state, context).await;
+        let Response::Info { info } = response else {
+            panic!("expected an info response, got {response:?}");
+        };
+        assert_eq!(
+            info,
+            DaemonInfo {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                state: whisrs::State::Idle,
+                recording: whisrs::recording::RecordingPhase::Idle,
+                backend: "deepgram".to_string(),
+                features: whisrs::built_features(),
+                started_at: 1_793_000_000_000,
+            }
+        );
+    }
+
     /// Built without the recording feature, every `recording` command,
     /// straight off the wire, gets the same plain error, and dictation's
     /// state is left alone.
@@ -561,6 +629,7 @@ mod tests {
             agents: crate::agent::AgentRuntime::disabled(),
             agent_board: tokio::sync::watch::channel(Vec::new()).0,
             agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
+            started_at: 0,
         });
         let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
         for action in [

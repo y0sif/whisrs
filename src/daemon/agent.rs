@@ -2770,6 +2770,7 @@ mod tests {
             agents: rt,
             agent_board: tokio::sync::watch::channel(Vec::new()).0,
             agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
+            started_at: 0,
         })
     }
 

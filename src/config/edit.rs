@@ -9,12 +9,13 @@
 //! compositor keybinding — while `config` only edits the TOML.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Editor, Input, Select};
 
-use crate::config::{setup, vocabulary};
+use crate::config::keys::{self, KeySummary};
+use crate::config::vocabulary::{self, VocabularyBaseline};
+use crate::config::{setup, write};
 use crate::service::ServiceManager;
 use crate::{
     AgentOverlayConfig, AgentOverlayCorner, AgentOverlayStyle, Config, HotkeyConfig, RestartOutcome,
@@ -31,8 +32,8 @@ use setup::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 pub fn run_config_menu() -> Result<()> {
     println!("\n{BOLD}whisrs config{RESET} — edit ~/.config/whisrs/config.toml\n");
 
-    let (mut config, fresh) = match setup::load_existing_config() {
-        setup::ExistingConfig::Loaded { config, unknown } => {
+    let (mut config, fresh) = match write::load_existing_config() {
+        write::ExistingConfig::Loaded { config, unknown } => {
             // Warn at load, not at save: the keys are about to be shown back to
             // the user as a config that looks fine (issue #116).
             setup::print_unknown_keys_warning(&unknown);
@@ -50,14 +51,14 @@ pub fn run_config_menu() -> Result<()> {
         // Returned as an error rather than printed: `src/cli/main.rs` renders
         // it as `config failed: {e:#}` and exits non-zero, so printing it here
         // too would show the same serde error twice.
-        setup::ExistingConfig::Unusable { kind, message } => {
-            anyhow::bail!(setup::unusable_config_refusal(
+        write::ExistingConfig::Unusable { kind, message } => {
+            anyhow::bail!(write::unusable_config_refusal(
                 kind,
                 &message,
                 &crate::config_path()
             ));
         }
-        setup::ExistingConfig::Missing => {
+        write::ExistingConfig::Missing => {
             println!(
                 "  {YELLOW}No config file found — starting from defaults.{RESET} \
                  Run {BOLD}whisrs setup{RESET} for the full onboarding flow."
@@ -67,28 +68,15 @@ pub fn run_config_menu() -> Result<()> {
     };
 
     let vocab_path = vocabulary::vocabulary_path();
-    let config_toml_vocabulary = config.general.vocabulary.clone();
-    let use_vocab_file = match vocabulary::load_vocabulary_file(&vocab_path) {
-        Ok(Some(terms)) => {
-            config.general.vocabulary =
-                vocabulary::merge_vocabulary(std::mem::take(&mut config.general.vocabulary), terms);
-            true
-        }
-        Ok(None) => false,
-        Err(e) => {
-            println!(
-                "  {YELLOW}Could not read {}: {e} — its terms are not shown and \
-                 vocabulary edits stay in config.toml.{RESET}",
-                vocab_path.display()
-            );
-            false
-        }
-    };
-    let vocabulary_baseline = VocabularyBaseline {
-        use_file: use_vocab_file,
-        config_toml: config_toml_vocabulary,
-        merged: config.general.vocabulary.clone(),
-    };
+    let (vocabulary_baseline, unreadable) = VocabularyBaseline::load(&mut config, &vocab_path);
+    if let Some(e) = unreadable {
+        println!(
+            "  {YELLOW}Could not read {}: {e} \u{2014} its terms are not shown and \
+             vocabulary edits stay in config.toml.{RESET}",
+            vocab_path.display()
+        );
+    }
+    let use_vocab_file = vocabulary_baseline.uses_file();
 
     loop {
         print_summary(&config);
@@ -216,73 +204,21 @@ fn print_summary(config: &Config) {
 /// last 4 chars so the user can tell which key they're looking at without
 /// leaking the full secret.
 fn current_key_summary(config: &Config) -> String {
-    current_key_summary_from(config, |name| std::env::var(name).ok())
+    render_key_summary(keys::key_summary(config))
 }
 
-/// [`current_key_summary`] with the environment passed in, so tests never
-/// touch the process env. Mirrors the daemon's resolvers in `factory.rs`: a
-/// `WHISRS_*_API_KEY` env var wins over `config.toml`. A key from the env is
-/// labelled "this shell", since a daemon run by systemd takes its env from the
-/// user manager and may not see it.
-fn current_key_summary_from(config: &Config, env: impl Fn(&str) -> Option<String>) -> String {
-    let from_env = |var: &str, key: &str| {
-        format!(
-            "{BOLD}{}{RESET} {DIM}({var}, this shell){RESET}",
-            setup::mask_api_key(key)
-        )
-    };
-    let (var, key) = match config.general.backend.as_str() {
-        "groq" => (
-            "WHISRS_GROQ_API_KEY",
-            config.groq.as_ref().map(|g| g.api_key.as_str()),
-        ),
-        "deepgram" | "deepgram-streaming" => (
-            "WHISRS_DEEPGRAM_API_KEY",
-            config.deepgram.as_ref().map(|d| d.api_key.as_str()),
-        ),
-        "openai" | "openai-realtime" => (
-            "WHISRS_OPENAI_API_KEY",
-            config.openai.as_ref().map(|o| o.api_key.as_str()),
-        ),
-        "local-whisper" | "local" | "local-vosk" | "local-parakeet" => {
-            return format!("{DIM}(local backend — no API key needed){RESET}");
+/// A [`KeySummary`] in the menu's colors.
+fn render_key_summary(summary: KeySummary) -> String {
+    match summary {
+        KeySummary::Env { var, masked } => {
+            format!("{BOLD}{masked}{RESET} {DIM}({var}, this shell){RESET}")
         }
-        "openai-compatible-realtime" => {
-            return match config
-                .openai_compatible_realtime
-                .as_ref()
-                .and_then(|r| r.api_key.as_deref())
-                .filter(|key| !key.is_empty())
-            {
-                Some(key) => format!("{BOLD}{}{RESET}", setup::mask_api_key(key)),
-                None => format!("{DIM}(optional bearer token not set){RESET}"),
-            };
+        KeySummary::File { masked } => format!("{BOLD}{masked}{RESET}"),
+        KeySummary::NotNeeded => {
+            format!("{DIM}(local backend \u{2014} no API key needed){RESET}")
         }
-        "asr-sidecar" | "asr" | "vibevoice" => {
-            // Unlike the other backends, the daemon trims both sides here and
-            // treats a blank value as absent.
-            let var = "WHISRS_ASR_SIDECAR_API_KEY";
-            if let Some(key) = env(var).filter(|key| !key.trim().is_empty()) {
-                return from_env(var, key.trim());
-            }
-            return match config
-                .asr_sidecar
-                .as_ref()
-                .and_then(|s| s.api_key.as_deref())
-                .filter(|key| !key.trim().is_empty())
-            {
-                Some(key) => format!("{BOLD}{}{RESET}", setup::mask_api_key(key)),
-                None => format!("{DIM}(optional API key not set){RESET}"),
-            };
-        }
-        _ => return format!("{YELLOW}not set{RESET}"),
-    };
-    if let Some(env_key) = env(var).filter(|key| !key.is_empty()) {
-        return from_env(var, &env_key);
-    }
-    match key {
-        Some(k) if !k.is_empty() => format!("{BOLD}{}{RESET}", setup::mask_api_key(k)),
-        _ => format!("{YELLOW}not set{RESET}"),
+        KeySummary::Optional(what) => format!("{DIM}(optional {what} not set){RESET}"),
+        KeySummary::NotSet => format!("{YELLOW}not set{RESET}"),
     }
 }
 
@@ -414,7 +350,7 @@ fn edit_filler_words(config: &mut Config) -> Result<()> {
         .interact_text()
         .context("failed to read filler word list")?;
 
-    config.general.filler_words = parse_csv_list(&input);
+    config.general.filler_words = vocabulary::parse_csv_list(&input);
     Ok(())
 }
 
@@ -439,7 +375,7 @@ fn edit_vocabulary_and_prompt(config: &mut Config, use_vocab_file: bool) -> Resu
         .allow_empty(true)
         .interact_text()
         .context("failed to read vocabulary")?;
-    config.general.vocabulary = parse_csv_list(&input);
+    config.general.vocabulary = vocabulary::parse_csv_list(&input);
 
     let prompt: String = Input::new()
         .with_prompt("Free-form prompt (style/register hints; leave blank to clear)")
@@ -1115,7 +1051,7 @@ fn edit_llm(config: &mut Config) -> Result<()> {
     let current_label = config
         .llm
         .as_ref()
-        .map(|l| format!("{} ({})", l.model, setup::mask_api_key(&l.api_key)))
+        .map(|l| format!("{} ({})", l.model, keys::mask_api_key(&l.api_key)))
         .unwrap_or_else(|| "not configured".to_string());
     println!("  Current: {current_label}");
 
@@ -1323,7 +1259,7 @@ fn truncate_for_menu(s: &str) -> String {
 
 fn show_config(config: &Config) {
     println!("\n  {BOLD}Current config (masked){RESET}\n");
-    match render_masked_toml(config) {
+    match keys::render_masked_toml(config) {
         Ok(s) => {
             for line in s.lines() {
                 println!("    {line}");
@@ -1331,35 +1267,6 @@ fn show_config(config: &Config) {
         }
         Err(e) => println!("  {RED}Failed to render config: {e}{RESET}"),
     }
-}
-
-/// Serialize a copy of the config with API keys replaced by `****<last4>`.
-///
-/// We clone before masking so the in-memory edit buffer keeps real keys.
-fn render_masked_toml(config: &Config) -> Result<String> {
-    let mut clone = config.clone();
-    if let Some(d) = clone.deepgram.as_mut() {
-        d.api_key = setup::mask_api_key(&d.api_key);
-    }
-    if let Some(g) = clone.groq.as_mut() {
-        g.api_key = setup::mask_api_key(&g.api_key);
-    }
-    if let Some(o) = clone.openai.as_mut() {
-        o.api_key = setup::mask_api_key(&o.api_key);
-    }
-    if let Some(r) = clone.openai_compatible_realtime.as_mut() {
-        r.api_key = r.api_key.as_ref().map(|key| setup::mask_api_key(key));
-    }
-    if let Some(s) = clone.asr_sidecar.as_mut() {
-        s.api_key = s.api_key.as_ref().map(|key| setup::mask_api_key(key));
-    }
-    if let Some(l) = clone.llm.as_mut() {
-        l.api_key = setup::mask_api_key(&l.api_key);
-    }
-    if let Some(t) = clone.tts.as_mut() {
-        t.api_key = t.api_key.as_ref().map(|key| setup::mask_api_key(key));
-    }
-    toml::to_string_pretty(&clone).context("failed to serialize config")
 }
 
 /// Open the current config in $EDITOR. Returns `true` when the user saved
@@ -1390,157 +1297,6 @@ fn open_in_editor(config: &mut Config) -> Result<bool> {
     }
 }
 
-/// Where the vocabulary stood when this `whisrs config` session started.
-///
-/// Two lists, because the editor works on the merged view while config.toml
-/// only ever held its own half. A save that did not touch the vocabulary has to
-/// put `config_toml` back, or the file's terms leak into config.toml and end up
-/// stored twice.
-struct VocabularyBaseline {
-    /// `vocabulary.txt` exists and was read successfully. False when it is
-    /// missing (feature not opted into) or unreadable, in which case the file
-    /// is never written and vocabulary edits stay in config.toml.
-    use_file: bool,
-    /// `[general] vocabulary` as read from config.toml, before the merge.
-    config_toml: Vec<String>,
-    /// The merged list the vocabulary editor started from.
-    merged: Vec<String>,
-}
-
-/// Whether this save should move the vocabulary into `vocabulary.txt`.
-///
-/// The migration is gated on an actual edit, not just on the file existing.
-/// Rewriting on every save made two unrelated saves destructive: it blanked
-/// `[general] vocabulary` in config.toml the first time anyone changed an
-/// unrelated setting (so deleting `vocabulary.txt` later lost the terms), and
-/// it flattened a hand-maintained `vocabulary.txt`, dropping its comments and
-/// grouping, for a save that had nothing to do with vocabulary.
-///
-/// Gating on the edit is also what makes an empty `vocabulary.txt` behave. An
-/// empty file is a legitimate way to opt in, and it stays untouched until the
-/// user actually adds a term — at which point the file is written non-empty,
-/// which is what the daemon-side merge requires.
-///
-/// The comparison is made on both lists *after* [`normalized_vocabulary`], so
-/// it is like-for-like.
-fn should_migrate_vocabulary(
-    use_vocab_file: bool,
-    baseline: &[String],
-    current: &[String],
-) -> bool {
-    use_vocab_file && normalized_vocabulary(baseline) != normalized_vocabulary(current)
-}
-
-/// A vocabulary list as the editor would hand it back.
-///
-/// The baseline is the raw merged list; anything that came out of "Vocabulary &
-/// prompt" has been through `join(", ")` and [`parse_csv_list`], and that round
-/// trip is not the identity — it trims padding and splits on commas. Comparing
-/// the two directly made an *unedited* pass through the editor look like an
-/// edit: a config.toml term with padding (`vocabulary = [" whisrs "]`, which is
-/// exactly what the templated-config setups this feature exists for produce) or
-/// with a comma in it fired the destructive migration when the user opened the
-/// section to change only the prompt and pressed Enter over the vocabulary
-/// line. Normalizing both sides removes the difference the editor itself
-/// introduced, leaving only the differences the user actually made.
-///
-/// The transform is idempotent — its output has no commas, no padding and no
-/// empty entries — so normalizing a list the editor already produced is a
-/// no-op, and the never-opened-the-editor path compares equal too.
-fn normalized_vocabulary(terms: &[String]) -> Vec<String> {
-    parse_csv_list(&terms.join(", "))
-}
-
-/// What `[general] vocabulary` config.toml should hold after this save.
-///
-/// The editor works on the merged view, so writing the in-memory list straight
-/// out would copy `vocabulary.txt`'s terms into config.toml and store every one
-/// of them twice. On a migration config.toml is emptied, since the file is now
-/// the single store. On an untouched vocabulary it gets back exactly the half
-/// it started with. With no `vocabulary.txt` in play there was no merge, so the
-/// edited list is written as-is, which is the pre-feature behavior.
-fn config_toml_vocabulary(vocab: &VocabularyBaseline, current: &[String]) -> Vec<String> {
-    if should_migrate_vocabulary(vocab.use_file, &vocab.merged, current) {
-        Vec::new()
-    } else if vocab.use_file {
-        vocab.config_toml.clone()
-    } else {
-        current.to_vec()
-    }
-}
-
-/// Everything a save does about the vocabulary, decided in one place.
-///
-/// The two halves are not independent — blanking `[general] vocabulary` is only
-/// safe *because* the same save wrote the terms to `vocabulary.txt` — so they
-/// are computed together and handed to the writer as a finished plan. Splitting
-/// the decision across the call site is what let a one-line slip there (write
-/// the blanked list to the file, skip the file write, write the merged list to
-/// config.toml) destroy every term the user had with every unit test still
-/// green.
-#[derive(Debug, PartialEq, Eq)]
-struct VocabularySavePlan {
-    /// The list `[general] vocabulary` is written with.
-    config_toml: Vec<String>,
-    /// The list `vocabulary.txt` is written with, or `None` to leave the file
-    /// exactly as it is (including its comments and grouping).
-    vocabulary_txt: Option<Vec<String>>,
-}
-
-/// Decide both halves of the save. Pure: it touches no disk.
-fn vocabulary_save_plan(vocab: &VocabularyBaseline, current: &[String]) -> VocabularySavePlan {
-    VocabularySavePlan {
-        config_toml: config_toml_vocabulary(vocab, current),
-        vocabulary_txt: should_migrate_vocabulary(vocab.use_file, &vocab.merged, current)
-            .then(|| current.to_vec()),
-    }
-}
-
-/// Execute a [`VocabularySavePlan`] and write config.toml, in that order.
-///
-/// The only place either store is written on save. `save_and_restart` calls
-/// this and does nothing else with the vocabulary, so there is no second copy
-/// of the decision for a call-site edit to get wrong.
-///
-/// Ordering: `vocabulary.txt` goes first because it is the direction that
-/// cannot lose a term. If config.toml then fails to write, every term the user
-/// kept is still on disk somewhere — the new list in `vocabulary.txt`, the old
-/// one still in config.toml. What that does *not* guarantee is that the save
-/// took effect: on a deletion config.toml keeps the removed term, and the next
-/// daemon start merges it straight back in. The error context says which half
-/// landed so the user is not left thinking the save rolled back cleanly.
-fn write_config_and_vocabulary(
-    config: &Config,
-    vocab: &VocabularyBaseline,
-    config_path: &Path,
-    vocab_path: &Path,
-) -> Result<Option<PathBuf>> {
-    let plan = vocabulary_save_plan(vocab, &config.general.vocabulary);
-
-    let mut vocabulary_written = None;
-    if let Some(terms) = &plan.vocabulary_txt {
-        vocabulary::write_vocabulary_file(vocab_path, terms)
-            .with_context(|| format!("failed to write {}", vocab_path.display()))?;
-        vocabulary_written = Some(vocab_path.to_path_buf());
-    }
-
-    let mut on_disk = config.clone();
-    on_disk.general.vocabulary = plan.config_toml;
-
-    if let Err(e) = setup::write_config_to(&on_disk, config_path) {
-        return Err(match &vocabulary_written {
-            Some(path) => e.context(format!(
-                "failed to write config: your vocabulary edits were already saved to {}, \
-                 but config.toml was not updated",
-                path.display()
-            )),
-            None => e.context("failed to write config"),
-        });
-    }
-
-    Ok(vocabulary_written)
-}
-
 /// Validate, write, and restart. Called only from the "Save & exit" branch.
 ///
 /// Returns `Ok(true)` on a successful save (caller should exit the menu) and
@@ -1551,9 +1307,9 @@ fn write_config_and_vocabulary(
 /// at startup) — in that case we point the user at `whisrs setup` for the
 /// permissions/systemd/keybinding bits we deliberately skipped.
 ///
-/// The vocabulary is not decided here: [`vocabulary_save_plan`] decides and
-/// [`write_config_and_vocabulary`] executes, and this function only reports
-/// which paths were written.
+/// The vocabulary is not decided here: `vocabulary_save_plan` decides and
+/// [`vocabulary::write_config_and_vocabulary`] executes, and this function
+/// only reports which paths were written.
 fn save_and_restart(config: &Config, fresh: bool, vocab: &VocabularyBaseline) -> Result<bool> {
     match config.validate() {
         Ok(warnings) => {
@@ -1575,8 +1331,12 @@ fn save_and_restart(config: &Config, fresh: bool, vocab: &VocabularyBaseline) ->
     // `write_config_and_vocabulary`. Nothing about the vocabulary is decided
     // here.
     let path = crate::config_path();
-    let vocabulary_written =
-        write_config_and_vocabulary(config, vocab, &path, &vocabulary::vocabulary_path())?;
+    let vocabulary_written = vocabulary::write_config_and_vocabulary(
+        config,
+        vocab,
+        &path,
+        &vocabulary::vocabulary_path(),
+    )?;
 
     if let Some(vocab_path) = &vocabulary_written {
         println!("\n  {GREEN}Wrote {}{RESET}", vocab_path.display());
@@ -1634,16 +1394,6 @@ fn save_and_restart(config: &Config, fresh: bool, vocab: &VocabularyBaseline) ->
         );
     }
     Ok(true)
-}
-
-/// Parse a comma-separated list, trimming whitespace and dropping empty entries.
-fn parse_csv_list(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 #[cfg(test)]
@@ -1908,10 +1658,10 @@ mod tests {
             .expect("run_config_menu has a body");
 
         let arm_at = body
-            .find("setup::ExistingConfig::Unusable {")
+            .find("write::ExistingConfig::Unusable {")
             .expect("run_config_menu does not handle an unusable config");
         let missing_at = body
-            .find("setup::ExistingConfig::Missing =>")
+            .find("write::ExistingConfig::Missing =>")
             .expect("run_config_menu does not handle a missing config");
         assert!(
             arm_at < missing_at,
@@ -1939,463 +1689,6 @@ mod tests {
             arm_at < prompt_at,
             "the refusal must come before the menu is shown"
         );
-    }
-
-    fn terms(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// No vocabulary.txt means no migration, however the list was edited: the
-    /// terms stay in config.toml, which is the pre-feature behavior.
-    #[test]
-    fn without_a_vocabulary_file_nothing_migrates() {
-        assert!(!should_migrate_vocabulary(
-            false,
-            &terms(&["whisrs"]),
-            &terms(&["whisrs", "NixOS"])
-        ));
-    }
-
-    /// The bug this gate exists for: a save that never touched the vocabulary
-    /// used to rewrite vocabulary.txt flat and blank `[general] vocabulary` in
-    /// config.toml. An unchanged list must leave both stores alone.
-    #[test]
-    fn an_unchanged_vocabulary_does_not_migrate() {
-        // Equal by value, not the same Vec: the save path compares the list
-        // the editor started from against the one it ends with.
-        assert!(!should_migrate_vocabulary(
-            true,
-            &terms(&["whisrs", "Hyprland"]),
-            &terms(&["whisrs", "Hyprland"])
-        ));
-    }
-
-    /// An empty vocabulary.txt is a legitimate way to opt in, so its mere
-    /// existence is not a reason to write anything. Nothing on either side, or
-    /// terms that only ever lived in config.toml, both stay put.
-    #[test]
-    fn an_empty_vocabulary_file_alone_does_not_migrate() {
-        assert!(!should_migrate_vocabulary(true, &[], &[]));
-        assert!(!should_migrate_vocabulary(
-            true,
-            &terms(&["whisrs"]),
-            &terms(&["whisrs"])
-        ));
-    }
-
-    /// Adding, removing or reordering a term is an edit, and an edit is what
-    /// moves the whole list into vocabulary.txt.
-    #[test]
-    fn any_vocabulary_edit_migrates() {
-        let baseline = terms(&["whisrs", "Hyprland"]);
-        for current in [
-            terms(&["whisrs", "Hyprland", "NixOS"]),
-            terms(&["whisrs"]),
-            terms(&["Hyprland", "whisrs"]),
-        ] {
-            assert!(
-                should_migrate_vocabulary(true, &baseline, &current),
-                "editing {baseline:?} into {current:?} must migrate"
-            );
-        }
-    }
-
-    /// Deleting every term still migrates, so vocabulary.txt is written empty
-    /// rather than left holding the terms the user just removed.
-    #[test]
-    fn clearing_the_vocabulary_migrates() {
-        assert!(should_migrate_vocabulary(
-            true,
-            &terms(&["whisrs", "Hyprland"]),
-            &[]
-        ));
-    }
-
-    /// Casing is part of the term: Deepgram echoes each keyterm back in the
-    /// casing configured, so `Whisrs` is a different term from `whisrs`.
-    #[test]
-    fn a_case_only_vocabulary_change_migrates() {
-        assert!(should_migrate_vocabulary(
-            true,
-            &terms(&["whisrs"]),
-            &terms(&["Whisrs"])
-        ));
-    }
-
-    fn baseline(use_file: bool, config_toml: &[&str], file: &[&str]) -> VocabularyBaseline {
-        VocabularyBaseline {
-            use_file,
-            config_toml: terms(config_toml),
-            merged: crate::config::vocabulary::merge_vocabulary(terms(config_toml), terms(file)),
-        }
-    }
-
-    /// The regression a naive "just don't migrate" fix introduces: the editor
-    /// holds the merged list, so an untouched save must put config.toml's own
-    /// half back rather than write the merge into it. Otherwise vocabulary.txt's
-    /// terms are silently copied into config.toml and stored twice.
-    #[test]
-    fn an_untouched_save_leaves_config_toml_holding_only_its_own_terms() {
-        let vocab = baseline(true, &["whisrs"], &["NixOS"]);
-        let current = vocab.merged.clone();
-        assert_eq!(
-            config_toml_vocabulary(&vocab, &current),
-            terms(&["whisrs"]),
-            "NixOS lives in vocabulary.txt and must not be copied into config.toml"
-        );
-    }
-
-    /// Once the user edits the list, vocabulary.txt becomes the single store
-    /// and config.toml is emptied, so deleting a term cannot resurrect it.
-    #[test]
-    fn an_edited_vocabulary_empties_config_toml() {
-        let vocab = baseline(true, &["whisrs"], &["NixOS"]);
-        assert!(
-            config_toml_vocabulary(&vocab, &terms(&["whisrs", "NixOS", "Hyprland"])).is_empty()
-        );
-        assert!(config_toml_vocabulary(&vocab, &[]).is_empty());
-    }
-
-    /// With no vocabulary.txt there was no merge, so the edited list is what
-    /// config.toml gets — the behavior from before the file existed.
-    #[test]
-    fn without_a_vocabulary_file_config_toml_keeps_the_edited_list() {
-        let vocab = baseline(false, &["whisrs"], &[]);
-        assert_eq!(
-            config_toml_vocabulary(&vocab, &terms(&["whisrs", "Hyprland"])),
-            terms(&["whisrs", "Hyprland"])
-        );
-    }
-
-    /// One row of the save-time state table: what the two stores were, what the
-    /// editor ended up holding, and what each store must be written with.
-    struct PlanRow {
-        what: &'static str,
-        /// `vocabulary.txt` exists and was read.
-        use_file: bool,
-        /// `[general] vocabulary` as config.toml held it at startup.
-        config_toml: &'static [&'static str],
-        /// The terms `vocabulary.txt` held at startup.
-        file: &'static [&'static str],
-        /// The list in memory when the user hit "Save & exit".
-        current: &'static [&'static str],
-        /// What `[general] vocabulary` must be written with.
-        expect_config_toml: &'static [&'static str],
-        /// What `vocabulary.txt` must be written with, `None` to leave it be.
-        expect_file: Option<&'static [&'static str]>,
-    }
-
-    /// The whole save-time decision, one row per reachable state.
-    ///
-    /// This is the table [`vocabulary_save_plan`] exists to satisfy. It is the
-    /// only decision the save makes about the vocabulary, so a slip in
-    /// `write_config_and_vocabulary` has nothing to reinterpret — see
-    /// `a_migrating_save_writes_the_whole_list_to_the_file_and_blanks_config_toml`
-    /// for the execution half.
-    #[test]
-    fn the_vocabulary_save_plan_covers_every_state() {
-        let rows = [
-            PlanRow {
-                what: "no vocabulary.txt, vocabulary untouched",
-                use_file: false,
-                config_toml: &["whisrs"],
-                file: &[],
-                current: &["whisrs"],
-                expect_config_toml: &["whisrs"],
-                expect_file: None,
-            },
-            PlanRow {
-                what: "no vocabulary.txt, term added — stays in config.toml",
-                use_file: false,
-                config_toml: &["whisrs"],
-                file: &[],
-                current: &["whisrs", "NixOS"],
-                expect_config_toml: &["whisrs", "NixOS"],
-                expect_file: None,
-            },
-            PlanRow {
-                what: "no vocabulary.txt, list cleared",
-                use_file: false,
-                config_toml: &["whisrs"],
-                file: &[],
-                current: &[],
-                expect_config_toml: &[],
-                expect_file: None,
-            },
-            PlanRow {
-                what: "vocabulary.txt present, vocabulary untouched — neither store moves",
-                use_file: true,
-                config_toml: &["whisrs"],
-                file: &["NixOS"],
-                current: &["whisrs", "NixOS"],
-                expect_config_toml: &["whisrs"],
-                expect_file: None,
-            },
-            PlanRow {
-                what: "term added — the whole merged list migrates to the file",
-                use_file: true,
-                config_toml: &["whisrs"],
-                file: &["NixOS"],
-                current: &["whisrs", "NixOS", "Deepgram"],
-                expect_config_toml: &[],
-                expect_file: Some(&["whisrs", "NixOS", "Deepgram"]),
-            },
-            PlanRow {
-                what: "term removed — the file gets the survivors, config.toml is blanked",
-                use_file: true,
-                config_toml: &["whisrs"],
-                file: &["NixOS"],
-                current: &["whisrs"],
-                expect_config_toml: &[],
-                expect_file: Some(&["whisrs"]),
-            },
-            PlanRow {
-                what: "reordered — order is part of the list (Deepgram budgets in order)",
-                use_file: true,
-                config_toml: &["whisrs"],
-                file: &["NixOS"],
-                current: &["NixOS", "whisrs"],
-                expect_config_toml: &[],
-                expect_file: Some(&["NixOS", "whisrs"]),
-            },
-            PlanRow {
-                what: "case-only change — Deepgram echoes the casing configured",
-                use_file: true,
-                config_toml: &["whisrs"],
-                file: &["NixOS"],
-                current: &["Whisrs", "NixOS"],
-                expect_config_toml: &[],
-                expect_file: Some(&["Whisrs", "NixOS"]),
-            },
-            PlanRow {
-                what: "everything deleted — the file is written empty, not left holding terms",
-                use_file: true,
-                config_toml: &["whisrs"],
-                file: &["NixOS"],
-                current: &[],
-                expect_config_toml: &[],
-                expect_file: Some(&[]),
-            },
-            PlanRow {
-                what: "empty vocabulary.txt, nothing anywhere — its existence is not an edit",
-                use_file: true,
-                config_toml: &[],
-                file: &[],
-                current: &[],
-                expect_config_toml: &[],
-                expect_file: None,
-            },
-            PlanRow {
-                what: "empty vocabulary.txt, config.toml terms untouched — they stay put",
-                use_file: true,
-                config_toml: &["whisrs"],
-                file: &[],
-                current: &["whisrs"],
-                expect_config_toml: &["whisrs"],
-                expect_file: None,
-            },
-            PlanRow {
-                what: "empty vocabulary.txt, term added — now the file is written",
-                use_file: true,
-                config_toml: &["whisrs"],
-                file: &[],
-                current: &["whisrs", "NixOS"],
-                expect_config_toml: &[],
-                expect_file: Some(&["whisrs", "NixOS"]),
-            },
-            PlanRow {
-                // The editor round-trips through `join(", ")` + `parse_csv_list`,
-                // which trims. A padded config.toml term must not read as an edit.
-                what: "padded config.toml term, editor opened and left alone",
-                use_file: true,
-                config_toml: &[" whisrs "],
-                file: &["NixOS"],
-                current: &["whisrs", "NixOS"],
-                expect_config_toml: &[" whisrs "],
-                expect_file: None,
-            },
-            PlanRow {
-                // Same, for the other half of that round trip: the editor's
-                // input format splits on commas.
-                what: "comma-containing config.toml term, editor opened and left alone",
-                use_file: true,
-                config_toml: &["Claude, Code"],
-                file: &["NixOS"],
-                current: &["Claude", "Code", "NixOS"],
-                expect_config_toml: &["Claude, Code"],
-                expect_file: None,
-            },
-        ];
-
-        for row in rows {
-            let vocab = baseline(row.use_file, row.config_toml, row.file);
-            let plan = vocabulary_save_plan(&vocab, &terms(row.current));
-            assert_eq!(
-                plan,
-                VocabularySavePlan {
-                    config_toml: terms(row.expect_config_toml),
-                    vocabulary_txt: row.expect_file.map(terms),
-                },
-                "{}",
-                row.what
-            );
-        }
-    }
-
-    /// A `whisrs config` session that only ever loaded the config: the baseline
-    /// and the in-memory list are the same raw merged list, padding and all.
-    /// Nothing may migrate.
-    #[test]
-    fn a_save_that_never_opened_the_vocabulary_editor_does_not_migrate() {
-        let vocab = baseline(true, &[" whisrs ", "Claude, Code"], &["NixOS"]);
-        let untouched = vocab.merged.clone();
-        assert_eq!(
-            vocabulary_save_plan(&vocab, &untouched).vocabulary_txt,
-            None
-        );
-    }
-
-    /// A config.toml + vocabulary.txt pair in a fresh temp dir, driven through
-    /// the real save path. Returns the two paths and what the vocabulary write
-    /// reported.
-    fn run_save(
-        vocab: &VocabularyBaseline,
-        current: &[&str],
-        vocabulary_txt: Option<&str>,
-    ) -> (tempfile::TempDir, PathBuf, PathBuf, Option<PathBuf>) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let config_path = dir.path().join("config.toml");
-        let vocab_path = dir.path().join("vocabulary.txt");
-        if let Some(contents) = vocabulary_txt {
-            fs::write(&vocab_path, contents).expect("seed vocabulary.txt");
-        }
-
-        let mut config = default_config();
-        config.general.vocabulary = terms(current);
-        let written = write_config_and_vocabulary(&config, vocab, &config_path, &vocab_path)
-            .expect("save succeeds");
-
-        (dir, config_path, vocab_path, written)
-    }
-
-    fn config_toml_terms(path: &Path) -> Vec<String> {
-        let contents = fs::read_to_string(path).expect("config.toml exists");
-        let parsed: Config = toml::from_str(&contents).expect("config.toml reparses");
-        parsed.general.vocabulary
-    }
-
-    /// The composition, not the pieces: an edit must put the *whole merged
-    /// list* in vocabulary.txt and an empty list in config.toml, in that order.
-    ///
-    /// Writing the blanked config.toml list to the file, skipping the file
-    /// write, or writing the merged list into config.toml each destroy or
-    /// duplicate the user's terms, and each is a one-line slip at this call
-    /// site. All three fail here.
-    #[test]
-    fn a_migrating_save_writes_the_whole_list_to_the_file_and_blanks_config_toml() {
-        let vocab = baseline(true, &["whisrs"], &["NixOS"]);
-        let (_dir, config_path, vocab_path, written) = run_save(
-            &vocab,
-            &["whisrs", "NixOS", "Deepgram"],
-            Some("# hand-written\nNixOS\n"),
-        );
-
-        assert_eq!(written.as_deref(), Some(vocab_path.as_path()));
-        assert_eq!(
-            vocabulary::load_vocabulary_file(&vocab_path).expect("readable"),
-            Some(terms(&["whisrs", "NixOS", "Deepgram"])),
-            "vocabulary.txt must hold every term the editor showed"
-        );
-        assert!(
-            config_toml_terms(&config_path).is_empty(),
-            "config.toml must be blanked so no term is stored twice"
-        );
-    }
-
-    /// The other half of the composition: with no edit, neither store is
-    /// touched. vocabulary.txt keeps its comments byte for byte and config.toml
-    /// gets back exactly its own half of the list, not the merge.
-    #[test]
-    fn a_save_without_a_vocabulary_edit_leaves_both_stores_alone() {
-        let seeded = "# Deepgram keyterms\n\n# proper nouns\nNixOS\n";
-        let vocab = baseline(true, &["whisrs"], &["NixOS"]);
-        let (_dir, config_path, vocab_path, written) =
-            run_save(&vocab, &["whisrs", "NixOS"], Some(seeded));
-
-        assert_eq!(written, None);
-        assert_eq!(
-            fs::read_to_string(&vocab_path).expect("readable"),
-            seeded,
-            "an untouched vocabulary must not cost the user their comments"
-        );
-        assert_eq!(
-            config_toml_terms(&config_path),
-            terms(&["whisrs"]),
-            "config.toml keeps its own half; the file's terms must not leak in"
-        );
-    }
-
-    /// FIX for the editor round trip: opening "Vocabulary & prompt" to change
-    /// only the prompt and pressing Enter over the vocabulary line is not an
-    /// edit, even when config.toml's terms have padding or a comma in them.
-    /// Before this, `parse_csv_list` normalized them, the lists compared
-    /// unequal, and a migration the user never asked for flattened their
-    /// hand-maintained vocabulary.txt.
-    #[test]
-    fn an_unedited_pass_through_the_editor_does_not_migrate() {
-        let seeded = "# grouped by project\nNixOS\n\n# people\nClaude\n";
-        let vocab = baseline(true, &[" whisrs ", "Claude, Code"], &["NixOS", "Claude"]);
-        // Exactly what the editor hands back when the user accepts the default.
-        let echoed = normalized_vocabulary(&vocab.merged);
-        let echoed: Vec<&str> = echoed.iter().map(String::as_str).collect();
-
-        let (_dir, config_path, vocab_path, written) = run_save(&vocab, &echoed, Some(seeded));
-
-        assert_eq!(written, None, "an unedited pass must not write the file");
-        assert_eq!(fs::read_to_string(&vocab_path).expect("readable"), seeded);
-        assert_eq!(
-            config_toml_terms(&config_path),
-            terms(&[" whisrs ", "Claude, Code"]),
-            "config.toml must keep its terms verbatim"
-        );
-    }
-
-    /// Deleting a term is the case blanking config.toml exists for: the term
-    /// must be in neither store afterwards, so the daemon's startup merge
-    /// cannot bring it back. This is the resurrection scenario end to end —
-    /// save, then re-run the merge the daemon does.
-    #[test]
-    fn a_deleted_term_cannot_resurrect_from_config_toml() {
-        let vocab = baseline(true, &["whisrs", "ghost"], &["NixOS"]);
-        let (_dir, config_path, vocab_path, _) =
-            run_save(&vocab, &["whisrs", "NixOS"], Some("NixOS\n"));
-
-        let from_file = vocabulary::load_vocabulary_file(&vocab_path)
-            .expect("readable")
-            .expect("written");
-        let merged = vocabulary::merge_vocabulary(config_toml_terms(&config_path), from_file);
-        assert_eq!(
-            merged,
-            terms(&["whisrs", "NixOS"]),
-            "the daemon must load exactly what the editor showed after the delete"
-        );
-    }
-
-    /// A term starting with `#` survives the migration. It used to be written
-    /// as a line the parser reads as a comment, so it disappeared from
-    /// vocabulary.txt in the same save that blanked config.toml — gone from
-    /// both stores, silently.
-    #[test]
-    fn a_hash_leading_term_survives_the_migration() {
-        let vocab = baseline(true, &["#1", "NixOS"], &[]);
-        let (_dir, config_path, vocab_path, _) =
-            run_save(&vocab, &["#1", "NixOS", "Deepgram"], Some(""));
-
-        let from_file = vocabulary::load_vocabulary_file(&vocab_path)
-            .expect("readable")
-            .expect("written");
-        let merged = vocabulary::merge_vocabulary(config_toml_terms(&config_path), from_file);
-        assert_eq!(merged, terms(&["#1", "NixOS", "Deepgram"]));
     }
 
     /// A section with nothing bound is dropped, keeping the TOML clean.
@@ -2426,231 +1719,40 @@ mod tests {
         }
     }
 
-    /// Every `Config` field whose section carries an `api_key`, discovered from
-    /// the struct definitions rather than a hand-written list. `[tts]` was
-    /// missed by `render_masked_toml` for six releases precisely because the
-    /// set of key-bearing sections lived only in that function's body.
-    fn key_bearing_config_fields() -> Vec<String> {
-        let types_src = include_str!("types.rs");
-
-        let mut with_key: Vec<&str> = Vec::new();
-        for src in [types_src, include_str!("../llm.rs")] {
-            for chunk in src.split("\npub struct ").skip(1) {
-                let name = chunk
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .next()
-                    .unwrap_or_default();
-                let body = chunk.split("\n}").next().unwrap_or_default();
-                if body.contains("pub api_key") {
-                    with_key.push(name);
-                }
-            }
-        }
-        assert_eq!(
-            with_key.len(),
-            7,
-            "the struct scan found {with_key:?} — it only sees column-0 `pub struct` \
-             in types.rs and llm.rs, so a key-bearing struct that moved elsewhere is \
-             invisible here and would pass vacuously"
-        );
-
-        let config_body = types_src
-            .split("\npub struct Config {")
-            .nth(1)
-            .expect("types.rs defines Config")
-            .split("\n}")
-            .next()
-            .expect("Config has a body");
-
-        let mut fields = Vec::new();
-        for line in config_body.lines() {
-            let Some(rest) = line.trim().strip_prefix("pub ") else {
-                continue;
-            };
-            let Some((name, ty)) = rest.split_once(':') else {
-                continue;
-            };
-            if with_key.iter().any(|s| ty.contains(s)) {
-                fields.push(name.trim().to_string());
-            }
-        }
-        fields
-    }
-
-    /// `render_masked_toml` masks a hand-written list of sections, so a new
-    /// key-bearing section is silently printed in cleartext under a heading
-    /// that promises "masked". Assert the function touches every section the
-    /// struct definitions say carries a key.
-    ///
-    /// Structural only: it proves each section is *mentioned*, not that the
-    /// mention masks anything. `a_populated_config_renders_no_cleartext_key`
-    /// is the semantic half, and neither test replaces the other.
+    /// The menu header shows each [`KeySummary`] as it always has: the
+    /// summary moved to `keys.rs`, its text did not change.
     #[test]
-    fn render_masked_toml_covers_every_key_bearing_section() {
-        let source = include_str!("edit.rs");
-        let body = source
-            .split("fn render_masked_toml(")
-            .nth(1)
-            .expect("edit.rs defines render_masked_toml")
-            .split("\nfn ")
-            .next()
-            .expect("render_masked_toml has a body");
-
-        let fields = key_bearing_config_fields();
-        for field in &fields {
-            // The trailing dot is load-bearing: `clone.openai` is a prefix of
-            // `clone.openai_compatible_realtime`, so an unanchored match let a
-            // deleted `[openai]` arm pass this test.
-            assert!(
-                body.contains(&format!("clone.{field}.")),
-                "render_masked_toml never masks `[{field}] api_key`, so \
-                 `whisrs config` prints it in cleartext under \"Current config (masked)\""
-            );
+    fn key_summary_renders_the_menu_text() {
+        let cases = [
+            (
+                KeySummary::Env {
+                    var: "WHISRS_GROQ_API_KEY",
+                    masked: "****9876".into(),
+                },
+                format!("{BOLD}****9876{RESET} {DIM}(WHISRS_GROQ_API_KEY, this shell){RESET}"),
+            ),
+            (
+                KeySummary::File {
+                    masked: "****1234".into(),
+                },
+                format!("{BOLD}****1234{RESET}"),
+            ),
+            (
+                KeySummary::NotNeeded,
+                format!("{DIM}(local backend \u{2014} no API key needed){RESET}"),
+            ),
+            (
+                KeySummary::Optional("bearer token"),
+                format!("{DIM}(optional bearer token not set){RESET}"),
+            ),
+            (
+                KeySummary::Optional("API key"),
+                format!("{DIM}(optional API key not set){RESET}"),
+            ),
+            (KeySummary::NotSet, format!("{YELLOW}not set{RESET}")),
+        ];
+        for (summary, expected) in cases {
+            assert_eq!(render_key_summary(summary.clone()), expected, "{summary:?}");
         }
-        assert_eq!(
-            fields.len(),
-            7,
-            "expected 7 key-bearing sections, found {fields:?} — update this count \
-             deliberately once the new section is masked above"
-        );
-    }
-
-    /// The value half: a config with a key in every section must render with
-    /// no secret surviving, and with every `api_key` still present and masked.
-    /// A section dropped from serialization would otherwise pass the scan test.
-    #[test]
-    fn a_populated_config_renders_no_cleartext_key() {
-        let config: Config = toml::from_str(
-            r#"
-[deepgram]
-api_key = "deepgram-SECRET-aaaa"
-[groq]
-api_key = "groq-SECRET-bbbb"
-[openai]
-api_key = "openai-SECRET-cccc"
-[asr-sidecar]
-api_key = "sidecar-SECRET-dddd"
-[openai-compatible-realtime]
-api_key = "realtime-SECRET-eeee"
-[llm]
-api_key = "llm-SECRET-ffff"
-[tts]
-api_key = "tts-SECRET-gggg"
-"#,
-        )
-        .expect("fixture parses");
-
-        let rendered = render_masked_toml(&config).expect("renders");
-
-        assert!(
-            !rendered.contains("SECRET"),
-            "a key survived masking:\n{rendered}"
-        );
-        assert_eq!(
-            rendered.matches("api_key").count(),
-            7,
-            "every section must still print a masked api_key:\n{rendered}"
-        );
-        for tail in ["aaaa", "bbbb", "cccc", "dddd", "eeee", "ffff", "gggg"] {
-            assert!(
-                rendered.contains(&format!("****{tail}")),
-                "`{tail}` section is missing its masked key:\n{rendered}"
-            );
-        }
-    }
-
-    /// Parse `toml` and summarize its key with `env` standing in for the
-    /// process environment, which these tests never touch.
-    fn key_summary(toml: &str, env: &[(&str, &str)]) -> String {
-        let config: Config = toml::from_str(toml).expect("fixture parses");
-        current_key_summary_from(&config, |name| {
-            env.iter()
-                .find(|(var, _)| *var == name)
-                .map(|(_, value)| value.to_string())
-        })
-    }
-
-    /// One row per keyed backend family, including an alias of each shared
-    /// section: backend, section name, and the env var the daemon reads.
-    const KEYED_BACKENDS: &[(&str, &str, &str)] = &[
-        ("groq", "groq", "WHISRS_GROQ_API_KEY"),
-        ("deepgram", "deepgram", "WHISRS_DEEPGRAM_API_KEY"),
-        ("deepgram-streaming", "deepgram", "WHISRS_DEEPGRAM_API_KEY"),
-        ("openai", "openai", "WHISRS_OPENAI_API_KEY"),
-        ("openai-realtime", "openai", "WHISRS_OPENAI_API_KEY"),
-        ("asr-sidecar", "asr-sidecar", "WHISRS_ASR_SIDECAR_API_KEY"),
-        ("asr", "asr-sidecar", "WHISRS_ASR_SIDECAR_API_KEY"),
-        ("vibevoice", "asr-sidecar", "WHISRS_ASR_SIDECAR_API_KEY"),
-    ];
-
-    #[test]
-    fn key_summary_shows_an_env_key_without_a_config_key() {
-        for &(backend, section, var) in KEYED_BACKENDS {
-            let absent = format!("[general]\nbackend = \"{backend}\"\n");
-            let empty = format!("{absent}[{section}]\napi_key = \"\"\n");
-            for toml in [absent, empty] {
-                let summary = key_summary(&toml, &[(var, "env-key-9876")]);
-                assert!(
-                    summary.contains("****9876") && summary.contains(var),
-                    "{backend}"
-                );
-                assert!(summary.contains("this shell"), "{backend}");
-            }
-        }
-    }
-
-    #[test]
-    fn key_summary_prefers_the_env_key_like_the_daemon() {
-        for &(backend, section, var) in KEYED_BACKENDS {
-            let toml = format!(
-                "[general]\nbackend = \"{backend}\"\n[{section}]\napi_key = \"file-key-1234\"\n"
-            );
-            let both = key_summary(&toml, &[(var, "env-key-9876")]);
-            assert!(
-                both.contains("****9876") && both.contains(var) && !both.contains("1234"),
-                "{backend}"
-            );
-
-            let file_only = key_summary(&toml, &[]);
-            assert!(
-                file_only.contains("****1234") && !file_only.contains(var),
-                "{backend}"
-            );
-        }
-    }
-
-    #[test]
-    fn key_summary_without_any_key_is_unchanged() {
-        for &(backend, section, var) in KEYED_BACKENDS {
-            let summary = key_summary(&format!("[general]\nbackend = \"{backend}\"\n"), &[]);
-            let expected = if section == "asr-sidecar" {
-                "(optional API key not set)"
-            } else {
-                "not set"
-            };
-            assert!(summary.contains(expected), "{backend}");
-            assert!(!summary.contains(var), "{backend}");
-        }
-    }
-
-    /// The daemon's blank-env rules differ by backend: groq only skips an
-    /// empty string, so whitespace counts as set, while the sidecar trims.
-    #[test]
-    fn key_summary_follows_each_backends_blank_env_rule() {
-        let groq = "[general]\nbackend = \"groq\"\n[groq]\napi_key = \"file-key-1234\"\n";
-        let empty = key_summary(groq, &[("WHISRS_GROQ_API_KEY", "")]);
-        assert!(empty.contains("****1234"));
-        let spaces = key_summary(groq, &[("WHISRS_GROQ_API_KEY", "     ")]);
-        assert!(spaces.contains("WHISRS_GROQ_API_KEY"));
-
-        let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\
-                       [asr-sidecar]\napi_key = \"file-key-1234\"\n";
-        let spaces = key_summary(sidecar, &[("WHISRS_ASR_SIDECAR_API_KEY", "   ")]);
-        assert!(spaces.contains("****1234") && !spaces.contains("WHISRS_"));
-        let padded = key_summary(
-            sidecar,
-            &[("WHISRS_ASR_SIDECAR_API_KEY", " env-key-9876\n")],
-        );
-        assert!(padded.contains("****9876"));
     }
 }
