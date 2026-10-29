@@ -23,6 +23,38 @@ fn config() -> Fixture {
     fixture
 }
 
+/// Config with the language picker open on `ger`, as the mockup has it.
+fn picker() -> Fixture {
+    let mut fixture = mockup();
+    press(&mut fixture.app, "\n\n");
+    for c in "ger".chars() {
+        press(&mut fixture.app, &c.to_string());
+    }
+    fixture
+}
+
+/// The toggle hotkey's dialog, Super added to its Alt+D.
+fn hotkey() -> Fixture {
+    let mut fixture = mockup();
+    // Hotkeys is the seventh section.
+    press(&mut fixture.app, "jjjjjj\n\n ");
+    fixture
+}
+
+#[test]
+fn picker_and_hotkey_snapshots() {
+    for (w, h) in [(60, 18), (90, 30)] {
+        assert_snapshot(
+            &format!("picker-{w}x{h}"),
+            &rows(&draw(&picker().app, w, h)),
+        );
+        assert_snapshot(
+            &format!("hotkey-{w}x{h}"),
+            &rows(&draw(&hotkey().app, w, h)),
+        );
+    }
+}
+
 #[test]
 fn home_snapshots() {
     let fixture = home();
@@ -155,6 +187,8 @@ fn no_size_panics() {
     let mut list = mockup();
     press(&mut list.app, "jjj\n\n");
     states.push(list);
+    states.push(picker());
+    states.push(hotkey());
     for fixture in &states {
         for w in [1, 2, 10, 40, 59, 60, 61, 70, 89, 90, 91, 120, 199, 200, 250] {
             for h in [1, 2, 5, 17, 18, 19, 25, 30, 60, 90] {

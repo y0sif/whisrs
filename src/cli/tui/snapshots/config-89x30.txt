@@ -13,7 +13,7 @@
    │   openai languages  none                                                        │
    │   whisper model     ~/.local/share/whisrs/models/ggml-base.en.bin               │
    │   segmentation      silence                                                     │
-   │   phrase silence    400                                                         │
+   │   phrase silence    400 ms                                                      │
    │   flash_attn        off                                                         │
    │   sidecar url       http://127.0.0.1:8765/transcribe                            │
    │   sidecar model     microsoft/VibeVoice-ASR-HF                                  │

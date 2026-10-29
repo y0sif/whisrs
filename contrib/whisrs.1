@@ -26,7 +26,22 @@ Does not require the daemon to be running.
 Open a full\-screen editor (a TUI) for every key of
 .IR config.toml ,
 by section: backend and API keys, language, hotkeys, overlay, read\-aloud,
-agents, recording, and the rest.
+agents, recording, and the rest. A value whisrs can list is picked, not
+recalled:
+.B h
+and
+.B l
+change a choice or step a number
+.RB ( H
+and
+.B L
+by a bigger step),
+.B Enter
+opens a picker that filters as you type (languages, models, voices,
+devices, model files), and a hotkey is built in a dialog of modifiers and
+a key. A value no list has can still be typed, and
+.B Tab
+completes a path.
 .B w
 saves, keeping comments, key order and unknown keys, then restarts the
 daemon through its service manager, but only while it is idle: while it
@@ -39,7 +54,15 @@ does it later.
 opens the file in
 .BR $VISUAL ,
 else
-.BR $EDITOR .
+.BR $EDITOR ,
+else the first of
+.BR nvim ,
+.BR vim ,
+.B vi
+and
+.B nano
+on
+.BR PATH .
 Colours follow the
 .B [overlay]
 theme;

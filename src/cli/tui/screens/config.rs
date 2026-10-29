@@ -2,6 +2,11 @@
 //! left the sections and on the right the rows of the one picked. At 90
 //! columns and up both panes show; below, the list drills into a section.
 //!
+//! Values are picked, stepped or typed by kind ([`Kind`]): closed sets
+//! cycle in place and open a picker, known values are suggested, numbers
+//! step by an amount that fits, hotkeys are built in a dialog. Typing stays
+//! wherever a value of the user's own is legitimate.
+//!
 //! Edits go into a [`Form`] and stay there until `w`, which validates the
 //! config, writes it through the format-preserving writer (comments, key
 //! order and unknown keys kept, 0600, atomic, `vocabulary.txt` by its own
@@ -20,14 +25,23 @@ use whisrs::config::keys::{self, KeySummary};
 use whisrs::config::vocabulary::{self, VocabularyBaseline};
 use whisrs::config::write::{self, ExistingConfig};
 
+use whisrs::overlay::palette::Palette;
+
 use crate::tui::app::{App, Dialog};
+use crate::tui::complete;
 use crate::tui::form::Form;
-use crate::tui::keys::Action;
-use crate::tui::schema::{self, Body, Entries, Field, Kind, Section, SECTIONS};
+use crate::tui::keys::{Action, Mode};
+use crate::tui::options::{self, Listed, Listing, Lists};
+use crate::tui::schema::{
+    self, Body, Check, Entries, Field, Kind, ListKind, Section, Steps, SECTIONS,
+};
+use crate::tui::theme::Rgb;
 use crate::tui::widgets::frame::{self, Header};
+use crate::tui::widgets::hotkey::{self, HotkeyDialog};
 use crate::tui::widgets::input::Input;
+use crate::tui::widgets::picker::{self, Picked, Picker};
 use crate::tui::widgets::row::{Row, Value as Shown};
-use crate::tui::widgets::{fit, scroll, width, wrap, Notice, Tone, Ui};
+use crate::tui::widgets::{dialog, fit, scroll, width, wrap, Notice, Tone, Ui};
 use crate::tui::{Env, Paths};
 
 /// The section list's width in the two-pane layout.
@@ -38,6 +52,9 @@ const MAX_LABEL: usize = 24;
 
 /// The most help lines under the rows.
 const MAX_HELP: usize = 4;
+
+/// How far `PgUp` and `PgDn` move the cursor.
+const PAGE: usize = 10;
 
 /// A config read from disk, ready to edit.
 pub struct Loaded {
@@ -230,7 +247,7 @@ enum Focus {
 }
 
 /// A level of the detail pane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 enum View {
     /// The section's own rows, entries or map.
     Section { cursor: usize },
@@ -239,7 +256,7 @@ enum View {
     /// The items of a list key.
     List {
         path: String,
-        field: &'static str,
+        field: &'static Field,
         cursor: usize,
     },
 }
@@ -306,6 +323,44 @@ struct Editing {
     input: Input,
 }
 
+/// An open picker, and what its pick sets.
+struct Picking {
+    picker: Picker,
+    purpose: Purpose,
+}
+
+#[derive(Clone)]
+enum Purpose {
+    Field {
+        field: &'static Field,
+        path: String,
+    },
+    /// An item of the list at `path`: an edit of `index`, or a new one.
+    Element {
+        field: &'static Field,
+        path: String,
+        index: Option<usize>,
+    },
+    /// The key of the open hotkey dialog.
+    HotkeyKey,
+}
+
+/// An open hotkey dialog, and the row it sets.
+struct Hotkeying {
+    dialog: HotkeyDialog,
+    field: &'static Field,
+    path: String,
+}
+
+/// How a row's value sits: arrows either side while focused, dimmed at a
+/// limit.
+#[derive(Debug, Clone, Copy, Default)]
+struct Look {
+    arrows: bool,
+    at_min: bool,
+    at_max: bool,
+}
+
 /// What a key on Config asks of the app.
 #[derive(Debug, Default)]
 pub struct Outcome {
@@ -314,6 +369,8 @@ pub struct Outcome {
     pub status: Option<Notice>,
     pub flash: Option<String>,
     pub dialog: Option<Dialog>,
+    /// A list to fetch on a worker.
+    pub load: Option<ListKind>,
 }
 
 impl Outcome {
@@ -338,12 +395,18 @@ pub struct ConfigScreen {
     /// The detail pane's levels, never empty.
     views: Vec<View>,
     editing: Option<Editing>,
+    picker: Option<Picking>,
+    hotkey: Option<Hotkeying>,
+    /// What the workers listed: devices, model files.
+    pub lists: Lists,
+    /// For `PATH` lookups and `~`.
+    env: Env,
     /// Rows whose label or path holds this, in any case.
     filter: String,
 }
 
 impl ConfigScreen {
-    pub fn new(loaded: Loaded) -> ConfigScreen {
+    pub fn new(loaded: Loaded, env: Env) -> ConfigScreen {
         ConfigScreen {
             form: loaded.form,
             vocabulary: loaded.vocabulary,
@@ -354,19 +417,71 @@ impl ConfigScreen {
             focus: Focus::Sections,
             views: vec![View::Section { cursor: 0 }],
             editing: None,
+            picker: None,
+            hotkey: None,
+            lists: Lists::default(),
+            env,
             filter: String::new(),
         }
     }
 
     /// Whether a text input has the keys.
+    #[cfg(test)]
     pub fn typing(&self) -> bool {
         self.editing.is_some()
     }
 
+    /// Who has the keys: a picker, the hotkey dialog, an input, or the
+    /// rows.
+    pub fn mode(&self) -> Mode {
+        if self.picker.is_some() {
+            Mode::Picker
+        } else if self.hotkey.is_some() {
+            Mode::Hotkey
+        } else if self.editing.is_some() {
+            Mode::Text
+        } else {
+            Mode::Browse
+        }
+    }
+
+    /// A worker's list came: keep it, and fill an open picker of that list
+    /// (any other picker is left as it is).
+    pub fn listed(&mut self, listing: Listing) {
+        let arrived = match listing {
+            Listing::Devices(found) => {
+                self.lists.devices = found.map_or_else(Listed::Failed, Listed::Ready);
+                ListKind::Devices
+            }
+            Listing::Models(found) => {
+                self.lists.models = found.map_or_else(Listed::Failed, Listed::Ready);
+                ListKind::Models
+            }
+        };
+        let Some(picking) = &mut self.picker else {
+            return;
+        };
+        if let Purpose::Field { field, path } | Purpose::Element { field, path, .. } =
+            &picking.purpose
+        {
+            if source(&field.kind).and_then(schema::Source::list) == Some(arrived) {
+                let options = options::options(field, path, &self.form, &self.lists);
+                picking.picker.set_options(options);
+            }
+        }
+    }
+
     pub fn discard(&mut self) {
         self.form.discard();
-        self.editing = None;
+        self.close();
         self.clamp();
+    }
+
+    /// Close any input, picker or hotkey dialog.
+    fn close(&mut self) {
+        self.editing = None;
+        self.picker = None;
+        self.hotkey = None;
     }
 
     /// Edit on from what a save wrote.
@@ -381,7 +496,7 @@ impl ConfigScreen {
         self.fresh = loaded.fresh;
         self.disk = loaded.disk;
         self.broken = None;
-        self.editing = None;
+        self.close();
         self.clamp();
     }
 
@@ -546,6 +661,12 @@ impl ConfigScreen {
     /// Handle `action`. The app has already taken quit, help, save, `e`
     /// and restart.
     pub fn key(&mut self, action: Action) -> Outcome {
+        if self.picker.is_some() {
+            return self.picker_key(action);
+        }
+        if self.hotkey.is_some() {
+            return self.hotkey_key(action);
+        }
         if self.editing.is_some() {
             return self.edit_key(action);
         }
@@ -575,7 +696,10 @@ impl ConfigScreen {
                 if !visible.is_empty() {
                     self.focus = Focus::Detail;
                 }
-                return Outcome::default();
+                return Outcome {
+                    load: self.prefetch(),
+                    ..Outcome::default()
+                };
             }
             Action::Back if !self.filter.is_empty() => {
                 self.set_filter(String::new());
@@ -602,6 +726,8 @@ impl ConfigScreen {
         let to = match action {
             Action::Up => cursor.saturating_sub(1),
             Action::Down => (cursor + 1).min(last),
+            Action::PageUp => cursor.saturating_sub(PAGE),
+            Action::PageDown => (cursor + PAGE).min(last),
             Action::First => 0,
             Action::Last => last,
             Action::Pane => {
@@ -619,7 +745,36 @@ impl ConfigScreen {
             _ => return self.item_key(action, items.get(cursor).cloned()),
         };
         self.view_mut().set_cursor(to);
-        Outcome::default()
+        Outcome {
+            load: self.prefetch(),
+            ..Outcome::default()
+        }
+    }
+
+    /// Ask, once, for the worker list behind the row the cursor is on, so
+    /// that `h`/`l` and its picker usually have it.
+    fn prefetch(&mut self) -> Option<ListKind> {
+        if self.focus != Focus::Detail {
+            return None;
+        }
+        let Some(Item::Field { field, .. }) = self.items().get(self.view().cursor()).cloned()
+        else {
+            return None;
+        };
+        let kind = source(&field.kind)?.list()?;
+        (self.lists.not_asked(kind) && self.lists.ask(kind)).then_some(kind)
+    }
+
+    /// Open entry `index` of the section's array of tables. An agent's
+    /// form notes a harness not on `PATH`, looked up once here.
+    fn open_entry(&mut self, index: usize) {
+        if self
+            .entries()
+            .is_some_and(|entries| entries.path == "agents")
+        {
+            self.lists.on_path = Some(options::harnesses_on_path(&self.env));
+        }
+        self.views.push(View::Entry { index, cursor: 0 });
     }
 
     fn item_key(&mut self, action: Action, item: Option<Item>) -> Outcome {
@@ -628,14 +783,20 @@ impl ConfigScreen {
         }
         let view = self.view().clone();
         match (&view, self.current().body, action) {
-            (View::List { path, .. }, _, Action::Add) => {
+            (View::List { path, field, .. }, _, Action::Add) => {
+                if matches!(field.kind, Kind::List { items: Some(_), .. }) {
+                    return self.open_element_picker(field, path, None);
+                }
                 self.type_into(Target::Element {
                     path: path.clone(),
                     index: None,
                 });
             }
-            (View::List { path, .. }, _, Action::Enter | Action::Right) => {
+            (View::List { path, field, .. }, _, Action::Enter | Action::Right) => {
                 if let Some(Item::Element(index)) = item {
+                    if matches!(field.kind, Kind::List { items: Some(_), .. }) {
+                        return self.open_element_picker(field, path, Some(index));
+                    }
                     let text = self.list(path).get(index).cloned().unwrap_or_default();
                     self.editing = Some(Editing {
                         target: Target::Element {
@@ -663,7 +824,7 @@ impl ConfigScreen {
             }
             (View::Section { .. }, Body::Entries(_), Action::Enter | Action::Right) => {
                 if let Some(Item::Entry(index)) = item {
-                    self.views.push(View::Entry { index, cursor: 0 });
+                    self.open_entry(index);
                 }
             }
             (View::Section { .. }, Body::Entries(_), Action::Delete) => {
@@ -704,11 +865,7 @@ impl ConfigScreen {
 
     fn field_key(&mut self, field: &'static Field, path: &str, action: Action) -> Outcome {
         let current = self.form.effective(path).cloned();
-        let step = match action {
-            Action::Left => -1,
-            Action::Right | Action::Enter | Action::Toggle => 1,
-            _ => 0,
-        };
+        let picked = picked(&field.kind);
         match (&field.kind, action) {
             (_, Action::Reset) => {
                 let result = self.form.reset(path);
@@ -718,44 +875,48 @@ impl ConfigScreen {
                 let on = current.and_then(|v| v.as_bool()).unwrap_or(false);
                 return self.set(path, field, Some(Value::Boolean(!on)));
             }
-            (Kind::MaybeBool { .. }, _) if step != 0 => {
-                let ring = [None, Some(true), Some(false)];
-                let at = ring
-                    .iter()
-                    .position(|v| *v == current.as_ref().and_then(Value::as_bool))
-                    .unwrap_or(0);
-                let next = ring[cycle(at, ring.len(), step)].map(Value::Boolean);
-                return self.set(path, field, next);
+            (_, Action::Left | Action::Right) if picked => {
+                let by = if action == Action::Right { 1 } else { -1 };
+                return self.step(field, path, by);
             }
-            (Kind::Choice(choices), _) if step != 0 => {
-                let at = current
-                    .as_ref()
-                    .and_then(Value::as_str)
-                    .and_then(|v| choices.iter().position(|c| *c == v));
-                let next = match at {
-                    Some(at) => cycle(at, choices.len(), step),
-                    None if step > 0 => 0,
-                    None => choices.len() - 1,
+            // Space is the next value of a closed set, as it always was.
+            (
+                Kind::Choice(_) | Kind::MaybeChoice { .. } | Kind::MaybeBool { .. },
+                Action::Toggle,
+            ) => return self.step(field, path, 1),
+            (_, Action::Enter) if picked => return self.open_picker(field, path),
+            (
+                Kind::Int(steps),
+                Action::Left | Action::Right | Action::BigLeft | Action::BigRight,
+            ) => {
+                let by = match action {
+                    Action::Left => -steps.step,
+                    Action::Right => steps.step,
+                    Action::BigLeft => -steps.big,
+                    _ => steps.big,
                 };
-                return self.set(path, field, Some(Value::from(choices[next])));
-            }
-            (Kind::MaybeChoice { choices, .. }, _) if step != 0 => {
-                let at = match current.as_ref().and_then(Value::as_str) {
-                    None => 0,
-                    Some(v) => choices.iter().position(|c| *c == v).map_or(0, |i| i + 1),
-                };
-                let next = cycle(at, choices.len() + 1, step);
-                let value = next.checked_sub(1).map(|i| Value::from(choices[i]));
-                return self.set(path, field, value);
-            }
-            (Kind::Int { min, max, step: by }, Action::Left | Action::Right) => {
-                let n = current.and_then(|v| v.as_integer()).unwrap_or(*min);
-                let n = (n + by * step).clamp(*min, *max);
+                let n = current.and_then(|v| v.as_integer()).unwrap_or(steps.min);
+                let n = n.saturating_add(by).clamp(steps.min, steps.max);
                 return self.set(path, field, Some(Value::Integer(n)));
             }
-            (Kind::Float { min, max, step: by }, Action::Left | Action::Right) => {
+            (
+                Kind::Float {
+                    min,
+                    max,
+                    step,
+                    big,
+                    ..
+                },
+                Action::Left | Action::Right | Action::BigLeft | Action::BigRight,
+            ) => {
+                let by = match action {
+                    Action::Left => -step,
+                    Action::Right => *step,
+                    Action::BigLeft => -big,
+                    _ => *big,
+                };
                 let n = current.and_then(|v| v.as_float()).unwrap_or(*min);
-                let n = ((n + by * step as f64) * 100.0).round() / 100.0;
+                let n = ((n + by) * 100.0).round() / 100.0;
                 return self.set(path, field, Some(Value::Float(n.clamp(*min, *max))));
             }
             (Kind::Text { .. }, Action::Enter)
@@ -770,7 +931,14 @@ impl ConfigScreen {
                     format!("{} spans lines: e edits it in config.toml", field.label),
                 );
             }
-            (Kind::Int { .. } | Kind::Float { .. } | Kind::Text { .. }, Action::Enter) => {
+            (
+                Kind::Int(_)
+                | Kind::Float { .. }
+                | Kind::Text { .. }
+                | Kind::Path { .. }
+                | Kind::Color,
+                Action::Enter,
+            ) => {
                 // The exact value: rounded, an untouched commit would change it.
                 let text = current.map(|v| match v {
                     Value::String(s) => s,
@@ -784,6 +952,7 @@ impl ConfigScreen {
                     input: Input::new(text.as_deref().unwrap_or_default(), false),
                 });
             }
+            (Kind::Hotkey { .. }, Action::Enter) => return self.open_hotkey(field, path),
             (Kind::Secret, Action::Enter) => {
                 // Starts empty: a key is typed whole, never shown back.
                 self.editing = Some(Editing {
@@ -797,7 +966,7 @@ impl ConfigScreen {
             (Kind::List { .. }, Action::Enter | Action::Right) => {
                 self.views.push(View::List {
                     path: path.to_string(),
-                    field: field.label,
+                    field,
                     cursor: 0,
                 });
             }
@@ -805,6 +974,325 @@ impl ConfigScreen {
             _ => {}
         }
         Outcome::default()
+    }
+
+    /// What `field` at `path` offers now.
+    fn options(&self, field: &Field, path: &str) -> options::Options {
+        options::options(field, path, &self.form, &self.lists)
+    }
+
+    /// The value at `path` as a picker or a ring names it: `None` unset (or
+    /// a value that means the same), `true`/`false` for an optional toggle.
+    fn current_text(&self, field: &Field, path: &str) -> Option<String> {
+        let value = self.form.effective(path)?;
+        match field.kind {
+            Kind::MaybeBool { .. } => value.as_bool().map(|on| on.to_string()),
+            _ => value
+                .as_str()
+                .filter(|text| !means_unset(path, text))
+                .map(str::to_string),
+        }
+    }
+
+    /// `h`/`l` on a picked row: the next value of its ring, round. A row
+    /// whose list comes from a worker is left as it is until the list is
+    /// here: stepping through half a list would drop the value set.
+    fn step(&mut self, field: &'static Field, path: &str, by: i64) -> Outcome {
+        if let Some(kind) = source(&field.kind).and_then(schema::Source::list) {
+            if !self.lists.ready(kind) {
+                return Outcome {
+                    load: self.lists.ask(kind).then_some(kind),
+                    ..Outcome::say(Tone::Muted, LOOKING)
+                };
+            }
+        }
+        let ring = self.options(field, path).ring();
+        if ring.is_empty() {
+            return Outcome::default();
+        }
+        let now = self.current_text(field, path);
+        let next = match ring.iter().position(|v| *v == now) {
+            Some(at) => cycle(at, ring.len(), by),
+            None if by > 0 => 0,
+            None => ring.len() - 1,
+        };
+        let value = to_value(&field.kind, ring[next].clone());
+        self.set(path, field, value)
+    }
+
+    /// `Enter` on a picked row: its picker, with the list behind it asked
+    /// for (again: devices come and go).
+    fn open_picker(&mut self, field: &'static Field, path: &str) -> Outcome {
+        let load = source(&field.kind)
+            .and_then(schema::Source::list)
+            .filter(|kind| self.lists.ask(*kind));
+        let options = self.options(field, path);
+        let current = self.current_text(field, path);
+        let paths = matches!(field.kind, Kind::Path { .. });
+        self.picker = Some(Picking {
+            picker: Picker::new(field.label, options, current.as_deref(), paths),
+            purpose: Purpose::Field {
+                field,
+                path: path.to_string(),
+            },
+        });
+        Outcome {
+            load,
+            ..Outcome::default()
+        }
+    }
+
+    /// The picker for an item of a list whose items are suggested.
+    fn open_element_picker(
+        &mut self,
+        field: &'static Field,
+        path: &str,
+        index: Option<usize>,
+    ) -> Outcome {
+        let current = index.and_then(|i| self.list(path).get(i).cloned());
+        let options = self.options(field, path);
+        self.picker = Some(Picking {
+            picker: Picker::new(field.label, options, current.as_deref(), false),
+            purpose: Purpose::Element {
+                field,
+                path: path.to_string(),
+                index,
+            },
+        });
+        Outcome::default()
+    }
+
+    fn picker_key(&mut self, action: Action) -> Outcome {
+        let picking = self.picker.as_mut().expect("a picker");
+        match picking.picker.key(action) {
+            picker::Answer::None => Outcome::default(),
+            picker::Answer::Closed => {
+                self.picker = None;
+                Outcome::default()
+            }
+            picker::Answer::Refused(why) => Outcome::say(Tone::Warn, why),
+            picker::Answer::Complete => {
+                let tilde = match &picking.purpose {
+                    Purpose::Field { field, .. } => {
+                        matches!(field.kind, Kind::Path { tilde: true, .. })
+                    }
+                    _ => true,
+                };
+                let done =
+                    complete::complete(&picking.picker.filter(), self.env.get("HOME"), tilde);
+                picking.picker.set_filter(&done.text);
+                candidates(&done.candidates)
+            }
+            picker::Answer::Picked(picked) => {
+                let purpose = picking.purpose.clone();
+                let (outcome, done) = self.apply_pick(&purpose, picked);
+                if done {
+                    self.picker = None;
+                }
+                outcome
+            }
+        }
+    }
+
+    /// Set what a picker picked; `false` when it was refused and the
+    /// picker stays, with why.
+    fn apply_pick(&mut self, purpose: &Purpose, picked: Picked) -> (Outcome, bool) {
+        match purpose {
+            Purpose::HotkeyKey => {
+                if let (Some(open), Picked::Value(name)) = (self.hotkey.as_mut(), &picked) {
+                    open.dialog.set_key(name);
+                }
+                (Outcome::default(), true)
+            }
+            Purpose::Field { field, path } => {
+                let text = match picked {
+                    Picked::Unset => None,
+                    Picked::Value(text) | Picked::Typed(text) => {
+                        let text = self.written(&field.kind, &text);
+                        match check_of(&field.kind).map_or(Ok(text.clone()), |check| check(&text)) {
+                            Ok(text) => Some(text),
+                            Err(why) => {
+                                return (
+                                    Outcome::say(Tone::Error, format!("{}: {why}", field.label)),
+                                    false,
+                                )
+                            }
+                        }
+                    }
+                };
+                let outcome = self.set(path, field, to_value(&field.kind, text));
+                let done = outcome.status.is_none();
+                (outcome, done)
+            }
+            Purpose::Element { field, path, index } => {
+                let (Picked::Value(text) | Picked::Typed(text)) = picked else {
+                    return (Outcome::default(), true);
+                };
+                match check_of(&field.kind).map_or(Ok(text.clone()), |check| check(&text)) {
+                    Ok(text) => (self.set_element(path, *index, &text), true),
+                    Err(why) => (
+                        Outcome::say(Tone::Error, format!("{}: {why}", field.label)),
+                        false,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// `Enter` on a hotkey row: the dialog, or typing for a value that does
+    /// not parse.
+    fn open_hotkey(&mut self, field: &'static Field, path: &str) -> Outcome {
+        let value = self
+            .form
+            .effective(path)
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let title = self.hotkey_title(field, path);
+        match HotkeyDialog::new(&title, value.as_deref(), self.hotkeys_but(path)) {
+            Some(dialog) => {
+                self.hotkey = Some(Hotkeying {
+                    dialog,
+                    field,
+                    path: path.to_string(),
+                });
+                Outcome::default()
+            }
+            None => {
+                let text = value.unwrap_or_default();
+                let why = schema::check_hotkey(&text).err().unwrap_or_default();
+                self.editing = Some(Editing {
+                    target: Target::Field {
+                        field,
+                        path: path.to_string(),
+                    },
+                    input: Input::new(&text, false),
+                });
+                Outcome::say(
+                    Tone::Warn,
+                    format!("{text} does not parse ({why}); type it"),
+                )
+            }
+        }
+    }
+
+    fn hotkey_key(&mut self, action: Action) -> Outcome {
+        let open = self.hotkey.as_mut().expect("a hotkey dialog");
+        match open.dialog.key(action) {
+            hotkey::Answer::None => Outcome::default(),
+            hotkey::Answer::Cancel => {
+                self.hotkey = None;
+                Outcome::default()
+            }
+            hotkey::Answer::PickKey => {
+                let current = open.dialog.key_name();
+                self.picker = Some(Picking {
+                    picker: Picker::new("key", options::hotkey_keys(), current, false),
+                    purpose: Purpose::HotkeyKey,
+                });
+                Outcome::default()
+            }
+            hotkey::Answer::Invalid(why) => Outcome::say(Tone::Error, why),
+            hotkey::Answer::Save(value) => {
+                let clash = open.dialog.clash().map(str::to_string);
+                let (field, path) = (open.field, open.path.clone());
+                let outcome = self.set(&path, field, Some(Value::String(value.clone())));
+                if outcome.status.is_some() {
+                    return outcome;
+                }
+                self.hotkey = None;
+                match clash {
+                    Some(who) => Outcome {
+                        status: Some(Notice::new(Tone::Warn, format!("{value} is also {who}"))),
+                        ..outcome
+                    },
+                    None => outcome,
+                }
+            }
+            hotkey::Answer::Type(text) => {
+                let (field, path) = (open.field, open.path.clone());
+                self.hotkey = None;
+                self.editing = Some(Editing {
+                    target: Target::Field { field, path },
+                    input: Input::new(&text, false),
+                });
+                Outcome::default()
+            }
+            hotkey::Answer::Unset => {
+                let (field, path) = (open.field, open.path.clone());
+                self.hotkey = None;
+                let result = self.form.reset(&path);
+                self.apply(&path, field, result)
+            }
+        }
+    }
+
+    /// The hotkey dialog's title: `toggle hotkey`, `jarvis hotkey`.
+    fn hotkey_title(&self, field: &Field, path: &str) -> String {
+        match path.split('.').collect::<Vec<_>>().as_slice() {
+            [list, index, _] => {
+                let name = self.name_of(list, index.parse().unwrap_or(0));
+                format!("{name} {}", field.label)
+            }
+            _ => format!("{} hotkey", field.label),
+        }
+    }
+
+    /// The name of entry `index` of the array of tables `list`.
+    fn name_of(&self, list: &str, index: usize) -> String {
+        let noun = SECTIONS
+            .iter()
+            .find_map(|s| match s.body {
+                Body::Entries(entries) if entries.path == list => Some(entries.noun),
+                _ => None,
+            })
+            .unwrap_or("entry");
+        self.form
+            .value(&format!("{list}.{index}.name"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| format!("{noun} {}", index + 1), str::to_string)
+    }
+
+    /// Every hotkey of the form but the one at `path`: who has it, and the
+    /// value.
+    fn hotkeys_but(&self, path: &str) -> Vec<(String, String)> {
+        let mut all = Vec::new();
+        let mut add = |who: String, at: String| {
+            if at == path {
+                return;
+            }
+            if let Some(value) = self.form.effective(&at).and_then(Value::as_str) {
+                if !value.trim().is_empty() {
+                    all.push((who, value.to_string()));
+                }
+            }
+        };
+        for section in SECTIONS {
+            match section.body {
+                Body::Rows(fields) => {
+                    for field in fields {
+                        if matches!(field.kind, Kind::Hotkey { .. }) {
+                            add(field.label.to_string(), field.path.to_string());
+                        }
+                    }
+                }
+                Body::Entries(entries) => {
+                    for index in 0..self.form.entries(entries.path).len() {
+                        let name = self.name_of(entries.path, index);
+                        for field in entries.fields {
+                            if matches!(field.kind, Kind::Hotkey { .. }) {
+                                add(
+                                    format!("{} {name} {}", entries.noun, field.label),
+                                    format!("{}.{index}.{}", entries.path, field.path),
+                                );
+                            }
+                        }
+                    }
+                }
+                Body::Map(_) => {}
+            }
+        }
+        all
     }
 
     /// Start typing a new value for `target`.
@@ -873,6 +1361,17 @@ impl ConfigScreen {
         let editing = self.editing.as_mut().expect("typing");
         match action {
             Action::Enter => self.commit(),
+            Action::Complete => {
+                let Target::Field { field, .. } = &editing.target else {
+                    return Outcome::default();
+                };
+                let Kind::Path { tilde, .. } = field.kind else {
+                    return Outcome::default();
+                };
+                let done = complete::complete(&editing.input.text(), self.env.get("HOME"), tilde);
+                editing.input = Input::new(&done.text, false);
+                candidates(&done.candidates)
+            }
             Action::Back => {
                 let editing = self.editing.take().expect("typing");
                 if matches!(editing.target, Target::Filter) {
@@ -902,40 +1401,41 @@ impl ConfigScreen {
                 self.set_filter(trimmed.to_string());
                 Outcome::default()
             }
-            Target::Field { field, path } => match parse(field, trimmed) {
-                Err(why) => {
-                    self.editing = Some(editing.clone());
-                    Outcome::say(Tone::Error, format!("{}: {why}", field.label))
-                }
-                Ok(None) => Outcome::default(),
-                Ok(Some(value)) => {
-                    let outcome = self.set(path, field, value);
-                    if outcome.status.is_some() {
+            Target::Field { field, path } => {
+                match parse(field, &self.written(&field.kind, trimmed)) {
+                    Err(why) => {
                         self.editing = Some(editing.clone());
+                        Outcome::say(Tone::Error, format!("{}: {why}", field.label))
                     }
-                    outcome
-                }
-            },
-            Target::Element { path, index } => {
-                let mut list = self.list(path);
-                match (index, trimmed.is_empty()) {
-                    (Some(i), _) if *i >= list.len() => return Outcome::default(),
-                    (Some(i), true) => {
-                        list.remove(*i);
+                    Ok(None) => Outcome::default(),
+                    Ok(Some(value)) => {
+                        let typed = value.as_ref().and_then(Value::as_str).map(str::to_string);
+                        let outcome = self.set(path, field, value);
+                        if outcome.status.is_some() {
+                            self.editing = Some(editing.clone());
+                            return outcome;
+                        }
+                        // A typed hotkey another row has too: said, not refused.
+                        if let (Kind::Hotkey { .. }, Some(typed)) = (&field.kind, typed) {
+                            let ours = whisrs::hotkey::hotkey_parts(&typed);
+                            let other = self.hotkeys_but(path).into_iter().find(|(_, value)| {
+                                ours.is_some() && whisrs::hotkey::hotkey_parts(value) == ours
+                            });
+                            if let Some((who, _)) = other {
+                                return Outcome {
+                                    status: Some(Notice::new(
+                                        Tone::Warn,
+                                        format!("{typed} is also {who}"),
+                                    )),
+                                    ..outcome
+                                };
+                            }
+                        }
+                        outcome
                     }
-                    (Some(i), false) => list[*i] = trimmed.to_string(),
-                    (None, true) => return Outcome::default(),
-                    (None, false) => list.push(trimmed.to_string()),
                 }
-                let added = index.is_none();
-                let len = list.len();
-                let outcome = self.set_list(path, list);
-                if added {
-                    self.view_mut().set_cursor(len - 1);
-                }
-                self.clamp();
-                outcome
             }
+            Target::Element { path, index } => self.set_element(path, *index, trimmed),
             Target::NewKey => {
                 let Body::Map(map) = self.current().body else {
                     return Outcome::default();
@@ -992,7 +1492,7 @@ impl ConfigScreen {
                 match self.form.push_entry(entries.path, entry) {
                     Ok(index) => {
                         self.view_mut().set_cursor(index);
-                        self.views.push(View::Entry { index, cursor: 0 });
+                        self.open_entry(index);
                         Outcome::default()
                     }
                     Err(why) => Outcome::say(Tone::Error, why),
@@ -1002,16 +1502,134 @@ impl ConfigScreen {
     }
 }
 
+impl ConfigScreen {
+    /// `text` as a row of `kind` stores it: a path whose key the daemon
+    /// does not expand `~` in gets the home folder written out.
+    fn written(&self, kind: &Kind, text: &str) -> String {
+        match kind {
+            Kind::Path { tilde: false, .. } => complete::expand_home(text, self.env.get("HOME")),
+            _ => text.to_string(),
+        }
+    }
+
+    /// Set item `index` of the list at `path` to `text` (blank removes
+    /// it), or add `text` as a new one.
+    fn set_element(&mut self, path: &str, index: Option<usize>, text: &str) -> Outcome {
+        let mut list = self.list(path);
+        match (index, text.is_empty()) {
+            (Some(i), _) if i >= list.len() => return Outcome::default(),
+            (Some(i), true) => {
+                list.remove(i);
+            }
+            (Some(i), false) => list[i] = text.to_string(),
+            (None, true) => return Outcome::default(),
+            (None, false) => list.push(text.to_string()),
+        }
+        let added = index.is_none();
+        let len = list.len();
+        let outcome = self.set_list(path, list);
+        if added {
+            self.view_mut().set_cursor(len - 1);
+        }
+        self.clamp();
+        outcome
+    }
+}
+
+/// What a row whose worker list is not here yet says.
+const LOOKING: &str = "looking...";
+
+/// A value that means what unset means for `path`: `system_device =
+/// "default"` is the default output's monitor, as no key is.
+fn means_unset(path: &str, text: &str) -> bool {
+    path == "recording.system_device" && matches!(text.trim(), "default" | "")
+}
+
 /// `at` moved `step` around a ring of `len`.
 fn cycle(at: usize, len: usize, step: i64) -> usize {
     (at as i64 + step).rem_euclid(len as i64) as usize
 }
 
+/// Whether a row is picked (`h`/`l` step its values, `Enter` opens its
+/// picker) rather than typed.
+fn picked(kind: &Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Choice(_)
+            | Kind::MaybeChoice { .. }
+            | Kind::MaybeBool { .. }
+            | Kind::Suggest { .. }
+            | Kind::Path { from: Some(_), .. }
+    )
+}
+
+/// Where a row's suggestions come from, if they do.
+fn source(kind: &Kind) -> Option<schema::Source> {
+    match kind {
+        Kind::Suggest { from, .. }
+        | Kind::Path {
+            from: Some(from), ..
+        } => Some(*from),
+        Kind::List {
+            items: Some((from, _)),
+            ..
+        } => Some(*from),
+        _ => None,
+    }
+}
+
+/// The check a typed or picked value of `kind` goes through.
+fn check_of(kind: &Kind) -> Option<Check> {
+    match kind {
+        Kind::Text { check, .. } | Kind::Suggest { check, .. } => *check,
+        Kind::Color => Some(schema::check_color),
+        Kind::Hotkey { .. } => Some(schema::check_hotkey),
+        Kind::List {
+            items: Some((_, check)),
+            ..
+        } => Some(*check),
+        _ => None,
+    }
+}
+
+/// A picked value as the config stores it: a bool for an optional toggle,
+/// else the string; `None` unsets.
+fn to_value(kind: &Kind, value: Option<String>) -> Option<Value> {
+    let value = value?;
+    Some(match kind {
+        Kind::MaybeBool { .. } => Value::Boolean(value == "true"),
+        _ => Value::String(value),
+    })
+}
+
+/// The names a `Tab` could still complete to, as a status line.
+fn candidates(names: &[String]) -> Outcome {
+    const SHOWN: usize = 8;
+    if names.is_empty() {
+        return Outcome::default();
+    }
+    let mut text = names
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("  ");
+    if names.len() > SHOWN {
+        text.push_str(&format!("  and {} more", names.len() - SHOWN));
+    }
+    Outcome::say(Tone::Muted, text)
+}
+
 /// What typing `text` into `field` sets: `Ok(None)` changes nothing,
 /// `Ok(Some(None))` unsets the key.
 fn parse(field: &Field, text: &str) -> Result<Option<Option<Value>>, String> {
+    // A blank string unsets an optional key, and empties a plain one.
+    let blank = |unset: Option<&str>| match unset {
+        Some(_) => None,
+        None => Some(Value::from("")),
+    };
     match &field.kind {
-        Kind::Int { min, max, .. } => {
+        Kind::Int(Steps { min, max, .. }) => {
             let n: i64 = text.parse().map_err(|_| "not a whole number".to_string())?;
             if !(*min..=*max).contains(&n) {
                 return Err(format!("use {min} to {max}"));
@@ -1025,18 +1643,21 @@ fn parse(field: &Field, text: &str) -> Result<Option<Option<Value>>, String> {
             }
             Ok(Some(Some(Value::Float(n))))
         }
-        Kind::Text { unset, check } => {
+        Kind::Text { unset, .. } | Kind::Suggest { unset, .. } | Kind::Path { unset, .. } => {
             if text.is_empty() {
-                return Ok(Some(match unset {
-                    Some(_) => None,
-                    None => Some(Value::from("")),
-                }));
+                return Ok(Some(blank(*unset)));
             }
-            let text = match check {
+            let text = match check_of(&field.kind) {
                 Some(check) => check(text)?,
                 None => text.to_string(),
             };
             Ok(Some(Some(Value::String(text))))
+        }
+        Kind::Color if text.is_empty() => Ok(Some(None)),
+        Kind::Hotkey { unset } if text.is_empty() => Ok(Some(blank(*unset))),
+        Kind::Color | Kind::Hotkey { .. } => {
+            let check = check_of(&field.kind).expect("colours and hotkeys are checked");
+            Ok(Some(Some(Value::String(check(text)?))))
         }
         // A blank key changes nothing; `x` clears one.
         Kind::Secret if text.is_empty() => Ok(None),
@@ -1048,51 +1669,163 @@ fn parse(field: &Field, text: &str) -> Result<Option<Option<Value>>, String> {
 /// How a row reads.
 fn shown(screen: &ConfigScreen, field: &Field, path: &str, env: &Env, ui: &Ui) -> Shown {
     let value = screen.form.effective(path);
+    let config = screen.form.config();
     let on_off = |on: bool| Shown::plain(if on { "on" } else { "off" });
-    let with_note = |text: &str| {
-        let shown = Shown::plain(text);
-        match schema::choice_note(text) {
-            Some(note) => shown.then(note, Tone::Muted),
-            None => shown,
-        }
-    };
+    let text = value.and_then(Value::as_str);
     match &field.kind {
         Kind::Bool => on_off(value.and_then(Value::as_bool).unwrap_or(false)),
         Kind::MaybeBool { unset } => match value.and_then(Value::as_bool) {
             Some(on) => on_off(on),
             None => Shown::muted(*unset),
         },
-        Kind::Choice(_) => with_note(value.and_then(Value::as_str).unwrap_or_default()),
-        Kind::MaybeChoice { unset, .. } => match value.and_then(Value::as_str) {
-            Some(text) => with_note(text),
-            None => Shown::muted(*unset),
+        Kind::Choice(_) => noted(screen, field, path, text.unwrap_or_default()),
+        Kind::MaybeChoice { unset, .. } => match text {
+            Some(text) => noted(screen, field, path, text),
+            None => Shown::muted(options::unset_text(path, unset, config)),
         },
-        Kind::Int { .. } => Shown::plain(value.map(|v| v.to_string()).unwrap_or_default()),
+        Kind::Int(steps) => Shown::plain(show_int(
+            value.and_then(Value::as_integer).unwrap_or(steps.min),
+            steps,
+        )),
+        Kind::Float { percent: true, .. } => {
+            let level = value
+                .and_then(Value::as_float)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let on = (level * 10.0).round() as usize;
+            let bar = format!(
+                "{}{}",
+                ui.glyphs.bar_on.repeat(on),
+                ui.glyphs.bar_off.repeat(10 - on)
+            );
+            Shown::plain(bar).then(format!("{:.0}%", level * 100.0), Tone::Plain)
+        }
         Kind::Float { .. } => Shown::plain(format!(
             "{:.2}",
             value.and_then(Value::as_float).unwrap_or(0.0)
         )),
-        Kind::Text { unset, .. } => match value.and_then(Value::as_str) {
+        Kind::Text { unset, .. } | Kind::Path { unset, .. } => typed(text, *unset, ui),
+        Kind::Suggest {
+            unset: Some(unset), ..
+        } if text.is_some_and(|text| means_unset(path, text)) => {
+            Shown::muted(options::unset_text(path, unset, config))
+        }
+        Kind::Suggest { unset, .. } => match text {
             Some("") => Shown::muted("empty"),
-            Some(text) => {
-                let mut lines = text.lines();
-                let first = lines.next().unwrap_or_default();
-                if lines.next().is_some() {
-                    Shown::plain(format!("{first}{}", ui.glyphs.ellipsis))
-                } else {
-                    Shown::plain(first)
-                }
+            Some(text) => Shown::plain(text),
+            None => Shown::muted(options::unset_text(
+                path,
+                unset.unwrap_or("not set"),
+                config,
+            )),
+        },
+        Kind::Color => color(screen, path, text, ui),
+        Kind::Hotkey { unset } => match text.map(str::trim) {
+            None | Some("") => Shown::muted(unset.unwrap_or("not set")),
+            Some(hotkey) if schema::check_hotkey(hotkey).is_err() => {
+                Shown::plain(hotkey).then("does not parse", Tone::Warn)
             }
-            None => Shown::muted(unset.unwrap_or("not set")),
+            Some(hotkey) => Shown::plain(hotkey),
         },
         Kind::Secret => secret(screen, path, env),
-        Kind::List { empty } => {
+        Kind::List { empty, .. } => {
             let list = screen.list(path);
             if list.is_empty() {
                 Shown::muted(*empty)
             } else {
                 Shown::plain(list.join(", "))
             }
+        }
+    }
+}
+
+/// A typed string: its first line, `empty`, or what applies while unset.
+fn typed(text: Option<&str>, unset: Option<&str>, ui: &Ui) -> Shown {
+    match text {
+        Some("") => Shown::muted("empty"),
+        Some(text) => {
+            let mut lines = text.lines();
+            let first = lines.next().unwrap_or_default();
+            if lines.next().is_some() {
+                Shown::plain(format!("{first}{}", ui.glyphs.ellipsis))
+            } else {
+                Shown::plain(first)
+            }
+        }
+        None => Shown::muted(unset.unwrap_or("not set")),
+    }
+}
+
+/// A choice's value, with why it cannot be used here or a word about it
+/// (`not built in`, `not on PATH`).
+fn noted(screen: &ConfigScreen, field: &Field, path: &str, value: &str) -> Shown {
+    let shown = Shown::plain(value);
+    let options = screen.options(field, path);
+    let refused = match options.find(value) {
+        Some(pick) => {
+            if let Some(note) = &pick.note {
+                return shown.then(note.clone(), Tone::Warn);
+            }
+            pick.refused.as_ref().map(|(short, _)| short.clone())
+        }
+        // An alias, or a value no list has.
+        None if matches!(path, "general.backend" | "recording.backend") => {
+            schema::backend_refusal(value).map(|(short, _)| short.to_string())
+        }
+        None => None,
+    };
+    match refused {
+        Some(short) => shown.then(short, Tone::Muted),
+        None => shown,
+    }
+}
+
+/// A number with its unit, or the name it has (`0` is `off`).
+fn show_int(n: i64, steps: &Steps) -> String {
+    if let Some((_, name)) = steps.named.iter().find(|(v, _)| *v == n) {
+        return name.to_string();
+    }
+    match steps.unit {
+        "" => n.to_string(),
+        "min" if n >= 60 => match (n / 60, n % 60) {
+            (hours, 0) => format!("{n} min ({hours} h)"),
+            (hours, minutes) => format!("{n} min ({hours} h {minutes:02})"),
+        },
+        "days" if n == 1 => "1 day".to_string(),
+        unit => format!("{n} {unit}"),
+    }
+}
+
+/// A colour row: the hex and a swatch of it, or `theme` and a swatch of the
+/// theme's colour while unset.
+fn color(screen: &ConfigScreen, path: &str, text: Option<&str>, ui: &Ui) -> Shown {
+    let swatch = |shown: Shown, argb: [u8; 4]| {
+        if ui.theme.color {
+            shown.then(
+                ui.glyphs.swatch.repeat(2),
+                Tone::Swatch(Rgb::from_argb(argb)),
+            )
+        } else {
+            shown
+        }
+    };
+    match text {
+        Some(hex) => match whisrs::parse_hex_color(hex) {
+            Some(argb) => swatch(Shown::plain(hex), argb),
+            None => Shown::plain(hex).then("not a colour", Tone::Warn),
+        },
+        None => {
+            let overlay = screen.form.config().overlay.clone().unwrap_or_default();
+            let palette = Palette::from_config(&overlay);
+            let argb = match path.rsplit('.').next().unwrap_or_default() {
+                "recording" => palette.rec_bar,
+                "transcribing" => palette.trans_bar,
+                "speaking" => palette.speak_bar,
+                "background" => palette.bg,
+                "ring" => palette.ring,
+                _ => palette.glow,
+            };
+            swatch(Shown::muted("theme"), argb)
         }
     }
 }
@@ -1144,18 +1877,37 @@ fn secret(screen: &ConfigScreen, path: &str, env: &Env) -> Shown {
     }
 }
 
-/// A row's label, value, and whether it is a choice.
-fn describe(screen: &ConfigScreen, item: &Item, env: &Env, ui: &Ui) -> (String, Shown, bool) {
+/// A row's label, value, and how the value sits.
+fn describe(screen: &ConfigScreen, item: &Item, env: &Env, ui: &Ui) -> (String, Shown, Look) {
     match item {
         Item::Field { field, path } => {
-            let choice = matches!(
-                field.kind,
-                Kind::Choice(_) | Kind::MaybeChoice { .. } | Kind::MaybeBool { .. }
-            );
+            let value = screen.form.effective(path);
+            let look = match &field.kind {
+                Kind::Int(steps) => {
+                    let n = value.and_then(Value::as_integer).unwrap_or(steps.min);
+                    Look {
+                        arrows: true,
+                        at_min: n <= steps.min,
+                        at_max: n >= steps.max,
+                    }
+                }
+                Kind::Float { min, max, .. } => {
+                    let n = value.and_then(Value::as_float).unwrap_or(*min);
+                    Look {
+                        arrows: true,
+                        at_min: n <= *min,
+                        at_max: n >= *max,
+                    }
+                }
+                kind => Look {
+                    arrows: picked(kind),
+                    ..Look::default()
+                },
+            };
             (
                 field.label.to_string(),
                 shown(screen, field, path, env, ui),
-                choice,
+                look,
             )
         }
         Item::Entry(index) => {
@@ -1173,7 +1925,7 @@ fn describe(screen: &ConfigScreen, item: &Item, env: &Env, ui: &Ui) -> (String, 
             (
                 screen.entry_name(*index),
                 Shown::joined(parts, ui.glyphs.separator),
-                false,
+                Look::default(),
             )
         }
         Item::Pair(key) => {
@@ -1182,7 +1934,7 @@ fn describe(screen: &ConfigScreen, item: &Item, env: &Env, ui: &Ui) -> (String, 
                 _ => "",
             };
             let value = screen.map(path).remove(key).unwrap_or_default();
-            (key.clone(), Shown::plain(value), false)
+            (key.clone(), Shown::plain(value), Look::default())
         }
         Item::Element(index) => {
             let path = match screen.view() {
@@ -1190,7 +1942,7 @@ fn describe(screen: &ConfigScreen, item: &Item, env: &Env, ui: &Ui) -> (String, 
                 _ => "",
             };
             let text = screen.list(path).get(*index).cloned().unwrap_or_default();
-            (String::new(), Shown::plain(text), false)
+            (String::new(), Shown::plain(text), Look::default())
         }
     }
 }
@@ -1207,14 +1959,33 @@ fn flash_key(item: &Item) -> Option<&str> {
 fn help(screen: &ConfigScreen, item: Option<&Item>) -> String {
     let section = screen.current();
     match (screen.view(), item) {
+        (View::List { field, .. }, _)
+            if matches!(field.kind, Kind::List { items: Some(_), .. }) =>
+        {
+            "a adds an item from a list, enter picks another, d deletes it.".to_string()
+        }
         (View::List { .. }, _) => "a adds an item, enter edits it, d deletes it.".to_string(),
-        (_, Some(Item::Field { field, .. })) => {
+        (_, Some(Item::Field { field, path })) => {
             let mut text = field.help.to_string();
             if let Some(gate) = field.gate.filter(|gate| !gate.built()) {
                 text.push_str(&format!(
                     " This whisrs was built without the {} feature, so the daemon ignores it.",
                     gate.name()
                 ));
+            }
+            // What the value set now is, when its list says.
+            if let Some(value) = screen.current_text(field, path) {
+                if let Some(pick) = screen.options(field, path).find(&value) {
+                    let about = match (&pick.refused, &pick.note) {
+                        (Some((_, why)), _) => why.clone(),
+                        (None, Some(note)) if pick.about.is_empty() => note.clone(),
+                        (None, Some(note)) => format!("{}, {note}", pick.about),
+                        (None, None) => pick.about.clone(),
+                    };
+                    if !about.is_empty() && !matches!(field.kind, Kind::MaybeBool { .. }) {
+                        text.push_str(&format!(" {}: {about}.", pick.label));
+                    }
+                }
             }
             text
         }
@@ -1292,18 +2063,19 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         ..body
     };
     let two_panes = area.width >= frame::TWO_PANES;
+    let mut detail_rect = panes;
     if two_panes {
         let list = Rect {
             width: LIST_WIDTH.min(panes.width),
             ..panes
         };
-        let detail = Rect {
+        detail_rect = Rect {
             x: panes.x + list.width,
             width: panes.width - list.width,
             ..panes
         };
         sections(screen, f, list, ui);
-        self::detail(app, f, detail, ui, false);
+        self::detail(app, f, detail_rect, ui, false);
     } else if screen.focus == Focus::Sections {
         sections(screen, f, panes, ui);
     } else {
@@ -1320,6 +2092,16 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
     }
 
     footer(screen, f, placed.footer, ui);
+
+    // The hotkey dialog, and a picker over the detail pane (the key picker
+    // over the dialog), the screen behind dimmed.
+    if let Some(open) = &screen.hotkey {
+        open.dialog.draw(f, placed.frame, ui);
+    }
+    if let Some(picking) = &screen.picker {
+        dialog::dim(f.buffer_mut(), placed.frame, ui);
+        picking.picker.draw(f, detail_rect, ui);
+    }
 }
 
 impl ConfigScreen {
@@ -1403,9 +2185,10 @@ fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
             ui.glyphs.separator,
             screen.entry_name(*index)
         )),
-        View::List { field, .. } => {
-            Some(format!("{} {} {field}", section.title, ui.glyphs.separator))
-        }
+        View::List { field, .. } => Some(format!(
+            "{} {} {}",
+            section.title, ui.glyphs.separator, field.label
+        )),
     };
     let text_width = usize::from(area.width.saturating_sub(2));
     if let Some(crumbs) = crumbs {
@@ -1442,7 +2225,7 @@ fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
 
     let items = screen.items();
     let cursor = screen.view().cursor();
-    let rows: Vec<(String, Shown, bool)> = items
+    let rows: Vec<(String, Shown, Look)> = items
         .iter()
         .map(|item| describe(screen, item, &app.env, ui))
         .collect();
@@ -1508,11 +2291,13 @@ fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
         };
         on.then_some(&editing.input)
     };
-    for (i, (label, value, choice)) in rows.into_iter().enumerate().skip(offset).take(height) {
+    for (i, (label, value, look)) in rows.into_iter().enumerate().skip(offset).take(height) {
         let item = &items[i];
         let row = Row {
             focused: focused && i == cursor && new_row.is_none(),
-            choice,
+            choice: look.arrows,
+            at_min: look.at_min,
+            at_max: look.at_max,
             flash: app
                 .flash
                 .as_deref()
@@ -1558,7 +2343,36 @@ fn screen_map_label(section: &Section) -> &'static str {
 }
 
 fn footer(screen: &ConfigScreen, f: &mut Frame, rect: Rect, ui: &Ui) {
-    if let Some(editing) = &screen.editing {
+    let hints = |pairs: &[(String, String)]| -> Vec<(String, String)> { pairs.to_vec() };
+    let pair = |key: &str, what: &str| (key.to_string(), what.to_string());
+    let owned: Vec<(String, String)> = if let Some(picking) = &screen.picker {
+        let mut keys = vec![
+            // In the order they are dropped from the end when narrow; ?
+            // lists them all.
+            pair("type", "to filter"),
+            pair("enter", "pick"),
+            pair("esc", "cancel"),
+            pair(
+                &format!("{}/{}", ui.glyphs.key_up, ui.glyphs.key_down),
+                "move",
+            ),
+        ];
+        if picking.picker.paths {
+            keys.push(pair("tab", "complete"));
+        }
+        keys.push(pair("?", "help"));
+        keys
+    } else if screen.hotkey.is_some() {
+        vec![
+            pair("tab", "next"),
+            pair("h/l", "change"),
+            pair("enter", "key/save"),
+            pair("esc", "cancel"),
+            pair("t", "type it"),
+            pair("x", "unset"),
+            pair("?", "help"),
+        ]
+    } else if let Some(editing) = &screen.editing {
         if matches!(editing.target, Target::Filter) {
             let mut spans = vec![Span::raw("  "), Span::styled("/", ui.theme.accent)];
             spans.extend(editing.input.spans(ui, 24));
@@ -1569,68 +2383,103 @@ fn footer(screen: &ConfigScreen, f: &mut Frame, rect: Rect, ui: &Ui) {
             f.render_widget(Line::from(spans), rect);
             return;
         }
-        return frame::footer(
-            f,
-            rect,
-            ui,
-            &[("enter", "keep"), ("esc", "cancel"), ("ctrl+u", "clear")],
+        let path = matches!(
+            &editing.target,
+            Target::Field { field, .. } if matches!(field.kind, Kind::Path { .. })
         );
-    }
-    let hints: Vec<(&str, &str)> = match screen.focus {
-        Focus::Sections => vec![
-            ("j/k", "move"),
-            ("tab", "pane"),
-            ("enter", "open"),
-            ("w", "save"),
-            ("e", "$EDITOR"),
-            ("/", "filter"),
-            ("?", "help"),
-        ],
-        Focus::Detail => {
-            let items = screen.items();
-            let item = items.get(screen.view().cursor());
-            let change = match item {
-                Some(Item::Field { field, .. }) => match field.kind {
-                    Kind::Bool => ("space", "toggle"),
-                    Kind::Choice(_) | Kind::MaybeChoice { .. } | Kind::MaybeBool { .. } => {
-                        ("h/l", "change")
-                    }
-                    Kind::Int { .. } | Kind::Float { .. } => ("h/l", "change"),
-                    Kind::List { .. } => ("enter", "open"),
-                    Kind::Text { .. } | Kind::Secret => ("enter", "edit"),
-                },
-                Some(Item::Entry(_)) => ("enter", "open"),
-                _ => ("enter", "edit"),
-            };
-            let lists = matches!(screen.view(), View::List { .. })
-                || matches!(
-                    (screen.view(), screen.current().body),
-                    (View::Section { .. }, Body::Entries(_) | Body::Map(_))
-                );
-            if lists {
-                vec![
-                    ("j/k", "move"),
-                    ("a", "add"),
-                    change,
-                    ("d", "delete"),
-                    ("esc", "back"),
-                    ("w", "save"),
-                    ("?", "help"),
-                ]
-            } else {
-                vec![
-                    ("j/k", "move"),
-                    ("tab", "pane"),
-                    change,
-                    ("w", "save"),
-                    ("e", "$EDITOR"),
-                    ("/", "filter"),
-                    ("?", "help"),
-                ]
+        let mut keys = vec![pair("enter", "keep"), pair("esc", "cancel")];
+        if path {
+            keys.push(pair("tab", "complete"));
+        }
+        keys.push(pair("ctrl+u", "clear"));
+        keys
+    } else {
+        match screen.focus {
+            Focus::Sections => hints(&[
+                pair("j/k", "move"),
+                pair("tab", "pane"),
+                pair("enter", "open"),
+                pair("w", "save"),
+                pair("e", "$EDITOR"),
+                pair("/", "filter"),
+                pair("?", "help"),
+            ]),
+            Focus::Detail => {
+                let items = screen.items();
+                let item = items.get(screen.view().cursor());
+                let change = match item {
+                    Some(Item::Field { field, .. }) => verbs(field, ui),
+                    Some(Item::Entry(_)) => vec![pair("enter", "open")],
+                    _ => vec![pair("enter", "edit")],
+                };
+                let lists = matches!(screen.view(), View::List { .. })
+                    || matches!(
+                        (screen.view(), screen.current().body),
+                        (View::Section { .. }, Body::Entries(_) | Body::Map(_))
+                    );
+                let mut keys = vec![pair("j/k", "move")];
+                if lists {
+                    keys.push(pair("a", "add"));
+                    keys.extend(change);
+                    keys.extend([pair("d", "delete"), pair("esc", "back")]);
+                    keys.extend([pair("w", "save"), pair("?", "help")]);
+                } else {
+                    keys.push(pair("tab", "pane"));
+                    keys.extend(change);
+                    keys.extend([
+                        pair("w", "save"),
+                        pair("e", "$EDITOR"),
+                        pair("/", "filter"),
+                        pair("?", "help"),
+                    ]);
+                }
+                keys
             }
         }
     };
-    frame::footer(f, rect, ui, &hints);
+    let refs: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(key, what)| (key.as_str(), what.as_str()))
+        .collect();
+    frame::footer(f, rect, ui, &refs);
+}
+
+/// What the keys do on a row of `field`: `h/l change · enter pick`,
+/// `h/l +/-250 · H/L +/-1000 · enter type`.
+fn verbs(field: &Field, ui: &Ui) -> Vec<(String, String)> {
+    let pm = ui.glyphs.plus_minus();
+    let pair = |key: &str, what: String| (key.to_string(), what);
+    let number = |n: f64| {
+        let text = format!("{n:.2}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    match &field.kind {
+        Kind::Bool => vec![pair("space", "toggle".into())],
+        Kind::Int(steps) => vec![
+            pair("h/l", format!("{pm}{}", steps.step)),
+            pair("H/L", format!("{pm}{}", steps.big)),
+            pair("enter", "type".into()),
+        ],
+        Kind::Float {
+            step,
+            big,
+            percent: true,
+            ..
+        } => vec![
+            pair("h/l", format!("{pm}{}%", number(step * 100.0))),
+            pair("H/L", format!("{pm}{}%", number(big * 100.0))),
+            pair("enter", "type".into()),
+        ],
+        Kind::Float { step, big, .. } => vec![
+            pair("h/l", format!("{pm}{}", number(*step))),
+            pair("H/L", format!("{pm}{}", number(*big))),
+            pair("enter", "type".into()),
+        ],
+        kind if picked(kind) => vec![pair("h/l", "change".into()), pair("enter", "pick".into())],
+        Kind::Hotkey { .. } => vec![pair("enter", "set".into())],
+        Kind::List { .. } => vec![pair("enter", "open".into())],
+        _ => vec![pair("enter", "edit".into())],
+    }
 }
 
 #[cfg(test)]
@@ -1640,6 +2489,48 @@ mod tests {
     use super::*;
     use crate::tui::app::{Dialog, Effect};
     use crate::tui::testing::{app, app_on, chord, mockup, paths, press, type_text, Fixture};
+
+    #[cfg(feature = "recording")]
+    #[test]
+    fn a_recording_language_is_unset_back_to_the_general_one() {
+        let mut fixture = app("[general]\nlanguage = \"de\"\n");
+        open(&mut fixture, "Recording");
+        to_row(&mut fixture, "language");
+        assert!(
+            crate::tui::testing::rows(&crate::tui::testing::draw(&fixture.app, 90, 30))
+                .iter()
+                .any(|r| r.contains("[general] language (de)"))
+        );
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, "french");
+        press(&mut fixture.app, "\n");
+        let language = |f: &Fixture| {
+            f.app
+                .config
+                .form
+                .config()
+                .recording
+                .as_ref()
+                .and_then(|r| r.language.clone())
+        };
+        assert_eq!(language(&fixture).as_deref(), Some("fr"));
+        // h steps back to unset, first in the ring.
+        press(&mut fixture.app, "\n");
+        chord(&mut fixture.app, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut fixture.app, "\n");
+        assert_eq!(language(&fixture), None);
+        // The retention names its ends.
+        to_row(&mut fixture, "keep audio");
+        press(&mut fixture.app, "\n");
+        chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        type_text(&mut fixture.app, "-1");
+        press(&mut fixture.app, "\n");
+        assert!(
+            crate::tui::testing::rows(&crate::tui::testing::draw(&fixture.app, 90, 30))
+                .iter()
+                .any(|r| r.contains("keep forever"))
+        );
+    }
 
     /// Open section `title` and put the focus on its rows.
     fn open(fixture: &mut Fixture, title: &str) {
@@ -2268,6 +3159,631 @@ mod tests {
         press(&mut fixture.app, " ");
         assert!(press(&mut fixture.app, "w").is_empty());
         assert_eq!(fixture.app.status.as_ref().unwrap().tone, Tone::Error);
+    }
+
+    // Picking, stepping and the hotkey dialog.
+
+    fn drawn(fixture: &Fixture) -> Vec<String> {
+        crate::tui::testing::rows(&crate::tui::testing::draw(&fixture.app, 90, 30))
+    }
+
+    fn mode(fixture: &Fixture) -> Mode {
+        fixture.app.config.mode()
+    }
+
+    fn status(fixture: &Fixture) -> Notice {
+        fixture.app.status.clone().expect("a status")
+    }
+
+    /// A language is picked by its name, stepped in place, or typed as a
+    /// code nobody lists, through the check.
+    #[test]
+    fn a_language_is_picked_by_name() {
+        let mut fixture = app("");
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "language");
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Picker);
+        // Letters filter; q is not quit here.
+        type_text(&mut fixture.app, "ger");
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("de") && r.contains("German")));
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Browse);
+        assert_eq!(config(&fixture).general.language, "de");
+        // h/l step through the list in place: auto, en, zh, de, es.
+        press(&mut fixture.app, "l");
+        assert_eq!(config(&fixture).general.language, "es");
+        press(&mut fixture.app, "hhh");
+        assert_eq!(config(&fixture).general.language, "en");
+        // A code no list has is offered as itself, normalized by the check.
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, "pt_br");
+        assert!(drawn(&fixture).iter().any(|r| r.contains("use \"pt_br\"")));
+        press(&mut fixture.app, "\n");
+        assert_eq!(config(&fixture).general.language, "pt-BR");
+        // One the check refuses keeps the picker open, with why.
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, "xyz1");
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Picker);
+        assert_eq!(status(&fixture).tone, Tone::Error);
+        // Esc leaves with nothing changed.
+        press(&mut fixture.app, "\x1b");
+        assert_eq!(mode(&fixture), Mode::Browse);
+        assert_eq!(config(&fixture).general.language, "pt-BR");
+    }
+
+    /// An unset-able row has unset first, saying what then applies.
+    #[test]
+    fn unset_is_a_row_of_its_own() {
+        let mut fixture = app("");
+        open(&mut fixture, "Read aloud (TTS)");
+        to_row(&mut fixture, "voice");
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("backend default (autumn)")));
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, "troy");
+        press(&mut fixture.app, "\n");
+        assert_eq!(
+            config(&fixture).tts.as_ref().unwrap().voice.as_deref(),
+            Some("troy")
+        );
+        // The cursor opens on the value set now; Home goes to unset.
+        press(&mut fixture.app, "\n");
+        chord(&mut fixture.app, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut fixture.app, "\n");
+        assert!(config(&fixture).tts.is_none());
+        // The voices follow the backend.
+        to_row(&mut fixture, "backend");
+        press(&mut fixture.app, "l");
+        assert_eq!(config(&fixture).tts.as_ref().unwrap().backend, "openai");
+        to_row(&mut fixture, "voice");
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, "marin");
+        press(&mut fixture.app, "\n");
+        assert_eq!(
+            config(&fixture).tts.as_ref().unwrap().voice.as_deref(),
+            Some("marin")
+        );
+    }
+
+    /// The backends not built or not implemented are skipped by h/l and
+    /// refused by the picker with why.
+    #[test]
+    fn a_backend_that_cannot_run_is_refused() {
+        let mut fixture = app("");
+        open(&mut fixture, "Backend & keys");
+        to_row(&mut fixture, "backend");
+        press(&mut fixture.app, "h");
+        assert_eq!(config(&fixture).general.backend, "asr-sidecar");
+        press(&mut fixture.app, "\n");
+        chord(&mut fixture.app, KeyCode::End, KeyModifiers::NONE);
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Picker);
+        let said = status(&fixture);
+        assert_eq!(said.tone, Tone::Warn);
+        assert!(said.text.contains("not implemented yet"), "{}", said.text);
+        assert!(drawn(&fixture).iter().any(|r| r.contains("coming soon")));
+        press(&mut fixture.app, "\x1b");
+        assert_eq!(config(&fixture).general.backend, "asr-sidecar");
+    }
+
+    /// Numbers step by their step, H/L by the big one, stop at a limit and
+    /// show their unit or name.
+    #[test]
+    fn numbers_step_and_show_their_unit() {
+        let mut fixture = app("");
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "silence timeout");
+        assert!(drawn(&fixture).iter().any(|r| r.contains("2000 ms")));
+        press(&mut fixture.app, "L");
+        assert_eq!(config(&fixture).general.silence_timeout_ms, 3000);
+        chord(&mut fixture.app, KeyCode::Left, KeyModifiers::SHIFT);
+        press(&mut fixture.app, "HH");
+        assert_eq!(config(&fixture).general.silence_timeout_ms, 0);
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("silence timeout") && r.contains("off")));
+        // At the limit it stops; it never wraps.
+        press(&mut fixture.app, "h");
+        assert_eq!(config(&fixture).general.silence_timeout_ms, 0);
+        let footer = drawn(&fixture).join("\n");
+        assert!(footer.contains("h/l \u{b1}250"), "{footer}");
+        assert!(footer.contains("H/L \u{b1}1000"), "{footer}");
+
+        to_row(&mut fixture, "feedback volume");
+        press(&mut fixture.app, "\n");
+        chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        type_text(&mut fixture.app, "0.4");
+        press(&mut fixture.app, "\n");
+        let bar = "\u{25B0}".repeat(4) + &"\u{25B1}".repeat(6) + " 40%";
+        assert!(drawn(&fixture).iter().any(|r| r.contains(&bar)), "{bar}");
+        press(&mut fixture.app, "L");
+        assert!((config(&fixture).general.audio_feedback_volume - 0.65).abs() < 1e-9);
+    }
+
+    #[test]
+    fn named_values_and_units_read_as_words() {
+        let steps = |unit, named| Steps {
+            min: -1,
+            max: 3000,
+            step: 1,
+            big: 10,
+            unit,
+            named,
+        };
+        let days = steps(
+            "days",
+            &[(-1, "keep forever"), (0, "delete once transcribed")],
+        );
+        assert_eq!(show_int(-1, &days), "keep forever");
+        assert_eq!(show_int(1, &days), "1 day");
+        assert_eq!(show_int(30, &days), "30 days");
+        let min = steps("min", &[]);
+        assert_eq!(show_int(45, &min), "45 min");
+        assert_eq!(show_int(90, &min), "90 min (1 h 30)");
+        assert_eq!(show_int(180, &min), "180 min (3 h)");
+        assert_eq!(show_int(3, &steps("", &[(0, "auto")])), "3");
+    }
+
+    /// The hotkey dialog builds a hotkey from toggles and a key, checks it
+    /// with the parser, and names a clash without refusing it.
+    #[test]
+    fn a_hotkey_is_built_in_its_dialog() {
+        let mut fixture = app("[hotkeys]\ntoggle = \"Alt+D\"\nrecording = \"Alt+Shift+M\"\n");
+        open(&mut fixture, "Hotkeys");
+        to_row(&mut fixture, "toggle");
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Hotkey);
+        // q and w are not quit and save while it is up.
+        assert!(press(&mut fixture.app, "qw").is_empty());
+        press(&mut fixture.app, " ");
+        assert!(drawn(&fixture).iter().any(|r| r.contains("Super+Alt+D")));
+        press(&mut fixture.app, "\t\t\t\t\t\n");
+        assert_eq!(mode(&fixture), Mode::Browse);
+        let hotkeys = |f: &Fixture| config(f).hotkeys.clone().unwrap();
+        assert_eq!(hotkeys(&fixture).toggle.as_deref(), Some("Super+Alt+D"));
+
+        // The key from its picker; a clash is a warning.
+        press(&mut fixture.app, "\n");
+        press(&mut fixture.app, " \t\t\t \t\n");
+        assert_eq!(mode(&fixture), Mode::Picker);
+        type_text(&mut fixture.app, "m");
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Hotkey);
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("Alt+Shift+M is already recording")));
+        press(&mut fixture.app, "\n");
+        assert_eq!(hotkeys(&fixture).toggle.as_deref(), Some("Alt+Shift+M"));
+        let said = status(&fixture);
+        assert_eq!(said.tone, Tone::Warn);
+        assert_eq!(said.text, "Alt+Shift+M is also recording");
+
+        // A bare key is refused, by the parser's own rule.
+        to_row(&mut fixture, "cancel");
+        press(&mut fixture.app, "\n\t\t\t\t\n");
+        type_text(&mut fixture.app, "d");
+        press(&mut fixture.app, "\n\n");
+        assert_eq!(mode(&fixture), Mode::Hotkey);
+        assert_eq!(status(&fixture).tone, Tone::Error);
+        assert!(status(&fixture).text.contains("ScrollLock"));
+        press(&mut fixture.app, "\x1b");
+        assert_eq!(hotkeys(&fixture).cancel, None);
+
+        // t types it instead; x unsets it.
+        to_row(&mut fixture, "toggle");
+        press(&mut fixture.app, "\nt");
+        assert_eq!(mode(&fixture), Mode::Text);
+        chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        type_text(&mut fixture.app, "Super+F9");
+        press(&mut fixture.app, "\n");
+        assert_eq!(hotkeys(&fixture).toggle.as_deref(), Some("Super+F9"));
+        press(&mut fixture.app, "\nx");
+        assert_eq!(hotkeys(&fixture).toggle, None);
+    }
+
+    /// A hotkey that does not parse opens as text, saying so; a typed one
+    /// is checked by the parser too.
+    #[test]
+    fn a_hotkey_that_does_not_parse_is_typed() {
+        let mut fixture = app("[hotkeys]\nspeak = \"Super+Nope\"\n");
+        open(&mut fixture, "Hotkeys");
+        to_row(&mut fixture, "speak");
+        assert!(drawn(&fixture).iter().any(|r| r.contains("does not parse")));
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Text);
+        assert_eq!(status(&fixture).tone, Tone::Warn);
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Text, "still refused");
+        chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        type_text(&mut fixture.app, "Ctrl+Alt+S");
+        press(&mut fixture.app, "\n");
+        assert_eq!(
+            config(&fixture).hotkeys.as_ref().unwrap().speak.as_deref(),
+            Some("Ctrl+Alt+S")
+        );
+    }
+
+    /// Every hotkey in the form is a candidate for a clash, entries too.
+    #[test]
+    fn a_clash_is_found_in_any_section() {
+        let mut fixture = app(
+            "[hotkeys]\ntoggle = \"Alt+D\"\n[[agents]]\nname = \"jarvis\"\nhotkey = \"Super+J\"\n",
+        );
+        let others = fixture.app.config.hotkeys_but("hotkeys.toggle");
+        assert!(others.contains(&("agent jarvis hotkey".to_string(), "Super+J".to_string())));
+        open(&mut fixture, "Hotkeys");
+        to_row(&mut fixture, "toggle");
+        press(&mut fixture.app, "\nt");
+        chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        type_text(&mut fixture.app, "super+j");
+        press(&mut fixture.app, "\n");
+        assert_eq!(status(&fixture).text, "super+j is also agent jarvis hotkey");
+    }
+
+    /// A worker's list: asked for when the picker opens, "looking..." until
+    /// it comes, then picked from; a failure says why and typing still
+    /// works.
+    #[test]
+    fn devices_load_on_a_worker() {
+        use crate::tui::app::Msg;
+        use crate::tui::options::Device;
+
+        let mut fixture = app("");
+        // Asked for as soon as the cursor lands on the row.
+        let index = SECTIONS.iter().position(|s| s.title == "Audio").unwrap();
+        press(&mut fixture.app, &"j".repeat(index));
+        assert_eq!(
+            press(&mut fixture.app, "\n"),
+            [Effect::List(ListKind::Devices)]
+        );
+        // On its way already: the picker does not ask twice.
+        assert!(press(&mut fixture.app, "\n").is_empty());
+        assert!(drawn(&fixture).iter().any(|r| r.contains("looking...")));
+        fixture
+            .app
+            .update(Msg::Listed(Listing::Devices(Ok(vec![Device {
+                id: "alsa_input.usb-yeti".into(),
+                description: "Blue Yeti".into(),
+                monitor: false,
+            }]))));
+        assert!(drawn(&fixture).iter().any(|r| r.contains("Blue Yeti")));
+        type_text(&mut fixture.app, "yeti");
+        press(&mut fixture.app, "\n");
+        assert_eq!(config(&fixture).audio.device, "alsa_input.usb-yeti");
+
+        // Asked again on the next open; this time it fails.
+        assert_eq!(
+            press(&mut fixture.app, "\n"),
+            [Effect::List(ListKind::Devices)]
+        );
+        fixture.app.update(Msg::Listed(Listing::Devices(Err(
+            "no input devices found".into()
+        ))));
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("no input devices found")));
+        type_text(&mut fixture.app, "hw:1");
+        press(&mut fixture.app, "\n");
+        assert_eq!(config(&fixture).audio.device, "hw:1");
+    }
+
+    /// The value set on a device row stays while the list is not here:
+    /// `h`/`l` only ask for it. Once it is, a value it lacks steps to its
+    /// first (or last) item.
+    #[test]
+    fn a_device_is_kept_until_its_list_is_here() {
+        use crate::tui::app::Msg;
+        use crate::tui::options::Device;
+
+        let mut fixture = app("[audio]\ndevice = \"alsa_input.usb-yeti\"\n");
+        open(&mut fixture, "Audio");
+        for keys in ["l", "h"] {
+            press(&mut fixture.app, keys);
+            assert_eq!(
+                config(&fixture).audio.device,
+                "alsa_input.usb-yeti",
+                "{keys}"
+            );
+        }
+        assert_eq!(status(&fixture).text, "looking...");
+        // A failed list is asked for again by the next press.
+        fixture.app.update(Msg::Listed(Listing::Devices(Err(
+            "no input devices found".into()
+        ))));
+        assert_eq!(
+            press(&mut fixture.app, "l"),
+            [Effect::List(ListKind::Devices)]
+        );
+        assert_eq!(config(&fixture).audio.device, "alsa_input.usb-yeti");
+        fixture
+            .app
+            .update(Msg::Listed(Listing::Devices(Ok(vec![Device {
+                id: "alsa_input.pci-builtin".into(),
+                description: "Built-in".into(),
+                monitor: false,
+            }]))));
+        assert!(fixture.app.status.is_none(), "looking... is gone");
+        press(&mut fixture.app, "h");
+        assert_eq!(config(&fixture).audio.device, "alsa_input.pci-builtin");
+        press(&mut fixture.app, "l");
+        assert_eq!(config(&fixture).audio.device, "default");
+    }
+
+    /// The recording devices too: an unset-able one is not unset, a
+    /// monitor not replaced by none, while their list is on its way.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn recording_devices_are_kept_until_their_list_is_here() {
+        let mut fixture = app("[recording]\nmic_device = \"x\"\nsystem_device = \"y.monitor\"\n");
+        open(&mut fixture, "Recording");
+        let recording = |f: &Fixture| f.app.config.form.config().recording.clone().unwrap();
+        to_row(&mut fixture, "mic device");
+        press(&mut fixture.app, "l");
+        assert_eq!(recording(&fixture).mic_device.as_deref(), Some("x"));
+        to_row(&mut fixture, "system device");
+        press(&mut fixture.app, "h");
+        assert_eq!(
+            recording(&fixture).system_device.as_deref(),
+            Some("y.monitor")
+        );
+        assert_eq!(status(&fixture).text, "looking...");
+    }
+
+    /// `system_device = "default"` is the default monitor, as unset is.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn a_system_device_of_default_reads_as_unset() {
+        let mut fixture = app("[recording]\nsystem_device = \"default\"\n");
+        open(&mut fixture, "Recording");
+        to_row(&mut fixture, "system device");
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("system device") && r.contains("default monitor")));
+        let field = SECTIONS
+            .iter()
+            .find_map(|s| match s.body {
+                Body::Rows(fields) => fields.iter().find(|f| f.path == "recording.system_device"),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            fixture
+                .app
+                .config
+                .current_text(field, "recording.system_device"),
+            None
+        );
+    }
+
+    /// A list that comes while another row's picker is open leaves that
+    /// picker as it is.
+    #[test]
+    fn a_list_refreshes_only_its_own_picker() {
+        use crate::tui::app::Msg;
+
+        let mut fixture = app("");
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "language");
+        // auto, en (the cursor), zh, de.
+        press(&mut fixture.app, "\n");
+        chord(&mut fixture.app, KeyCode::Down, KeyModifiers::NONE);
+        chord(&mut fixture.app, KeyCode::Down, KeyModifiers::NONE);
+        fixture.app.update(Msg::Listed(Listing::Devices(Err(
+            "no input devices found".into()
+        ))));
+        press(&mut fixture.app, "\n");
+        assert_eq!(config(&fixture).general.language, "de");
+    }
+
+    /// Space is the next value of a closed set.
+    #[test]
+    fn space_steps_a_closed_set() {
+        let mut fixture = app("");
+        open(&mut fixture, "Overlay");
+        to_row(&mut fixture, "theme");
+        press(&mut fixture.app, " ");
+        assert_eq!(fixture.app.overlay().theme, "ember");
+        to_row(&mut fixture, "agent overlay");
+        press(&mut fixture.app, " ");
+        assert_eq!(
+            config(&fixture).agent_overlay.as_ref().unwrap().enabled,
+            Some(true)
+        );
+    }
+
+    /// The model path's key is not `~`-expanded by the daemon, so a typed
+    /// `~` is written out.
+    #[test]
+    fn a_tilde_in_the_model_path_is_written_out() {
+        let mut fixture = app_on(Some(""), &[("HOME", "/home/ada")]);
+        open(&mut fixture, "Backend & keys");
+        to_row(&mut fixture, "whisper model");
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, "~/models/ggml-x.bin");
+        press(&mut fixture.app, "\n");
+        assert_eq!(
+            config(&fixture).local_whisper.as_ref().unwrap().model_path,
+            "/home/ada/models/ggml-x.bin"
+        );
+    }
+
+    /// An expected language is a language: `auto` is refused, and not
+    /// offered.
+    #[test]
+    fn expected_languages_refuse_auto() {
+        let mut fixture = app("");
+        open(&mut fixture, "Backend & keys");
+        to_row(&mut fixture, "openai languages");
+        press(&mut fixture.app, "\na");
+        type_text(&mut fixture.app, "auto");
+        assert!(!drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("detect the language")));
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Picker);
+        assert!(status(&fixture).text.contains("auto is no language"));
+        assert!(config(&fixture).openai.is_none());
+    }
+
+    /// `?` in a picker or the hotkey dialog lists its keys, and closes
+    /// back onto it; the lines wrap at 60 columns rather than being cut.
+    #[test]
+    fn help_inside_a_picker_and_the_hotkey_dialog() {
+        use crate::tui::app::HelpFor;
+
+        let mut fixture = app("[hotkeys]\ntoggle = \"Alt+D\"\n");
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "language");
+        press(&mut fixture.app, "\n?");
+        assert_eq!(fixture.app.dialog, Some(Dialog::Help(HelpFor::Picker)));
+        let small = crate::tui::testing::rows(&crate::tui::testing::draw(&fixture.app, 60, 18));
+        assert!(small.iter().any(|r| r.contains("picker keys")));
+        assert!(!small.iter().any(|r| r.contains('\u{2026}')), "{small:#?}");
+        assert!(
+            small.iter().any(|r| r.contains("of what it is")),
+            "{small:#?}"
+        );
+        press(&mut fixture.app, "x");
+        assert_eq!(fixture.app.dialog, None);
+        assert_eq!(mode(&fixture), Mode::Picker);
+        press(&mut fixture.app, "\x1b");
+
+        open(&mut fixture, "Hotkeys");
+        to_row(&mut fixture, "toggle");
+        press(&mut fixture.app, "\n?");
+        assert_eq!(fixture.app.dialog, Some(Dialog::Help(HelpFor::Hotkey)));
+        press(&mut fixture.app, "\x1b");
+        assert_eq!(mode(&fixture), Mode::Hotkey);
+    }
+
+    /// The model files load on a worker and set a full path; Tab in the
+    /// filter completes a path.
+    #[test]
+    fn a_model_file_is_picked_or_its_path_completed() {
+        use crate::tui::app::Msg;
+        use crate::tui::options::ModelFile;
+
+        let mut fixture = app("");
+        let models = fixture.dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        open(&mut fixture, "Backend & keys");
+        let row = fixture
+            .app
+            .config
+            .items()
+            .iter()
+            .position(
+                |item| matches!(item, Item::Field { field, .. } if field.label == "whisper model"),
+            )
+            .unwrap();
+        press(&mut fixture.app, "g");
+        // Asked for when the cursor lands on the row.
+        let effects = press(&mut fixture.app, &"j".repeat(row));
+        assert_eq!(effects, [Effect::List(ListKind::Models)]);
+        assert!(press(&mut fixture.app, "\n").is_empty());
+        let small = models.join("ggml-small.en.bin");
+        fixture
+            .app
+            .update(Msg::Listed(Listing::Models(Ok(vec![ModelFile {
+                path: small.clone(),
+                size: 466_000_000,
+            }]))));
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("ggml-small.en.bin") && r.contains("466 MB")));
+        type_text(&mut fixture.app, "small");
+        press(&mut fixture.app, "\n");
+        let path = |f: &Fixture| config(f).local_whisper.as_ref().unwrap().model_path.clone();
+        assert_eq!(path(&fixture), small.to_string_lossy());
+
+        std::fs::write(models.join("ggml-tiny.bin"), b"x").unwrap();
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, &format!("{}/ggml-t", models.display()));
+        chord(&mut fixture.app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut fixture.app, "\n");
+        assert_eq!(
+            path(&fixture),
+            models.join("ggml-tiny.bin").to_string_lossy()
+        );
+    }
+
+    /// Tab completes a typed path in a path input.
+    #[test]
+    fn a_path_input_completes_with_tab() {
+        let mut fixture = app("[[agents]]\nname = \"jarvis\"\n");
+        let root = fixture.dir.path().to_path_buf();
+        std::fs::create_dir(root.join("Documents")).unwrap();
+        open(&mut fixture, "Agents");
+        press(&mut fixture.app, "\n");
+        to_row(&mut fixture, "dir");
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, &format!("{}/Doc", root.display()));
+        chord(&mut fixture.app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(drawn(&fixture).join("\n").contains("tab complete"));
+        press(&mut fixture.app, "\n");
+        assert_eq!(
+            config(&fixture).agents[0].dir,
+            format!("{}/Documents/", root.display())
+        );
+    }
+
+    /// A list whose items are languages adds and changes them through the
+    /// picker.
+    #[test]
+    fn list_items_are_picked() {
+        let mut fixture = app("");
+        open(&mut fixture, "Backend & keys");
+        to_row(&mut fixture, "openai languages");
+        press(&mut fixture.app, "\na");
+        assert_eq!(mode(&fixture), Mode::Picker);
+        type_text(&mut fixture.app, "ukr");
+        press(&mut fixture.app, "\n");
+        assert_eq!(config(&fixture).openai.as_ref().unwrap().languages, ["uk"]);
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, "ru");
+        press(&mut fixture.app, "\n");
+        assert_eq!(config(&fixture).openai.as_ref().unwrap().languages, ["ru"]);
+    }
+
+    /// A colour shows a swatch of itself, or of the theme's while unset.
+    #[test]
+    fn a_colour_shows_its_swatch() {
+        let fixture =
+            app("[overlay]\ntheme = \"custom\"\n[overlay.colors]\nrecording = \"#F97316\"\n");
+        let mut fixture = fixture;
+        open(&mut fixture, "Overlay");
+        let buf = crate::tui::testing::draw(&fixture.app, 90, 30);
+        let rows = crate::tui::testing::rows(&buf);
+        let (y, row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains("#F97316"))
+            .expect("the colour row");
+        let x = row.chars().position(|c| c == '\u{2588}').expect("a swatch") as u16;
+        assert_eq!(
+            buf[(x, y as u16)].fg,
+            ratatui::style::Color::Rgb(0xF9, 0x73, 0x16)
+        );
+        // Unset: the theme's own (ember's, under custom) beside "theme".
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("speaking color") && r.contains("theme \u{2588}")));
+    }
+
+    /// A harness whose binary is not on PATH says so.
+    #[test]
+    fn a_missing_harness_is_noted() {
+        let mut fixture = app("[[agents]]\nname = \"jarvis\"\n");
+        open(&mut fixture, "Agents");
+        press(&mut fixture.app, "\n");
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("claude not on PATH")));
     }
 
     /// Built without the recording feature, Recording says so and keeps

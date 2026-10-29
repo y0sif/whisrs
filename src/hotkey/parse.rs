@@ -57,6 +57,102 @@ pub fn parse_hotkey(s: &str) -> anyhow::Result<HotkeyBinding> {
     Ok(HotkeyBinding { modifiers, trigger })
 }
 
+/// The modifiers a hotkey can hold, in the order a picker writes them.
+pub const MODIFIER_NAMES: [&str; 4] = ["Super", "Ctrl", "Alt", "Shift"];
+
+/// Every key a hotkey can end in, once each, by the name a picker offers.
+/// [`parse_hotkey`] takes each one (a test holds both ways), and the other
+/// spellings it takes (`Esc`, `PgUp`) are names of keys listed here.
+///
+/// No digits: a one-character key is read as a letter, so `Super+1` does
+/// not parse, and offering it would only be refused.
+pub const KEY_NAMES: &[&str] = &[
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5",
+    "F6",
+    "F7",
+    "F8",
+    "F9",
+    "F10",
+    "F11",
+    "F12",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F17",
+    "F18",
+    "F19",
+    "F20",
+    "F21",
+    "F22",
+    "F23",
+    "F24",
+    "Space",
+    "Enter",
+    "Escape",
+    "Tab",
+    "Backspace",
+    "Delete",
+    "Insert",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+    "Up",
+    "Down",
+    "Left",
+    "Right",
+    "ScrollLock",
+    "Pause",
+];
+
+/// A hotkey as the names of its modifiers ([`MODIFIER_NAMES`]) and its key
+/// ([`KEY_NAMES`]), whatever spelling it was written in: `alt+shift+m` is
+/// `(["Alt", "Shift"], "M")`. `None` for a hotkey [`parse_hotkey`] refuses.
+pub fn hotkey_parts(s: &str) -> Option<(Vec<&'static str>, &'static str)> {
+    let binding = parse_hotkey(s).ok()?;
+    let mut modifiers: Vec<&'static str> = MODIFIER_NAMES
+        .into_iter()
+        .filter(|name| parse_modifier(name).is_some_and(|key| binding.modifiers.contains(&key)))
+        .collect();
+    modifiers.dedup();
+    let key = KEY_NAMES
+        .iter()
+        .copied()
+        .find(|name| parse_key(name) == Some(binding.trigger))?;
+    Some((modifiers, key))
+}
+
 fn parse_modifier(s: &str) -> Option<Key> {
     match s.to_lowercase().as_str() {
         "super" | "meta" | "win" | "hyper" => Some(Key::KEY_LEFTMETA),
@@ -289,5 +385,92 @@ mod tests {
     #[test]
     fn parse_unknown_key_fails() {
         assert!(parse_hotkey("Super+Unknown").is_err());
+    }
+
+    /// Every spelling `parse_key` takes, by hand from its arms; a new arm
+    /// belongs here and, under its main name, in `KEY_NAMES`.
+    const EVERY_SPELLING: &[&str] = &[
+        "a",
+        "z",
+        "space",
+        "enter",
+        "return",
+        "escape",
+        "esc",
+        "tab",
+        "backspace",
+        "delete",
+        "del",
+        "insert",
+        "ins",
+        "home",
+        "end",
+        "pageup",
+        "pgup",
+        "pagedown",
+        "pgdn",
+        "up",
+        "down",
+        "left",
+        "right",
+        "scrolllock",
+        "scroll_lock",
+        "scroll",
+        "pause",
+        "break",
+        "f1",
+        "f12",
+        "f13",
+        "f24",
+        "0",
+        "9",
+    ];
+
+    /// A picker offers `KEY_NAMES`, so each must parse, each once, and every
+    /// key the parser knows must be offered under one name.
+    #[test]
+    fn key_names_are_exactly_the_keys_the_parser_takes() {
+        let mut keys = Vec::new();
+        for name in KEY_NAMES {
+            let key = parse_key(name).unwrap_or_else(|| panic!("{name} does not parse"));
+            assert!(!keys.contains(&key), "{name} names a key twice");
+            keys.push(key);
+            assert!(parse_hotkey(&format!("Super+{name}")).is_ok(), "{name}");
+        }
+        for spelling in EVERY_SPELLING {
+            if let Some(key) = parse_key(spelling) {
+                assert!(keys.contains(&key), "{spelling} parses but is not offered");
+            }
+        }
+        // Each letter and function key, not just the ends listed above.
+        for c in 'a'..='z' {
+            assert!(keys.contains(&parse_key(&c.to_string()).unwrap()));
+        }
+        for n in 1..=24 {
+            assert!(keys.contains(&parse_key(&format!("f{n}")).unwrap()));
+        }
+    }
+
+    #[test]
+    fn modifier_names_parse() {
+        for name in MODIFIER_NAMES {
+            assert!(parse_modifier(name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn hotkey_parts_name_any_spelling() {
+        assert_eq!(
+            hotkey_parts("alt+shift+m"),
+            Some((vec!["Alt", "Shift"], "M"))
+        );
+        // Written in the picker's order, whatever order it was typed in.
+        assert_eq!(
+            hotkey_parts("Shift+Meta+pgup"),
+            Some((vec!["Super", "Shift"], "PageUp"))
+        );
+        assert_eq!(hotkey_parts("ScrollLock"), Some((vec![], "ScrollLock")));
+        assert_eq!(hotkey_parts("D"), None);
+        assert_eq!(hotkey_parts("Super+1"), None);
     }
 }

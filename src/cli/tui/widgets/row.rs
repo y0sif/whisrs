@@ -58,8 +58,11 @@ pub struct Row<'a> {
     pub focused: bool,
     /// The row picked in a list without the focus: plain rather than muted.
     pub selected: bool,
-    /// A choice: arrows either side of the value while focused.
+    /// A choice or a number: arrows either side of the value while focused.
     pub choice: bool,
+    /// The value is at its lower or upper limit: that side's arrow dims.
+    pub at_min: bool,
+    pub at_max: bool,
     /// The value just changed: shown reversed for a moment.
     pub flash: bool,
     /// Being typed into.
@@ -77,6 +80,8 @@ impl Row<'_> {
             focused: false,
             selected: false,
             choice: false,
+            at_min: false,
+            at_max: false,
             flash: false,
             input: None,
             gutter: true,
@@ -115,9 +120,13 @@ impl Row<'_> {
             spans.extend(input.spans(ui, room));
         } else {
             let arrows = self.focused && self.choice;
+            let arrow = |end: bool| if end { theme.faint } else { theme.accent };
             if arrows {
                 room = room.saturating_sub(4);
-                spans.push(Span::styled(format!("{} ", ui.glyphs.left), theme.accent));
+                spans.push(Span::styled(
+                    format!("{} ", ui.glyphs.left),
+                    arrow(self.at_min),
+                ));
             }
             for (text, tone) in self.value.parts {
                 if room == 0 {
@@ -136,7 +145,10 @@ impl Row<'_> {
                 spans.push(Span::styled(text, style));
             }
             if arrows {
-                spans.push(Span::styled(format!(" {}", ui.glyphs.right), theme.accent));
+                spans.push(Span::styled(
+                    format!(" {}", ui.glyphs.right),
+                    arrow(self.at_max),
+                ));
             }
         }
         Line::from(spans).render(area, buf);

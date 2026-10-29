@@ -98,12 +98,18 @@ src/
 │   ├── keys.rs             #   key -> Action (pure)
 │   ├── theme.rs            #   colour roles from the overlay theme; 16-colour map, light remap, NO_COLOR
 │   ├── glyphs.rs           #   Unicode and ASCII glyph sets (one char, one column each)
-│   ├── schema.rs           #   every config key as a row (kind, help, feature gate) + coverage test
+│   ├── schema.rs           #   every config key as a row (kind, help, feature gate) + coverage tests
+│   │                       #   (every key a row; every typed string in FREE_TEXT with a reason)
+│   ├── options.rs          #   what a row offers: picks (catalog lists, by backend or URL host, worker
+│   │                       #   lists), the unset row, refusals (not built in, coming soon), notes
+│   ├── complete.rs         #   Tab completion of a typed path
 │   ├── form.rs             #   the edit buffer: dotted-path get/set over a toml::Table, checked by serde
 │   ├── worker.rs           #   threads: the 2 s info poll (status for an older daemon), the restart
 │   │                       #   gate (only an idle daemon; silence, a recording, an agent turn or
-│   │                       #   busy skip it; an older one is asked `recording status` too)
-│   ├── widgets/            #   frame + footer, row, text input, dialog
+│   │                       #   busy skip it; an older one is asked `recording status` too), and the
+│   │                       #   lists a picker needs (input devices, ggml-*.bin), the lister injected
+│   ├── widgets/            #   frame + footer, row, text input, dialog, picker (filter by word
+│   │                       #   prefix), hotkey dialog (checked by hotkey::parse_hotkey)
 │   ├── screens/            #   home.rs (the hub), config.rs (sections, rows, list/map/entry editors, save)
 │   ├── testing.rs, render_tests.rs  #   fixtures; snapshots, styles, layouts (tests only)
 │   └── snapshots/          #   TestBackend row-string snapshots (WHISRS_UPDATE_SNAPSHOTS=1 rewrites)
@@ -186,6 +192,8 @@ src/
     ├── write.rs            # Load (ExistingConfig, refusals) and the format-preserving write
     ├── vocabulary.rs       # vocabulary.txt, and the save that splits terms between the two stores
     ├── keys.rs             # mask_api_key, the key summary (env var wins), the masked TOML
+    ├── catalog.rs          # (value, description) lists the pickers offer: languages, models, voices,
+    │                       #   closed choices; each provider list names its source URL and check date
     └── setup.rs            # Interactive onboarding (whisrs setup)
 ```
 

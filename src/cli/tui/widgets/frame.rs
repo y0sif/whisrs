@@ -149,16 +149,17 @@ pub fn footer(f: &mut Frame, rect: Rect, ui: &Ui, hints: &[(&str, &str)]) {
     f.render_widget(Paragraph::new(Line::from(spans)), rect);
 }
 
-/// The most notice lines at the foot of a screen; past it, one line counts
-/// the rest.
+/// The most notices at the foot of a screen; past it, one line counts the
+/// rest.
 const MAX_NOTICES: usize = 4;
 
-/// The most lines a status wraps to.
+/// The most lines a notice or the status wraps to.
 const MAX_STATUS: usize = 3;
 
-/// The lines at the foot of a body, `max` columns wide: each notice on a
-/// line of its own, then the status, wrapped. A warning leads with `!`, and
-/// an error says `error:` when there is no colour to say it.
+/// The lines at the foot of a body, `max` columns wide: each notice, then
+/// the status, wrapped (a warning's later lines under its text, past the
+/// `!`). A warning leads with `!`, and an error says `error:` when there is
+/// no colour to say it.
 pub fn messages(
     notices: &[Notice],
     status: Option<&Notice>,
@@ -170,6 +171,10 @@ pub fn messages(
         Tone::Error if !ui.theme.color => format!("error: {}", notice.text),
         _ => notice.text.clone(),
     };
+    let hang = |notice: &Notice| match notice.tone {
+        Tone::Warn => width(ui.glyphs.warn) + 1,
+        _ => 0,
+    };
     let line = |text: String, tone: Tone| Line::from(Span::styled(text, tone.style(ui.theme)));
     let mut lines = Vec::new();
     let shown = if notices.len() > MAX_NOTICES {
@@ -178,10 +183,8 @@ pub fn messages(
         notices.len()
     };
     for notice in &notices[..shown] {
-        lines.push(line(
-            fit(&text(notice), max, ui.glyphs.ellipsis),
-            notice.tone,
-        ));
+        let wrapped = wrap_at_most(&text(notice), max, hang(notice), ui.glyphs.ellipsis);
+        lines.extend(wrapped.into_iter().map(|text| line(text, notice.tone)));
     }
     if shown < notices.len() {
         let more = format!(
@@ -192,18 +195,45 @@ pub fn messages(
         lines.push(line(fit(&more, max, ui.glyphs.ellipsis), Tone::Warn));
     }
     if let Some(status) = status {
-        let mut wrapped = wrap(&text(status), max);
-        if wrapped.len() > MAX_STATUS {
-            wrapped.truncate(MAX_STATUS);
-            let last = wrapped.pop().unwrap_or_default();
-            wrapped.push(fit(
-                &format!("{last} {}", ui.glyphs.ellipsis),
-                max,
-                ui.glyphs.ellipsis,
-            ));
-        }
+        let wrapped = wrap_at_most(&text(status), max, hang(status), ui.glyphs.ellipsis);
         lines.extend(wrapped.into_iter().map(|text| line(text, status.tone)));
     }
+    lines
+}
+
+/// `text` wrapped to `max` columns, its later lines indented by `hang`, in
+/// at most [`MAX_STATUS`] lines, the last one cut with `ellipsis` when more
+/// was left.
+fn wrap_at_most(text: &str, max: usize, hang: usize, ellipsis: &str) -> Vec<String> {
+    let mut lines = wrap_hanging(text, max, hang);
+    if lines.len() > MAX_STATUS {
+        lines.truncate(MAX_STATUS);
+        let last = lines.pop().unwrap_or_default();
+        lines.push(fit(&format!("{last} {ellipsis}"), max, ellipsis));
+    }
+    lines
+}
+
+/// [`wrap`], with every line after the first indented by `hang` columns.
+fn wrap_hanging(text: &str, max: usize, hang: usize) -> Vec<String> {
+    let plain = wrap(text, max);
+    if plain.len() <= 1 || hang == 0 || max <= hang {
+        return plain;
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let head = &plain[0];
+    let taken = head.split_whitespace().count();
+    // A first word cut to fit is no whole word to carry on after.
+    if words[..taken.min(words.len())].join(" ") != *head {
+        return plain;
+    }
+    let indent = " ".repeat(hang);
+    let mut lines = vec![head.clone()];
+    lines.extend(
+        wrap(&words[taken..].join(" "), max - hang)
+            .into_iter()
+            .map(|line| format!("{indent}{line}")),
+    );
     lines
 }
 
@@ -224,5 +254,38 @@ mod tests {
         let placed = place(Rect::new(0, 0, 90, 30), Some(8)).unwrap();
         assert_eq!(placed.frame, Rect::new(3, 8, 84, 12));
         assert_eq!(placed.footer, Rect::new(3, 20, 84, 1));
+    }
+
+    /// A long warning wraps instead of being cut, its later lines under its
+    /// text; past three lines it ends in an ellipsis.
+    #[test]
+    fn messages_wrap() {
+        let theme = crate::tui::testing::theme();
+        let glyphs = crate::tui::glyphs::Glyphs::UNICODE;
+        let ui = Ui {
+            theme: &theme,
+            glyphs: &glyphs,
+        };
+        let warning = Notice::new(
+            Tone::Warn,
+            "[general] prompt is ignored with backend = \"deepgram-streaming\": the \
+             Deepgram API takes no prompt",
+        );
+        let lines: Vec<String> = messages(&[warning], None, &ui, 40)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "! [general] prompt is ignored with",
+                "  backend = \"deepgram-streaming\": the",
+                "  Deepgram API takes no prompt",
+            ]
+        );
+        let long = Notice::new(Tone::Muted, "word ".repeat(40));
+        let lines = messages(&[], Some(&long), &ui, 20);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[2].to_string().ends_with('\u{2026}'));
     }
 }

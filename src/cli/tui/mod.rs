@@ -8,9 +8,11 @@
 //! from [`worker`] threads, so a daemon that hangs cannot freeze the screen.
 
 mod app;
+mod complete;
 mod form;
 mod glyphs;
 mod keys;
+mod options;
 #[cfg(test)]
 mod render_tests;
 mod schema;
@@ -97,6 +99,8 @@ pub struct Paths {
     pub config: PathBuf,
     pub vocabulary: PathBuf,
     pub socket: PathBuf,
+    /// Where `whisrs setup` puts whisper models.
+    pub models: PathBuf,
 }
 
 impl Paths {
@@ -105,6 +109,9 @@ impl Paths {
             config: whisrs::config_path(),
             vocabulary: whisrs::config::vocabulary::vocabulary_path(),
             socket: whisrs::socket_path(),
+            models: dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+                .join("whisrs/models"),
         }
     }
 }
@@ -145,7 +152,16 @@ pub fn run(entry: Entry) -> anyhow::Result<()> {
         }
     };
     let (tx, rx) = mpsc::channel();
-    let workers = worker::Workers::start(tx, &app.paths.socket, app.service);
+    let workers = worker::Workers::start(
+        tx,
+        &app.paths.socket,
+        app.service,
+        worker::Lister {
+            devices: worker::list_devices_quietly,
+            models: app.paths.models.clone(),
+            home: app.env.get("HOME").map(str::to_string),
+        },
+    );
     let result = restoring(ratatui::restore, || {
         drain_early_input()?;
         event_loop(
@@ -293,6 +309,14 @@ fn perform(
                 workers.restart(next == Effect::RestartAnyway);
                 None
             }
+            Effect::List(kind) => {
+                workers.list(kind);
+                None
+            }
+            Effect::Reclaim => {
+                reclaim(terminal)?;
+                None
+            }
             Effect::Reload => {
                 let reload = screens::config::reload(&app.paths);
                 app.update(Msg::Reloaded(reload))
@@ -315,34 +339,93 @@ fn perform(
     Ok(())
 }
 
-/// Leave the TUI for `$VISUAL`, else `$EDITOR`, else `vi`, on `path`, and
-/// come back to it. The editor command may carry arguments (`code -w`), so
-/// it runs through `sh`. The inner `Err` is an editor that did not start;
-/// the outer one a terminal that could not be taken back.
+/// The editors tried, in order, when neither `$VISUAL` nor `$EDITOR` is
+/// set. Arch installs no `vi` by default.
+const EDITORS: [&str; 4] = ["nvim", "vim", "vi", "nano"];
+
+/// What `e` runs: `$VISUAL`, else `$EDITOR`, else the first of [`EDITORS`]
+/// on `PATH`; `None` when there is none.
+fn editor_command(env: &Env) -> Option<String> {
+    ["VISUAL", "EDITOR"]
+        .into_iter()
+        .find_map(|key| env.get(key).filter(|value| !value.trim().is_empty()))
+        .map(str::to_string)
+        .or_else(|| {
+            EDITORS
+                .into_iter()
+                .find(|name| find_on_path(env, name).is_some())
+                .map(str::to_string)
+        })
+}
+
+/// The executable `name` in `env`'s `PATH`, as a shell would find it.
+pub fn find_on_path(env: &Env, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    env.get("PATH")?
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join(name))
+        .find(|path| {
+            std::fs::metadata(path)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// How the editor's run ended: `Err` when it never started (`sh` answers
+/// 126 for a command it cannot run, 127 for one it cannot find), so the
+/// file is not read again as if it had been edited.
+fn editor_ran(
+    editor: &str,
+    status: std::io::Result<std::process::ExitStatus>,
+) -> Result<(), String> {
+    match status {
+        Ok(status) if matches!(status.code(), Some(126 | 127)) => Err(format!(
+            "{editor} did not start (sh exit {}): set $VISUAL or $EDITOR to an editor that is \
+             installed",
+            status.code().unwrap_or_default()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("cannot run {editor}: {e}")),
+    }
+}
+
+/// Leave the TUI for the editor [`editor_command`] names, on `path`, and
+/// come back to it. The command may carry arguments (`code -w`), so it runs
+/// through `sh`. The inner `Err` is an editor that did not start, or none
+/// found, which never leaves the screen; the outer one a terminal that
+/// could not be taken back.
 fn suspend_for_editor(
     terminal: &mut ratatui::DefaultTerminal,
     env: &Env,
     path: &Path,
 ) -> anyhow::Result<Result<(), String>> {
-    let editor = ["VISUAL", "EDITOR"]
-        .into_iter()
-        .find_map(|key| env.get(key).filter(|value| !value.trim().is_empty()))
-        .unwrap_or("vi");
-    ratatui::restore();
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$1\""))
-        .arg("sh")
-        .arg(path)
-        .status();
-    // Back in, without `ratatui::init` again: that would stack a second
-    // panic hook.
+    let Some(editor) = editor_command(env) else {
+        return Ok(Err("no editor found: set $VISUAL or $EDITOR".to_string()));
+    };
+    // A device listing may have stderr on /dev/null: the editor waits
+    // until it is back, so it never gets /dev/null as its stderr.
+    let status = {
+        let _stderr = worker::stderr_lock();
+        ratatui::restore();
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{editor} \"$1\""))
+            .arg("sh")
+            .arg(path)
+            .status()
+    };
+    reclaim(terminal)?;
+    Ok(editor_ran(&editor, status))
+}
+
+/// Take the terminal back after it was given away (to `$EDITOR`, or by the
+/// panic hook), without `ratatui::init` again: that would stack a second
+/// panic hook.
+fn reclaim(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
     enable_raw_mode().context("cannot reopen the terminal")?;
     execute!(std::io::stdout(), EnterAlternateScreen).context("cannot reopen the terminal")?;
     terminal.clear()?;
-    Ok(status
-        .map(|_| ())
-        .map_err(|e| format!("cannot run {editor}: {e}")))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -360,6 +443,62 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(restored);
+    }
+
+    /// A fake `PATH`: a folder holding executables named `names`.
+    fn path_with(names: &[&str]) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for name in names {
+            let bin = dir.path().join(name);
+            std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Not executable: not an editor.
+        std::fs::write(dir.path().join("nano"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_editor_is_visual_then_editor_then_the_first_on_path() {
+        let bin = path_with(&["vim", "vi"]);
+        let path = bin.path().to_str().unwrap();
+        let env = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("PATH", path)];
+            all.extend_from_slice(pairs);
+            Env::from_pairs(&all)
+        };
+        assert_eq!(
+            editor_command(&env(&[("VISUAL", "code -w"), ("EDITOR", "nvim")])).as_deref(),
+            Some("code -w")
+        );
+        assert_eq!(
+            editor_command(&env(&[("VISUAL", " "), ("EDITOR", "hx")])).as_deref(),
+            Some("hx")
+        );
+        // No nvim here: vim comes next.
+        assert_eq!(editor_command(&env(&[])).as_deref(), Some("vim"));
+        let bare = path_with(&[]);
+        let none = Env::from_pairs(&[("PATH", bare.path().to_str().unwrap())]);
+        assert_eq!(editor_command(&none), None);
+        assert_eq!(editor_command(&Env::default()), None);
+    }
+
+    /// `sh` exits 126 or 127 when the editor never started: that is a
+    /// failure naming it, not an edit to read back.
+    #[test]
+    fn an_editor_that_did_not_start_is_a_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let exit = |code: i32| Ok(std::process::ExitStatus::from_raw(code << 8));
+        assert_eq!(editor_ran("nvim", exit(0)), Ok(()));
+        assert_eq!(editor_ran("nvim", exit(1)), Ok(()));
+        for code in [126, 127] {
+            let why = editor_ran("vi", exit(code)).unwrap_err();
+            assert!(why.starts_with("vi did not start"), "{why}");
+        }
+        assert!(editor_ran("vi", Err(std::io::Error::other("no sh")))
+            .unwrap_err()
+            .contains("cannot run vi"));
     }
 
     #[test]

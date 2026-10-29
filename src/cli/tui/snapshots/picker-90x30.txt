@@ -1,0 +1,30 @@
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                         config · ●  │
+   │                                                                                  │
+   │   General               ┏ language ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓  │
+   │   Backend & keys        ┃ › ger                                               ┃  │
+   │   Audio                 ┃ ▌ de  German                                        ┃  │
+   │   Vocabulary            ┃   use "ger"                                         ┃  │
+   │   Replacements          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  │
+   │   Typing                  feedback volume  ▰▰▰▰▰▱▱▱▱▱ 50%                        │
+   │   Hotkeys                 tray icon        on                                    │
+   │   Overlay                                                                        │
+   │   Read aloud (TTS)        The language you dictate in, or auto. whisrs toggle    │
+   │   Agents                  -l overrides it for one dictation. en: English.        │
+   │   LLM                                                                            │
+   │   LLM commands                                                                   │
+   │   Recording                                                                      │
+   │   Hooks                                                                          │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     type to filter · enter pick · esc cancel · ↑/↓ move · ? help

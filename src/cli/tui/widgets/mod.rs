@@ -1,16 +1,18 @@
 //! The pieces every screen draws with: the frame and footer, rows, the text
-//! input, scrolling, and dialogs.
+//! input, the picker and the hotkey dialog, scrolling, and dialogs.
 
 pub mod dialog;
 pub mod frame;
+pub mod hotkey;
 pub mod input;
+pub mod picker;
 pub mod row;
 
 use ratatui::style::Style;
 use ratatui::text::Span;
 
 use super::glyphs::Glyphs;
-use super::theme::Theme;
+use super::theme::{Rgb, Theme};
 
 /// What a frame is drawn with.
 #[derive(Clone, Copy)]
@@ -28,6 +30,8 @@ pub enum Tone {
     Ok,
     Warn,
     Error,
+    /// A colour of the user's own: a swatch.
+    Swatch(Rgb),
 }
 
 impl Tone {
@@ -39,6 +43,7 @@ impl Tone {
             Tone::Ok => theme.ok,
             Tone::Warn => theme.warn,
             Tone::Error => theme.error,
+            Tone::Swatch(rgb) => theme.swatch(rgb).unwrap_or_default(),
         }
     }
 }

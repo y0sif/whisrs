@@ -10,6 +10,8 @@ use whisrs::service::ServiceManager;
 use whisrs::OverlayConfig;
 
 use super::keys::{self, Action, Mode};
+use super::options::Listing;
+use super::schema::ListKind;
 use super::screens::config::{ConfigScreen, Loaded, SaveError, Saved};
 use super::screens::{config, home};
 use super::widgets::{dialog, frame, Notice, Tone, Ui};
@@ -33,11 +35,19 @@ pub enum Msg {
     Reloaded(Result<Loaded, String>),
     /// `$EDITOR` did not start.
     EditorFailed(String),
+    /// A worker's list: devices, model files.
+    Listed(Listing),
+    /// A worker panicked, and the panic hook gave the terminal back.
+    Reclaim,
 }
 
 /// What the loop runs for the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
+    /// Fetch a list on a worker; answered with [`Msg::Listed`].
+    List(ListKind),
+    /// Take the terminal back: raw mode and the alternate screen again.
+    Reclaim,
     /// Validate and write the config, unless config.toml changed on disk
     /// since it was read; answered with [`Msg::Saved`].
     Save,
@@ -64,10 +74,18 @@ pub enum After {
     Editor,
 }
 
+/// Whose keys the help lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpFor {
+    Rows,
+    Picker,
+    Hotkey,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dialog {
     Unsaved(After),
-    Help,
+    Help(HelpFor),
     /// Delete entry `index` of the current section's list.
     DeleteEntry {
         index: usize,
@@ -130,12 +148,12 @@ impl App {
         };
         let notices = loaded.notices.clone();
         App {
+            config: ConfigScreen::new(loaded, env.clone()),
             env,
             paths,
             service,
             stack,
             home: home::Home::default(),
-            config: ConfigScreen::new(loaded),
             daemon: DaemonView::Checking,
             dialog: None,
             notices,
@@ -216,6 +234,15 @@ impl App {
                 self.status = Some(Notice::new(Tone::Error, why));
                 None
             }
+            Msg::Listed(listing) => {
+                self.config.listed(listing);
+                // It came: a row that was looking for it is not any more.
+                if self.status.as_ref().is_some_and(|s| s.text == "looking...") {
+                    self.status = None;
+                }
+                None
+            }
+            Msg::Reclaim => Some(Effect::Reclaim),
         }
     }
 
@@ -223,8 +250,8 @@ impl App {
         self.flash = None;
         let mode = if self.dialog.is_some() {
             Mode::Dialog
-        } else if self.config.typing() {
-            Mode::Text
+        } else if self.screen() == Screen::Config {
+            self.config.mode()
         } else {
             Mode::Browse
         };
@@ -235,10 +262,21 @@ impl App {
         if action == Action::Quit {
             return self.ask_quit();
         }
+        // A picker and the hotkey dialog have keys of their own; the help
+        // closes back onto them.
+        let help = match mode {
+            Mode::Picker => Some(HelpFor::Picker),
+            Mode::Hotkey => Some(HelpFor::Hotkey),
+            _ => None,
+        };
+        if let (Action::Help, Some(help)) = (action, help) {
+            self.dialog = Some(Dialog::Help(help));
+            return None;
+        }
         if mode == Mode::Browse {
             match action {
                 Action::Help => {
-                    self.dialog = Some(Dialog::Help);
+                    self.dialog = Some(Dialog::Help(HelpFor::Rows));
                     return None;
                 }
                 Action::Save => return self.save(),
@@ -264,14 +302,14 @@ impl App {
                 }
                 self.flash = outcome.flash;
                 self.dialog = outcome.dialog;
-                None
+                outcome.load.map(Effect::List)
             }
         }
     }
 
     fn dialog_key(&mut self, dialog: Dialog, action: Action) -> Option<Effect> {
         match (&dialog, action) {
-            (Dialog::Help, _) => None,
+            (Dialog::Help(_), _) => None,
             (Dialog::Unsaved(after), Action::Type('w')) => {
                 self.pending = Some(*after);
                 self.save()
@@ -521,7 +559,15 @@ impl App {
             Screen::Config => config::view(self, f, ui),
         }
         if let Some(dialog) = &self.dialog {
-            dialog::draw(f, area, ui, dialog_lines(dialog, ui));
+            // The box's border and padding off.
+            let width = usize::from(area.width.saturating_sub(4));
+            let title = match dialog {
+                Dialog::Help(HelpFor::Rows) => "keys",
+                Dialog::Help(HelpFor::Picker) => "picker keys",
+                Dialog::Help(HelpFor::Hotkey) => "hotkey keys",
+                _ => "",
+            };
+            dialog::draw_titled(f, area, ui, title, dialog_lines(dialog, ui, width));
         }
     }
 }
@@ -535,8 +581,9 @@ fn not_restarted_while_broken() -> Notice {
     )
 }
 
-/// What a dialog says.
-fn dialog_lines(dialog: &Dialog, ui: &Ui) -> Vec<Line<'static>> {
+/// What a dialog says, `width` columns at most: the help wraps its lines,
+/// under their text.
+fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
     let keys = |pairs: &[(&'static str, &'static str)]| {
         let sep = format!(" {} ", ui.glyphs.separator);
         let mut spans = Vec::new();
@@ -575,28 +622,63 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui) -> Vec<Line<'static>> {
                 ("esc", "cancel"),
             ]),
         ],
-        Dialog::Help => {
-            let row = |key: &'static str, what: &'static str| {
-                Line::from(vec![
-                    Span::styled(format!("{key:<10}"), ui.theme.accent),
-                    Span::raw(what),
-                ])
+        Dialog::Help(help) => {
+            const KEY: usize = 10;
+            let rows: &[(&str, &str)] = match help {
+                HelpFor::Rows => &[
+                    ("j k", "move, g G first and last"),
+                    ("h l", "change a value, step a number; else panes"),
+                    ("H L", "a number by its big step"),
+                    ("enter", "pick from a list, or type a value"),
+                    ("space", "flip a toggle, or the next value"),
+                    ("x", "back to the default"),
+                    ("a d", "add or delete, in a list"),
+                    ("/", "filter the rows; esc clears it"),
+                    ("tab", "the other pane"),
+                    ("w", "save, then restart the daemon if idle"),
+                    ("r", "restart the daemon"),
+                    ("e", "edit config.toml in $EDITOR"),
+                    ("esc", "back one level, or cancel"),
+                    ("q", "quit, asking first about unsaved edits"),
+                    ("?", "in a picker or a hotkey dialog: its keys"),
+                ],
+                HelpFor::Picker => &[
+                    (
+                        "type",
+                        "filter: each word starts a word of a value or of what it is",
+                    ),
+                    ("up down", "move; ctrl+p ctrl+n, pgup pgdn, home end too"),
+                    ("enter", "pick; a dimmed value says why it cannot be used"),
+                    ("use", "a typed value no list has comes last, checked"),
+                    ("backspace", "erase; ctrl+u clears the filter"),
+                    ("tab", "complete a typed path, on a path row"),
+                    ("esc", "leave with nothing changed"),
+                ],
+                HelpFor::Hotkey => &[
+                    ("tab j k", "the next or the previous part"),
+                    ("space h l", "flip a modifier, or step the key"),
+                    ("enter", "on the key: pick it from a list; else save"),
+                    ("t", "type the hotkey instead"),
+                    ("x", "unset it"),
+                    ("esc", "cancel"),
+                    (
+                        "",
+                        "Only ScrollLock, Pause and F13 to F24 go without a modifier.",
+                    ),
+                ],
             };
-            vec![
-                row("j k", "move (or the arrows), g G first and last"),
-                row("h l", "change a choice or number, or move between panes"),
-                row("tab", "the other pane"),
-                row("enter", "open, edit, or commit what you typed"),
-                row("space", "flip a toggle"),
-                row("x", "back to the default"),
-                row("a d", "add or delete, in a list"),
-                row("/", "filter the rows; esc clears it"),
-                row("w", "save, then restart the daemon if it is idle"),
-                row("e", "edit config.toml in $EDITOR"),
-                row("r", "restart the daemon"),
-                row("esc", "back one level, or cancel typing"),
-                row("q", "quit, asking first about unsaved changes"),
-            ]
+            let mut lines = Vec::new();
+            for (key, what) in rows {
+                let wrapped = crate::tui::widgets::wrap(what, width.saturating_sub(KEY).max(1));
+                for (i, part) in wrapped.into_iter().enumerate() {
+                    let key = if i == 0 { *key } else { "" };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{key:<KEY$}"), ui.theme.accent),
+                        Span::raw(part),
+                    ]));
+                }
+            }
+            lines
         }
     }
 }

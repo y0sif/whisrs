@@ -1,5 +1,6 @@
 //! Configuration management and interactive setup for whisrs.
 
+pub mod catalog;
 pub mod keys;
 pub mod setup;
 pub mod types;

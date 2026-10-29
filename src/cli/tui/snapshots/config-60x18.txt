@@ -8,11 +8,11 @@
    │   deepgram model    nova-3                         │
    │   groq api_key      WHISRS_GROQ_API_KEY (this sh…  │
    │   groq model        whisper-large-v3-turbo         │
-   │   openai api_key    not set                        │
    │                                                    │
    │   API key for the deepgram backends.               │
    │   WHISRS_DEEPGRAM_API_KEY wins over it.            │
    │                                                    │
-   │   ! unknown key [general] silense_timeout_ms is …  │
+   │   ! unknown key [general] silense_timeout_ms is    │
+   │     ignored                                        │
    ╰────────────────────────────────────────────────────╯
      j/k move · tab pane · enter edit · w save · ? help

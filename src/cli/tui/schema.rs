@@ -6,6 +6,8 @@
 //! neither a row here nor in [`EDITOR_ONLY`], so a new field cannot slip in
 //! without a way to edit it.
 
+use whisrs::config::catalog;
+
 /// A section of the Config screen.
 pub struct Section {
     pub title: &'static str,
@@ -40,6 +42,9 @@ pub struct Field {
 /// A text value's check: the value as stored, or why it is refused.
 pub type Check = fn(&str) -> Result<String, String>;
 
+/// A value a row offers, and what it is.
+pub type Opt = catalog::Entry;
+
 /// How a value is shown and changed.
 pub enum Kind {
     Bool,
@@ -47,35 +52,116 @@ pub enum Kind {
     MaybeBool {
         unset: &'static str,
     },
-    Choice(&'static [&'static str]),
-    /// An `Option<String>` from a list; unset shows `unset`.
+    /// A closed set: `h`/`l` cycle it, `Enter` opens the picker.
+    Choice(&'static [Opt]),
+    /// An `Option<String>` from a closed set; unset shows `unset`.
     MaybeChoice {
         unset: &'static str,
-        choices: &'static [&'static str],
+        choices: &'static [Opt],
     },
-    Int {
-        min: i64,
-        max: i64,
-        step: i64,
-    },
+    /// A whole number: `h`/`l` step it, `H`/`L` by `big`, `Enter` types it.
+    Int(Steps),
+    /// A number, the same way; `percent` shows 0 to 1 as a bar.
     Float {
         min: f64,
         max: f64,
         step: f64,
+        big: f64,
+        percent: bool,
     },
-    /// A string. With `unset`, an `Option<String>` that a blank input
-    /// clears; without, a plain string. `check` refuses a value, or returns
-    /// it normalized.
+    /// A string with nothing to suggest. With `unset`, an `Option<String>`
+    /// that a blank input clears; without, a plain string. `check` refuses
+    /// a value, or returns it normalized. Every one is in [`FREE_TEXT`].
     Text {
         unset: Option<&'static str>,
         check: Option<Check>,
     },
+    /// A string with values to suggest: `h`/`l` step through them, `Enter`
+    /// picks one or takes a typed value through `check`.
+    Suggest {
+        unset: Option<&'static str>,
+        check: Option<Check>,
+        from: Source,
+    },
+    /// A path, completed with `Tab` while typing. `tilde`: the daemon
+    /// expands `~`, so a completion keeps it; else it writes the home
+    /// folder out. With `from`, picked like [`Kind::Suggest`].
+    Path {
+        unset: Option<&'static str>,
+        tilde: bool,
+        from: Option<Source>,
+    },
+    /// A hex colour, shown with a swatch of it (of the theme's while unset).
+    Color,
+    /// A hotkey, set in the hotkey dialog. With `unset`, an
+    /// `Option<String>`; without, a string that may be empty.
+    Hotkey {
+        unset: Option<&'static str>,
+    },
     /// An API key: shown as where it comes from, typed as bullets.
     Secret,
-    /// A list of strings, edited one item at a time; `empty` describes none.
+    /// A list of strings, edited one item at a time; `empty` describes
+    /// none. With `items`, an item is picked like [`Kind::Suggest`].
     List {
         empty: &'static str,
+        items: Option<(Source, Check)>,
     },
+}
+
+/// A whole number's range and steps.
+pub struct Steps {
+    pub min: i64,
+    pub max: i64,
+    pub step: i64,
+    pub big: i64,
+    /// After the number: `ms`, `px`. `min` adds the hours, `days` says
+    /// `1 day`.
+    pub unit: &'static str,
+    /// Values shown by name instead (`0` is `off`).
+    pub named: &'static [(i64, &'static str)],
+}
+
+/// Where a row's suggestions come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    List(&'static [Opt]),
+    /// `auto`, then Whisper's languages; without `auto` for a list of
+    /// expected languages.
+    Languages {
+        auto: bool,
+    },
+    /// The models of the form's `[tts] backend`.
+    TtsModels,
+    /// The voices of the form's `[tts] backend`.
+    TtsVoices,
+    /// The chat models of the form's `[llm] api_url` host.
+    LlmModels,
+    /// Microphones, from the sound server, on a worker.
+    Inputs,
+    /// What the speakers play (monitor sources), on a worker.
+    Monitors,
+    /// `ggml-*.bin` in the models folder, on a worker.
+    ModelFiles,
+}
+
+impl Source {
+    /// The worker list it needs, if any.
+    pub fn list(self) -> Option<ListKind> {
+        match self {
+            Source::Inputs | Source::Monitors => Some(ListKind::Devices),
+            Source::ModelFiles => Some(ListKind::Models),
+            _ => None,
+        }
+    }
+}
+
+/// A list that loads on a worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    /// The sound server's input sources.
+    Devices,
+    /// The whisper models in the models folder.
+    Models,
 }
 
 /// An array of tables.
@@ -140,22 +226,72 @@ pub const RECORDING_MISSING: &str = "This whisrs was built without the recording
 #[cfg(test)]
 pub const EDITOR_ONLY: &[&str] = &["local-vosk.model_path", "local-parakeet.model_path"];
 
-/// The transcription backends, in the order `whisrs setup` offers them.
-pub const BACKENDS: &[&str] = &[
-    "groq",
-    "deepgram-streaming",
-    "deepgram",
-    "openai-realtime",
-    "openai",
-    "openai-compatible-realtime",
-    "local-whisper",
-    "asr-sidecar",
+/// The string keys that are typed, with nothing whisrs could suggest, and
+/// why. A new string key has to be decided: suggested, or listed here.
+#[cfg(test)]
+pub const FREE_TEXT: &[(&str, &str)] = &[
+    ("general.prompt", "free-form context in your own words"),
+    (
+        "general.llm_instruction",
+        "an instruction in your own words",
+    ),
+    ("asr-sidecar.url", "where your own server listens"),
+    ("asr-sidecar.model", "named by your own server"),
+    (
+        "openai-compatible-realtime.url",
+        "where your own server listens",
+    ),
+    (
+        "openai-compatible-realtime.model",
+        "named by your own server",
+    ),
+    ("tts.url", "where your own server listens"),
+    ("recording.user_name", "your name"),
+    (
+        "recording.diarization_url",
+        "where your own sidecar listens",
+    ),
+    ("recording.summary_instruction", "rules in your own words"),
+    ("hooks.on_record_start", "a shell command of your own"),
+    ("hooks.on_record_stop", "a shell command of your own"),
+    ("llm_commands.name", "a name you choose"),
+    (
+        "llm_commands.instruction",
+        "an instruction in your own words",
+    ),
+    ("agents.name", "a name you choose"),
+    (
+        "agents.command",
+        "a binary of your own, else the harness on PATH",
+    ),
+    (
+        "agents.reply_instruction",
+        "an instruction in your own words",
+    ),
 ];
 
-/// A note for a choice value this build cannot use.
-pub fn choice_note(value: &str) -> Option<&'static str> {
-    (matches!(value, "local-whisper" | "local") && !Gate::LocalWhisper.built())
-        .then_some("not built in")
+/// The values the backend row offers: every backend, the two not
+/// implemented yet last.
+pub const BACKENDS: &[Opt] = catalog::BACKENDS;
+
+/// Why `value` cannot be picked for a backend row in this build, short
+/// (`not built in`) and in full; `None` when it can.
+pub fn backend_refusal(value: &str) -> Option<(&'static str, String)> {
+    if matches!(value, "local-whisper" | "local") && !Gate::LocalWhisper.built() {
+        return Some((
+            "not built in",
+            "this whisrs was built without local-whisper: use a release build, or rebuild \
+             with cargo install whisrs --features local-whisper"
+                .to_string(),
+        ));
+    }
+    if catalog::STUB_BACKENDS.contains(&value) {
+        return Some((
+            "coming soon",
+            format!("{value} is not implemented yet, so it cannot transcribe"),
+        ));
+    }
+    None
 }
 
 /// An `http(s)://` URL, stored trimmed.
@@ -173,13 +309,33 @@ fn check_language(input: &str) -> Result<String, String> {
     whisrs::validate_language_override(input)
 }
 
+/// A language openai-realtime is told to expect: a code, since `auto` and
+/// `multi` say nothing about which.
+fn check_expected_language(input: &str) -> Result<String, String> {
+    let code = check_language(input)?;
+    if matches!(code.as_str(), "auto" | "multi") {
+        return Err(format!(
+            "{code} is no language: list the ones you expect, or none"
+        ));
+    }
+    Ok(code)
+}
+
 /// A pill colour: `#RGB`, `#RRGGBB` or `#RRGGBBAA`.
-fn check_color(input: &str) -> Result<String, String> {
+pub fn check_color(input: &str) -> Result<String, String> {
     let input = input.trim();
     match whisrs::parse_hex_color(input) {
         Some(_) => Ok(input.to_string()),
         None => Err("use a hex colour: #RGB, #RRGGBB or #RRGGBBAA".to_string()),
     }
+}
+
+/// A hotkey `parse_hotkey` takes, stored as typed.
+pub fn check_hotkey(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    whisrs::hotkey::parse_hotkey(input)
+        .map(|_| input.to_string())
+        .map_err(|e| e.to_string())
 }
 
 /// An optional string; `unset` says what applies while it is not set.
@@ -195,6 +351,53 @@ const STRING: Kind = Kind::Text {
     unset: None,
     check: None,
 };
+
+/// A string picked from `list`, or typed.
+const fn suggest(list: &'static [Opt]) -> Kind {
+    Kind::Suggest {
+        unset: None,
+        check: None,
+        from: Source::List(list),
+    }
+}
+
+/// A language: `auto` or a code, picked or typed.
+const fn language(unset: Option<&'static str>) -> Kind {
+    Kind::Suggest {
+        unset,
+        check: Some(check_language),
+        from: Source::Languages { auto: true },
+    }
+}
+
+/// An optional hotkey.
+const HOTKEY: Kind = Kind::Hotkey {
+    unset: Some("not set"),
+};
+
+/// Milliseconds.
+const fn ms(min: i64, max: i64, step: i64, big: i64) -> Kind {
+    Kind::Int(Steps {
+        min,
+        max,
+        step,
+        big,
+        unit: "ms",
+        named: &[],
+    })
+}
+
+/// Pixels.
+const fn px(min: i64, max: i64, step: i64, big: i64) -> Kind {
+    Kind::Int(Steps {
+        min,
+        max,
+        step,
+        big,
+        unit: "px",
+        named: &[],
+    })
+}
 
 const fn field(path: &'static str, label: &'static str, kind: Kind, help: &'static str) -> Field {
     Field {
@@ -226,19 +429,22 @@ const GENERAL: &[Field] = &[
     field(
         "general.language",
         "language",
-        STRING,
-        "The language you dictate in: an ISO 639-1 code (en, de) or auto. whisrs toggle -l \
-         overrides it for one dictation.",
+        language(None),
+        "The language you dictate in, or auto. whisrs toggle -l overrides it for one \
+         dictation.",
     ),
     field(
         "general.silence_timeout_ms",
         "silence timeout",
-        Kind::Int {
+        Kind::Int(Steps {
             min: 0,
             max: 600_000,
             step: 250,
-        },
-        "Stop dictating after this much silence, in milliseconds. 0 never stops on its own.",
+            big: 1000,
+            unit: "ms",
+            named: &[(0, "off")],
+        }),
+        "Stop dictating after this much silence. off never stops on its own.",
     ),
     field(
         "general.notify",
@@ -266,8 +472,10 @@ const GENERAL: &[Field] = &[
             min: 0.0,
             max: 1.0,
             step: 0.05,
+            big: 0.25,
+            percent: true,
         },
-        "Volume of the tones, 0 to 1.",
+        "Volume of the tones.",
     ),
     gated(
         "general.tray",
@@ -295,8 +503,9 @@ const BACKEND: &[Field] = &[
     field(
         "deepgram.model",
         "deepgram model",
-        STRING,
-        "Deepgram model, such as nova-3.",
+        suggest(catalog::DEEPGRAM_MODELS),
+        "The Deepgram model. Nova-3 models take your vocabulary as keyterms; older ones get \
+         none of it.",
     ),
     field(
         "groq.api_key",
@@ -307,8 +516,8 @@ const BACKEND: &[Field] = &[
     field(
         "groq.model",
         "groq model",
-        STRING,
-        "Groq Whisper model, such as whisper-large-v3-turbo.",
+        suggest(catalog::GROQ_MODELS),
+        "The Whisper model on Groq.",
     ),
     field(
         "openai.api_key",
@@ -319,40 +528,44 @@ const BACKEND: &[Field] = &[
     field(
         "openai.model",
         "openai model",
-        STRING,
-        "OpenAI transcription model, such as gpt-4o-mini-transcribe.",
+        suggest(catalog::OPENAI_MODELS),
+        "The model of both openai backends. A recording on openai sends gpt-transcribe in \
+         place of a realtime-only one.",
     ),
     field(
         "openai.languages",
         "openai languages",
-        Kind::List { empty: "none" },
+        Kind::List {
+            empty: "none",
+            items: Some((Source::Languages { auto: false }, check_expected_language)),
+        },
         "Expected input languages for gpt-live-transcribe or gpt-transcribe on \
          openai-realtime. Overrides [general] language.",
     ),
     gated(
         "local-whisper.model_path",
         "whisper model",
-        STRING,
-        "Path to the ggml model file. whisrs setup downloads one.",
+        Kind::Path {
+            unset: None,
+            tilde: false,
+            from: Some(Source::ModelFiles),
+        },
+        "The ggml model file. Those in the models folder are listed; any other path can be \
+         typed, tab completes it. whisrs setup downloads one.",
         Gate::LocalWhisper,
     ),
     gated(
         "local-whisper.segmentation",
         "segmentation",
-        Kind::Choice(&["silence", "window", "none"]),
-        "silence types each phrase after a pause, window is the older sliding window, none \
-         types everything when you stop.",
+        Kind::Choice(catalog::SEGMENTATIONS),
+        "When whisper types: after each pause, in a sliding window, or all at the end.",
         Gate::LocalWhisper,
     ),
     gated(
         "local-whisper.phrase_silence_ms",
         "phrase silence",
-        Kind::Int {
-            min: 0,
-            max: 10_000,
-            step: 50,
-        },
-        "Milliseconds of silence that end a phrase with silence segmentation.",
+        ms(0, 10_000, 50, 250),
+        "The silence that ends a phrase with silence segmentation.",
         Gate::LocalWhisper,
     ),
     gated(
@@ -395,14 +608,14 @@ const BACKEND: &[Field] = &[
     field(
         "openai-compatible-realtime.profile",
         "realtime profile",
-        Kind::Choice(&["lemonade", "openai"]),
+        Kind::Choice(catalog::REALTIME_PROFILES),
         "Which server dialect to speak.",
     ),
     field(
         "openai-compatible-realtime.turn_detection",
         "turn detection",
-        Kind::Choice(&["server-vad", "manual-commit"]),
-        "Who decides where a turn ends: the server, or whisrs when you stop.",
+        Kind::Choice(catalog::TURN_DETECTIONS),
+        "Who decides where a turn ends.",
     ),
     field(
         "openai-compatible-realtime.api_key",
@@ -415,15 +628,23 @@ const BACKEND: &[Field] = &[
 const AUDIO: &[Field] = &[field(
     "audio.device",
     "device",
-    STRING,
-    "The microphone: default, or a source name from pactl list short sources.",
+    Kind::Suggest {
+        unset: None,
+        check: None,
+        from: Source::Inputs,
+    },
+    "The microphone: default, or a source the sound server lists. Monitors, last, record \
+     what the speakers play.",
 )];
 
 const VOCABULARY: &[Field] = &[
     field(
         "general.vocabulary",
         "vocabulary",
-        Kind::List { empty: "none" },
+        Kind::List {
+            empty: "none",
+            items: None,
+        },
         "Names and terms sent to the backend as a hint. With a vocabulary.txt, a changed \
          list is written back there whole.",
     ),
@@ -445,6 +666,7 @@ const VOCABULARY: &[Field] = &[
         "filler words",
         Kind::List {
             empty: "built-in list",
+            items: None,
         },
         "Your own filler words. Empty uses the built-in list.",
     ),
@@ -454,30 +676,28 @@ const TYPING: &[Field] = &[
     field(
         "input.backend",
         "backend",
-        Kind::Choice(&["auto", "uinput", "wayland-vk", "xtest"]),
-        "How text is typed. auto prefers the Wayland virtual keyboard; xtest types through \
-         the X server on X11.",
+        Kind::Choice(catalog::INPUT_BACKENDS),
+        "How text is typed.",
     ),
     field(
         "input.key_delay_ms",
         "key delay",
-        Kind::Int {
-            min: 0,
-            max: 1000,
-            step: 1,
-        },
-        "Milliseconds between keys. Raise it if a terminal app drops characters.",
+        ms(0, 1000, 1, 10),
+        "The pause between keys. Raise it if a terminal app drops characters.",
     ),
     field(
         "input.modifier_wait_ms",
         "modifier wait",
-        Kind::Int {
+        Kind::Int(Steps {
             min: 0,
             max: 600_000,
             step: 1000,
-        },
+            big: 10_000,
+            unit: "ms",
+            named: &[(0, "no wait")],
+        }),
         "How long to wait for held Super, Alt, Ctrl or Shift before each key; still held, \
-         the rest goes to the clipboard. 0 does not wait.",
+         the rest goes to the clipboard. no wait sends it there at once.",
     ),
     field(
         "input.paste",
@@ -500,7 +720,10 @@ const TYPING: &[Field] = &[
     field(
         "input.terminal_classes",
         "terminal classes",
-        Kind::List { empty: "none" },
+        Kind::List {
+            empty: "none",
+            items: None,
+        },
         "Window classes to treat as terminals, beside the built-in list. Matched whole, any \
          case.",
     ),
@@ -510,32 +733,31 @@ const HOTKEYS: &[Field] = &[
     field(
         "hotkeys.toggle",
         "toggle",
-        text("not set"),
-        "Start and stop dictation, such as Super+Shift+D. Most setups bind whisrs toggle in \
-         the compositor instead.",
+        HOTKEY,
+        "Start and stop dictation. Most setups bind whisrs toggle in the compositor instead.",
     ),
     field(
         "hotkeys.cancel",
         "cancel",
-        text("not set"),
+        HOTKEY,
         "Cancel dictation and discard the audio.",
     ),
     field(
         "hotkeys.command",
         "command",
-        text("not set"),
+        HOTKEY,
         "Command mode: speak an instruction, the LLM rewrites the selection.",
     ),
     field(
         "hotkeys.speak",
         "speak",
-        text("not set"),
+        HOTKEY,
         "Read the selection aloud ([tts]).",
     ),
     gated(
         "hotkeys.recording",
         "recording",
-        text("not set"),
+        HOTKEY,
         "Start and stop a recording of mic and system audio.",
         Gate::Recording,
     ),
@@ -552,94 +774,51 @@ const OVERLAY: &[Field] = &[
     field(
         "overlay.theme",
         "theme",
-        Kind::Choice(&["carbon", "ember", "cyan", "custom"]),
+        Kind::Choice(catalog::OVERLAY_THEMES),
         "Colours the pill and this screen. custom takes the colors below.",
     ),
     field(
         "overlay.position",
         "position",
-        Kind::Choice(&[
-            "bottom-center",
-            "bottom-left",
-            "bottom-right",
-            "top-center",
-            "top-left",
-            "top-right",
-        ]),
+        Kind::Choice(catalog::OVERLAY_POSITIONS),
         "Where the pill sits.",
     ),
-    field(
-        "overlay.width",
-        "width",
-        Kind::Int {
-            min: 90,
-            max: 120,
-            step: 2,
-        },
-        "Pill width in pixels, 90 to 120.",
-    ),
-    field(
-        "overlay.height",
-        "height",
-        Kind::Int {
-            min: 36,
-            max: 48,
-            step: 1,
-        },
-        "Pill height in pixels, 36 to 48.",
-    ),
+    field("overlay.width", "width", px(90, 120, 2, 10), "Pill width."),
+    field("overlay.height", "height", px(36, 48, 1, 4), "Pill height."),
     field(
         "overlay.colors.recording",
         "recording color",
-        Kind::Text {
-            unset: Some("theme"),
-            check: Some(check_color),
-        },
+        Kind::Color,
         "The custom theme's recording colour, and this screen's accent.",
     ),
     field(
         "overlay.colors.transcribing",
         "transcribing color",
-        Kind::Text {
-            unset: Some("theme"),
-            check: Some(check_color),
-        },
+        Kind::Color,
         "The custom theme's transcribing colour.",
     ),
     field(
         "overlay.colors.speaking",
         "speaking color",
-        Kind::Text {
-            unset: Some("theme"),
-            check: Some(check_color),
-        },
+        Kind::Color,
         "The custom theme's read-aloud colour.",
     ),
     field(
         "overlay.colors.background",
         "background color",
-        Kind::Text {
-            unset: Some("theme"),
-            check: Some(check_color),
-        },
+        Kind::Color,
         "The custom theme's pill background.",
     ),
     field(
         "overlay.colors.ring",
         "ring color",
-        Kind::Text {
-            unset: Some("theme"),
-            check: Some(check_color),
-        },
+        Kind::Color,
         "The custom theme's pill outline.",
     ),
     field(
         "overlay.colors.glow",
         "glow color",
-        Kind::Text {
-            unset: Some("theme"),
-            check: Some(check_color),
-        },
+        Kind::Color,
         "The custom theme's glow.",
     ),
     field(
@@ -653,13 +832,13 @@ const OVERLAY: &[Field] = &[
     field(
         "agent_overlay.style",
         "agent style",
-        Kind::Choice(&["orb", "face"]),
-        "orb draws rings in the state's colour, face a small face.",
+        Kind::Choice(catalog::AGENT_STYLES),
+        "How the agent overlay draws each agent.",
     ),
     field(
         "agent_overlay.corner",
         "agent corner",
-        Kind::Choice(&["bottom-right", "bottom-left", "top-right", "top-left"]),
+        Kind::Choice(catalog::AGENT_CORNERS),
         "The agent overlay's corner.",
     ),
 ];
@@ -674,20 +853,29 @@ const TTS: &[Field] = &[
     field(
         "tts.backend",
         "backend",
-        Kind::Choice(&["groq", "openai", "deepgram", "tts-sidecar"]),
+        Kind::Choice(catalog::TTS_BACKENDS),
         "tts-sidecar is a local OpenAI-compatible server at the url below.",
     ),
     field(
         "tts.model",
         "model",
-        text("backend default"),
-        "The TTS model. Unset, each backend uses its own default.",
+        Kind::Suggest {
+            unset: Some("backend default"),
+            check: None,
+            from: Source::TtsModels,
+        },
+        "The TTS model, from the backend's list. With deepgram the model is the voice.",
     ),
     field(
         "tts.voice",
         "voice",
-        text("backend default"),
-        "The voice name, as the backend spells it.",
+        Kind::Suggest {
+            unset: Some("backend default"),
+            check: None,
+            from: Source::TtsVoices,
+        },
+        "The voice, as the backend spells it. deepgram does not use it: its voice is in the \
+         model.",
     ),
     field(
         "tts.api_key",
@@ -707,8 +895,8 @@ const TTS: &[Field] = &[
     field(
         "tts.response_format",
         "response format",
-        STRING,
-        "The audio format asked for. whisrs plays wav.",
+        suggest(catalog::TTS_RESPONSE_FORMATS),
+        "The audio format asked for. whisrs plays WAV only, so wav is the one that works.",
     ),
 ];
 
@@ -723,14 +911,23 @@ const LLM: &[Field] = &[
     field(
         "llm.model",
         "model",
-        STRING,
-        "Chat model, such as gpt-4o-mini.",
+        Kind::Suggest {
+            unset: None,
+            check: None,
+            from: Source::LlmModels,
+        },
+        "The chat model. Suggested for the OpenAI, Groq, OpenRouter and Ollama URLs; any \
+         other name can be typed.",
     ),
     field(
         "llm.api_url",
         "api_url",
-        STRING,
-        "The chat completions endpoint. OpenAI by default; Groq and OpenRouter work too.",
+        Kind::Suggest {
+            unset: None,
+            check: Some(check_url),
+            from: Source::List(catalog::LLM_URLS),
+        },
+        "The chat completions endpoint.",
     ),
     field(
         "general.llm_post_process",
@@ -751,13 +948,13 @@ const LLM_COMMAND_FIELDS: &[Field] = &[
     field(
         "hotkey",
         "hotkey",
-        STRING,
+        Kind::Hotkey { unset: None },
         "Dictate, and the LLM applies the instruction before typing.",
     ),
     field(
         "set_hotkey",
         "set_hotkey",
-        text("not set"),
+        HOTKEY,
         "Press it with text selected to make the selection the new instruction.",
     ),
     field(
@@ -786,32 +983,36 @@ const AGENT_FIELDS: &[Field] = &[
     field(
         "hotkey",
         "hotkey",
-        text("not set"),
+        HOTKEY,
         "Records a voice turn for this agent.",
     ),
     field(
         "new_session_hotkey",
         "new session key",
-        text("not set"),
+        HOTKEY,
         "Records a voice turn that starts a fresh session.",
     ),
     field(
         "harness",
         "harness",
-        Kind::Choice(&["claude", "opencode", "codex", "copilot"]),
+        Kind::Choice(catalog::HARNESSES),
         "The coding agent this entry drives.",
     ),
     field(
         "dir",
         "dir",
-        STRING,
+        Kind::Path {
+            unset: None,
+            tilde: true,
+            from: None,
+        },
         "The directory the agent works in. It must exist.",
     ),
     field(
         "permissions",
         "permissions",
-        Kind::Choice(&["auto", "bypass", "ask"]),
-        "auto lets the agent work, bypass skips every check, ask keeps it read-only.",
+        Kind::Choice(catalog::PERMISSIONS),
+        "What the agent may do without asking.",
     ),
     field(
         "command",
@@ -822,7 +1023,10 @@ const AGENT_FIELDS: &[Field] = &[
     field(
         "args",
         "args",
-        Kind::List { empty: "none" },
+        Kind::List {
+            empty: "none",
+            items: None,
+        },
         "Extra arguments for the harness.",
     ),
     field(
@@ -834,7 +1038,7 @@ const AGENT_FIELDS: &[Field] = &[
     field(
         "feedback",
         "feedback",
-        Kind::Choice(&["brief", "summary", "conversational"]),
+        Kind::Choice(catalog::FEEDBACK),
         "How much the agent says while it works.",
     ),
 ];
@@ -861,9 +1065,10 @@ const RECORDING: &[Field] = &[
         "backend",
         Kind::MaybeChoice {
             unset: "same as dictation",
-            choices: &["groq", "openai", "deepgram", "asr-sidecar", "local-whisper"],
+            choices: catalog::RECORDING_BACKENDS,
         },
-        "The backend recordings are transcribed with, after you stop. Batch backends only.",
+        "The backend recordings are transcribed with, after you stop. It must take a file: \
+         the realtime ones cannot.",
     ),
     field(
         "recording.user_name",
@@ -874,74 +1079,82 @@ const RECORDING: &[Field] = &[
     field(
         "recording.language",
         "language",
-        Kind::Text {
-            unset: Some("[general] language"),
-            check: Some(check_language),
-        },
+        language(Some("[general] language")),
         "The language of both tracks, or auto.",
     ),
     field(
         "recording.mic_language",
         "mic language",
-        Kind::Text {
-            unset: Some("as language"),
-            check: Some(check_language),
-        },
+        language(Some("as language")),
         "The language of your microphone.",
     ),
     field(
         "recording.system_language",
         "system language",
-        Kind::Text {
-            unset: Some("as language"),
-            check: Some(check_language),
-        },
+        language(Some("as language")),
         "The language of the system audio.",
     ),
     field(
         "recording.mic_device",
         "mic device",
-        text("[audio] device"),
+        Kind::Suggest {
+            unset: Some("[audio] device"),
+            check: None,
+            from: Source::Inputs,
+        },
         "The microphone for recordings.",
     ),
     field(
         "recording.system_device",
         "system device",
-        text("default monitor"),
-        "What your computer plays: a .monitor source, or none for the mic only.",
+        Kind::Suggest {
+            unset: Some("default monitor"),
+            check: None,
+            from: Source::Monitors,
+        },
+        "What your computer plays: a monitor source, or none for the mic only.",
     ),
     field(
         "recording.max_duration_minutes",
         "max duration",
-        Kind::Int {
+        Kind::Int(Steps {
             min: 1,
             max: 2160,
             step: 15,
-        },
-        "Stop a recording after this many minutes, 1 to 2160.",
+            big: 60,
+            unit: "min",
+            named: &[],
+        }),
+        "Stop a recording after this long, at most 36 hours.",
     ),
     field(
         "recording.audio_retention_days",
         "keep audio",
-        Kind::Int {
+        Kind::Int(Steps {
             min: -1,
             max: 3650,
             step: 1,
-        },
-        "Days to keep a recording's audio. 0 deletes it once transcribed, -1 keeps it.",
+            big: 30,
+            unit: "days",
+            named: &[(-1, "keep forever"), (0, "delete once transcribed")],
+        }),
+        "How long a recording's audio is kept. The transcript always stays.",
     ),
     field(
         "recording.dir",
         "folder",
-        text("~/.local/share/whisrs/recordings"),
+        Kind::Path {
+            unset: Some("~/.local/share/whisrs/recordings"),
+            tilde: true,
+            from: None,
+        },
         "Where recordings are kept.",
     ),
     field(
         "recording.diarization",
         "speakers",
-        Kind::Choice(&["auto", "backend", "sidecar", "off"]),
-        "How the voices on the system audio are told apart. auto: the sidecar when its URL is \
-         set, else Deepgram.",
+        Kind::Choice(catalog::DIARIZATIONS),
+        "How the voices on the system audio are told apart.",
     ),
     field(
         "recording.diarization_url",
@@ -955,12 +1168,15 @@ const RECORDING: &[Field] = &[
     field(
         "recording.num_speakers",
         "voices",
-        Kind::Int {
+        Kind::Int(Steps {
             min: 0,
             max: whisrs::recording::NUM_SPEAKERS_MAX as i64,
             step: 1,
-        },
-        "How many voices the sidecar should find. 0 lets it decide.",
+            big: 5,
+            unit: "",
+            named: &[(0, "auto")],
+        }),
+        "How many voices the sidecar should find. auto lets it decide.",
     ),
     field(
         "recording.shared_mic",
@@ -1465,38 +1681,167 @@ mod tests {
     }
 
     /// The backend choice offers exactly the backends `Config::validate`
-    /// routes, its aliases and stubs aside.
+    /// routes, its aliases aside, and refuses the two stubs as coming soon.
     #[test]
     fn the_backend_choice_is_every_primary_backend() {
-        let offered: BTreeSet<&str> = BACKENDS.iter().copied().collect();
+        let offered: BTreeSet<&str> = BACKENDS
+            .iter()
+            .map(|(value, _)| *value)
+            .filter(|value| !catalog::STUB_BACKENDS.contains(value))
+            .collect();
         let primary: BTreeSet<&str> = whisrs::primary_backend_names().into_iter().collect();
         assert_eq!(offered, primary);
+        for stub in catalog::STUB_BACKENDS {
+            assert_eq!(backend_refusal(stub).map(|r| r.0), Some("coming soon"));
+        }
+        assert_eq!(backend_refusal("groq"), None);
+        assert_eq!(
+            backend_refusal("local-whisper").is_some(),
+            !cfg!(feature = "local-whisper")
+        );
     }
 
-    /// The choices name values the types accept: a config with each one
-    /// still parses.
-    #[test]
-    fn every_choice_parses() {
+    /// Every row with its path, entry fields under their list's path.
+    fn every_field() -> Vec<(String, &'static Field)> {
+        let mut out = Vec::new();
         for section in SECTIONS {
-            let Body::Rows(fields) = section.body else {
-                continue;
-            };
-            for field in fields {
-                let choices = match field.kind {
-                    Kind::Choice(choices) | Kind::MaybeChoice { choices, .. } => choices,
-                    _ => continue,
-                };
-                for choice in choices {
-                    let (table, key) = field.path.rsplit_once('.').unwrap();
-                    let toml = format!("[{table}]\n{key} = \"{choice}\"\n");
-                    assert!(
-                        toml::from_str::<Config>(&toml).is_ok(),
-                        "{} = {choice} does not parse",
-                        field.path
-                    );
+            match section.body {
+                Body::Rows(fields) => out.extend(fields.iter().map(|f| (f.path.to_string(), f))),
+                Body::Entries(entries) => out.extend(
+                    entries
+                        .fields
+                        .iter()
+                        .map(|f| (format!("{}.{}", entries.path, f.path), f)),
+                ),
+                Body::Map(_) => {}
+            }
+        }
+        out
+    }
+
+    /// The TOML that sets `path` (an entry field's under a new entry with
+    /// its required keys) to `value`.
+    fn setting(path: &str, value: &str) -> String {
+        for section in SECTIONS {
+            if let Body::Entries(entries) = section.body {
+                if let Some(key) = path.strip_prefix(&format!("{}.", entries.path)) {
+                    let mut toml = format!("[[{}]]\n", entries.path);
+                    for required in entries.required.iter().filter(|r| **r != key) {
+                        toml.push_str(&format!("{required} = \"x\"\n"));
+                    }
+                    if !entries.required.contains(&"name") && key != "name" {
+                        toml.push_str("name = \"x\"\n");
+                    }
+                    return toml + &format!("{key} = \"{value}\"\n");
                 }
             }
         }
+        let (table, key) = path.rsplit_once('.').unwrap();
+        format!("[{table}]\n{key} = \"{value}\"\n")
+    }
+
+    /// The choices name values the types accept: a config with each one
+    /// still parses, entries' choices too.
+    #[test]
+    fn every_choice_parses() {
+        for (path, field) in every_field() {
+            let choices = match field.kind {
+                Kind::Choice(choices) | Kind::MaybeChoice { choices, .. } => choices,
+                _ => continue,
+            };
+            for (choice, _) in choices {
+                let toml = setting(&path, choice);
+                assert!(
+                    toml::from_str::<Config>(&toml).is_ok(),
+                    "{path} = {choice} does not parse:\n{toml}"
+                );
+            }
+        }
+    }
+
+    /// Every typed string is decided: a `Text` row is in [`FREE_TEXT`]
+    /// with a reason, and [`FREE_TEXT`] names only `Text` rows. A new
+    /// string key fails here until it is suggested or listed.
+    #[test]
+    fn every_free_text_field_is_listed_with_a_reason() {
+        let text: BTreeSet<String> = every_field()
+            .into_iter()
+            .filter(|(_, field)| matches!(field.kind, Kind::Text { .. }))
+            .map(|(path, _)| path)
+            .collect();
+        let listed: BTreeSet<String> = FREE_TEXT.iter().map(|(p, _)| p.to_string()).collect();
+        let unlisted: Vec<&String> = text.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "typed with no suggestions and not in FREE_TEXT: {unlisted:?}"
+        );
+        let stale: Vec<&String> = listed.difference(&text).collect();
+        assert!(
+            stale.is_empty(),
+            "in FREE_TEXT but not a Text row: {stale:?}"
+        );
+        assert_eq!(listed.len(), FREE_TEXT.len(), "a FREE_TEXT path twice");
+        for (path, why) in FREE_TEXT {
+            assert!(!why.is_empty(), "{path} has no reason");
+        }
+    }
+
+    /// Each number row's default is in its range, and so is each value it
+    /// names; the big step is bigger than the step.
+    #[test]
+    fn steppers_hold_their_defaults() {
+        let defaults = toml::Table::try_from(
+            toml::from_str::<Config>("[local-whisper]\n[overlay]\n[recording]\n").unwrap(),
+        )
+        .unwrap();
+        let at = |path: &str| {
+            let mut value = defaults.get(path.split('.').next().unwrap())?;
+            for seg in path.split('.').skip(1) {
+                value = value.get(seg)?;
+            }
+            Some(value.clone())
+        };
+        for (path, field) in every_field() {
+            match &field.kind {
+                Kind::Int(steps) => {
+                    assert!(steps.big > steps.step, "{path}");
+                    for (n, _) in steps.named {
+                        assert!((steps.min..=steps.max).contains(n), "{path} names {n}");
+                    }
+                    let n = at(&path).and_then(|v| v.as_integer()).expect(&path);
+                    assert!((steps.min..=steps.max).contains(&n), "{path} = {n}");
+                }
+                Kind::Float {
+                    min,
+                    max,
+                    step,
+                    big,
+                    ..
+                } => {
+                    assert!(big > step, "{path}");
+                    let n = at(&path).and_then(|v| v.as_float()).expect(&path);
+                    assert!((*min..=*max).contains(&n), "{path} = {n}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Every hotkey, `[hotkeys]` and entries alike, is set in the hotkey
+    /// dialog.
+    #[test]
+    fn every_hotkey_row_uses_the_dialog() {
+        for (path, field) in every_field() {
+            let hotkey = path.starts_with("hotkeys.") || path.ends_with("hotkey");
+            assert_eq!(hotkey, matches!(field.kind, Kind::Hotkey { .. }), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_hotkey_is_checked_by_the_parser() {
+        assert_eq!(check_hotkey(" Super+Shift+D "), Ok("Super+Shift+D".into()));
+        assert!(check_hotkey("D").is_err());
+        assert!(check_hotkey("Super+Nope").is_err());
     }
 
     #[test]
@@ -1509,6 +1854,9 @@ mod tests {
         assert!(check_url("127.0.0.1:8770").is_err());
         assert_eq!(check_language("DE"), Ok("de".into()));
         assert!(check_language("german").is_err());
+        assert_eq!(check_expected_language("UK"), Ok("uk".into()));
+        assert!(check_expected_language("auto").is_err());
+        assert!(check_expected_language("Multi").is_err());
         assert_eq!(check_color(" #abc "), Ok("#abc".into()));
         assert!(check_color("#é1").is_err());
     }

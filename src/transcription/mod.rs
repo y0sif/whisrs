@@ -456,7 +456,7 @@ pub trait TranscriptionBackend: Send + Sync {
 }
 
 /// Error for a backend that only transcribes live audio.
-pub(crate) fn live_only_error(backend: &str) -> anyhow::Error {
+pub fn live_only_error(backend: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "the {backend} backend only transcribes live audio and cannot transcribe a \
          recording. Set [recording] backend to a batch backend: groq, openai, deepgram, \

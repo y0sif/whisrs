@@ -35,7 +35,7 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
     /// The `[A, R, G, B]` of a pill palette colour, alpha dropped.
-    fn from_argb(argb: [u8; 4]) -> Rgb {
+    pub fn from_argb(argb: [u8; 4]) -> Rgb {
         Rgb(argb[1], argb[2], argb[3])
     }
 
@@ -140,6 +140,8 @@ pub struct Theme {
     pub error: Style,
     /// False under `NO_COLOR`, where an error also says `error:`.
     pub color: bool,
+    /// How many colours there are, for a swatch.
+    pub depth: Depth,
 }
 
 impl Theme {
@@ -156,6 +158,7 @@ impl Theme {
                     warn: Style::new(),
                     error: Style::new().add_modifier(Modifier::BOLD),
                     color: false,
+                    depth,
                 };
             }
             Depth::Truecolor => {
@@ -186,6 +189,17 @@ impl Theme {
             warn: Style::new().fg(Color::Yellow),
             error: Style::new().fg(Color::Red),
             color: true,
+            depth,
+        }
+    }
+
+    /// A swatch of `rgb`: the colour itself, the nearest of the 16, or
+    /// `None` with no colour to show it in.
+    pub fn swatch(&self, rgb: Rgb) -> Option<Style> {
+        match self.depth {
+            Depth::Truecolor => Some(Style::new().fg(rgb.color())),
+            Depth::Ansi16 => Some(Style::new().fg(nearest16(rgb))),
+            Depth::NoColor => None,
         }
     }
 }

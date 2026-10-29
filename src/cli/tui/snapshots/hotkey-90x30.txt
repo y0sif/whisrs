@@ -1,0 +1,30 @@
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                         config · ●  │
+   │                                                                                  │
+   │   General               ▌ toggle     Alt+D                                       │
+   │   Backend & keys          cancel     not set                                     │
+   │   Audio                   command    not set                                     │
+   │   Vocabulary              speak      not set                                     │
+   │   Replacements            recording  Alt+Shift+M                                 │
+   │   Typing                                                                         │
+   │   Hotkeys                 Start and stop dictation. Most setups bind whisrs      │
+   │   Overlay                 toggle in the compositor instead.                      │
+   │   Read aloud (TTS)                                                               │
+   │   Agents     ┏ toggle hotkey ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓              │
+   │   LLM        ┃ ▌ modifiers   [x] Super [ ] Ctrl [x] Alt [ ] Shift ┃              │
+   │   LLM command┃   key         D                                    ┃              │
+   │   Recording  ┃   result      Super+Alt+D                          ┃              │
+   │   Hooks      ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛              │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     tab next · h/l change · enter key/save · esc cancel · t type it · x unset · ? help

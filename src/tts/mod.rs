@@ -39,6 +39,29 @@ const OPENAI_DEFAULT_VOICE: &str = "alloy";
 const SIDECAR_DEFAULT_MODEL: &str = "kokoro";
 const SIDECAR_DEFAULT_VOICE: &str = "af_heart";
 
+/// The model `backend` uses while `[tts] model` is unset (the config
+/// editor names it).
+pub fn default_model(backend: &str) -> Option<&'static str> {
+    match backend {
+        "groq" => Some(GROQ_DEFAULT_MODEL),
+        "openai" => Some(OPENAI_DEFAULT_MODEL),
+        "tts-sidecar" | "openai-compat" => Some(SIDECAR_DEFAULT_MODEL),
+        "deepgram" => Some(deepgram_aura::DEFAULT_MODEL),
+        _ => None,
+    }
+}
+
+/// The voice `backend` uses while `[tts] voice` is unset; `None` for
+/// deepgram, whose voice is part of the model id.
+pub fn default_voice(backend: &str) -> Option<&'static str> {
+    match backend {
+        "groq" => Some(GROQ_DEFAULT_VOICE),
+        "openai" => Some(OPENAI_DEFAULT_VOICE),
+        "tts-sidecar" | "openai-compat" => Some(SIDECAR_DEFAULT_VOICE),
+        _ => None,
+    }
+}
+
 /// Trait for text-to-speech backends.
 ///
 /// Each backend takes input text and returns the synthesized speech as a

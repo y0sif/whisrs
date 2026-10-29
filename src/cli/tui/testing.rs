@@ -29,6 +29,7 @@ pub fn paths(dir: &std::path::Path) -> Paths {
         config: dir.join("config.toml"),
         vocabulary: dir.join("vocabulary.txt"),
         socket: dir.join("whisrs.sock"),
+        models: dir.join("models"),
     }
 }
 

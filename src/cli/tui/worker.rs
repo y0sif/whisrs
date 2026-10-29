@@ -1,7 +1,9 @@
-//! The TUI's threads: the daemon poll and the restart after a save. Every
-//! request to the daemon is made here, never on the loop that draws and
-//! reads keys: a blocking connect to a daemon that stopped accepting has no
-//! timeout, and the screen must not freeze on it.
+//! The TUI's threads: the daemon poll, the restart after a save, and the
+//! lists a picker needs (sound devices, model files). Every request to the
+//! daemon, and every listing, is made here, never on the loop that draws
+//! and reads keys: a blocking connect to a daemon that stopped accepting has
+//! no timeout, a sound server can be slow to answer, and the screen must not
+//! freeze on either.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +16,11 @@ use whisrs::recording::{RecordingAction, RecordingOptions, RecordingPhase};
 use whisrs::service::ServiceManager;
 use whisrs::{Command, InfoAnswer, RequestError, Response, RestartOutcome, State};
 
+use whisrs::audio::device::InputDeviceInfo;
+
 use super::app::Msg;
+use super::options::{self, Device, Listing};
+use super::schema::ListKind;
 
 /// How often the daemon is asked what it is doing.
 const POLL_EVERY: Duration = Duration::from_secs(2);
@@ -52,11 +58,22 @@ pub enum RestartReport {
     NoService,
 }
 
-/// The poll thread, and what starts a restart.
+/// What the list workers read: the sound server's inputs (a function, so a
+/// test stands in for it) and the models folder.
+#[derive(Clone)]
+pub struct Lister {
+    pub devices: fn() -> Vec<InputDeviceInfo>,
+    pub models: PathBuf,
+    /// Shortens the models folder to `~` in what a failure says.
+    pub home: Option<String>,
+}
+
+/// The poll thread, and what starts a restart or a listing.
 pub struct Workers {
     tx: Sender<Msg>,
     socket: PathBuf,
     service: ServiceManager,
+    lister: Lister,
     /// The daemon hung up on `info`: it is older than it, so it is asked
     /// `status` instead of logging an error at every poll, and `info` again
     /// now and then ([`REPROBE_EVERY`]).
@@ -66,11 +83,17 @@ pub struct Workers {
 impl Workers {
     /// Start the poll: it answers at once, then every [`POLL_EVERY`] when
     /// the answer changed, and stops when the TUI is gone.
-    pub fn start(tx: Sender<Msg>, socket: &Path, service: ServiceManager) -> Workers {
+    pub fn start(
+        tx: Sender<Msg>,
+        socket: &Path,
+        service: ServiceManager,
+        lister: Lister,
+    ) -> Workers {
         let workers = Workers {
             tx,
             socket: socket.to_path_buf(),
             service,
+            lister,
             older: Arc::new(AtomicBool::new(false)),
         };
         let (tx, socket, older) = (
@@ -110,6 +133,113 @@ impl Workers {
             let _ = tx.send(Msg::Restarted(report));
         });
     }
+}
+
+impl Workers {
+    /// Make the list `kind` on a thread of its own; it comes back as
+    /// [`Msg::Listed`].
+    pub fn list(&self, kind: ListKind) {
+        let (tx, lister) = (self.tx.clone(), self.lister.clone());
+        std::thread::spawn(move || {
+            let (listing, panicked) = list_caught(kind, &lister);
+            if panicked {
+                let _ = tx.send(Msg::Reclaim);
+            }
+            let _ = tx.send(Msg::Listed(listing));
+        });
+    }
+}
+
+/// [`list`], with a panic in it caught: it becomes the list's failure, so
+/// the picker says so and the list can be asked for again. `true` when it
+/// panicked: the panic hook gave the terminal back on the way, and the TUI
+/// takes it again.
+fn list_caught(kind: ListKind, lister: &Lister) -> (Listing, bool) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| list(kind, lister))) {
+        Ok(listing) => (listing, false),
+        Err(_) => {
+            let failed = |what: &str| format!("listing the {what} failed");
+            let listing = match kind {
+                ListKind::Devices => Listing::Devices(Err(failed("input devices"))),
+                ListKind::Models => Listing::Models(Err(failed("model files"))),
+            };
+            (listing, true)
+        }
+    }
+}
+
+/// The list `kind`, as `lister` finds it.
+pub fn list(kind: ListKind, lister: &Lister) -> Listing {
+    match kind {
+        ListKind::Devices => {
+            let found: Vec<Device> = (lister.devices)()
+                .into_iter()
+                .map(|info| Device {
+                    monitor: info.is_monitor(),
+                    id: info.id,
+                    description: info.description,
+                })
+                .collect();
+            Listing::Devices(if found.is_empty() {
+                Err("no input devices found: is the sound server running?".to_string())
+            } else {
+                Ok(found)
+            })
+        }
+        ListKind::Models => {
+            Listing::Models(options::model_files(&lister.models, lister.home.as_deref()))
+        }
+    }
+}
+
+/// The sound server's inputs, with stderr shut while they are listed: ALSA
+/// and PulseAudio print to it, which would land on the TUI's screen.
+pub fn list_devices_quietly() -> Vec<InputDeviceInfo> {
+    quiet_stderr(whisrs::audio::device::list_input_devices)
+}
+
+/// Held while file descriptor 2 may be on `/dev/null`, and around handing
+/// it to a child (`$EDITOR`), which then waits for a listing to put it back.
+pub fn stderr_lock() -> std::sync::MutexGuard<'static, ()> {
+    static QUIET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    QUIET
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Run `f` with file descriptor 2 on `/dev/null`, and put it back after,
+/// a panic in `f` too. One at a time: two overlapping would put back each
+/// other's `/dev/null`.
+fn quiet_stderr<T>(f: impl FnOnce() -> T) -> T {
+    use std::os::fd::AsRawFd;
+
+    /// Puts the saved descriptor back on 2 when dropped.
+    struct Restore(libc::c_int);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a descriptor this owns; 2 always exists.
+            unsafe {
+                libc::dup2(self.0, 2);
+                libc::close(self.0);
+            }
+        }
+    }
+
+    let _one = stderr_lock();
+    let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") else {
+        return f();
+    };
+    // SAFETY: plain descriptor calls. The copy is close-on-exec, so no child
+    // started meanwhile inherits it.
+    let saved = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 0) };
+    if saved < 0 {
+        return f();
+    }
+    let _back = Restore(saved);
+    // SAFETY: as above; `null` outlives the call.
+    unsafe { libc::dup2(null.as_raw_fd(), 2) };
+    f()
 }
 
 /// Ask the daemon once: `info`, or `status` for a daemon known to be older
@@ -270,6 +400,146 @@ fn restart(
         }
         RestartOutcome::Failed => RestartReport::Failed(service),
         RestartOutcome::NoService => RestartReport::NoService,
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use whisrs::audio::device::DeviceHost;
+
+    use super::*;
+
+    fn two() -> Vec<InputDeviceInfo> {
+        vec![
+            InputDeviceInfo {
+                host: DeviceHost::PulseAudio,
+                id: "alsa_input.usb-yeti".into(),
+                description: "Blue Yeti".into(),
+            },
+            InputDeviceInfo {
+                host: DeviceHost::PulseAudio,
+                id: "alsa_output.speaker.monitor".into(),
+                description: "Monitor of Speaker".into(),
+            },
+        ]
+    }
+
+    fn none() -> Vec<InputDeviceInfo> {
+        Vec::new()
+    }
+
+    /// The devices come from the lister given, never the sound server, and
+    /// monitors are told apart.
+    #[test]
+    fn devices_come_from_the_lister() {
+        let dir = tempfile::tempdir().unwrap();
+        let lister = Lister {
+            devices: two,
+            models: dir.path().to_path_buf(),
+            home: None,
+        };
+        let Listing::Devices(Ok(found)) = list(ListKind::Devices, &lister) else {
+            panic!("no devices");
+        };
+        assert_eq!(found.len(), 2);
+        assert!(!found[0].monitor && found[1].monitor);
+        assert_eq!(found[0].description, "Blue Yeti");
+
+        let empty = Lister {
+            devices: none,
+            ..lister
+        };
+        match list(ListKind::Devices, &empty) {
+            Listing::Devices(Err(why)) => assert!(why.contains("sound server"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn models_are_read_from_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ggml-tiny.bin"), b"x").unwrap();
+        let lister = Lister {
+            devices: none,
+            models: dir.path().to_path_buf(),
+            home: None,
+        };
+        let Listing::Models(Ok(files)) = list(ListKind::Models, &lister) else {
+            panic!("no models");
+        };
+        assert_eq!(files.len(), 1);
+    }
+
+    /// A list on its thread answers through the channel.
+    #[test]
+    fn a_listing_comes_back_as_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers = Workers {
+            tx,
+            socket: dir.path().join("whisrs.sock"),
+            service: ServiceManager::None,
+            lister: Lister {
+                devices: two,
+                models: dir.path().to_path_buf(),
+                home: None,
+            },
+            older: Arc::new(AtomicBool::new(false)),
+        };
+        workers.list(ListKind::Devices);
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Listed(Listing::Devices(Ok(found))) => assert_eq!(found.len(), 2),
+            _ => panic!("not a device list"),
+        }
+    }
+
+    /// The device and inode file descriptor 2 is on.
+    fn stderr_file() -> (u64, u64) {
+        // SAFETY: fstat into a zeroed struct of the right type.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(2, &mut stat) }, 0);
+        (stat.st_dev, stat.st_ino)
+    }
+
+    /// Stderr is back after a quiet listing, a panicking one too, and the
+    /// saved copy is not left open.
+    #[test]
+    fn stderr_comes_back_after_a_quiet_listing() {
+        let before = stderr_file();
+        assert_eq!(quiet_stderr(|| 7), 7);
+        assert_eq!(stderr_file(), before);
+        let caught = std::panic::catch_unwind(|| quiet_stderr(|| panic!("in the listing")));
+        assert!(caught.is_err());
+        assert_eq!(stderr_file(), before);
+        // Not poisoned for the next one.
+        assert_eq!(quiet_stderr(|| 8), 8);
+    }
+
+    fn boom() -> Vec<InputDeviceInfo> {
+        panic!("the sound server library panicked")
+    }
+
+    /// A panic while listing is the list's failure, not a picker looking
+    /// forever, and says the terminal must be taken back.
+    #[test]
+    fn a_panicking_listing_is_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let lister = Lister {
+            devices: boom,
+            models: dir.path().to_path_buf(),
+            home: None,
+        };
+        let (listing, panicked) = list_caught(ListKind::Devices, &lister);
+        assert!(panicked);
+        assert_eq!(
+            listing,
+            Listing::Devices(Err("listing the input devices failed".into()))
+        );
+        let ok = Lister {
+            devices: two,
+            ..lister
+        };
+        assert!(!list_caught(ListKind::Devices, &ok).1);
     }
 }
 

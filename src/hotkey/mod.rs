@@ -18,7 +18,7 @@ use crate::llm::LlmCommandConfig;
 #[cfg(feature = "recording")]
 use crate::recording::{RecordingAction, RecordingOptions};
 use crate::{Command, HotkeyConfig};
-pub use parse::{parse_hotkey, HotkeyBinding};
+pub use parse::{hotkey_parts, parse_hotkey, HotkeyBinding, KEY_NAMES, MODIFIER_NAMES};
 
 /// Maximum number of attempts to find keyboard input devices.
 const HOTKEY_MAX_RETRIES: u32 = 10;

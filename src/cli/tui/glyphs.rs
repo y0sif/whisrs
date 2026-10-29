@@ -35,6 +35,21 @@ pub struct Glyphs {
     pub bullet: &'static str,
     /// Leads a warning line.
     pub warn: &'static str,
+    /// Leads a picker's filter line.
+    pub prompt: &'static str,
+    /// Marks the value a picker's row has now.
+    pub current: &'static str,
+    /// A percent bar's filled and empty cells.
+    pub bar_on: &'static str,
+    pub bar_off: &'static str,
+    /// A colour's swatch, drawn twice in that colour.
+    pub swatch: &'static str,
+    /// The arrow keys, in key hints.
+    pub key_up: &'static str,
+    pub key_down: &'static str,
+    /// The ASCII set: text with no one-character ASCII stand-in (`±`) is
+    /// spelled out instead.
+    pub ascii: bool,
 }
 
 impl Glyphs {
@@ -51,6 +66,14 @@ impl Glyphs {
         ellipsis: "\u{2026}",                       // … HORIZONTAL ELLIPSIS
         bullet: "\u{2022}",                         // • BULLET
         warn: "!",
+        prompt: "\u{203A}",   // › SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
+        current: "\u{25CF}",  // ● BLACK CIRCLE
+        bar_on: "\u{25B0}",   // ▰ BLACK PARALLELOGRAM
+        bar_off: "\u{25B1}",  // ▱ WHITE PARALLELOGRAM
+        swatch: "\u{2588}",   // █ FULL BLOCK
+        key_up: "\u{2191}",   // ↑ UPWARDS ARROW
+        key_down: "\u{2193}", // ↓ DOWNWARDS ARROW
+        ascii: false,
     };
 
     pub const ASCII: Glyphs = Glyphs {
@@ -84,7 +107,24 @@ impl Glyphs {
         ellipsis: "~",
         bullet: "*",
         warn: "!",
+        prompt: ">",
+        current: "*",
+        bar_on: "#",
+        bar_off: "-",
+        swatch: "#",
+        key_up: "^",
+        key_down: "v",
+        ascii: true,
     };
+
+    /// Plus or minus, before a step in a key hint.
+    pub fn plus_minus(&self) -> &'static str {
+        if self.ascii {
+            "+/-"
+        } else {
+            "\u{00B1}"
+        }
+    }
 
     /// The set `env`'s locale can show.
     pub fn detect(env: &Env) -> Glyphs {
@@ -130,9 +170,18 @@ mod tests {
             ellipsis,
             bullet,
             warn,
+            prompt,
+            current,
+            bar_on,
+            bar_off,
+            swatch,
+            key_up,
+            key_down,
+            ascii: _,
         } = *set;
         let mut glyphs = vec![
-            gutter, up, down, left, right, separator, ellipsis, bullet, warn,
+            gutter, up, down, left, right, separator, ellipsis, bullet, warn, prompt, current,
+            bar_on, bar_off, swatch, key_up, key_down,
         ];
         glyphs.extend(wave);
         for border in [frame, dialog] {
@@ -166,6 +215,8 @@ mod tests {
         for glyph in all(&Glyphs::ASCII) {
             assert!(glyph.is_ascii(), "{glyph:?} is not ASCII");
         }
+        assert!(Glyphs::ASCII.plus_minus().is_ascii());
+        assert_eq!(Glyphs::UNICODE.plus_minus(), "\u{00B1}");
     }
 
     #[test]

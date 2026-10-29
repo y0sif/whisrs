@@ -1,5 +1,4 @@
 
-
    ╭────────────────────────────────────────────────────╮
    │ whisrs ▁▃▅▃▁                             home · ●  │
    │                                                    │
@@ -11,7 +10,8 @@
    │   hotkeys     toggle Alt+D · recording Alt+Shift…  │
    │   built with  local-whisper tray overlay hooks r…  │
    │                                                    │
-   │   ! unknown key [general] silense_timeout_ms is …  │
+   │   ! unknown key [general] silense_timeout_ms is    │
+   │     ignored                                        │
    ╰────────────────────────────────────────────────────╯
      j/k move · enter open · ? help · q quit
 
