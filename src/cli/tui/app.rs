@@ -75,8 +75,8 @@ pub enum Dialog {
     },
     /// `r` found the daemon not answering: restart it anyway (default no)?
     RestartAnyway,
-    /// A save found config.toml changed on disk since it was read.
-    Changed,
+    /// A save found this file changed on disk since it was read.
+    Changed(&'static str),
 }
 
 pub struct App {
@@ -190,8 +190,8 @@ impl App {
                 self.status = Some(Notice::new(Tone::Error, format!("not saved: {why}")));
                 None
             }
-            Msg::Saved(Err(SaveError::Changed)) => {
-                self.dialog = Some(Dialog::Changed);
+            Msg::Saved(Err(SaveError::Changed(file))) => {
+                self.dialog = Some(Dialog::Changed(file));
                 None
             }
             Msg::Saved(Err(SaveError::Reread(why))) => {
@@ -288,6 +288,11 @@ impl App {
                 None
             }
             (Dialog::RestartAnyway, Action::Type('y')) => {
+                // The file may have stopped loading while the daemon was asked.
+                if self.config.broken.is_some() {
+                    self.status = Some(not_restarted_while_broken());
+                    return None;
+                }
                 self.status = Some(Notice::new(Tone::Muted, "restarting the daemon"));
                 Some(Effect::RestartAnyway)
             }
@@ -299,12 +304,12 @@ impl App {
                 ));
                 None
             }
-            (Dialog::Changed, Action::Type('o')) => Some(Effect::SaveOver),
-            (Dialog::Changed, Action::Type('l')) => {
+            (Dialog::Changed(_), Action::Type('o')) => Some(Effect::SaveOver),
+            (Dialog::Changed(_), Action::Type('l')) => {
                 self.pending = None;
                 Some(Effect::Reload)
             }
-            (Dialog::Changed, Action::Back) => {
+            (Dialog::Changed(_), Action::Back) => {
                 self.pending = None;
                 self.status = Some(Notice::new(Tone::Muted, "not saved"));
                 None
@@ -320,11 +325,7 @@ impl App {
     /// `r`: restart the daemon if it is idle, once config.toml loads.
     fn restart(&mut self) -> Option<Effect> {
         if self.config.broken.is_some() {
-            self.status = Some(Notice::new(
-                Tone::Error,
-                "not restarted: config.toml does not load, and the daemon would start on \
-                 defaults. e opens it to fix it.",
-            ));
+            self.status = Some(not_restarted_while_broken());
             return None;
         }
         self.restart_by_key = true;
@@ -429,6 +430,14 @@ impl App {
     fn restarted(&mut self, report: RestartReport) -> Option<Effect> {
         let by_key = std::mem::take(&mut self.restart_by_key);
         let notice = match report {
+            // Another dialog is up (unsaved changes, a change on disk): it
+            // stays, and the question is a line instead.
+            RestartReport::NotAnswering if by_key && !self.quitting && self.dialog.is_some() => {
+                Notice::new(
+                    Tone::Warn,
+                    "restart skipped: daemon is not answering; r asks to restart it anyway",
+                )
+            }
             RestartReport::NotAnswering if by_key && !self.quitting => {
                 self.dialog = Some(Dialog::RestartAnyway);
                 self.status = None;
@@ -517,6 +526,15 @@ impl App {
     }
 }
 
+/// `r` (or `y` to restart anyway) while config.toml does not load.
+fn not_restarted_while_broken() -> Notice {
+    Notice::new(
+        Tone::Error,
+        "not restarted: config.toml does not load, and the daemon would start on defaults. e \
+         opens it to fix it.",
+    )
+}
+
 /// What a dialog says.
 fn dialog_lines(dialog: &Dialog, ui: &Ui) -> Vec<Line<'static>> {
     let keys = |pairs: &[(&'static str, &'static str)]| {
@@ -548,8 +566,8 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui) -> Vec<Line<'static>> {
             Line::default(),
             keys(&[("y", "restart"), ("n", "no")]),
         ],
-        Dialog::Changed => vec![
-            Line::from("config.toml changed on disk since you opened it."),
+        Dialog::Changed(file) => vec![
+            Line::from(format!("{file} changed on disk since you opened it.")),
             Line::default(),
             keys(&[
                 ("o", "overwrite"),
@@ -763,6 +781,47 @@ mod tests {
             fixture.app.status.as_ref().unwrap().text,
             "restart skipped: daemon is not answering, press r later"
         );
+    }
+
+    /// A not-answering that comes back after another dialog opened leaves
+    /// that dialog up, and says it as a line.
+    #[test]
+    fn a_late_not_answering_does_not_replace_a_dialog() {
+        let mut fixture = edited();
+        assert_eq!(press(&mut fixture.app, "r"), [Effect::Restart]);
+        press(&mut fixture.app, "q");
+        assert_eq!(fixture.app.dialog, Some(Dialog::Unsaved(After::Quit)));
+        fixture
+            .app
+            .update(Msg::Restarted(RestartReport::NotAnswering));
+        assert_eq!(fixture.app.dialog, Some(Dialog::Unsaved(After::Quit)));
+        assert!(fixture
+            .app
+            .status
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("r asks to restart it anyway"));
+    }
+
+    /// `y` checks again that config.toml loads: it may have broken while
+    /// the daemon was asked.
+    #[test]
+    fn restart_anyway_is_refused_while_the_file_does_not_load() {
+        let mut fixture = app("");
+        press(&mut fixture.app, "r");
+        fixture
+            .app
+            .update(Msg::Restarted(RestartReport::NotAnswering));
+        fixture.app.config.broken = Some("TOML parse error".into());
+        assert!(press(&mut fixture.app, "y").is_empty());
+        assert!(fixture
+            .app
+            .status
+            .as_ref()
+            .unwrap()
+            .text
+            .starts_with("not restarted"));
     }
 
     /// Saved on the way out with the daemon busy, the farewell says what to

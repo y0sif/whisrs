@@ -106,12 +106,12 @@ src/
   window/              — compositor-specific window tracking
   hotkey/              — evdev hotkey listener + spec parsing
   tray/, overlay/      — tray icon and recording overlay (feature-gated)
-  config/              — interactive setup and config editor
 ```
 
-The `whisrs config` TUI is in `src/cli/tui/`, in the CLI binary so whisrsd never links
-ratatui: screens, widgets, and the schema of every config key. It reads and writes
-config.toml through `src/config/`.
+`src/config/` holds the config types and their validation, `whisrs setup`, and the load
+and format-preserving write. The `whisrs config` TUI is in `src/cli/tui/`, in the CLI binary
+so whisrsd never links ratatui: screens, widgets, and the schema of every config key. It
+reads and writes config.toml through `src/config/`.
 
 Injection policy stays in the daemon (`inject_text` and friends in `src/daemon/main.rs`),
 but the primitives it calls live in the `xkb-type` workspace crate, alongside four other

@@ -475,6 +475,19 @@ impl RecordingRuntime {
         self.status_tx.subscribe()
     }
 
+    /// Whether a start, stop or cancel holds the session, or a start is in
+    /// progress: the view shows Idle until a start's devices are open, and a
+    /// restart then abandons the start and deletes its folder. Never waits,
+    /// for `info`: a lock it cannot take is held.
+    pub(crate) fn session_busy(&self) -> bool {
+        let starting = match self.starting.try_lock() {
+            Ok(starting) => starting.is_some(),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().is_some(),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+        };
+        starting || self.session.try_lock().is_err()
+    }
+
     /// Whether a recording is in progress. Reads the view, never the session
     /// lock, so it answers at once while a start or stop holds that lock for
     /// seconds opening or closing devices. A start counts once its devices
@@ -2599,6 +2612,24 @@ async fn abandon_start(runtime: &RecordingRuntime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A start holds the session lock through the free-space check, the
+    /// source lookup and the device open, with the view still Idle: `info`
+    /// counts that as busy, without waiting for the lock.
+    #[tokio::test]
+    async fn a_recording_start_in_progress_is_busy() {
+        let (runtime, _, _) = RecordingRuntime::new();
+        assert!(!runtime.session_busy());
+        let held = runtime.session.lock().await;
+        assert!(runtime.session_busy());
+        assert_eq!(runtime.phase(), RecordingPhase::Idle);
+        drop(held);
+        let dir = tempfile::tempdir().unwrap();
+        let starting = StartingGuard::new(&runtime, dir.path());
+        assert!(runtime.session_busy());
+        drop(starting);
+        assert!(!runtime.session_busy());
+    }
     use crate::command_mode::{handle_command_mode, handle_llm_command};
     use crate::context::{CommandModeContext, DaemonState, LlmCommandContext};
     use crate::dictation::{handle_cancel, handle_toggle};

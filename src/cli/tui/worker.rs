@@ -9,6 +9,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
+use whisrs::agent::{AgentAction, AgentPhase};
 use whisrs::recording::{RecordingAction, RecordingOptions, RecordingPhase};
 use whisrs::service::ServiceManager;
 use whisrs::{Command, InfoAnswer, RequestError, Response, RestartOutcome, State};
@@ -93,8 +94,8 @@ impl Workers {
         workers
     }
 
-    /// Restart the daemon, on a thread of its own; the answer comes back as
-    /// [`Msg::Restarted`]. Unless `anyway`, only when it is idle.
+    /// Restart the daemon, on a thread of its own, if it is idle (or, with
+    /// `anyway`, silent); the answer comes back as [`Msg::Restarted`].
     pub fn restart(&self, anyway: bool) {
         let (tx, socket, service, older) = (
             self.tx.clone(),
@@ -103,7 +104,9 @@ impl Workers {
             Arc::clone(&self.older),
         );
         std::thread::spawn(move || {
-            let report = restart(&socket, service, &older, anyway);
+            let report = restart(&socket, service, &older, anyway, || {
+                service.service_installed()
+            });
             let _ = tx.send(Msg::Restarted(report));
         });
     }
@@ -169,8 +172,8 @@ enum Gate {
 }
 
 /// Ask the daemon what a restart would cost: `info` first, every time, so a
-/// daemon restarted into a newer one is known; for an older one, `status`
-/// and then `recording status`.
+/// daemon restarted into a newer one is known; for an older one, `status`,
+/// then `recording status` and `agent list`.
 fn gate(socket: &Path, older: &AtomicBool) -> Gate {
     let answer = match whisrs::request_info_blocking_at(socket, Some(ANSWER_TIMEOUT)) {
         Ok(answer) => answer,
@@ -185,9 +188,14 @@ fn gate(socket: &Path, older: &AtomicBool) -> Gate {
         return Gate::Clear;
     }
     match older_recording(socket) {
-        Some(RecordingPhase::Idle) => Gate::Clear,
-        Some(RecordingPhase::Recording) => Gate::Busy("recording"),
-        Some(RecordingPhase::Processing) => Gate::Busy("processing a recording"),
+        Some(RecordingPhase::Idle) => {}
+        Some(RecordingPhase::Recording) => return Gate::Busy("recording"),
+        Some(RecordingPhase::Processing) => return Gate::Busy("processing a recording"),
+        None => return Gate::NotAnswering,
+    }
+    match older_agents_busy(socket) {
+        Some(false) => Gate::Clear,
+        Some(true) => Gate::Busy("running an agent turn"),
         None => Gate::NotAnswering,
     }
 }
@@ -212,21 +220,48 @@ fn older_recording(socket: &Path) -> Option<RecordingPhase> {
     }
 }
 
+/// Whether an agent of a daemon older than `info` is not idle, from `agent
+/// list` (v0.1.31 answers it with no agents configured too); `None` when it
+/// does not answer in time. One that hangs up on it, or refuses it, has no
+/// agents.
+fn older_agents_busy(socket: &Path) -> Option<bool> {
+    let list = Command::Agent {
+        action: AgentAction::List,
+        name: None,
+        text: None,
+        new: false,
+    };
+    match whisrs::request_blocking_at(socket, &list, Some(ANSWER_TIMEOUT)) {
+        Ok(Response::Agents { agents }) => {
+            Some(agents.iter().any(|agent| agent.phase != AgentPhase::Idle))
+        }
+        Ok(Response::Error { .. })
+        | Err(RequestError::Closed)
+        | Err(RequestError::NotRunning(_)) => Some(false),
+        Ok(_) | Err(_) => None,
+    }
+}
+
 /// Restart through the service manager, as `whisrs config` always has, but
-/// unless `anyway` only when the daemon is idle: a restart would lose the
-/// dictation, recording or agent turn it is on.
+/// only when the daemon is idle: a restart would lose the dictation,
+/// recording or agent turn it is on. `anyway` (asked with `r`, then `y`)
+/// overrides silence alone; the daemon is asked again, and a busy one is
+/// still left alone. `installed` says whether a service is there to restart
+/// through: without one, silence gets the hint to restart by hand, not the
+/// question.
 fn restart(
     socket: &Path,
     service: ServiceManager,
     older: &AtomicBool,
     anyway: bool,
+    installed: impl Fn() -> bool,
 ) -> RestartReport {
-    if !anyway {
-        match gate(socket, older) {
-            Gate::Clear => {}
-            Gate::Busy(doing) => return RestartReport::Busy(doing),
-            Gate::NotAnswering => return RestartReport::NotAnswering,
-        }
+    match gate(socket, older) {
+        Gate::Clear => {}
+        Gate::NotAnswering if anyway => {}
+        Gate::NotAnswering if !installed() => return RestartReport::NoService,
+        Gate::NotAnswering => return RestartReport::NotAnswering,
+        Gate::Busy(doing) => return RestartReport::Busy(doing),
     }
     match service.restart() {
         RestartOutcome::Restarted => {
@@ -259,19 +294,26 @@ mod tests {
 
     use Meet::{Answer, HangUp, Silent};
 
+    /// What a fake daemon was asked, once it met every connection it
+    /// expected. A client that never asks fails the test, not hangs it.
+    struct Asked(std::sync::mpsc::Receiver<Vec<String>>);
+
+    impl Asked {
+        fn join(self) -> Vec<String> {
+            self.0
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the daemon was not asked all it was meant to be")
+        }
+    }
+
     /// A daemon on a temp socket meeting each connection as the next of
-    /// `meets`. The thread returns each command it read.
-    fn fake_daemon(
-        meets: Vec<Meet>,
-    ) -> (
-        tempfile::TempDir,
-        PathBuf,
-        std::thread::JoinHandle<Vec<String>>,
-    ) {
+    /// `meets`, which tells each command it read.
+    fn fake_daemon(meets: Vec<Meet>) -> (tempfile::TempDir, PathBuf, Asked) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("whisrs.sock");
         let listener = UnixListener::bind(&path).unwrap();
-        let daemon = std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let mut seen = Vec::new();
             for meet in meets {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -294,9 +336,9 @@ mod tests {
                     Silent => std::thread::sleep(ANSWER_TIMEOUT + Duration::from_millis(500)),
                 }
             }
-            seen
+            let _ = tx.send(seen);
         });
-        (dir, path, daemon)
+        (dir, path, Asked(rx))
     }
 
     fn ok(state: State) -> Meet {
@@ -340,7 +382,7 @@ mod tests {
             poll(&path, &older, false),
             DaemonView::Up(InfoAnswer::Older(State::Recording))
         );
-        assert_eq!(daemon.join().unwrap(), vec!["info", "status", "status"]);
+        assert_eq!(daemon.join(), vec!["info", "status", "status"]);
     }
 
     /// Now and then an older daemon is asked `info` again, and once `info`
@@ -355,14 +397,14 @@ mod tests {
         );
         assert!(!older.load(Ordering::Relaxed));
         poll(&path, &older, false);
-        assert_eq!(daemon.join().unwrap(), vec!["info", "info"]);
+        assert_eq!(daemon.join(), vec!["info", "info"]);
 
         // The gate always asks `info` first.
         let (_dir, path, daemon) = fake_daemon(vec![info(idle())]);
         let older = AtomicBool::new(true);
         assert_eq!(gate(&path, &older), Gate::Clear);
         assert!(!older.load(Ordering::Relaxed));
-        assert_eq!(daemon.join().unwrap(), vec!["info"]);
+        assert_eq!(daemon.join(), vec!["info"]);
     }
 
     /// No daemon is down, and whatever starts next is asked `info` again.
@@ -382,35 +424,71 @@ mod tests {
     #[test]
     fn a_daemon_that_does_not_answer_is_not_restarted() {
         let (_dir, path, daemon) = fake_daemon(vec![Silent]);
-        let report = restart(&path, ServiceManager::None, &AtomicBool::new(false), false);
+        let older = AtomicBool::new(false);
+        let report = restart(&path, ServiceManager::None, &older, false, || true);
         assert_eq!(report, RestartReport::NotAnswering);
-        assert_eq!(daemon.join().unwrap(), vec!["info"]);
+        assert_eq!(daemon.join(), vec!["info"]);
 
-        // An older daemon silent on `recording status` is not either.
-        let (_dir, path, daemon) = fake_daemon(vec![HangUp, ok(State::Idle), Silent]);
-        assert_eq!(gate(&path, &AtomicBool::new(false)), Gate::NotAnswering);
-        assert_eq!(
-            daemon.join().unwrap(),
-            vec!["info", "status", "recording status"]
-        );
+        // With no service to restart through, the hint, not the question.
+        let (_dir, path, daemon) = fake_daemon(vec![Silent]);
+        let report = restart(&path, ServiceManager::None, &older, false, || false);
+        assert_eq!(report, RestartReport::NoService);
+        daemon.join();
+
+        // An older daemon silent on `recording status`, or on `agent list`,
+        // is not restarted either.
+        for meets in [
+            vec![HangUp, ok(State::Idle), Silent],
+            vec![
+                HangUp,
+                ok(State::Idle),
+                recording(RecordingPhase::Idle),
+                Silent,
+            ],
+        ] {
+            let asked = meets.len();
+            let (_dir, path, daemon) = fake_daemon(meets);
+            assert_eq!(gate(&path, &AtomicBool::new(false)), Gate::NotAnswering);
+            assert_eq!(daemon.join().len(), asked);
+        }
     }
 
-    /// Asked anyway (`r`, then `y`), it restarts without asking the daemon.
+    /// Asked anyway (`r`, then `y`), silence is overridden, and only that:
+    /// the daemon is asked again, and a busy one is still left alone.
     #[test]
-    fn a_restart_anyway_asks_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+    fn a_restart_anyway_overrides_only_silence() {
+        let (_dir, path, daemon) = fake_daemon(vec![Silent]);
         let report = restart(
-            &dir.path().join("whisrs.sock"),
+            &path,
             ServiceManager::None,
             &AtomicBool::new(false),
             true,
+            || true,
         );
+        // Restarted through the service manager: here, none.
         assert_eq!(report, RestartReport::NoService);
+        assert_eq!(daemon.join(), vec!["info"]);
+
+        let (_dir, path, daemon) = fake_daemon(vec![info(DaemonInfo {
+            recording: Some(RecordingPhase::Recording),
+            ..idle()
+        })]);
+        let report = restart(
+            &path,
+            ServiceManager::None,
+            &AtomicBool::new(false),
+            true,
+            || true,
+        );
+        assert_eq!(report, RestartReport::Busy("recording"));
+        daemon.join();
     }
 
-    /// An older daemon's recording is asked for: v0.1.30 and v0.1.31 record.
+    /// An older daemon's recording and agents are asked for: v0.1.30 and
+    /// v0.1.31 record, and v0.1.31 drives agents.
     #[test]
-    fn an_older_daemon_that_records_is_not_restarted() {
+    fn an_older_daemon_that_records_or_runs_an_agent_is_not_restarted() {
+        let no_agents = || Answer(Response::Agents { agents: Vec::new() });
         for (phase, gated) in [
             (RecordingPhase::Recording, Gate::Busy("recording")),
             (
@@ -419,27 +497,71 @@ mod tests {
             ),
             (RecordingPhase::Idle, Gate::Clear),
         ] {
-            let (_dir, path, daemon) = fake_daemon(vec![HangUp, ok(State::Idle), recording(phase)]);
+            let mut meets = vec![HangUp, ok(State::Idle), recording(phase)];
+            // Only an idle recording goes on to the agents.
+            if gated == Gate::Clear {
+                meets.push(no_agents());
+            }
+            let (_dir, path, daemon) = fake_daemon(meets);
             assert_eq!(gate(&path, &AtomicBool::new(false)), gated);
-            daemon.join().unwrap();
+            daemon.join();
         }
-        // Older than recordings (hangs up), or built without them (refuses):
-        // nothing records.
+        // Older than recordings and agents (hangs up), or built without
+        // recordings (refuses): nothing records, no agent runs.
         for last in [
             HangUp,
             Answer(Response::Error {
                 message: "built without the recording feature".into(),
             }),
         ] {
-            let (_dir, path, daemon) = fake_daemon(vec![HangUp, ok(State::Idle), last]);
+            let (_dir, path, daemon) = fake_daemon(vec![HangUp, ok(State::Idle), last, HangUp]);
             assert_eq!(gate(&path, &AtomicBool::new(false)), Gate::Clear);
-            daemon.join().unwrap();
+            assert_eq!(
+                daemon.join(),
+                vec!["info", "status", "recording status", "agent list"]
+            );
         }
-        // A dictation is enough; the recording is not asked.
+        // An agent not idle is a turn the restart would stop.
+        for (phase, gated) in [
+            (
+                whisrs::agent::AgentPhase::Working,
+                Gate::Busy("running an agent turn"),
+            ),
+            (
+                whisrs::agent::AgentPhase::NeedsYou,
+                Gate::Busy("running an agent turn"),
+            ),
+            (whisrs::agent::AgentPhase::Idle, Gate::Clear),
+        ] {
+            let agents = Answer(Response::Agents {
+                agents: vec![whisrs::agent::AgentInfo {
+                    name: "jarvis".into(),
+                    harness: "claude".into(),
+                    phase,
+                    session: None,
+                    bg_id: None,
+                }],
+            });
+            let (_dir, path, daemon) = fake_daemon(vec![
+                HangUp,
+                ok(State::Idle),
+                recording(RecordingPhase::Idle),
+                agents,
+            ]);
+            assert_eq!(gate(&path, &AtomicBool::new(false)), gated);
+            daemon.join();
+        }
+        // A dictation is enough; the rest is not asked.
         let (_dir, path, daemon) = fake_daemon(vec![HangUp, ok(State::Transcribing)]);
-        let report = restart(&path, ServiceManager::None, &AtomicBool::new(false), false);
+        let report = restart(
+            &path,
+            ServiceManager::None,
+            &AtomicBool::new(false),
+            false,
+            || true,
+        );
         assert_eq!(report, RestartReport::Busy("transcribing"));
-        assert_eq!(daemon.join().unwrap(), vec!["info", "status"]);
+        assert_eq!(daemon.join(), vec!["info", "status"]);
     }
 
     /// A restart is skipped while the daemon dictates, records or processes
@@ -489,9 +611,15 @@ mod tests {
             ),
         ] {
             let (_dir, path, daemon) = fake_daemon(vec![info(busy_info)]);
-            let report = restart(&path, ServiceManager::None, &AtomicBool::new(false), false);
+            let report = restart(
+                &path,
+                ServiceManager::None,
+                &AtomicBool::new(false),
+                false,
+                || true,
+            );
             assert_eq!(report, RestartReport::Busy(doing));
-            daemon.join().unwrap();
+            daemon.join();
         }
     }
 
@@ -503,6 +631,7 @@ mod tests {
             ServiceManager::None,
             &AtomicBool::new(false),
             false,
+            || true,
         );
         assert_eq!(report, RestartReport::NoService);
     }

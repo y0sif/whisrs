@@ -47,10 +47,36 @@ pub struct Loaded {
     pub fresh: bool,
     /// Unknown keys, an unreadable `vocabulary.txt`, a fresh config.
     pub notices: Vec<Notice>,
-    /// config.toml's bytes as read (`None`: no file), to tell at save
-    /// whether something else wrote it since, such as the daemon's
-    /// `llm-command-set`.
-    pub disk: Option<Vec<u8>>,
+    /// Both files as read, to tell at save whether something else wrote
+    /// one since, such as the daemon's `llm-command-set`.
+    pub disk: OnDisk,
+}
+
+/// config.toml's and `vocabulary.txt`'s bytes (`None`: no file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnDisk {
+    config: Option<Vec<u8>>,
+    vocabulary: Option<Vec<u8>>,
+}
+
+impl OnDisk {
+    fn read(paths: &Paths) -> OnDisk {
+        OnDisk {
+            config: std::fs::read(&paths.config).ok(),
+            vocabulary: std::fs::read(&paths.vocabulary).ok(),
+        }
+    }
+
+    /// The file that is not as it was in `self`, if one is not.
+    fn changed(&self, now: &OnDisk) -> Option<&'static str> {
+        if self.config != now.config {
+            Some("config.toml")
+        } else if self.vocabulary != now.vocabulary {
+            Some("vocabulary.txt")
+        } else {
+            None
+        }
+    }
 }
 
 /// What a save did.
@@ -69,8 +95,8 @@ pub struct Saved {
 pub enum SaveError {
     /// Refused or failed: nothing was written, or not all of it.
     Failed(String),
-    /// config.toml changed on disk since it was read; nothing was written.
-    Changed,
+    /// This file changed on disk since it was read; nothing was written.
+    Changed(&'static str),
     /// Written, but reading it back failed.
     Reread(String),
 }
@@ -104,7 +130,7 @@ pub fn reload(paths: &Paths) -> Result<Loaded, String> {
 fn read(paths: &Paths) -> Result<Loaded, (write::UnusableKind, String)> {
     // Before the load: a write between the two then reads as a change at
     // save, which only asks.
-    let disk = std::fs::read(&paths.config).ok();
+    let disk = OnDisk::read(paths);
     let (mut config, fresh, unknown) = match write::load_existing_config_from(&paths.config) {
         ExistingConfig::Loaded { config, unknown } => (config, false, unknown),
         ExistingConfig::Unusable { kind, message } => return Err((kind, message)),
@@ -162,11 +188,13 @@ fn show_key(path: &str) -> String {
 
 /// Validate the edited config and write it, `vocabulary.txt` by the plan
 /// `write_config_and_vocabulary` makes; then read both back. Unless
-/// `overwrite`, a config.toml that changed on disk since it was read is left
-/// alone: writing it would undo what changed it.
+/// `overwrite`, a config.toml or `vocabulary.txt` that changed on disk since
+/// it was read is left alone: writing it would undo what changed it.
 pub fn save(screen: &ConfigScreen, paths: &Paths, overwrite: bool) -> Result<Saved, SaveError> {
-    if !overwrite && std::fs::read(&paths.config).ok() != screen.disk {
-        return Err(SaveError::Changed);
+    if !overwrite {
+        if let Some(file) = screen.disk.changed(&OnDisk::read(paths)) {
+            return Err(SaveError::Changed(file));
+        }
     }
     let config = screen.form.config();
     let warnings = config
@@ -303,8 +331,8 @@ pub struct ConfigScreen {
     pub fresh: bool,
     /// config.toml stopped loading after `$EDITOR`: `w` and `r` are refused.
     pub broken: Option<String>,
-    /// config.toml as last read ([`Loaded::disk`]).
-    disk: Option<Vec<u8>>,
+    /// Both files as last read ([`Loaded::disk`]).
+    disk: OnDisk,
     section: usize,
     focus: Focus,
     /// The detail pane's levels, never empty.
@@ -2026,10 +2054,10 @@ mod tests {
         std::fs::write(&paths.config, &changed).unwrap();
 
         let refused = save(&fixture.app.config, &paths, false);
-        assert!(matches!(refused, Err(SaveError::Changed)));
+        assert!(matches!(refused, Err(SaveError::Changed("config.toml"))));
         assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), changed);
         fixture.app.update(crate::tui::app::Msg::Saved(refused));
-        assert_eq!(fixture.app.dialog, Some(Dialog::Changed));
+        assert_eq!(fixture.app.dialog, Some(Dialog::Changed("config.toml")));
         let drawn = crate::tui::testing::rows(&crate::tui::testing::draw(&fixture.app, 90, 30));
         assert!(drawn.iter().any(|r| r.contains("changed on disk")));
 
@@ -2073,6 +2101,45 @@ mod tests {
         save(&fixture.app.config, &paths, true).expect("overwrites");
         let out = std::fs::read_to_string(&paths.config).unwrap();
         assert!(out.contains("notify = false"), "{out}");
+    }
+
+    /// vocabulary.txt is in the snapshot too, read through a symlink, and a
+    /// save writes through the link and keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_vocabulary_is_kept_and_watched() {
+        let toml = "[general]\nbackend = \"groq\"\n[groq]\napi_key = \"k\"\n";
+        let mut fixture = app(toml);
+        let paths = paths(fixture.dir.path());
+        std::fs::create_dir(fixture.dir.path().join("dotfiles")).unwrap();
+        let target = fixture.dir.path().join("dotfiles/vocabulary.txt");
+        std::fs::write(&target, "NixOS\n").unwrap();
+        std::os::unix::fs::symlink(&target, &paths.vocabulary).unwrap();
+        fixture
+            .app
+            .update(crate::tui::app::Msg::Reloaded(reload(&paths)));
+        assert_eq!(config(&fixture).general.vocabulary, ["NixOS"]);
+
+        open(&mut fixture, "Vocabulary");
+        to_row(&mut fixture, "vocabulary");
+        press(&mut fixture.app, "\na");
+        type_text(&mut fixture.app, "Arch");
+        press(&mut fixture.app, "\n");
+        let saved = save(&fixture.app.config, &paths, false).expect("saves");
+        let link = std::fs::symlink_metadata(&paths.vocabulary).unwrap();
+        assert!(link.file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NixOS\nArch\n");
+        fixture.app.update(crate::tui::app::Msg::Saved(Ok(saved)));
+
+        // Edited outside (its own target): the next save asks first.
+        std::fs::write(&target, "NixOS\nArch\nGentoo\n").unwrap();
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "history");
+        press(&mut fixture.app, " ");
+        assert!(matches!(
+            save(&fixture.app.config, &paths, false),
+            Err(SaveError::Changed("vocabulary.txt"))
+        ));
     }
 
     /// While config.toml does not load, `r` is refused too: the daemon

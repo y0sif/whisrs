@@ -303,7 +303,9 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "info"}                      // version, state, recording phase, backend, built features,
                                      // started_at (Unix ms), busy, agent_turn. Never waits: the state
                                      // comes from a try_lock of the dictation lock, else the published
-                                     // one with busy = true. An older daemon hangs up on it (and logs
+                                     // one with busy = true; busy also covers a held agent runtime
+                                     // lock and a recording start or stop under way, and agent_turn
+                                     // a turn on its way to start. An older daemon hangs up on it (and logs
                                      // an error), so the TUI asks status and remembers, asking info
                                      // again every 10th poll; `whisrs status` asks status only
 {"cmd": "log", "limit": 20}

@@ -72,6 +72,9 @@ pub fn merge_vocabulary(config_terms: Vec<String>, file_terms: Vec<String>) -> V
 /// 0600 temp file renamed over it, so a crash never leaves it half written)
 /// rather than through `fs::write`, which leaves it world-readable under the
 /// usual umask.
+///
+/// A symlink (stow, home-manager) is written through, to its target: a rename
+/// over the link itself would replace it with a regular file.
 pub fn write_vocabulary_file(path: &Path, terms: &[String]) -> io::Result<()> {
     let mut contents = String::new();
     for term in terms {
@@ -81,7 +84,23 @@ pub fn write_vocabulary_file(path: &Path, terms: &[String]) -> io::Result<()> {
         contents.push_str(term);
         contents.push('\n');
     }
-    write::atomic_write(path, &contents)
+    write::atomic_write(&link_target(path), &contents)
+}
+
+/// Where a write to `path` lands: the file a symlink points to (a dangling
+/// one too), or `path` itself.
+fn link_target(path: &Path) -> PathBuf {
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return path.to_path_buf();
+    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| match std::fs::read_link(path) {
+        Ok(target) => match path.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        },
+        Err(_) => path.to_path_buf(),
+    })
 }
 
 /// Where the vocabulary stood when this `whisrs config` session started.
@@ -494,6 +513,39 @@ NixOS
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["vocabulary.txt"]);
+    }
+
+    /// A symlinked file (stow, home-manager) stays a symlink: the new list
+    /// lands in its target, atomically and 0600.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_written_through() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("dotfiles")).unwrap();
+        let target = dir.path().join("dotfiles/vocabulary.txt");
+        std::fs::write(&target, "old\n").unwrap();
+        let link = dir.path().join("vocabulary.txt");
+        std::os::unix::fs::symlink("dotfiles/vocabulary.txt", &link).unwrap();
+
+        write_vocabulary_file(&link, &["new".to_string()]).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // A dangling one gets its target created.
+        std::fs::remove_file(&target).unwrap();
+        write_vocabulary_file(&link, &["again".to_string()]).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "again\n");
     }
 
     /// The file holds vocabulary that used to live in the 0600 config.toml, so

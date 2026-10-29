@@ -188,9 +188,11 @@ pub fn write_config(config: &Config) -> Result<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Regenerated {
     pub backup: PathBuf,
-    /// Completes "existing config at <path> ...". Nothing from the file is
-    /// in it: a TOML error quotes the offending line, which can hold a key.
-    pub reason: &'static str,
+    /// Completes "existing config at <path> ...", with the line and column
+    /// when known. This warning quotes nothing from the file (a TOML error's
+    /// own text shows the offending line, which can hold a key); the load
+    /// errors elsewhere still carry the error's text.
+    pub reason: String,
 }
 
 impl Regenerated {
@@ -279,11 +281,8 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
                 // with `duplicate field`, which is total config loss (see
                 // [`is_preserved`]).
                 Err(reason) => {
-                    regenerated = Some(backup_and_regenerate(
-                        config_path,
-                        &existing_str,
-                        reason.summary(),
-                    )?);
+                    let reason = reason.summary(&existing_str);
+                    regenerated = Some(backup_and_regenerate(config_path, &existing_str, reason)?);
                     fresh_str
                 }
             },
@@ -292,12 +291,13 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
             // behavior). This branch skips the merge entirely, so unknown
             // keys are lost here by design; the file is kept verbatim as
             // `.bak`, which is the recovery path for them.
-            Err(_) => {
-                regenerated = Some(backup_and_regenerate(
-                    config_path,
-                    &existing_str,
+            Err(e) => {
+                let reason = crate::config::types::with_position(
                     "is not valid TOML",
-                )?);
+                    &existing_str,
+                    e.span(),
+                );
+                regenerated = Some(backup_and_regenerate(config_path, &existing_str, reason)?);
                 fresh_str
             }
         },
@@ -341,7 +341,7 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
 fn backup_and_regenerate(
     config_path: &Path,
     existing_str: &str,
-    reason: &'static str,
+    reason: String,
 ) -> Result<Regenerated> {
     let backup_path = config_backup_path(config_path);
     write_private_file(&backup_path, existing_str).with_context(|| {
@@ -751,6 +751,38 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    /// The regenerate warning says where the file went wrong, by line and
+    /// column, and quotes nothing of it: the line can hold a key.
+    #[test]
+    fn a_regenerate_names_the_position_and_quotes_nothing() {
+        for (contents, what) in [
+            (
+                "[groq]\napi_key = \"gsk_SECRET\nmodel = \"m\"\n",
+                "is not valid TOML (line ",
+            ),
+            (
+                "[groq]\napi_key = \"gsk_SECRET\"\n[general]\nsilence_timeout_ms = \"gsk_SECRET\"\n",
+                "does not deserialize into a whisrs config (line 4, column ",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, contents).unwrap();
+            let config: Config = toml::from_str("").unwrap();
+            let regenerated = write_config_noting(&config, &path)
+                .unwrap()
+                .expect("the file was regenerated");
+            assert!(regenerated.reason.starts_with(what), "{}", regenerated.reason);
+            assert!(regenerated.reason.ends_with(')'), "{}", regenerated.reason);
+            let warning = regenerated.warning(&path);
+            assert!(!warning.contains("SECRET"), "{warning}");
+            assert_eq!(
+                std::fs::read_to_string(config_backup_path(&path)).unwrap(),
+                contents
+            );
+        }
+    }
 
     /// A config the way a user actually writes it: header comments, inline
     /// comments, custom section order ([audio] before [general]), and

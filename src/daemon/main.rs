@@ -449,7 +449,8 @@ async fn handle_command(
         // Never waits on a lock: a poll every 2 s would time out on each
         // dictation start (`handle_toggle` holds the lock through the mic
         // open). Free, the lock gives the real state, unpublished claims
-        // included; held, the published one, and `busy`.
+        // included; held, the published one, and `busy`. `busy` also covers
+        // a held agent runtime and a recording start or stop in progress.
         Command::Info => {
             let (state, locked) = match daemon_state.try_lock() {
                 Ok(ds) => (ds.state_machine.state(), false),
@@ -459,8 +460,12 @@ async fn handle_command(
                 Some(running) => (running, false),
                 None => (false, true),
             };
+            #[cfg(feature = "recording")]
+            let recording_busy = context.recording.session_busy();
+            #[cfg(not(feature = "recording"))]
+            let recording_busy = false;
             let mut info = daemon_info(state, &context);
-            info.busy = locked || agents_locked;
+            info.busy = locked || agents_locked || recording_busy;
             info.agent_turn = agent_turn;
             Response::Info { info }
         }

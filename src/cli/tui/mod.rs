@@ -144,27 +144,45 @@ pub fn run(entry: Entry) -> anyhow::Result<()> {
             return Err(e).context("cannot open the terminal");
         }
     };
-    // Whatever arrived before the first frame is not a key for it: a colour
-    // reply that came late would read as Alt+], r, g, b and hex digits.
-    while event::poll(Duration::ZERO)? {
-        event::read()?;
-    }
     let (tx, rx) = mpsc::channel();
     let workers = worker::Workers::start(tx, &app.paths.socket, app.service);
-    let result = event_loop(
-        &mut terminal,
-        &mut app,
-        &workers,
-        &rx,
-        glyphs,
-        depth,
-        ground,
-    );
-    ratatui::restore();
+    let result = restoring(ratatui::restore, || {
+        drain_early_input()?;
+        event_loop(
+            &mut terminal,
+            &mut app,
+            &workers,
+            &rx,
+            glyphs,
+            depth,
+            ground,
+        )
+    });
     for line in &app.farewell {
         println!("{line}");
     }
     result
+}
+
+/// Run `body` in the TUI, then `restore` the terminal, whatever `body`
+/// returned: an error from anywhere in it leaves a usable shell.
+fn restoring<T>(
+    restore: impl FnOnce(),
+    body: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let result = body();
+    restore();
+    result
+}
+
+/// Read away whatever arrived before the first frame: it is not a key for
+/// it. A colour reply that came late would read as Alt+], r, g, b and hex
+/// digits.
+fn drain_early_input() -> std::io::Result<()> {
+    while event::poll(Duration::ZERO)? {
+        event::read()?;
+    }
+    Ok(())
 }
 
 /// The refusal for a session that is not on an interactive terminal, or
@@ -330,6 +348,19 @@ fn suspend_for_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error inside the TUI, the early-input drain's first, still
+    /// restores the terminal.
+    #[test]
+    fn an_error_in_the_tui_restores_the_terminal() {
+        let mut restored = false;
+        let result: anyhow::Result<()> = restoring(
+            || restored = true,
+            || Err(std::io::Error::other("cannot read the terminal").into()),
+        );
+        assert!(result.is_err());
+        assert!(restored);
+    }
 
     #[test]
     fn a_session_off_a_terminal_is_refused_with_the_path() {

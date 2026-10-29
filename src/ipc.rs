@@ -164,11 +164,13 @@ pub struct DaemonInfo {
     /// When this whisrsd started, in Unix milliseconds: a client that sees
     /// it change knows the daemon restarted.
     pub started_at: u64,
-    /// The dictation lock was held when asked (a dictation starting, a
-    /// command running): `state` is then the last one published, which can
-    /// lag, and the daemon counts as busy.
+    /// Something `info` does not wait for was mid-change when asked, and
+    /// the daemon counts as busy: the dictation lock was held (a dictation
+    /// starting, a command running; `state` is then the last one published,
+    /// which can lag), or the agent runtime's lock, or a recording start or
+    /// stop was under way.
     pub busy: bool,
-    /// An agent turn runs: a restart stops it.
+    /// An agent turn runs, or is on its way to start: a restart stops it.
     pub agent_turn: bool,
 }
 

@@ -1260,9 +1260,10 @@ struct UnknownKeyScan {
 /// Every variant means the same thing to a caller about to rewrite the file:
 /// there is no preserve set for these bytes, so merging the reserialized struct
 /// into them would delete every key the schema does not carry — issue #134. The
-/// `Display` text completes the sentence "existing config at `<path>` …", which
-/// is how `write_config_to` reports the divert.
-#[derive(Debug)]
+/// [`Self::summary`] completes the sentence "existing config at `<path>` ...",
+/// which is how `write_config_to` reports the divert. There is no `Display`,
+/// and `Debug` names only the variant: the errors' own text quotes the file,
+/// which can hold an API key.
 pub(crate) enum UndescribableConfig {
     /// Not valid TOML at all.
     Unparseable(toml::de::Error),
@@ -1275,34 +1276,56 @@ pub(crate) enum UndescribableConfig {
     /// named rather than folded into the others so that if a field ever does
     /// stop reserializing, the divert is the documented outcome instead of a
     /// silent merge against an empty preserve set.
-    Unserializable(toml::ser::Error),
+    Unserializable,
 }
 
 impl UndescribableConfig {
-    /// The `Display` text without the error: it completes the same
-    /// sentence, and quotes nothing from the file. A TOML error shows the
-    /// offending line, which can hold an API key.
-    pub(crate) fn summary(&self) -> &'static str {
-        match self {
-            Self::Unparseable(_) => "is not valid TOML",
-            Self::NotAConfig(_) => "does not deserialize into a whisrs config",
-            Self::Unserializable(_) => "does not round-trip through the config schema",
-        }
+    /// Why, completing "existing config at `<path>` ...", with where in
+    /// `contents` (the text it was read from) it went wrong when that is
+    /// known. Nothing of the text is quoted.
+    pub(crate) fn summary(&self, contents: &str) -> String {
+        let (what, span) = match self {
+            Self::Unparseable(e) => ("is not valid TOML", e.span()),
+            Self::NotAConfig(e) => ("does not deserialize into a whisrs config", e.span()),
+            Self::Unserializable => ("does not round-trip through the config schema", None),
+        };
+        with_position(what, contents, span)
     }
 }
 
-impl fmt::Display for UndescribableConfig {
+impl fmt::Debug for UndescribableConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // Same wording as `write_config_to`'s own `DocumentMut` parse arm,
-            // which rejects an unparseable file before this is ever consulted.
-            Self::Unparseable(e) => write!(f, "is not valid TOML ({e})"),
-            Self::NotAConfig(e) => write!(f, "does not deserialize into a whisrs config ({e})"),
-            Self::Unserializable(e) => {
-                write!(f, "does not round-trip through the config schema ({e})")
-            }
+        f.write_str(match self {
+            Self::Unparseable(_) => "Unparseable",
+            Self::NotAConfig(_) => "NotAConfig",
+            Self::Unserializable => "Unserializable",
+        })
+    }
+}
+
+/// `what`, then where the byte `span` starts in `contents`, as
+/// `(line 3, column 10)`: a position, never the line itself.
+pub(crate) fn with_position(
+    what: &str,
+    contents: &str,
+    span: Option<std::ops::Range<usize>>,
+) -> String {
+    let Some(span) = span else {
+        return what.to_string();
+    };
+    let (mut line, mut column) = (1, 1);
+    for (at, c) in contents.char_indices() {
+        if at >= span.start {
+            break;
+        }
+        if c == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
         }
     }
+    format!("{what} (line {line}, column {column})")
 }
 
 /// Run the diff prefilter and the pruning confirmation over `contents`.
@@ -1315,7 +1338,7 @@ fn scan_unknown_keys(contents: &str) -> Result<UnknownKeyScan, UndescribableConf
         .parse::<toml::Table>()
         .map_err(UndescribableConfig::Unparseable)?;
     let config = toml::from_str::<Config>(contents).map_err(UndescribableConfig::NotAConfig)?;
-    let known = toml::Value::try_from(&config).map_err(UndescribableConfig::Unserializable)?;
+    let known = toml::Value::try_from(&config).map_err(|_| UndescribableConfig::Unserializable)?;
     let mut candidates = Vec::new();
     diff_config_tables(
         &document,
