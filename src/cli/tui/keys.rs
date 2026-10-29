@@ -47,6 +47,9 @@ pub enum Mode {
     Browse,
     /// A text input: letters are text, `Enter` commits, `Esc` cancels.
     Text,
+    /// A dialog: a letter is the letter its line names (`w save`), in any
+    /// case.
+    Dialog,
 }
 
 pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
@@ -77,6 +80,10 @@ pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
             KeyCode::Delete => Some(Action::EraseForward),
             KeyCode::Home => Some(Action::Home),
             KeyCode::End => Some(Action::End),
+            _ => None,
+        },
+        Mode::Dialog => match key.code {
+            KeyCode::Char(c) => Some(Action::Type(c.to_ascii_lowercase())),
             _ => None,
         },
         Mode::Browse => match key.code {
@@ -141,6 +148,24 @@ mod tests {
             assert_eq!(action(press(KeyCode::Esc), mode), Some(Action::Back));
             assert_eq!(action(press(KeyCode::Left), mode), Some(Action::Left));
         }
+    }
+
+    /// A dialog's letters are the ones it names, even those that move
+    /// elsewhere (`l`, `d`).
+    #[test]
+    fn a_dialog_gets_its_letters() {
+        assert_eq!(
+            action(press(KeyCode::Char('l')), Mode::Dialog),
+            Some(Action::Type('l'))
+        );
+        assert_eq!(
+            action(press(KeyCode::Char('Y')), Mode::Dialog),
+            Some(Action::Type('y'))
+        );
+        assert_eq!(
+            action(press(KeyCode::Esc), Mode::Dialog),
+            Some(Action::Back)
+        );
     }
 
     #[test]

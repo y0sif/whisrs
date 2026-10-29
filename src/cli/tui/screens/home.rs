@@ -160,6 +160,12 @@ fn info_rows(app: &App, ui: &Ui) -> Vec<(&'static str, Value)> {
                         }
                         _ => {}
                     }
+                    if info.agent_turn {
+                        parts.push(("agent turn".into(), Tone::Plain));
+                    }
+                    if info.busy {
+                        parts.push(("busy".into(), Tone::Muted));
+                    }
                     if !info.version.is_empty() {
                         parts.push((format!("v{}", info.version), Tone::Plain));
                     }

@@ -183,12 +183,45 @@ pub fn write_config(config: &Config) -> Result<PathBuf> {
     Ok(config_path)
 }
 
+/// A write that could not merge into the file on disk: the file was kept at
+/// `backup` and the config written from scratch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Regenerated {
+    pub backup: PathBuf,
+    /// Completes "existing config at <path> ...". Nothing from the file is
+    /// in it: a TOML error quotes the offending line, which can hold a key.
+    pub reason: &'static str,
+}
+
+impl Regenerated {
+    /// What happened, for the config at `config_path`.
+    pub fn warning(&self, config_path: &Path) -> String {
+        format!(
+            "existing config at {} {}; rewrote it from scratch (backup saved to {})",
+            config_path.display(),
+            self.reason,
+            self.backup.display()
+        )
+    }
+}
+
 /// Implementation of [`write_config`] against an explicit path (testable).
 ///
 /// Takes the path so the `whisrs config` save path can be driven end to end in
 /// a temp dir: the composition of "write vocabulary.txt, then write config.toml
 /// with the right list" is where the destructive bugs live, not in either half.
 pub fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
+    if let Some(regenerated) = write_config_noting(config, config_path)? {
+        // `tracing` alone is invisible in `whisrs setup`, which installs no
+        // subscriber that prints warnings, so say it on stderr as well.
+        eprintln!("warning: {}", regenerated.warning(config_path));
+    }
+    Ok(())
+}
+
+/// [`write_config_to`] that prints nothing: a file it had to regenerate
+/// comes back, for a caller that owns the screen (the TUI) to say so.
+pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option<Regenerated>> {
     let config_dir = config_path
         .parent()
         .expect("config path should have a parent directory");
@@ -202,6 +235,7 @@ pub fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
     // their values are; the on-disk document is the source of truth for
     // comments, ordering, and formatting.
     let fresh_str = toml::to_string_pretty(config).context("failed to serialize config to TOML")?;
+    let mut regenerated = None;
     let mut output = match fs::read_to_string(config_path) {
         Ok(existing_str) => match existing_str.parse::<DocumentMut>() {
             // Derived from the bytes on disk, on every write: a set built from
@@ -245,7 +279,11 @@ pub fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
                 // with `duplicate field`, which is total config loss (see
                 // [`is_preserved`]).
                 Err(reason) => {
-                    backup_and_regenerate(config_path, &existing_str, &reason.to_string())?;
+                    regenerated = Some(backup_and_regenerate(
+                        config_path,
+                        &existing_str,
+                        reason.summary(),
+                    )?);
                     fresh_str
                 }
             },
@@ -254,12 +292,12 @@ pub fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
             // behavior). This branch skips the merge entirely, so unknown
             // keys are lost here by design; the file is kept verbatim as
             // `.bak`, which is the recovery path for them.
-            Err(e) => {
-                backup_and_regenerate(
+            Err(_) => {
+                regenerated = Some(backup_and_regenerate(
                     config_path,
                     &existing_str,
-                    &format!("is not valid TOML ({e})"),
-                )?;
+                    "is not valid TOML",
+                )?);
                 fresh_str
             }
         },
@@ -285,11 +323,12 @@ pub fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
     }
 
     atomic_write(config_path, &output)
-        .with_context(|| format!("failed to write config to {}", config_path.display()))
+        .with_context(|| format!("failed to write config to {}", config_path.display()))?;
+    Ok(regenerated)
 }
 
-/// Park the current contents of `config_path` in a private `.bak` beside it and
-/// tell the user the file is about to be regenerated from the struct.
+/// Park the current contents of `config_path` in a private `.bak` beside it,
+/// for the file to be regenerated from the struct; what to tell the user.
 ///
 /// The shared body of the two [`write_config_to`] branches that cannot merge
 /// into the file on disk: `toml_edit` could not parse it, or it has no
@@ -299,7 +338,11 @@ pub fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
 /// The broken file is the only copy of the user's hand-edits, so it is saved
 /// first, at 0600 because it may hold API keys, and an error here aborts the
 /// write rather than overwriting the only copy.
-fn backup_and_regenerate(config_path: &Path, existing_str: &str, reason: &str) -> Result<()> {
+fn backup_and_regenerate(
+    config_path: &Path,
+    existing_str: &str,
+    reason: &'static str,
+) -> Result<Regenerated> {
     let backup_path = config_backup_path(config_path);
     write_private_file(&backup_path, existing_str).with_context(|| {
         format!(
@@ -309,20 +352,15 @@ fn backup_and_regenerate(config_path: &Path, existing_str: &str, reason: &str) -
             backup_path.display()
         )
     })?;
-    // `tracing` alone is invisible in the CLI flows (`whisrs setup` / `whisrs
-    // config` install no subscriber that prints warnings), so tell the user on
-    // stderr as well.
     tracing::warn!(
         "existing config at {} {reason}; rewriting it from scratch (backup saved to {})",
         config_path.display(),
         backup_path.display()
     );
-    eprintln!(
-        "warning: existing config at {} {reason}; rewriting it from scratch (backup saved to {})",
-        config_path.display(),
-        backup_path.display()
-    );
-    Ok(())
+    Ok(Regenerated {
+        backup: backup_path,
+        reason,
+    })
 }
 
 /// Sync `existing` (the user's on-disk TOML, decor intact) to hold exactly the
@@ -660,7 +698,7 @@ fn merge_inline_table(existing: &mut InlineTable, fresh: &Table, preserved: &Pre
 /// directory, fsync it, then rename it over `path`. Interrupted writes can
 /// only ever leave the temp file behind, never a truncated config, and the
 /// mode is set at creation so the file is private for its entire lifetime.
-fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     let dir = path
         .parent()
         .expect("config path should have a parent directory");

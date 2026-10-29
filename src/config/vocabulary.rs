@@ -68,7 +68,8 @@ pub fn merge_vocabulary(config_terms: Vec<String>, file_terms: Vec<String>) -> V
 /// as-is.
 ///
 /// The file sits next to `config.toml` and now holds vocabulary that used to
-/// live inside it, so it is written with the same private-file helper (0600)
+/// live inside it, so it is written the way config.toml is: atomically (a
+/// 0600 temp file renamed over it, so a crash never leaves it half written)
 /// rather than through `fs::write`, which leaves it world-readable under the
 /// usual umask.
 pub fn write_vocabulary_file(path: &Path, terms: &[String]) -> io::Result<()> {
@@ -80,7 +81,7 @@ pub fn write_vocabulary_file(path: &Path, terms: &[String]) -> io::Result<()> {
         contents.push_str(term);
         contents.push('\n');
     }
-    write::write_private_file(path, &contents)
+    write::atomic_write(path, &contents)
 }
 
 /// Where the vocabulary stood when this `whisrs config` session started.
@@ -239,7 +240,7 @@ pub fn write_config_and_vocabulary(
     vocab: &VocabularyBaseline,
     config_path: &Path,
     vocab_path: &Path,
-) -> Result<Option<PathBuf>> {
+) -> Result<Wrote> {
     let plan = vocabulary_save_plan(vocab, &config.general.vocabulary);
 
     let mut vocabulary_written = None;
@@ -252,18 +253,30 @@ pub fn write_config_and_vocabulary(
     let mut on_disk = config.clone();
     on_disk.general.vocabulary = plan.config_toml;
 
-    if let Err(e) = write::write_config_to(&on_disk, config_path) {
-        return Err(match &vocabulary_written {
+    match write::write_config_noting(&on_disk, config_path) {
+        Ok(regenerated) => Ok(Wrote {
+            vocabulary: vocabulary_written,
+            regenerated,
+        }),
+        Err(e) => Err(match &vocabulary_written {
             Some(path) => e.context(format!(
                 "failed to write config: your vocabulary edits were already saved to {}, \
                  but config.toml was not updated",
                 path.display()
             )),
             None => e.context("failed to write config"),
-        });
+        }),
     }
+}
 
-    Ok(vocabulary_written)
+/// What [`write_config_and_vocabulary`] wrote besides config.toml.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Wrote {
+    /// `vocabulary.txt`, when the save wrote it.
+    pub vocabulary: Option<PathBuf>,
+    /// config.toml could not be merged into, and was written from scratch.
+    /// Not printed: the caller owns the screen.
+    pub regenerated: Option<write::Regenerated>,
 }
 
 /// Parse a comma-separated list, trimming whitespace and dropping empty entries.
@@ -457,6 +470,30 @@ NixOS
             parse_vocabulary("# a real comment\n\\#1\nNixOS\n"),
             vec!["#1", "NixOS"]
         );
+    }
+
+    /// The file is replaced, not truncated and rewritten: a new inode is
+    /// renamed over the old one, so a crash mid-write leaves the old list
+    /// whole, and no temp file stays behind.
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_replaced_atomically() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vocabulary.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap().ino();
+        write_vocabulary_file(&path, &["new".to_string()]).unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_ne!(after.ino(), before, "the file was rewritten in place");
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["vocabulary.txt"]);
     }
 
     /// The file holds vocabulary that used to live in the 0600 config.toml, so
@@ -862,7 +899,8 @@ NixOS
         let mut config: Config = toml::from_str("").expect("empty config uses defaults");
         config.general.vocabulary = terms(current);
         let written = write_config_and_vocabulary(&config, vocab, &config_path, &vocab_path)
-            .expect("save succeeds");
+            .expect("save succeeds")
+            .vocabulary;
 
         (dir, config_path, vocab_path, written)
     }

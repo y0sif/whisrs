@@ -423,9 +423,11 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Whether `cmd` only reads: no state change follows it, so there is
-/// nothing to broadcast after it. Nothing relies on that broadcast: every
-/// transition publishes itself, or is published by the command that made it.
+/// Whether `cmd` only reads: it changes no state, so there is nothing of its
+/// own to broadcast after it. A broadcast there could show sooner a
+/// transition that was not published (the command-mode and LLM-command
+/// claims), but nothing waits on that: the tray and the overlays catch up at
+/// the next publish, and the hooks and the reply queue are woken by changes.
 fn is_read_only(cmd: &Command) -> bool {
     matches!(cmd, Command::Status | Command::Info | Command::Log { .. })
 }
@@ -444,11 +446,24 @@ async fn handle_command(
                 state: ds.state_machine.state(),
             }
         }
-        // The published state, not the lock: a poll every 2 s would
-        // otherwise time out on each dictation start.
-        Command::Info => Response::Info {
-            info: daemon_info(context.state_tx.raw(), &context),
-        },
+        // Never waits on a lock: a poll every 2 s would time out on each
+        // dictation start (`handle_toggle` holds the lock through the mic
+        // open). Free, the lock gives the real state, unpublished claims
+        // included; held, the published one, and `busy`.
+        Command::Info => {
+            let (state, locked) = match daemon_state.try_lock() {
+                Ok(ds) => (ds.state_machine.state(), false),
+                Err(_) => (context.state_tx.raw(), true),
+            };
+            let (agent_turn, agents_locked) = match context.agents.any_turn_running() {
+                Some(running) => (running, false),
+                None => (false, true),
+            };
+            let mut info = daemon_info(state, &context);
+            info.busy = locked || agents_locked;
+            info.agent_turn = agent_turn;
+            Response::Info { info }
+        }
         Command::Log { limit } => match history::read_entries(limit) {
             Ok(entries) => Response::History { entries },
             Err(e) => Response::Error {
@@ -518,6 +533,8 @@ fn daemon_info(state: whisrs::State, context: &DaemonContext) -> DaemonInfo {
         backend: context.config.general.backend.clone(),
         features: whisrs::built_features(),
         started_at: context.started_at,
+        busy: false,
+        agent_turn: false,
     }
 }
 
@@ -622,12 +639,14 @@ mod tests {
                 backend: "deepgram".to_string(),
                 features: whisrs::built_features(),
                 started_at: 1_793_000_000_000,
+                busy: false,
+                agent_turn: false,
             }
         );
     }
 
     /// `info` answers while the dictation lock is held (`handle_toggle` holds
-    /// it through the mic open), with the state last published.
+    /// it through the mic open), with the state last published, and busy.
     #[tokio::test]
     async fn info_answers_while_the_dictation_lock_is_held() {
         use whisrs::state::Action;
@@ -649,6 +668,29 @@ mod tests {
             panic!("expected an info response, got {answer:?}");
         };
         assert_eq!(info.state, Some(whisrs::State::Recording));
+        assert!(info.busy);
+    }
+
+    /// With the lock free, `info` reads the state machine itself: a claim
+    /// that moved it without publishing shows, and nothing is busy.
+    #[tokio::test]
+    async fn info_reads_an_unpublished_state_under_a_free_lock() {
+        use whisrs::state::Action;
+
+        let context = info_context();
+        let mut ds = DaemonState::new();
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        let daemon_state = Arc::new(Mutex::new(ds));
+        assert_eq!(context.state_tx.raw(), whisrs::State::Idle);
+
+        let answer = handle_command(Command::Info, daemon_state, context).await;
+        let Response::Info { info } = answer else {
+            panic!("expected an info response, got {answer:?}");
+        };
+        assert_eq!(info.state, Some(whisrs::State::Transcribing));
+        assert!(!info.busy);
+        assert!(!info.agent_turn);
     }
 
     /// Only the commands that change nothing skip the broadcast after them.

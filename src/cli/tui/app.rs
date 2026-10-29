@@ -10,7 +10,7 @@ use whisrs::service::ServiceManager;
 use whisrs::OverlayConfig;
 
 use super::keys::{self, Action, Mode};
-use super::screens::config::{ConfigScreen, Loaded, Saved};
+use super::screens::config::{ConfigScreen, Loaded, SaveError, Saved};
 use super::screens::{config, home};
 use super::widgets::{dialog, frame, Notice, Tone, Ui};
 use super::worker::{DaemonView, RestartReport};
@@ -26,8 +26,8 @@ pub enum Screen {
 pub enum Msg {
     Key(KeyEvent),
     Daemon(DaemonView),
-    /// The answer to [`Effect::Save`].
-    Saved(Result<Saved, String>),
+    /// The answer to [`Effect::Save`] and [`Effect::SaveOver`].
+    Saved(Result<Saved, SaveError>),
     Restarted(RestartReport),
     /// config.toml read again after `$EDITOR`, or why it cannot be used.
     Reloaded(Result<Loaded, String>),
@@ -38,13 +38,22 @@ pub enum Msg {
 /// What the loop runs for the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
-    /// Validate and write the config; answered with [`Msg::Saved`].
+    /// Validate and write the config, unless config.toml changed on disk
+    /// since it was read; answered with [`Msg::Saved`].
     Save,
-    /// Restart the daemon (on a worker); answered with [`Msg::Restarted`].
+    /// [`Effect::Save`] over a config.toml that changed on disk.
+    SaveOver,
+    /// Restart the daemon (on a worker) if it is idle; answered with
+    /// [`Msg::Restarted`].
     Restart,
+    /// Restart it whatever it is doing.
+    RestartAnyway,
     /// Leave the TUI for `$EDITOR` on config.toml; answered with
     /// [`Msg::Reloaded`].
     OpenEditor,
+    /// Read config.toml again, dropping the edits; answered with
+    /// [`Msg::Reloaded`].
+    Reload,
     Quit,
 }
 
@@ -64,6 +73,10 @@ pub enum Dialog {
         index: usize,
         name: String,
     },
+    /// `r` found the daemon not answering: restart it anyway (default no)?
+    RestartAnyway,
+    /// A save found config.toml changed on disk since it was read.
+    Changed,
 }
 
 pub struct App {
@@ -83,6 +96,8 @@ pub struct App {
     pending: Option<After>,
     /// Saved on the way out: quit once the restart answered.
     quitting: bool,
+    /// The restart running was asked for with `r`, not by a save.
+    restart_by_key: bool,
     /// The row whose value just changed, shown reversed for a moment.
     pub flash: Option<String>,
     pub quit: bool,
@@ -127,6 +142,7 @@ impl App {
             status: None,
             pending: None,
             quitting: false,
+            restart_by_key: false,
             flash: None,
             quit: false,
             farewell: Vec::new(),
@@ -169,9 +185,26 @@ impl App {
                 None
             }
             Msg::Saved(Ok(saved)) => self.saved(saved),
-            Msg::Saved(Err(why)) => {
+            Msg::Saved(Err(SaveError::Failed(why))) => {
                 self.pending = None;
                 self.status = Some(Notice::new(Tone::Error, format!("not saved: {why}")));
+                None
+            }
+            Msg::Saved(Err(SaveError::Changed)) => {
+                self.dialog = Some(Dialog::Changed);
+                None
+            }
+            Msg::Saved(Err(SaveError::Reread(why))) => {
+                // It is on disk; what is not known is what it says now, so
+                // nothing restarts and `w` waits for `e`.
+                self.config.form.mark_saved();
+                self.config.broken = Some(why.clone());
+                let text = format!("saved, but re-reading it failed: {why}");
+                self.status = Some(Notice::new(Tone::Warn, text.clone()));
+                if self.pending.take() == Some(After::Quit) {
+                    self.farewell.push(text);
+                    return Some(Effect::Quit);
+                }
                 None
             }
             Msg::Restarted(report) => self.restarted(report),
@@ -188,7 +221,9 @@ impl App {
 
     fn key(&mut self, key: KeyEvent) -> Option<Effect> {
         self.flash = None;
-        let mode = if self.dialog.is_none() && self.config.typing() {
+        let mode = if self.dialog.is_some() {
+            Mode::Dialog
+        } else if self.config.typing() {
             Mode::Text
         } else {
             Mode::Browse
@@ -208,10 +243,7 @@ impl App {
                 }
                 Action::Save => return self.save(),
                 Action::Editor => return self.editor(),
-                Action::Restart => {
-                    self.status = Some(Notice::new(Tone::Muted, "restarting the daemon"));
-                    return Some(Effect::Restart);
-                }
+                Action::Restart => return self.restart(),
                 _ => {}
             }
         }
@@ -240,19 +272,41 @@ impl App {
     fn dialog_key(&mut self, dialog: Dialog, action: Action) -> Option<Effect> {
         match (&dialog, action) {
             (Dialog::Help, _) => None,
-            (Dialog::Unsaved(after), Action::Save) => {
+            (Dialog::Unsaved(after), Action::Type('w')) => {
                 self.pending = Some(*after);
                 self.save()
             }
-            (Dialog::Unsaved(after), Action::Delete) => {
+            (Dialog::Unsaved(after), Action::Type('d')) => {
                 self.config.discard();
                 Some(match after {
                     After::Quit => Effect::Quit,
                     After::Editor => Effect::OpenEditor,
                 })
             }
-            (Dialog::DeleteEntry { index, name }, Action::Delete) => {
+            (Dialog::DeleteEntry { index, name }, Action::Type('d')) => {
                 self.status = Some(self.config.delete_entry(*index, name));
+                None
+            }
+            (Dialog::RestartAnyway, Action::Type('y')) => {
+                self.status = Some(Notice::new(Tone::Muted, "restarting the daemon"));
+                Some(Effect::RestartAnyway)
+            }
+            // No is the default: anything else.
+            (Dialog::RestartAnyway, _) => {
+                self.status = Some(Notice::new(
+                    Tone::Warn,
+                    "restart skipped: daemon is not answering",
+                ));
+                None
+            }
+            (Dialog::Changed, Action::Type('o')) => Some(Effect::SaveOver),
+            (Dialog::Changed, Action::Type('l')) => {
+                self.pending = None;
+                Some(Effect::Reload)
+            }
+            (Dialog::Changed, Action::Back) => {
+                self.pending = None;
+                self.status = Some(Notice::new(Tone::Muted, "not saved"));
                 None
             }
             (_, Action::Back) => None,
@@ -261,6 +315,21 @@ impl App {
                 None
             }
         }
+    }
+
+    /// `r`: restart the daemon if it is idle, once config.toml loads.
+    fn restart(&mut self) -> Option<Effect> {
+        if self.config.broken.is_some() {
+            self.status = Some(Notice::new(
+                Tone::Error,
+                "not restarted: config.toml does not load, and the daemon would start on \
+                 defaults. e opens it to fix it.",
+            ));
+            return None;
+        }
+        self.restart_by_key = true;
+        self.status = Some(Notice::new(Tone::Muted, "restarting the daemon"));
+        Some(Effect::Restart)
     }
 
     fn ask_quit(&mut self) -> Option<Effect> {
@@ -321,7 +390,18 @@ impl App {
                  keybinding.",
             ));
         }
+        if let Some(regenerated) = &saved.regenerated {
+            self.notices.push(Notice::new(
+                Tone::Warn,
+                format!(
+                    "config.toml {}, so it was written from scratch; the old file is {}",
+                    regenerated.reason,
+                    tilde(&regenerated.backup, self.env.get("HOME")).display()
+                ),
+            ));
+        }
         self.config.saved(saved.loaded);
+        self.restart_by_key = false;
         match self.pending.take() {
             Some(After::Editor) => {
                 self.status = Some(Notice::new(Tone::Ok, format!("saved {file}")));
@@ -347,12 +427,35 @@ impl App {
     }
 
     fn restarted(&mut self, report: RestartReport) -> Option<Effect> {
+        let by_key = std::mem::take(&mut self.restart_by_key);
         let notice = match report {
+            RestartReport::NotAnswering if by_key && !self.quitting => {
+                self.dialog = Some(Dialog::RestartAnyway);
+                self.status = None;
+                return None;
+            }
             RestartReport::Restarted => Notice::new(Tone::Ok, "daemon restarted"),
-            RestartReport::Busy(doing) => Notice::new(
-                Tone::Warn,
-                format!("restart skipped: daemon is {doing}, press r later"),
-            ),
+            // After a save, silence may be a dictation starting.
+            RestartReport::Busy(_) | RestartReport::NotAnswering => {
+                let doing = match report {
+                    RestartReport::Busy(doing) => doing,
+                    _ => "not answering",
+                };
+                if self.quitting {
+                    Notice::new(
+                        Tone::Warn,
+                        format!(
+                            "Restart skipped: the daemon is {doing}. Run whisrs restart when \
+                             it is done."
+                        ),
+                    )
+                } else {
+                    Notice::new(
+                        Tone::Warn,
+                        format!("restart skipped: daemon is {doing}, press r later"),
+                    )
+                }
+            }
             RestartReport::Failed(manager) => {
                 let hint = manager.restart_hint().unwrap_or("restart");
                 let check = match manager {
@@ -439,6 +542,21 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui) -> Vec<Line<'static>> {
             Line::default(),
             keys(&[("d", "delete"), ("esc", "keep")]),
         ],
+        Dialog::RestartAnyway => vec![
+            Line::from("The daemon is not answering, so it may be busy."),
+            Line::from("Restart it anyway?"),
+            Line::default(),
+            keys(&[("y", "restart"), ("n", "no")]),
+        ],
+        Dialog::Changed => vec![
+            Line::from("config.toml changed on disk since you opened it."),
+            Line::default(),
+            keys(&[
+                ("o", "overwrite"),
+                ("l", "load it (drops your edits)"),
+                ("esc", "cancel"),
+            ]),
+        ],
         Dialog::Help => {
             let row = |key: &'static str, what: &'static str| {
                 Line::from(vec![
@@ -455,7 +573,7 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui) -> Vec<Line<'static>> {
                 row("x", "back to the default"),
                 row("a d", "add or delete, in a list"),
                 row("/", "filter the rows; esc clears it"),
-                row("w", "save, then restart the daemon"),
+                row("w", "save, then restart the daemon if it is idle"),
                 row("e", "edit config.toml in $EDITOR"),
                 row("r", "restart the daemon"),
                 row("esc", "back one level, or cancel typing"),
@@ -518,7 +636,7 @@ mod tests {
         press(&mut fixture.app, "q");
         assert_eq!(press(&mut fixture.app, "w"), [Effect::Save]);
         let paths = paths(fixture.dir.path());
-        let saved = save(&fixture.app.config, &paths);
+        let saved = save(&fixture.app.config, &paths, false);
         assert_eq!(fixture.app.update(Msg::Saved(saved)), Some(Effect::Restart));
         assert_eq!(
             fixture.app.update(Msg::Restarted(RestartReport::Restarted)),
@@ -537,12 +655,17 @@ mod tests {
         let mut fixture = edited();
         press(&mut fixture.app, "q");
         press(&mut fixture.app, "w");
-        assert_eq!(fixture.app.update(Msg::Saved(Err("invalid".into()))), None);
+        assert_eq!(
+            fixture
+                .app
+                .update(Msg::Saved(Err(SaveError::Failed("invalid".into())))),
+            None
+        );
         assert!(!fixture.app.quit);
         assert!(fixture.app.config.form.is_dirty());
         // The next save is a plain one.
         assert_eq!(press(&mut fixture.app, "w"), [Effect::Save]);
-        let saved = save(&fixture.app.config, &paths(fixture.dir.path()));
+        let saved = save(&fixture.app.config, &paths(fixture.dir.path()), false);
         assert_eq!(fixture.app.update(Msg::Saved(saved)), Some(Effect::Restart));
         assert_eq!(
             fixture.app.update(Msg::Restarted(RestartReport::Restarted)),
@@ -565,7 +688,7 @@ mod tests {
         let mut fixture = edited();
         press(&mut fixture.app, "e");
         assert_eq!(press(&mut fixture.app, "w"), [Effect::Save]);
-        let saved = save(&fixture.app.config, &paths(fixture.dir.path()));
+        let saved = save(&fixture.app.config, &paths(fixture.dir.path()), false);
         assert_eq!(
             fixture.app.update(Msg::Saved(saved)),
             Some(Effect::OpenEditor)
@@ -598,6 +721,71 @@ mod tests {
         assert!(status.text.contains("pkill whisrsd; sleep 0.2; whisrsd &"));
     }
 
+    /// `r` on a daemon that does not answer asks before restarting it, no
+    /// by default; after a save, silence just skips the restart.
+    #[test]
+    fn a_daemon_that_does_not_answer_is_restarted_only_when_asked() {
+        let mut fixture = app("");
+        assert_eq!(press(&mut fixture.app, "r"), [Effect::Restart]);
+        fixture
+            .app
+            .update(Msg::Restarted(RestartReport::NotAnswering));
+        assert_eq!(fixture.app.dialog, Some(Dialog::RestartAnyway));
+        let drawn = crate::tui::testing::rows(&crate::tui::testing::draw(&fixture.app, 90, 30));
+        assert!(drawn.iter().any(|r| r.contains("Restart it anyway?")));
+        // Anything but y is no.
+        assert!(press(&mut fixture.app, "\n").is_empty());
+        assert_eq!(fixture.app.dialog, None);
+        assert!(fixture
+            .app
+            .status
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("not answering"));
+
+        press(&mut fixture.app, "r");
+        fixture
+            .app
+            .update(Msg::Restarted(RestartReport::NotAnswering));
+        assert_eq!(press(&mut fixture.app, "y"), [Effect::RestartAnyway]);
+
+        // A save's restart does not ask.
+        let mut fixture = edited();
+        press(&mut fixture.app, "w");
+        let saved = save(&fixture.app.config, &paths(fixture.dir.path()), false);
+        assert_eq!(fixture.app.update(Msg::Saved(saved)), Some(Effect::Restart));
+        fixture
+            .app
+            .update(Msg::Restarted(RestartReport::NotAnswering));
+        assert_eq!(fixture.app.dialog, None);
+        assert_eq!(
+            fixture.app.status.as_ref().unwrap().text,
+            "restart skipped: daemon is not answering, press r later"
+        );
+    }
+
+    /// Saved on the way out with the daemon busy, the farewell says what to
+    /// run: there is no r once the TUI is gone.
+    #[test]
+    fn a_skipped_restart_on_the_way_out_says_to_run_whisrs_restart() {
+        let mut fixture = edited();
+        press(&mut fixture.app, "q");
+        press(&mut fixture.app, "w");
+        let saved = save(&fixture.app.config, &paths(fixture.dir.path()), false);
+        fixture.app.update(Msg::Saved(saved));
+        assert_eq!(
+            fixture
+                .app
+                .update(Msg::Restarted(RestartReport::Busy("recording"))),
+            Some(Effect::Quit)
+        );
+        assert_eq!(
+            fixture.app.farewell[1],
+            "Restart skipped: the daemon is recording. Run whisrs restart when it is done."
+        );
+    }
+
     /// Esc on Config goes up to Home; enter on Home opens Config again,
     /// edits kept.
     #[test]
@@ -613,12 +801,15 @@ mod tests {
     /// A save of a config that had no file writes one, and points to setup.
     #[test]
     fn saving_a_fresh_config_points_to_setup() {
-        let toml = "[general]\nbackend = \"groq\"\n[groq]\napi_key = \"k\"\n";
-        let mut fixture = app(toml);
+        let mut fixture = crate::tui::testing::app_on(None, &[]);
         let paths = paths(fixture.dir.path());
-        std::fs::remove_file(&paths.config).unwrap();
-        fixture.app.config.fresh = true;
-        let saved = save(&fixture.app.config, &paths);
+        assert!(fixture.app.config.fresh);
+        // groq, the default backend, needs its key to validate.
+        press(&mut fixture.app, "j\n");
+        press(&mut fixture.app, "jjj\n");
+        crate::tui::testing::type_text(&mut fixture.app, "gsk_1");
+        press(&mut fixture.app, "\n");
+        let saved = save(&fixture.app.config, &paths, false);
         assert_eq!(fixture.app.update(Msg::Saved(saved)), Some(Effect::Restart));
         assert!(paths.config.is_file());
         assert!(fixture

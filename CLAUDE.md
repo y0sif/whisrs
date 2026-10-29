@@ -43,7 +43,8 @@ whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs config    # full-screen config editor (TUI): every key by section, w saves (comments kept)
-                 # and restarts the daemon, e opens config.toml in $EDITOR. Refuses off a terminal
+                 # and restarts the daemon only while it is idle (r later), e opens config.toml
+                 # in $EDITOR. Refuses off a terminal
 whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
 whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once
@@ -100,6 +101,8 @@ src/
 │   ├── schema.rs           #   every config key as a row (kind, help, feature gate) + coverage test
 │   ├── form.rs             #   the edit buffer: dotted-path get/set over a toml::Table, checked by serde
 │   ├── worker.rs           #   threads: the 2 s info poll (status for an older daemon), the restart
+│   │                       #   gate (only an idle daemon; silence, a recording, an agent turn or
+│   │                       #   busy skip it; an older one is asked `recording status` too)
 │   ├── widgets/            #   frame + footer, row, text input, dialog
 │   ├── screens/            #   home.rs (the hub), config.rs (sections, rows, list/map/entry editors, save)
 │   ├── testing.rs, render_tests.rs  #   fixtures; snapshots, styles, layouts (tests only)
@@ -298,9 +301,11 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "cancel"}
 {"cmd": "status"}
 {"cmd": "info"}                      // version, state, recording phase, backend, built features,
-                                     // started_at (Unix ms); read without the dictation lock. An
-                                     // older daemon hangs up on it (and logs an error), so the TUI
-                                     // then asks status and remembers; `whisrs status` asks status only
+                                     // started_at (Unix ms), busy, agent_turn. Never waits: the state
+                                     // comes from a try_lock of the dictation lock, else the published
+                                     // one with busy = true. An older daemon hangs up on it (and logs
+                                     // an error), so the TUI asks status and remembers, asking info
+                                     // again every 10th poll; `whisrs status` asks status only
 {"cmd": "log", "limit": 20}
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite

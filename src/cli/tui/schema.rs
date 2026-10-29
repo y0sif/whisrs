@@ -1331,6 +1331,115 @@ mod tests {
         assert_eq!(table.len(), 21);
     }
 
+    /// The field names `T`'s `Deserialize` declares: every one, an `Option`
+    /// too, which serializes to nothing when `None` and so cannot be seen in
+    /// a serialized config.
+    fn fields_of<T: serde::de::DeserializeOwned>() -> Vec<&'static str> {
+        struct Fields(Vec<&'static str>);
+
+        impl<'de> serde::Deserializer<'de> for &mut Fields {
+            type Error = serde::de::value::Error;
+
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(serde::de::Error::custom("fields only"))
+            }
+
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                self.0 = fields.to_vec();
+                Err(serde::de::Error::custom("fields only"))
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map enum identifier ignored_any
+            }
+        }
+
+        let mut fields = Fields(Vec::new());
+        let _ = T::deserialize(&mut fields);
+        assert!(
+            !fields.0.is_empty(),
+            "{} is not a struct",
+            std::any::type_name::<T>()
+        );
+        fields.0
+    }
+
+    /// The names serde also accepts for a field or section, which are not
+    /// keys of their own.
+    const ALIASES: &[&str] = &["local", "asr", "vibevoice", "read"];
+
+    /// Every field of every section has a row, read from the types rather
+    /// than from a config: a new `Option` field left `None` above would
+    /// otherwise pass [`every_config_key_is_editable`] with no row.
+    #[test]
+    fn every_field_has_a_row_even_one_never_set() {
+        let covered: BTreeSet<String> = schema_paths()
+            .into_iter()
+            .chain(EDITOR_ONLY.iter().map(|p| p.to_string()))
+            .collect();
+        let sections = [
+            ("general", fields_of::<GeneralConfig>()),
+            ("audio", fields_of::<AudioConfig>()),
+            ("input", fields_of::<InputConfig>()),
+            ("deepgram", fields_of::<DeepgramConfig>()),
+            ("groq", fields_of::<GroqConfig>()),
+            ("openai", fields_of::<OpenAiConfig>()),
+            ("local-whisper", fields_of::<LocalWhisperConfig>()),
+            ("local-vosk", fields_of::<LocalVoskConfig>()),
+            ("local-parakeet", fields_of::<LocalParakeetConfig>()),
+            ("asr-sidecar", fields_of::<AsrSidecarConfig>()),
+            (
+                "openai-compatible-realtime",
+                fields_of::<OpenAiCompatibleRealtimeConfig>(),
+            ),
+            ("llm", fields_of::<LlmConfig>()),
+            ("tts", fields_of::<TtsConfig>()),
+            ("hotkeys", fields_of::<HotkeyConfig>()),
+            ("hooks", fields_of::<HooksConfig>()),
+            ("overlay", fields_of::<OverlayConfig>()),
+            ("overlay.colors", fields_of::<OverlayColors>()),
+            ("agent_overlay", fields_of::<AgentOverlayConfig>()),
+            ("llm_commands", fields_of::<LlmCommandConfig>()),
+            ("agents", fields_of::<AgentConfig>()),
+            ("recording", fields_of::<RecordingConfig>()),
+        ];
+        // Every section of `Config` is listed here, but the one map.
+        let top: BTreeSet<&str> = fields_of::<Config>()
+            .into_iter()
+            .filter(|name| !ALIASES.contains(name))
+            .collect();
+        let listed: BTreeSet<&str> = sections
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !name.contains('.'))
+            .chain(["replacements"])
+            .collect();
+        assert_eq!(top, listed);
+
+        for (section, fields) in &sections {
+            for field in fields.iter().filter(|name| !ALIASES.contains(name)) {
+                let path = format!("{section}.{field}");
+                if sections.iter().any(|(name, _)| *name == path) {
+                    continue;
+                }
+                assert!(
+                    covered.contains(&path),
+                    "{path} has no row and is not in EDITOR_ONLY"
+                );
+            }
+        }
+    }
+
     /// Each path appears once: two rows for one key would fight.
     #[test]
     fn no_key_has_two_rows() {

@@ -16,10 +16,6 @@ use whisrs::OverlayConfig;
 
 use super::Env;
 
-/// How long the colour probe waits for the terminal. A terminal that does
-/// not answer is caught sooner by the DA1 fence the probe sends after it.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
-
 /// How much foreground survives in `muted` (help text, inherited values).
 const MUTED_ALPHA: f32 = 0.62;
 
@@ -82,12 +78,21 @@ pub struct Ground {
 impl Ground {
     /// Ask the terminal for its foreground and background (OSC 10 and 11).
     /// Runs before raw mode and the input reader, so the answer cannot be
-    /// read as keystrokes. A terminal that does not answer falls back to
-    /// `COLORFGBG`, which kitty and foot do not set, then to dark.
+    /// read as keystrokes. The wait is the crate's (1 s): a terminal that
+    /// does not answer is caught at once by the DA1 fence sent after the
+    /// query. One that does not answer falls back to `COLORFGBG`, which
+    /// kitty and foot do not set, then to dark.
+    ///
+    /// Not asked over SSH ([`remote`]): there the reply can come after the
+    /// wait, into the TUI, as keys.
     pub fn probe(env: &Env) -> Ground {
-        let mut options = QueryOptions::default();
-        options.timeout = PROBE_TIMEOUT;
-        match terminal_colorsaurus::color_palette(options) {
+        if remote(env) {
+            return Ground {
+                light: colorfgbg_is_light(env).unwrap_or(false),
+                colors: None,
+            };
+        }
+        match terminal_colorsaurus::color_palette(QueryOptions::default()) {
             Ok(palette) => {
                 let rgb = |c: &terminal_colorsaurus::Color| {
                     let (r, g, b) = c.scale_to_8bit();
@@ -104,6 +109,13 @@ impl Ground {
             },
         }
     }
+}
+
+/// Whether the TUI runs over SSH, where a terminal's answer can be slow.
+pub fn remote(env: &Env) -> bool {
+    ["SSH_TTY", "SSH_CONNECTION"]
+        .into_iter()
+        .any(|key| env.get(key).is_some_and(|value| !value.is_empty()))
 }
 
 /// Whether `COLORFGBG` (`fg;bg`, or `fg;default;bg`) names a light
@@ -475,6 +487,29 @@ mod tests {
         );
         // An empty NO_COLOR does not count.
         assert_eq!(depth(&[("NO_COLOR", "")]), Depth::Ansi16);
+    }
+
+    /// Over SSH the terminal is not asked: the ground is dark, or what
+    /// `COLORFGBG` says.
+    #[test]
+    fn the_probe_is_skipped_over_ssh() {
+        let ssh = Env::from_pairs(&[("SSH_TTY", "/dev/pts/3")]);
+        assert!(remote(&ssh));
+        assert_eq!(Ground::probe(&ssh), Ground::default());
+        let ssh_light = Env::from_pairs(&[
+            ("SSH_CONNECTION", "10.0.0.2 51234 10.0.0.1 22"),
+            ("COLORFGBG", "0;15"),
+        ]);
+        assert!(remote(&ssh_light));
+        assert_eq!(
+            Ground::probe(&ssh_light),
+            Ground {
+                light: true,
+                colors: None
+            }
+        );
+        assert!(!remote(&Env::from_pairs(&[("SSH_TTY", "")])));
+        assert!(!remote(&Env::default()));
     }
 
     #[test]

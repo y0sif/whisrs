@@ -529,6 +529,14 @@ impl AgentRuntime {
             .any(|a| a.hotkey.is_some() || a.new_session_hotkey.is_some())
     }
 
+    /// Whether a whisrs turn of any agent runs (a restart stops it), or
+    /// `None` while the runtime's lock is held, for `info`, which never
+    /// waits on it.
+    pub(crate) fn any_turn_running(&self) -> Option<bool> {
+        let inner = self.inner.try_lock().ok()?;
+        Some(inner.slots.values().any(|slot| slot.turn.is_some()))
+    }
+
     fn agent(&self, name: &str) -> Option<Arc<Agent>> {
         self.agents.iter().find(|a| a.name == name).cloned()
     }
@@ -2793,6 +2801,29 @@ mod tests {
                     .map_or_else(whisrs::agent::progress::Feedback::default, |a| a.feedback),
             ),
         });
+    }
+
+    /// `info` counts a running turn, so a restart after a save leaves it
+    /// alone; a held runtime lock is not known, never waited on.
+    #[tokio::test]
+    async fn info_names_a_running_agent_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis"], dir.path());
+        assert_eq!(context.agents.any_turn_running(), Some(false));
+        install_turn(&context, "jarvis", 1, "check it").await;
+        assert_eq!(context.agents.any_turn_running(), Some(true));
+
+        let ds = Arc::new(Mutex::new(crate::context::DaemonState::new()));
+        let answer = crate::handle_command(whisrs::Command::Info, ds, Arc::clone(&context)).await;
+        let whisrs::Response::Info { info } = answer else {
+            panic!("expected an info response, got {answer:?}");
+        };
+        assert!(info.agent_turn);
+        assert!(!info.busy);
+
+        let held = context.agents.inner.lock().await;
+        assert_eq!(context.agents.any_turn_running(), None);
+        drop(held);
     }
 
     fn queued(rt: &AgentRuntime) -> Vec<String> {

@@ -479,7 +479,7 @@ response_format = "wav"     # audio format requested from the API
 #                             #   An ISO 639 code, optionally with a region, or "auto"
 # mic_language = "de"         # language of your mic track; default: language
 # system_language = "auto"    # language of the system audio track; default: language
-# mic_device = "alsa_input.usb-..."  # a source name from whisrs config or pactl list short sources
+# mic_device = "alsa_input.usb-..."  # a source name, from pactl list short sources
 #                             #   default: [audio] device
 # system_device = "default"   # "default" = monitor of the default output,
 #                             #   "none" = mic only, or a source name ending in .monitor
@@ -1290,7 +1290,7 @@ without a whisrs release: whisrs reads the output of 1.0.103.
 `[audio] device` picks the input whisrs records from:
 
 - `"default"` (or empty): the system default input, through ALSA. With the PipeWire or PulseAudio ALSA plugin installed (the usual setup) this follows the default source set in your sound settings.
-- A PulseAudio or PipeWire source name, such as `alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo`. List them with `pactl list short sources` (second column), or pick one from `whisrs config` under the audio device item. The source description shown in your sound settings also works. Monitor sources (names ending in `.monitor`) record what your speakers play.
+- A PulseAudio or PipeWire source name, such as `alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo`. List them with `pactl list short sources` (second column). The source description shown in your sound settings also works; on PipeWire, `wpctl status` lists the sources by description. Monitor sources (names ending in `.monitor`) record what your speakers play.
 - An ALSA PCM name, such as `pipewire`, `plughw:1,0` or `sysdefault:CARD=PCH` (see `arecord -L`). This also covers systems without a PulseAudio or PipeWire server.
 
 PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matches nothing logs a warning listing the valid names and falls back to the system default. The daemon reads the device when it starts, so restart it after a change (`whisrs restart`); its startup log shows which device the name resolved to. Audio cues and read-aloud playback always use the default output device.
@@ -1582,8 +1582,8 @@ in or unplugged, another output picked), the system track moves to the new
 one within about 2 seconds, and the moment in between is filled with silence
 so the track stays in step with your mic. Set it to `"none"` to record only
 your mic, or to a specific monitor source from `pactl list short sources`
-(names ending in `.monitor`), which is never followed. `whisrs config` lists
-the monitors under "Recording". If the system audio cannot be opened, the
+(names ending in `.monitor`), which is never followed. `pactl list short
+sources` lists the monitors. If the system audio cannot be opened, the
 recording takes your mic only and notes that in the transcript. With
 `mic_device` and `[audio] device` at `"default"`, the mic records the ALSA
 default device, which whisrs does not move. Through PipeWire's ALSA plugin

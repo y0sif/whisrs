@@ -23,10 +23,30 @@ test the microphone, and write
 Does not require the daemon to be running.
 .TP
 .B config
-Open an interactive menu to edit any section of
-.IR config.toml
-\(em backend, language, hotkeys, overlay, command-mode LLM, and more.
-On save, writes the file and restarts the daemon via systemd. Unlike
+Open a full\-screen editor (a TUI) for every key of
+.IR config.toml ,
+by section: backend and API keys, language, hotkeys, overlay, read\-aloud,
+agents, recording, and the rest.
+.B w
+saves, keeping comments, key order and unknown keys, then restarts the
+daemon through its service manager, but only while it is idle: while it
+dictates, records or runs an agent turn the restart is skipped, and
+.B r
+(or
+.BR "whisrs restart" )
+does it later.
+.B e
+opens the file in
+.BR $VISUAL ,
+else
+.BR $EDITOR .
+Colours follow the
+.B [overlay]
+theme;
+.B NO_COLOR
+turns them off. Off an interactive terminal (stdin or stdout not a TTY, or
+.BR TERM=dumb )
+it prints where to edit the file and exits 1, changing nothing. Unlike
 .B setup
 this does not touch udev rules, the systemd unit, or compositor keybindings.
 .TP
@@ -445,6 +465,11 @@ Groq API key. Overrides the value in
 OpenAI API key. Overrides the value in
 .IR config.toml .
 .TP
+.B NO_COLOR
+Set and not empty:
+.B whisrs config
+draws without colour.
+.TP
 .B XDG_RUNTIME_DIR
 Directory for the Unix socket. The socket is created at
 .IR $XDG_RUNTIME_DIR/whisrs.sock .
@@ -490,7 +515,9 @@ Written only when agents are configured.
 Success.
 .TP
 .B 1
-Error (daemon not running, invalid state transition, or setup failure).
+Error (daemon not running, invalid state transition, setup failure, or
+.B whisrs config
+off an interactive terminal).
 .SH EXAMPLES
 Run interactive setup:
 .PP

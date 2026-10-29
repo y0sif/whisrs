@@ -243,10 +243,10 @@ impl StateBus {
         });
     }
 
-    /// The raw state as last published. Every transition is published
-    /// under the dictation lock before the command that made it answers, so
-    /// this is the state any client can have seen, read without waiting for
-    /// that lock (which `handle_toggle` holds through the mic open).
+    /// The raw state as last published. It can lag the state machine: not
+    /// every transition is published as it happens (the command-mode and
+    /// LLM-command claims move Recording to Transcribing unpublished), so
+    /// `info` reads it only while the dictation lock is held, and says so.
     pub(crate) fn raw(&self) -> State {
         *self.raw.borrow()
     }

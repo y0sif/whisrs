@@ -93,6 +93,8 @@ pub fn mockup() -> Fixture {
         .map(String::from)
         .to_vec(),
         started_at: 1,
+        busy: false,
+        agent_turn: false,
     };
     fixture
         .app

@@ -610,7 +610,10 @@ pub struct GeneralConfig {
     #[serde(default)]
     pub audio_feedback: bool,
     /// Volume for audio feedback (0.0 to 1.0).
-    #[serde(default = "default_audio_feedback_volume")]
+    #[serde(
+        default = "default_audio_feedback_volume",
+        serialize_with = "serialize_f32_shortest"
+    )]
     pub audio_feedback_volume: f32,
     /// Custom vocabulary — domain-specific terms, names, acronyms.
     /// Passed as a prompt hint to transcription backends to improve accuracy.
@@ -1114,6 +1117,20 @@ fn default_device() -> String {
 fn default_audio_feedback_volume() -> f32 {
     0.5
 }
+
+/// An `f32` as the shortest decimal that reads back as it. TOML floats are
+/// `f64`, and widening an `f32` turns a hand-written `0.3` into
+/// `0.30000001192092896` on every save.
+fn serialize_f32_shortest<S: serde::Serializer>(
+    value: &f32,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let shortest = value
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(f64::from(*value));
+    serializer.serialize_f64(shortest)
+}
 /// Default toggle-path post-processing instruction. Conservative on purpose:
 /// dictation is content, not a request, so the out-of-the-box behavior is a
 /// cleanup pass that must not reword anything.
@@ -1259,6 +1276,19 @@ pub(crate) enum UndescribableConfig {
     /// stop reserializing, the divert is the documented outcome instead of a
     /// silent merge against an empty preserve set.
     Unserializable(toml::ser::Error),
+}
+
+impl UndescribableConfig {
+    /// The `Display` text without the error: it completes the same
+    /// sentence, and quotes nothing from the file. A TOML error shows the
+    /// offending line, which can hold an API key.
+    pub(crate) fn summary(&self) -> &'static str {
+        match self {
+            Self::Unparseable(_) => "is not valid TOML",
+            Self::NotAConfig(_) => "does not deserialize into a whisrs config",
+            Self::Unserializable(_) => "does not round-trip through the config schema",
+        }
+    }
 }
 
 impl fmt::Display for UndescribableConfig {
@@ -3311,6 +3341,24 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `0.3` written by hand stays `0.3` through a save, not the `f32`
+    /// widened to `f64`.
+    #[test]
+    fn an_f32_volume_round_trips_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = "[general]\naudio_feedback_volume = 0.3\n";
+        std::fs::write(&path, toml).unwrap();
+        let config: Config = toml::from_str(toml).unwrap();
+        crate::config::write::write_config_to(&config, &path).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("audio_feedback_volume = 0.3\n"), "{out}");
+        let fresh = toml::to_string(&config).unwrap();
+        assert!(fresh.contains("audio_feedback_volume = 0.3\n"), "{fresh}");
+        let back: Config = toml::from_str(&fresh).unwrap();
+        assert_eq!(back.general.audio_feedback_volume, 0.3);
+    }
 
     #[test]
     fn hex_colors_parse_in_every_form() {

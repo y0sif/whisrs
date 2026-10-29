@@ -129,13 +129,26 @@ pub fn run(entry: Entry) -> anyhow::Result<()> {
     let glyphs = Glyphs::detect(&app.env);
     let depth = Depth::detect(&app.env);
     // Asked before raw mode and before anything reads keys, so the answer
-    // cannot be taken for keystrokes. NO_COLOR needs no ground.
+    // is not taken for keystrokes (`Ground::probe` skips it over SSH, where
+    // it can come late). NO_COLOR needs no ground.
     let ground = match depth {
         Depth::NoColor => Ground::default(),
         _ => Ground::probe(&app.env),
     };
 
-    let mut terminal = ratatui::try_init().context("cannot open the terminal")?;
+    let mut terminal = match ratatui::try_init() {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            // Raw mode may be on already, with the alternate screen not.
+            ratatui::restore();
+            return Err(e).context("cannot open the terminal");
+        }
+    };
+    // Whatever arrived before the first frame is not a key for it: a colour
+    // reply that came late would read as Alt+], r, g, b and hex digits.
+    while event::poll(Duration::ZERO)? {
+        event::read()?;
+    }
     let (tx, rx) = mpsc::channel();
     let workers = worker::Workers::start(tx, &app.paths.socket, app.service);
     let result = event_loop(
@@ -253,13 +266,18 @@ fn perform(
 ) -> anyhow::Result<()> {
     while let Some(next) = effect.take() {
         effect = match next {
-            Effect::Save => {
-                let saved = screens::config::save(&app.config, &app.paths);
+            Effect::Save | Effect::SaveOver => {
+                let overwrite = next == Effect::SaveOver;
+                let saved = screens::config::save(&app.config, &app.paths, overwrite);
                 app.update(Msg::Saved(saved))
             }
-            Effect::Restart => {
-                workers.restart();
+            Effect::Restart | Effect::RestartAnyway => {
+                workers.restart(next == Effect::RestartAnyway);
                 None
+            }
+            Effect::Reload => {
+                let reload = screens::config::reload(&app.paths);
+                app.update(Msg::Reloaded(reload))
             }
             Effect::OpenEditor => {
                 match suspend_for_editor(terminal, &app.env, &app.paths.config)? {

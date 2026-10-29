@@ -47,6 +47,10 @@ pub struct Loaded {
     pub fresh: bool,
     /// Unknown keys, an unreadable `vocabulary.txt`, a fresh config.
     pub notices: Vec<Notice>,
+    /// config.toml's bytes as read (`None`: no file), to tell at save
+    /// whether something else wrote it since, such as the daemon's
+    /// `llm-command-set`.
+    pub disk: Option<Vec<u8>>,
 }
 
 /// What a save did.
@@ -54,8 +58,21 @@ pub struct Saved {
     /// config.toml.
     pub path: PathBuf,
     pub warnings: Vec<String>,
+    /// config.toml could not be merged into and was written from scratch.
+    pub regenerated: Option<write::Regenerated>,
     /// Both stores as they are now on disk, to edit on from.
     pub loaded: Loaded,
+}
+
+/// Why a save did not go through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveError {
+    /// Refused or failed: nothing was written, or not all of it.
+    Failed(String),
+    /// config.toml changed on disk since it was read; nothing was written.
+    Changed,
+    /// Written, but reading it back failed.
+    Reread(String),
 }
 
 /// Load config.toml (and `vocabulary.txt`) to edit. A file that cannot be
@@ -85,6 +102,9 @@ pub fn reload(paths: &Paths) -> Result<Loaded, String> {
 }
 
 fn read(paths: &Paths) -> Result<Loaded, (write::UnusableKind, String)> {
+    // Before the load: a write between the two then reads as a change at
+    // save, which only asks.
+    let disk = std::fs::read(&paths.config).ok();
     let (mut config, fresh, unknown) = match write::load_existing_config_from(&paths.config) {
         ExistingConfig::Loaded { config, unknown } => (config, false, unknown),
         ExistingConfig::Unusable { kind, message } => return Err((kind, message)),
@@ -128,6 +148,7 @@ fn read(paths: &Paths) -> Result<Loaded, (write::UnusableKind, String)> {
         vocabulary,
         fresh,
         notices,
+        disk,
     })
 }
 
@@ -140,21 +161,31 @@ fn show_key(path: &str) -> String {
 }
 
 /// Validate the edited config and write it, `vocabulary.txt` by the plan
-/// `write_config_and_vocabulary` makes; then read both back.
-pub fn save(screen: &ConfigScreen, paths: &Paths) -> Result<Saved, String> {
+/// `write_config_and_vocabulary` makes; then read both back. Unless
+/// `overwrite`, a config.toml that changed on disk since it was read is left
+/// alone: writing it would undo what changed it.
+pub fn save(screen: &ConfigScreen, paths: &Paths, overwrite: bool) -> Result<Saved, SaveError> {
+    if !overwrite && std::fs::read(&paths.config).ok() != screen.disk {
+        return Err(SaveError::Changed);
+    }
     let config = screen.form.config();
-    let warnings = config.validate().map_err(|e| one_line(&e.to_string()))?;
-    vocabulary::write_config_and_vocabulary(
+    let warnings = config
+        .validate()
+        .map_err(|e| SaveError::Failed(one_line(&e.to_string())))?;
+    let wrote = vocabulary::write_config_and_vocabulary(
         config,
         &screen.vocabulary,
         &paths.config,
         &paths.vocabulary,
     )
-    .map_err(|e| format!("{e:#}"))?;
-    let loaded = load(paths)?;
+    .map_err(|e| SaveError::Failed(format!("{e:#}")))?;
+    let loaded = read(paths).map_err(|(_, message)| {
+        SaveError::Reread(message.lines().next().unwrap_or_default().to_string())
+    })?;
     Ok(Saved {
         path: paths.config.clone(),
         warnings: warnings.into_iter().map(|w| w.message).collect(),
+        regenerated: wrote.regenerated,
         loaded,
     })
 }
@@ -270,8 +301,10 @@ pub struct ConfigScreen {
     pub form: Form,
     pub vocabulary: VocabularyBaseline,
     pub fresh: bool,
-    /// config.toml stopped loading after `$EDITOR`: `w` is refused.
+    /// config.toml stopped loading after `$EDITOR`: `w` and `r` are refused.
     pub broken: Option<String>,
+    /// config.toml as last read ([`Loaded::disk`]).
+    disk: Option<Vec<u8>>,
     section: usize,
     focus: Focus,
     /// The detail pane's levels, never empty.
@@ -288,6 +321,7 @@ impl ConfigScreen {
             vocabulary: loaded.vocabulary,
             fresh: loaded.fresh,
             broken: None,
+            disk: loaded.disk,
             section: 0,
             focus: Focus::Sections,
             views: vec![View::Section { cursor: 0 }],
@@ -317,6 +351,7 @@ impl ConfigScreen {
         self.form = loaded.form;
         self.vocabulary = loaded.vocabulary;
         self.fresh = loaded.fresh;
+        self.disk = loaded.disk;
         self.broken = None;
         self.editing = None;
         self.clamp();
@@ -708,9 +743,9 @@ impl ConfigScreen {
                 );
             }
             (Kind::Int { .. } | Kind::Float { .. } | Kind::Text { .. }, Action::Enter) => {
+                // The exact value: rounded, an untouched commit would change it.
                 let text = current.map(|v| match v {
                     Value::String(s) => s,
-                    Value::Float(f) => format!("{f:.2}"),
                     other => other.to_string(),
                 });
                 self.editing = Some(Editing {
@@ -1575,7 +1610,7 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
     use super::*;
-    use crate::tui::app::Effect;
+    use crate::tui::app::{Dialog, Effect};
     use crate::tui::testing::{app, app_on, chord, mockup, paths, press, type_text, Fixture};
 
     /// Open section `title` and put the focus on its rows.
@@ -1883,7 +1918,7 @@ mod tests {
         assert_eq!(press(&mut fixture.app, "w"), [Effect::Save]);
 
         let paths = paths(fixture.dir.path());
-        let saved = save(&fixture.app.config, &paths).expect("saves");
+        let saved = save(&fixture.app.config, &paths, false).expect("saves");
         let out = std::fs::read_to_string(&paths.config).unwrap();
         assert!(out.contains("# my config\n[groq]\n"), "{out}");
         assert!(out.contains("# the model\nmodel = \"m\""), "{out}");
@@ -1915,17 +1950,16 @@ mod tests {
         press(&mut fixture.app, " ");
 
         let paths = paths(fixture.dir.path());
-        let refused = save(&fixture.app.config, &paths).map(|_| ());
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|e| e.contains("Deepgram backend selected")),
-            "{refused:?}"
-        );
+        let why = match save(&fixture.app.config, &paths, false) {
+            Err(SaveError::Failed(why)) => why,
+            Err(other) => panic!("refused for another reason: {other:?}"),
+            Ok(_) => panic!("saved an invalid config"),
+        };
+        assert!(why.contains("Deepgram backend selected"), "{why}");
         assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), toml);
         fixture
             .app
-            .update(crate::tui::app::Msg::Saved(refused.map(|_| unreachable!())));
+            .update(crate::tui::app::Msg::Saved(Err(SaveError::Failed(why))));
         let status = fixture.app.status.clone().unwrap();
         assert_eq!(status.tone, Tone::Error);
         assert!(status.text.starts_with("not saved: "), "{}", status.text);
@@ -1955,7 +1989,7 @@ mod tests {
         open(&mut fixture, "General");
         to_row(&mut fixture, "history");
         press(&mut fixture.app, " ");
-        let saved = save(&fixture.app.config, &paths).unwrap();
+        let saved = save(&fixture.app.config, &paths, false).unwrap();
         assert_eq!(
             std::fs::read_to_string(&paths.vocabulary).unwrap(),
             "# mine\nb\n"
@@ -1967,13 +2001,108 @@ mod tests {
         press(&mut fixture.app, "\na");
         type_text(&mut fixture.app, "c");
         press(&mut fixture.app, "\n");
-        save(&fixture.app.config, &paths).unwrap();
+        save(&fixture.app.config, &paths, false).unwrap();
         assert_eq!(
             std::fs::read_to_string(&paths.vocabulary).unwrap(),
             "a\nb\nc\n"
         );
         let out = std::fs::read_to_string(&paths.config).unwrap();
         assert!(out.contains("vocabulary = []"), "{out}");
+    }
+
+    /// A save finds config.toml changed by something else (the daemon's
+    /// `llm-command-set`) and asks: overwrite, load it, or cancel.
+    #[test]
+    fn a_change_on_disk_is_not_overwritten_unasked() {
+        let toml = "[general]\nbackend = \"groq\"\n[groq]\napi_key = \"k\"\n";
+        let mut fixture = app(toml);
+        let paths = paths(fixture.dir.path());
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "history");
+        press(&mut fixture.app, " ");
+        let changed = format!(
+            "{toml}[[llm_commands]]\nname = \"de\"\nhotkey = \"F9\"\ninstruction = \"x\"\n"
+        );
+        std::fs::write(&paths.config, &changed).unwrap();
+
+        let refused = save(&fixture.app.config, &paths, false);
+        assert!(matches!(refused, Err(SaveError::Changed)));
+        assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), changed);
+        fixture.app.update(crate::tui::app::Msg::Saved(refused));
+        assert_eq!(fixture.app.dialog, Some(Dialog::Changed));
+        let drawn = crate::tui::testing::rows(&crate::tui::testing::draw(&fixture.app, 90, 30));
+        assert!(drawn.iter().any(|r| r.contains("changed on disk")));
+
+        // Esc cancels; `w` asks again; `l` loads it, edits dropped.
+        press(&mut fixture.app, "\x1b");
+        assert_eq!(fixture.app.dialog, None);
+        assert!(fixture.app.config.form.is_dirty());
+        assert_eq!(press(&mut fixture.app, "w"), [Effect::Save]);
+        fixture.app.update(crate::tui::app::Msg::Saved(save(
+            &fixture.app.config,
+            &paths,
+            false,
+        )));
+        assert_eq!(press(&mut fixture.app, "l"), [Effect::Reload]);
+        fixture
+            .app
+            .update(crate::tui::app::Msg::Reloaded(reload(&paths)));
+        assert!(!fixture.app.config.form.is_dirty());
+        assert_eq!(config(&fixture).llm_commands.len(), 1);
+
+        // What was loaded is the new baseline: a save goes through.
+        press(&mut fixture.app, "\t");
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "history");
+        press(&mut fixture.app, " ");
+        let saved = save(&fixture.app.config, &paths, false).expect("saves");
+        assert!(saved.loaded.form.config().llm_commands.len() == 1);
+
+        // o overwrites.
+        std::fs::write(&paths.config, toml).unwrap();
+        fixture.app.update(crate::tui::app::Msg::Saved(Ok(saved)));
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "notifications");
+        press(&mut fixture.app, " ");
+        fixture.app.update(crate::tui::app::Msg::Saved(save(
+            &fixture.app.config,
+            &paths,
+            false,
+        )));
+        assert_eq!(press(&mut fixture.app, "o"), [Effect::SaveOver]);
+        save(&fixture.app.config, &paths, true).expect("overwrites");
+        let out = std::fs::read_to_string(&paths.config).unwrap();
+        assert!(out.contains("notify = false"), "{out}");
+    }
+
+    /// While config.toml does not load, `r` is refused too: the daemon
+    /// would start on defaults.
+    #[test]
+    fn r_is_refused_while_the_file_does_not_load() {
+        let mut fixture = app("");
+        fixture.app.config.broken = Some("TOML parse error".into());
+        assert!(press(&mut fixture.app, "r").is_empty());
+        let status = fixture.app.status.clone().unwrap();
+        assert_eq!(status.tone, Tone::Error);
+        assert!(status.text.starts_with("not restarted"), "{}", status.text);
+        fixture.app.config.broken = None;
+        assert_eq!(press(&mut fixture.app, "r"), [Effect::Restart]);
+    }
+
+    /// Enter on a number fills the input with the exact value, so a commit
+    /// without a change changes nothing.
+    #[test]
+    fn a_float_is_edited_from_its_exact_value() {
+        let mut fixture = app("[general]\naudio_feedback_volume = 0.333\n");
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "feedback volume");
+        press(&mut fixture.app, "\n");
+        assert_eq!(
+            fixture.app.config.editing.as_ref().unwrap().input.text(),
+            "0.333"
+        );
+        press(&mut fixture.app, "\n");
+        assert!(!fixture.app.config.form.is_dirty());
     }
 
     // Opening.

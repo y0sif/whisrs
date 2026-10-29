@@ -164,6 +164,12 @@ pub struct DaemonInfo {
     /// When this whisrsd started, in Unix milliseconds: a client that sees
     /// it change knows the daemon restarted.
     pub started_at: u64,
+    /// The dictation lock was held when asked (a dictation starting, a
+    /// command running): `state` is then the last one published, which can
+    /// lag, and the daemon counts as busy.
+    pub busy: bool,
+    /// An agent turn runs: a restart stops it.
+    pub agent_turn: bool,
 }
 
 /// A field of [`DaemonInfo`] that an enum fills: its variant, or `None` for
@@ -1110,6 +1116,8 @@ mod tests {
             backend: "deepgram-streaming".to_string(),
             features: vec!["tray".to_string(), "recording".to_string()],
             started_at: 1_793_000_000_000,
+            busy: true,
+            agent_turn: false,
         }
     }
 
@@ -1130,7 +1138,7 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(
             json,
-            r#"{"status":"info","info":{"version":"0.2.0","state":"recording","recording":"processing","backend":"deepgram-streaming","features":["tray","recording"],"started_at":1793000000000}}"#
+            r#"{"status":"info","info":{"version":"0.2.0","state":"recording","recording":"processing","backend":"deepgram-streaming","features":["tray","recording"],"started_at":1793000000000,"busy":true,"agent_turn":false}}"#
         );
         let parsed: Response = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Response::Info { info } if info == sample_info()));

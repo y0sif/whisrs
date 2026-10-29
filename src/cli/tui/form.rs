@@ -73,6 +73,12 @@ impl Form {
         self.table != self.baseline
     }
 
+    /// What is edited now is what is on disk: a save that could not be read
+    /// back still wrote it.
+    pub fn mark_saved(&mut self) {
+        self.baseline = self.table.clone();
+    }
+
     /// Drop every edit.
     pub fn discard(&mut self) {
         self.table = self.baseline.clone();
