@@ -5,7 +5,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 
-use super::testing::{assert_snapshot, draw, mockup, press, rows, theme, Fixture};
+use super::testing::{assert_snapshot, draw, mockup, mockup_with, press, rows, theme, Fixture};
 
 const SIZES: [(u16, u16); 5] = [(59, 17), (60, 18), (89, 30), (90, 30), (200, 60)];
 
@@ -51,6 +51,25 @@ fn picker_and_hotkey_snapshots() {
         assert_snapshot(
             &format!("hotkey-{w}x{h}"),
             &rows(&draw(&hotkey().app, w, h)),
+        );
+    }
+}
+
+/// Hotkeys with one agent, whose two keys follow the `[hotkeys]` rows.
+fn hotkeys_with_an_agent() -> Fixture {
+    let mut fixture =
+        mockup_with("\n[[agents]]\nname = \"jarvis\"\nhotkey = \"Super+J\"\ndir = \"/tmp\"\n");
+    // Hotkeys is the seventh section; the cursor on the agent's key.
+    press(&mut fixture.app, "jjjjjj\njjjjj");
+    fixture
+}
+
+#[test]
+fn hotkeys_section_snapshots() {
+    for (w, h) in [(60, 18), (90, 30)] {
+        assert_snapshot(
+            &format!("hotkeys-agent-{w}x{h}"),
+            &rows(&draw(&hotkeys_with_an_agent().app, w, h)),
         );
     }
 }
@@ -189,6 +208,7 @@ fn no_size_panics() {
     states.push(list);
     states.push(picker());
     states.push(hotkey());
+    states.push(hotkeys_with_an_agent());
     for fixture in &states {
         for w in [1, 2, 10, 40, 59, 60, 61, 70, 89, 90, 91, 120, 199, 200, 250] {
             for h in [1, 2, 5, 17, 18, 19, 25, 30, 60, 90] {

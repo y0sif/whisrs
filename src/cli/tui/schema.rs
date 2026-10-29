@@ -15,6 +15,10 @@ pub struct Section {
     /// Built without this feature, the section says so instead of showing
     /// its rows, and the file keeps the section as it is.
     pub gate: Option<Gate>,
+    /// After its rows, every entry's hotkeys (`[[agents]]`,
+    /// `[[llm_commands]]`), so one section shows every binding. They are
+    /// the entries' own keys, not copies.
+    pub entry_hotkeys: bool,
 }
 
 /// What a section holds.
@@ -304,9 +308,22 @@ fn check_url(input: &str) -> Result<String, String> {
     Ok(input.to_string())
 }
 
-/// A language as `-l` takes it, stored normalized.
+/// A language as `-l` takes it, stored normalized, and one whisrs knows:
+/// `auto`, `multi` (Deepgram), or a tag whose primary subtag is in the
+/// language table (`en-US`, `zh-Hans`). `-l` itself stays structural
+/// (`validate_language_override`): backends accept different sets.
 fn check_language(input: &str) -> Result<String, String> {
-    whisrs::validate_language_override(input)
+    let tag = whisrs::validate_language_override(input)?;
+    let primary = tag.split('-').next().unwrap_or_default();
+    if matches!(tag.as_str(), "auto" | "multi")
+        || catalog::find(catalog::LANGUAGES, primary).is_some()
+    {
+        return Ok(tag);
+    }
+    Err(format!(
+        "{tag} is not a language whisrs knows: pick one from the list (e edits the file for \
+         anything else)"
+    ))
 }
 
 /// A language openai-realtime is told to expect: a code, since `auto` and
@@ -1234,71 +1251,85 @@ pub const SECTIONS: &[Section] = &[
         title: "General",
         body: Body::Rows(GENERAL),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "Backend & keys",
         body: Body::Rows(BACKEND),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "Audio",
         body: Body::Rows(AUDIO),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "Vocabulary",
         body: Body::Rows(VOCABULARY),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "Replacements",
         body: Body::Map(&REPLACEMENTS),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "Typing",
         body: Body::Rows(TYPING),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "Hotkeys",
         body: Body::Rows(HOTKEYS),
         gate: None,
+        entry_hotkeys: true,
     },
     Section {
         title: "Overlay",
         body: Body::Rows(OVERLAY),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "Read aloud (TTS)",
         body: Body::Rows(TTS),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "Agents",
         body: Body::Entries(&AGENTS),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "LLM",
         body: Body::Rows(LLM),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "LLM commands",
         body: Body::Entries(&LLM_COMMANDS),
         gate: None,
+        entry_hotkeys: false,
     },
     Section {
         title: "Recording",
         body: Body::Rows(RECORDING),
         gate: Some(Gate::Recording),
+        entry_hotkeys: false,
     },
     Section {
         title: "Hooks",
         body: Body::Rows(HOOKS),
         gate: None,
+        entry_hotkeys: false,
     },
 ];
 
@@ -1854,6 +1885,23 @@ mod tests {
         assert!(check_url("127.0.0.1:8770").is_err());
         assert_eq!(check_language("DE"), Ok("de".into()));
         assert!(check_language("german").is_err());
+        // Well-formed is not enough: the primary subtag must be a known code.
+        assert_eq!(
+            check_language("zz"),
+            Err(
+                "zz is not a language whisrs knows: pick one from the list (e edits the \
+                 file for anything else)"
+                    .into()
+            )
+        );
+        assert!(check_language("zz-US").is_err());
+        assert_eq!(check_language("en_us"), Ok("en-US".into()));
+        assert_eq!(check_language("pt-BR"), Ok("pt-BR".into()));
+        assert_eq!(check_language("zh-Hans"), Ok("zh-Hans".into()));
+        assert_eq!(check_language("yue"), Ok("yue".into()));
+        assert_eq!(check_language("Multi"), Ok("multi".into()));
+        assert_eq!(check_language("auto"), Ok("auto".into()));
+        assert!(check_expected_language("zz").is_err());
         assert_eq!(check_expected_language("UK"), Ok("uk".into()));
         assert!(check_expected_language("auto").is_err());
         assert!(check_expected_language("Multi").is_err());

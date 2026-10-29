@@ -292,6 +292,9 @@ enum Item {
     Pair(String),
     /// Item `index` of the list being edited.
     Element(usize),
+    /// A group's title among the rows (the Hotkeys section's `Agents`);
+    /// the cursor passes over it.
+    Heading(&'static str),
 }
 
 /// What is being typed.
@@ -556,7 +559,10 @@ impl ConfigScreen {
                 query.is_empty()
                     || section.title.to_lowercase().contains(&query)
                     || match section.body {
-                        Body::Rows(fields) => fields.iter().any(|f| self.passes(section, f)),
+                        Body::Rows(fields) => {
+                            fields.iter().any(|f| self.passes(section, f))
+                                || (section.entry_hotkeys && !self.entry_hotkeys().is_empty())
+                        }
                         Body::Entries(entries) => entries.path.contains(&query),
                         Body::Map(map) => map.path.contains(&query),
                     }
@@ -570,14 +576,20 @@ impl ConfigScreen {
         match self.view() {
             _ if !self.built() => Vec::new(),
             View::Section { .. } => match section.body {
-                Body::Rows(fields) => fields
-                    .iter()
-                    .filter(|f| self.passes(section, f))
-                    .map(|field| Item::Field {
-                        field,
-                        path: field.path.to_string(),
-                    })
-                    .collect(),
+                Body::Rows(fields) => {
+                    let mut items: Vec<Item> = fields
+                        .iter()
+                        .filter(|f| self.passes(section, f))
+                        .map(|field| Item::Field {
+                            field,
+                            path: field.path.to_string(),
+                        })
+                        .collect();
+                    if section.entry_hotkeys {
+                        items.extend(self.entry_hotkeys());
+                    }
+                    items
+                }
                 Body::Entries(entries) => (0..self.form.entries(entries.path).len())
                     .map(Item::Entry)
                     .collect(),
@@ -596,6 +608,61 @@ impl ConfigScreen {
             }
             View::List { path, .. } => (0..self.list(path).len()).map(Item::Element).collect(),
         }
+    }
+
+    /// Every entry's hotkey rows, a heading per list that has entries:
+    /// the entries' own keys, edited here as in their forms.
+    fn entry_hotkeys(&self) -> Vec<Item> {
+        let query = self.filter.to_lowercase();
+        let mut items = Vec::new();
+        for section in SECTIONS {
+            let Body::Entries(entries) = section.body else {
+                continue;
+            };
+            let mut rows = Vec::new();
+            for index in 0..self.form.entries(entries.path).len() {
+                for field in entries.fields {
+                    if !matches!(field.kind, Kind::Hotkey { .. }) {
+                        continue;
+                    }
+                    let path = format!("{}.{index}.{}", entries.path, field.path);
+                    let label = self.entry_label(field, &path);
+                    if query.is_empty()
+                        || "hotkeys".contains(&query)
+                        || field.label.contains(&query)
+                        || label.to_lowercase().contains(&query)
+                    {
+                        rows.push(Item::Field { field, path });
+                    }
+                }
+            }
+            if !rows.is_empty() {
+                items.push(Item::Heading(section.title));
+                items.extend(rows);
+            }
+        }
+        items
+    }
+
+    /// An entry's hotkey row as the Hotkeys section labels it: the entry's
+    /// name (`jarvis`, `jarvis new session`, `translate-de set`).
+    fn entry_label(&self, field: &Field, path: &str) -> String {
+        let Some((list, index)) = entry_index(path) else {
+            return field.label.to_string();
+        };
+        let name = self.name_of(list, index);
+        match field.path {
+            "hotkey" => name,
+            "new_session_hotkey" => format!("{name} new session"),
+            "set_hotkey" => format!("{name} set"),
+            other => format!("{name} {other}"),
+        }
+    }
+
+    /// Whether `path` is an entry's key shown outside its form (the Hotkeys
+    /// section).
+    fn borrowed(&self, path: &str) -> bool {
+        matches!(self.view(), View::Section { .. }) && entry_index(path).is_some()
     }
 
     fn list(&self, path: &str) -> Vec<String> {
@@ -645,9 +712,10 @@ impl ConfigScreen {
                 _ => true,
             });
         }
-        let len = self.items().len();
+        let items = self.items();
         let view = self.view_mut();
-        view.set_cursor(view.cursor().min(len.saturating_sub(1)));
+        let at = view.cursor().min(items.len().saturating_sub(1));
+        view.set_cursor(past_headings(&items, at, at));
     }
 
     /// Show section `to`, its own rows first.
@@ -744,6 +812,7 @@ impl ConfigScreen {
             }
             _ => return self.item_key(action, items.get(cursor).cloned()),
         };
+        let to = past_headings(&items, cursor, to);
         self.view_mut().set_cursor(to);
         Outcome {
             load: self.prefetch(),
@@ -1228,12 +1297,9 @@ impl ConfigScreen {
 
     /// The hotkey dialog's title: `toggle hotkey`, `jarvis hotkey`.
     fn hotkey_title(&self, field: &Field, path: &str) -> String {
-        match path.split('.').collect::<Vec<_>>().as_slice() {
-            [list, index, _] => {
-                let name = self.name_of(list, index.parse().unwrap_or(0));
-                format!("{name} {}", field.label)
-            }
-            _ => format!("{} hotkey", field.label),
+        match entry_index(path) {
+            Some((list, index)) => format!("{} {}", self.name_of(list, index), field.label),
+            None => format!("{} hotkey", field.label),
         }
     }
 
@@ -1538,6 +1604,41 @@ impl ConfigScreen {
 
 /// What a row whose worker list is not here yet says.
 const LOOKING: &str = "looking...";
+
+/// The list and the entry an entry's key is in (`agents.0.hotkey`); `None`
+/// for a key of a section (`overlay.colors.ring`).
+fn entry_index(path: &str) -> Option<(&str, usize)> {
+    match path.split('.').collect::<Vec<_>>().as_slice() {
+        [list, index, _] => Some((list, index.parse().ok()?)),
+        _ => None,
+    }
+}
+
+/// `text` with its first letter lower case, to follow a colon.
+fn lower_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// `to`, or past it when it is a heading: on in the way the cursor moved,
+/// else back. A heading is never where the cursor stops.
+fn past_headings(items: &[Item], from: usize, to: usize) -> usize {
+    let row = |i: &usize| !matches!(items.get(*i), Some(Item::Heading(_)));
+    if row(&to) {
+        return to;
+    }
+    let after = (to..items.len()).find(row);
+    let before = (0..to).rev().find(row);
+    let found = if to >= from {
+        after.or(before)
+    } else {
+        before.or(after)
+    };
+    found.unwrap_or(from)
+}
 
 /// A value that means what unset means for `path`: `system_device =
 /// "default"` is the default output's monitor, as no key is.
@@ -1904,12 +2005,14 @@ fn describe(screen: &ConfigScreen, item: &Item, env: &Env, ui: &Ui) -> (String, 
                     ..Look::default()
                 },
             };
-            (
-                field.label.to_string(),
-                shown(screen, field, path, env, ui),
-                look,
-            )
+            let label = if screen.borrowed(path) {
+                screen.entry_label(field, path)
+            } else {
+                field.label.to_string()
+            };
+            (label, shown(screen, field, path, env, ui), look)
         }
+        Item::Heading(title) => (title.to_string(), Shown::default(), Look::default()),
         Item::Entry(index) => {
             let entries = screen.entries().expect("entries");
             let parts: Vec<(String, Tone)> = entries
@@ -1965,6 +2068,22 @@ fn help(screen: &ConfigScreen, item: Option<&Item>) -> String {
             "a adds an item from a list, enter picks another, d deletes it.".to_string()
         }
         (View::List { .. }, _) => "a adds an item, enter edits it, d deletes it.".to_string(),
+        (_, Some(Item::Field { field, path })) if screen.borrowed(path) => {
+            let (list, index) = entry_index(path).unwrap_or_default();
+            let (noun, title) = SECTIONS
+                .iter()
+                .find_map(|s| match s.body {
+                    Body::Entries(entries) if entries.path == list => Some((entries.noun, s.title)),
+                    _ => None,
+                })
+                .unwrap_or(("entry", "its section"));
+            let name = screen.name_of(list, index);
+            format!(
+                "The {label} of {noun} {name}: {help} Its other settings are under {title}.",
+                label = field.label,
+                help = lower_first(field.help),
+            )
+        }
         (_, Some(Item::Field { field, path })) => {
             let mut text = field.help.to_string();
             if let Some(gate) = field.gate.filter(|gate| !gate.built()) {
@@ -2241,9 +2360,12 @@ fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
         Target::EntryName => Some(("name", &e.input)),
         _ => None,
     });
+    // A heading is not lined up with the rows' labels.
     let label_width = rows
         .iter()
-        .map(|(label, _, _)| width(label))
+        .zip(&items)
+        .filter(|(_, item)| !matches!(item, Item::Heading(_)))
+        .map(|((label, _, _), _)| width(label))
         .chain(new_row.map(|(label, _)| width(label)))
         .max()
         .map_or(0, |w| if w == 0 { 0 } else { (w + 2).min(MAX_LABEL) });
@@ -2293,6 +2415,20 @@ fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
     };
     for (i, (label, value, look)) in rows.into_iter().enumerate().skip(offset).take(height) {
         let item = &items[i];
+        let y = top + (i - offset) as u16;
+        if let Item::Heading(title) = item {
+            // The title, then a rule to the edge: a group, not a row.
+            let title = fit(title, text_width, ui.glyphs.ellipsis);
+            let rule = text_width.saturating_sub(width(&title) + 1);
+            let line = Line::from(vec![
+                Span::raw("  "),
+                Span::styled(title, ui.theme.muted),
+                Span::raw(" "),
+                Span::styled(ui.glyphs.frame.horizontal_top.repeat(rule), ui.theme.faint),
+            ]);
+            f.render_widget(line, Rect::new(area.x, y, area.width, 1));
+            continue;
+        }
         let row = Row {
             focused: focused && i == cursor && new_row.is_none(),
             choice: look.arrows,
@@ -2305,7 +2441,6 @@ fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
             input: input_on(item),
             ..Row::new(&label, value)
         };
-        let y = top + (i - offset) as u16;
         row.draw(
             Rect::new(area.x, y, area.width, 1),
             f.buffer_mut(),
@@ -3784,6 +3919,199 @@ mod tests {
         assert!(drawn(&fixture)
             .iter()
             .any(|r| r.contains("claude not on PATH")));
+    }
+
+    /// A typed language must be one whisrs knows: `zz` is refused in the
+    /// picker, a region tag of a known code and `multi` are taken.
+    #[test]
+    fn a_typed_language_must_be_known() {
+        let mut fixture = app("");
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "language");
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, "zz");
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Picker);
+        let said = status(&fixture);
+        assert_eq!(said.tone, Tone::Error);
+        assert!(
+            said.text.contains("zz is not a language whisrs knows"),
+            "{}",
+            said.text
+        );
+        press(&mut fixture.app, "\x1b");
+        assert_eq!(config(&fixture).general.language, "en");
+        for (typed, stored) in [("en-US", "en-US"), ("multi", "multi")] {
+            press(&mut fixture.app, "\n");
+            type_text(&mut fixture.app, typed);
+            // The typed value's row is the last one.
+            chord(&mut fixture.app, KeyCode::End, KeyModifiers::NONE);
+            press(&mut fixture.app, "\n");
+            assert_eq!(config(&fixture).general.language, stored, "{typed}");
+        }
+    }
+
+    /// Move the cursor to the row whose key is `path`.
+    fn to_path(fixture: &mut Fixture, path: &str) {
+        press(&mut fixture.app, "g");
+        for _ in 0..40 {
+            let screen = &fixture.app.config;
+            let at = screen.items().get(screen.view().cursor()).cloned();
+            if matches!(at, Some(Item::Field { path: ref p, .. }) if p == path) {
+                return;
+            }
+            press(&mut fixture.app, "j");
+        }
+        panic!("no row {path}");
+    }
+
+    fn labels(fixture: &Fixture) -> Vec<String> {
+        let screen = &fixture.app.config;
+        screen
+            .items()
+            .iter()
+            .map(|item| describe(screen, item, &fixture.app.env, &ui()).0)
+            .collect()
+    }
+
+    fn ui() -> Ui<'static> {
+        static THEME: std::sync::OnceLock<crate::tui::theme::Theme> = std::sync::OnceLock::new();
+        Ui {
+            theme: THEME.get_or_init(crate::tui::testing::theme),
+            glyphs: &crate::tui::glyphs::Glyphs::UNICODE,
+        }
+    }
+
+    /// With no entries, Hotkeys is its `[hotkeys]` rows, as before.
+    #[test]
+    fn hotkeys_without_entries_are_the_hotkeys_rows() {
+        let mut fixture = app("");
+        open(&mut fixture, "Hotkeys");
+        let paths: Vec<String> = fixture
+            .app
+            .config
+            .items()
+            .iter()
+            .map(|item| match item {
+                Item::Field { path, .. } => path.clone(),
+                _ => panic!("not a row"),
+            })
+            .collect();
+        let rows: Vec<String> = SECTIONS
+            .iter()
+            .find(|s| s.title == "Hotkeys")
+            .map(|s| match s.body {
+                Body::Rows(fields) => fields.iter().map(|f| f.path.to_string()).collect(),
+                _ => Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(paths, rows);
+    }
+
+    /// Every binding shows in Hotkeys: each agent's and command's keys,
+    /// under a heading, named by the entry.
+    #[test]
+    fn hotkeys_show_every_entrys_keys() {
+        let mut fixture = app(
+            "[[agents]]\nname = \"jarvis\"\n[[llm_commands]]\nname = \"translate-de\"\n\
+             hotkey = \"F9\"\ninstruction = \"x\"\n",
+        );
+        open(&mut fixture, "Hotkeys");
+        let labels = labels(&fixture);
+        assert_eq!(
+            labels[5..],
+            [
+                "Agents",
+                "jarvis",
+                "jarvis new session",
+                "LLM commands",
+                "translate-de",
+                "translate-de set",
+            ]
+        );
+        // The cursor passes over the headings, both ways.
+        to_path(&mut fixture, "hotkeys.recording");
+        press(&mut fixture.app, "j");
+        let screen = &fixture.app.config;
+        assert!(matches!(
+            screen.items().get(screen.view().cursor()),
+            Some(Item::Field { path, .. }) if path == "agents.0.hotkey"
+        ));
+        press(&mut fixture.app, "k");
+        let screen = &fixture.app.config;
+        assert!(matches!(
+            screen.items().get(screen.view().cursor()),
+            Some(Item::Field { path, .. }) if path == "hotkeys.recording"
+        ));
+    }
+
+    /// An agent's key set from Hotkeys is the agent's own: its form shows
+    /// it, a save writes it under [[agents]], and x resets it.
+    #[test]
+    fn an_agent_hotkey_set_from_hotkeys_is_the_agents_own() {
+        let mut fixture = app(
+            "[general]\nbackend = \"groq\"\n[groq]\napi_key = \"k\"\n[[agents]]\nname =              \"jarvis\"\ndir = \"/tmp\"\n",
+        );
+        open(&mut fixture, "Hotkeys");
+        to_path(&mut fixture, "agents.0.hotkey");
+        press(&mut fixture.app, "\n");
+        assert_eq!(mode(&fixture), Mode::Hotkey);
+        assert!(drawn(&fixture).iter().any(|r| r.contains("jarvis hotkey")));
+        press(&mut fixture.app, "t");
+        type_text(&mut fixture.app, "Super+J");
+        press(&mut fixture.app, "\n");
+        assert_eq!(
+            config(&fixture).agents[0].hotkey.as_deref(),
+            Some("Super+J")
+        );
+
+        // The agent's form shows it.
+        open(&mut fixture, "Agents");
+        press(&mut fixture.app, "\n");
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("hotkey") && r.contains("Super+J")));
+        // An edit there shows in Hotkeys.
+        to_row(&mut fixture, "new session key");
+        press(&mut fixture.app, "\nt");
+        type_text(&mut fixture.app, "Super+Shift+J");
+        press(&mut fixture.app, "\n\x1b");
+        open(&mut fixture, "Hotkeys");
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("jarvis new session") && r.contains("Super+Shift+J")));
+
+        let paths = paths(fixture.dir.path());
+        save(&fixture.app.config, &paths, false).expect("saves");
+        let out = std::fs::read_to_string(&paths.config).unwrap();
+        assert!(out.contains("[[agents]]"), "{out}");
+        assert!(out.contains("hotkey = \"Super+J\""), "{out}");
+        assert!(!out.contains("[hotkeys]"), "{out}");
+
+        to_path(&mut fixture, "agents.0.hotkey");
+        press(&mut fixture.app, "x");
+        assert_eq!(config(&fixture).agents[0].hotkey, None);
+    }
+
+    /// An agent's key that a [hotkeys] row has too warns, in the dialog
+    /// and after.
+    #[test]
+    fn an_agent_hotkey_clash_with_a_hotkeys_row_warns() {
+        let mut fixture = app("[hotkeys]\ntoggle = \"Alt+D\"\n[[agents]]\nname = \"jarvis\"\n");
+        open(&mut fixture, "Hotkeys");
+        to_path(&mut fixture, "agents.0.hotkey");
+        press(&mut fixture.app, "\n");
+        // Alt, then D from the key picker.
+        press(&mut fixture.app, "\t\t ");
+        press(&mut fixture.app, "\t\t\n");
+        type_text(&mut fixture.app, "d");
+        press(&mut fixture.app, "\n");
+        assert!(drawn(&fixture)
+            .iter()
+            .any(|r| r.contains("Alt+D is already toggle")));
+        press(&mut fixture.app, "\n");
+        assert_eq!(config(&fixture).agents[0].hotkey.as_deref(), Some("Alt+D"));
+        assert_eq!(status(&fixture).text, "Alt+D is also toggle");
     }
 
     /// Built without the recording feature, Recording says so and keeps

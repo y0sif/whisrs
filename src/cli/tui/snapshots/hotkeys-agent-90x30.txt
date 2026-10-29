@@ -1,0 +1,30 @@
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                         config · ●  │
+   │                                                                                  │
+   │   General                 toggle              Alt+D                              │
+   │   Backend & keys          cancel              not set                            │
+   │   Audio                   command             not set                            │
+   │   Vocabulary              speak               not set                            │
+   │   Replacements            recording           Alt+Shift+M                        │
+   │   Typing                  Agents ──────────────────────────────────────────────  │
+   │   Hotkeys               ▌ jarvis              Super+J                            │
+   │   Overlay                 jarvis new session  not set                            │
+   │   Read aloud (TTS)                                                               │
+   │   Agents  1               The hotkey of agent jarvis: records a voice turn for   │
+   │   LLM                     this agent. Its other settings are under Agents.       │
+   │   LLM commands                                                                   │
+   │   Recording                                                                      │
+   │   Hooks                                                                          │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k move · tab pane · enter set · w save · e $EDITOR · / filter · ? help

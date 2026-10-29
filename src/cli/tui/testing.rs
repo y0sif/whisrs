@@ -77,7 +77,13 @@ recording = "Alt+Shift+M"
 /// The mockups' app: [`MOCKUP`], a Groq key in this shell, and a daemon
 /// that answered `info`.
 pub fn mockup() -> Fixture {
-    let mut fixture = app_on(Some(MOCKUP), &[("WHISRS_GROQ_API_KEY", "gsk_live_1234")]);
+    mockup_with("")
+}
+
+/// [`mockup`] with `extra` after [`MOCKUP`]'s text.
+pub fn mockup_with(extra: &str) -> Fixture {
+    let toml = format!("{MOCKUP}{extra}");
+    let mut fixture = app_on(Some(&toml), &[("WHISRS_GROQ_API_KEY", "gsk_live_1234")]);
     let info = DaemonInfo {
         version: "0.2.0".into(),
         state: Some(State::Idle),

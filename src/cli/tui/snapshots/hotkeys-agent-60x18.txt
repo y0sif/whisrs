@@ -1,0 +1,18 @@
+   ╭────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                           config · ●  │
+   │                                                    │
+   │   Hotkeys                                          │
+   │                                                    │
+   │   speak               not set                      │
+   │   recording           Alt+Shift+M                  │
+   │   Agents ────────────────────────────────────────  │
+   │ ▌ jarvis              Super+J                      │
+   │                                                    │
+   │   The hotkey of agent jarvis: records a voice      │
+   │   turn for this agent. Its other settings are      │
+   │   under Agents.                                    │
+   │                                                    │
+   │   ! unknown key [general] silense_timeout_ms is    │
+   │     ignored                                        │
+   ╰────────────────────────────────────────────────────╯
+     j/k move · tab pane · enter set · w save · ? help
