@@ -1,16 +1,19 @@
 //! Setup: the onboarding wizard behind `whisrs setup`. One step at a time:
 //! the backend, its key (or model, or server), the language, the microphone,
-//! the extras, the typing backend, the LLM for command mode, a review that
-//! writes config.toml, and the checks of the machine (uinput, the service,
-//! a keybinding, the GNOME extension).
+//! the extras, the typing backend, then the optional modes (recording,
+//! command mode, read aloud, Jarvis), a review that writes config.toml, and
+//! the checks of the machine (uinput, the service, a keybinding, the GNOME
+//! extension).
 //!
 //! Every answer is a Config row, edited with Config's own editors: the
 //! wizard pins a step's rows on a [`ConfigScreen`] of its own, over a form
 //! that starts from the defaults. `Enter` goes on, `Backspace` back, `Space`
 //! opens a row's picker or input (`h`/`l` change it in place), `t` tests a
-//! key, `s` skips an optional step. Writing goes through Config's save, so
-//! its checks and refusals hold here too.
+//! key, `s` skips an optional step. An optional step asks first whether to
+//! set its mode up; skipped, none of its keys are written. Writing goes
+//! through Config's save, so its checks and refusals hold here too.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ratatui::layout::Rect;
@@ -21,7 +24,7 @@ use ratatui::Frame;
 use toml::Value;
 use whisrs::config::catalog::{self, WhisperModel};
 use whisrs::config::keys::{self, KeySummary};
-use whisrs::config::setup::key_test::{Target, Tested};
+use whisrs::config::setup::key_test::{Provider, Target, Tested};
 use whisrs::config::setup::keybind::{self, Binding, Compositor};
 use whisrs::config::setup::model::{self, DownloadError};
 use whisrs::config::setup::uinput::Uinput;
@@ -30,7 +33,7 @@ use whisrs::service::ServiceManager;
 
 use crate::tui::app::{App, Dialog, Effect};
 use crate::tui::keys::{Action, Mode};
-use crate::tui::options::{self, Listed, Loading, Options, Pick};
+use crate::tui::options::{self, Listed, Loading, ModelFile, Options, Pick};
 use crate::tui::schema::{self, Field, Gate, Kind, ListKind};
 use crate::tui::screens::config::{self, ConfigScreen, Loaded, Outcome, Pane, Test};
 use crate::tui::widgets::frame::{self, Header};
@@ -38,16 +41,16 @@ use crate::tui::widgets::picker::{self, Picked, Picker};
 use crate::tui::widgets::row::{Row, Value as Shown};
 use crate::tui::widgets::{fit, progress, wrap, Notice, Tone, Ui};
 use crate::tui::worker::Download;
-use crate::tui::{tilde, Env};
-
-/// The numbered steps.
-pub const STEPS: usize = 9;
+use crate::tui::{complete, tilde, Env};
 
 /// The label column of setup's own rows.
 const LABEL_WIDTH: usize = 12;
 
+/// What `t` on read aloud says, with the voice picked.
+pub const SAMPLE: &str = "This is how whisrs reads your text aloud.";
+
 /// A step of the wizard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
     /// A config is on disk: start fresh, or only check the machine.
     Existing,
@@ -58,55 +61,138 @@ pub enum Step {
     Mic,
     Extras,
     Typing,
-    Llm,
+    /// Recording (optional, in a build with it): `[recording]`.
+    Recording,
+    /// Command mode (optional): `[llm]` and its hotkey.
+    Command,
+    /// Read aloud (optional): `[tts]` and its hotkey.
+    ReadAloud,
+    /// Jarvis (optional): one `[[agents]]` entry.
+    Jarvis,
     Review,
     Checks,
 }
 
 impl Step {
-    /// Its number of [`STEPS`]; the first question has none.
+    /// The numbered steps, in order: recording only in a build with it.
+    pub fn all() -> Vec<Step> {
+        let mut steps = vec![
+            Step::Backend,
+            Step::Key,
+            Step::Language,
+            Step::Mic,
+            Step::Extras,
+            Step::Typing,
+        ];
+        if Gate::Recording.built() {
+            steps.push(Step::Recording);
+        }
+        steps.extend([
+            Step::Command,
+            Step::ReadAloud,
+            Step::Jarvis,
+            Step::Review,
+            Step::Checks,
+        ]);
+        steps
+    }
+
+    /// How many numbered steps there are.
+    pub fn count() -> usize {
+        Step::all().len()
+    }
+
+    /// Its number in [`Step::all`]; the first question has none.
     pub fn number(self) -> Option<usize> {
-        Some(match self {
-            Step::Existing => return None,
-            Step::Backend => 1,
-            Step::Key => 2,
-            Step::Language => 3,
-            Step::Mic => 4,
-            Step::Extras => 5,
-            Step::Typing => 6,
-            Step::Llm => 7,
-            Step::Review => 8,
-            Step::Checks => 9,
-        })
+        Step::all().iter().position(|s| *s == self).map(|at| at + 1)
     }
 
     fn after(self) -> Option<Step> {
-        Some(match self {
-            Step::Existing | Step::Checks => return None,
-            Step::Backend => Step::Key,
-            Step::Key => Step::Language,
-            Step::Language => Step::Mic,
-            Step::Mic => Step::Extras,
-            Step::Extras => Step::Typing,
-            Step::Typing => Step::Llm,
-            Step::Llm => Step::Review,
-            Step::Review => Step::Checks,
-        })
+        let all = Step::all();
+        let at = all.iter().position(|s| *s == self)?;
+        all.get(at + 1).copied()
     }
 
-    /// A step whose answers go into config.toml.
+    /// A step whose answers go into config.toml, whatever is chosen there.
     fn answers(self) -> bool {
         matches!(
             self,
-            Step::Backend
-                | Step::Key
-                | Step::Language
-                | Step::Mic
-                | Step::Extras
-                | Step::Typing
-                | Step::Llm
+            Step::Backend | Step::Key | Step::Language | Step::Mic | Step::Extras | Step::Typing
         )
     }
+
+    /// An optional step: it asks first whether to set its mode up.
+    pub fn optional(self) -> bool {
+        matches!(
+            self,
+            Step::Recording | Step::Command | Step::ReadAloud | Step::Jarvis
+        )
+    }
+
+    /// What config.toml calls the optional step's keys.
+    fn section(self) -> &'static str {
+        match self {
+            Step::Recording => "[recording]",
+            Step::Command => "[llm]",
+            Step::ReadAloud => "[tts]",
+            Step::Jarvis => "[[agents]]",
+            _ => "",
+        }
+    }
+
+    /// The optional step's mode, as messages name it.
+    fn mode(self) -> &'static str {
+        match self {
+            Step::Recording => "recording",
+            Step::Command => "command mode",
+            Step::ReadAloud => "read aloud",
+            Step::Jarvis => "Jarvis",
+            _ => "",
+        }
+    }
+
+    /// Every answer the optional step can change: what Set it up keeps, to
+    /// put back on a skip.
+    fn paths(self) -> &'static [&'static str] {
+        match self {
+            Step::Recording => &[
+                "recording.user_name",
+                "recording.backend",
+                "hotkeys.recording",
+                "groq.api_key",
+                "openai.api_key",
+                "deepgram.api_key",
+            ],
+            Step::Command => &["llm.api_url", "llm.model", "llm.api_key", "hotkeys.command"],
+            Step::ReadAloud => &[
+                "tts.enabled",
+                "tts.backend",
+                "tts.model",
+                "tts.voice",
+                "tts.url",
+                "tts.api_key",
+                "hotkeys.speak",
+            ],
+            Step::Jarvis => &["agents"],
+            _ => &[],
+        }
+    }
+}
+
+/// The answers an optional step's Set it up may change, as they were
+/// before it: what a skip puts back.
+type Before = Vec<(String, Option<Value>)>;
+
+/// The read-aloud sample: playing, or how it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sample {
+    /// Being said, as sample `id`.
+    Playing {
+        id: u64,
+    },
+    Said,
+    Stopped,
+    Failed(String),
 }
 
 /// The config on disk when setup opened (or last wrote it).
@@ -128,6 +214,8 @@ pub struct Downloading {
     /// `[local-whisper] model_path` and the model picked before it, put
     /// back when the download does not finish.
     before: (Option<Value>, usize),
+    /// Started by `Enter`: the wizard goes on once it is done.
+    go_on: bool,
 }
 
 /// What the machine looks like for the last step.
@@ -204,6 +292,9 @@ pub struct Reply {
     /// A download stopped on screen whose worker may still be writing its
     /// `.part`: its id and that `.part`, for the way out.
     pub orphan: Option<(u64, PathBuf)>,
+    /// The step (or an optional step's phase) changed: a status the
+    /// change did not set itself is cleared.
+    pub moved: bool,
 }
 
 impl Reply {
@@ -247,10 +338,18 @@ pub struct Setup {
     pub written: bool,
     /// The answers started fresh (not only the checks).
     pub fresh: bool,
-    /// The LLM step was skipped: its keys stay as the file has them.
-    skipped_llm: bool,
+    /// The optional steps set up, each with its answers as they were
+    /// before: a skip puts them back. A step not here is skipped, and its
+    /// keys stay as the file has them.
+    set_up: BTreeMap<Step, Before>,
+    /// The optional step shows its rows, not its question.
+    filling: bool,
     /// The key test of the step.
     pub test: Option<Test>,
+    /// The read-aloud sample.
+    pub sample: Option<Sample>,
+    /// The id of the last sample started.
+    samples: u64,
     pub spin: usize,
     pub download: Option<Downloading>,
     /// Into [`catalog::WHISPER_MODELS`].
@@ -289,8 +388,11 @@ impl Setup {
             cursor: 0,
             written: false,
             fresh: false,
-            skipped_llm: false,
+            set_up: BTreeMap::new(),
+            filling: false,
             test: None,
+            sample: None,
+            samples: 0,
             spin: 0,
             download: None,
             model,
@@ -304,7 +406,8 @@ impl Setup {
         if setup.existing.is_none() {
             setup.fresh = true;
             setup.step = Step::Backend;
-            setup.editor.pin(setup.fields());
+            let rows = setup.rows();
+            setup.editor.pin_at(rows);
         }
         setup
     }
@@ -340,12 +443,16 @@ impl Setup {
         if self.written {
             return self.editor.form.is_dirty();
         }
-        self.editor.form.is_dirty() || self.back.iter().any(|s| s.answers())
+        self.editor.form.is_dirty()
+            || self.back.iter().any(|s| s.answers())
+            || !self.set_up.is_empty()
     }
 
-    /// Whether something is moving on screen: a test or the checks.
+    /// Whether something is moving on screen: a test, the sample or the
+    /// checks.
     pub fn spinning(&self) -> bool {
         self.test == Some(Test::Running)
+            || matches!(self.sample, Some(Sample::Playing { .. }))
             || (self.step == Step::Checks && self.checks.is_none())
             || self.editor.tests.values().any(|t| *t == Test::Running)
     }
@@ -354,14 +461,19 @@ impl Setup {
         self.editor.form.config().general.backend.clone()
     }
 
-    /// The rows of the step, from the schema.
-    fn fields(&self) -> Vec<&'static Field> {
-        self.fields_of(self.step)
+    /// The rows on screen now: none while an optional step asks its
+    /// question.
+    fn rows(&self) -> Vec<(&'static Field, String)> {
+        if self.step.optional() && !self.filling {
+            return Vec::new();
+        }
+        self.rows_of(self.step)
     }
 
-    /// The rows of `step`, for the backend as answered.
-    fn fields_of(&self, step: Step) -> Vec<&'static Field> {
-        let f = schema::row;
+    /// The rows of `step`, each at its path, for the answers as they are.
+    fn rows_of(&self, step: Step) -> Vec<(&'static Field, String)> {
+        let f = |path: &str| (schema::row(path), path.to_string());
+        let hotkey = |path: &str| (schema::mode_hotkey(path), path.to_string());
         match step {
             Step::Backend => vec![f("general.backend")],
             Step::Key => match self.backend().as_str() {
@@ -399,9 +511,105 @@ impl Setup {
                 rows
             }
             Step::Typing => vec![f("input.backend")],
-            Step::Llm => vec![f("llm.api_url"), f("llm.model"), f("llm.api_key")],
+            Step::Recording => {
+                let mut rows = vec![
+                    f("recording.user_name"),
+                    f("recording.backend"),
+                    hotkey("hotkeys.recording"),
+                ];
+                rows.extend(self.recording_key().map(f));
+                rows
+            }
+            Step::Command => vec![
+                f("llm.api_url"),
+                f("llm.model"),
+                f("llm.api_key"),
+                hotkey("hotkeys.command"),
+            ],
+            Step::ReadAloud => {
+                let mut rows = vec![f("tts.backend"), f("tts.model"), f("tts.voice")];
+                if matches!(self.tts_backend().as_str(), "tts-sidecar" | "openai-compat") {
+                    rows.push(f("tts.url"));
+                }
+                rows.extend([f("tts.api_key"), hotkey("hotkeys.speak")]);
+                rows
+            }
+            Step::Jarvis => match self.jarvis() {
+                Some(n) => [
+                    "name",
+                    "harness",
+                    "dir",
+                    "permissions",
+                    "feedback",
+                    "hotkey",
+                    "new_session_hotkey",
+                ]
+                .into_iter()
+                .map(|key| {
+                    (
+                        schema::entry_row("agents", key),
+                        format!("agents.{n}.{key}"),
+                    )
+                })
+                .collect(),
+                None => Vec::new(),
+            },
             Step::Existing | Step::Review | Step::Checks => Vec::new(),
         }
+    }
+
+    /// The key row recording needs beside the dictation one: its backend's,
+    /// when that is another provider's.
+    fn recording_key(&self) -> Option<&'static str> {
+        let name = recording_backend(self.editor.form.config()).ok()?;
+        let provider = Provider::of_backend(&name)?;
+        (Provider::of_backend(&self.backend()) != Some(provider)).then_some(match provider {
+            Provider::Groq => "groq.api_key",
+            Provider::OpenAi => "openai.api_key",
+            Provider::Deepgram => "deepgram.api_key",
+        })
+    }
+
+    /// Whether `[tts]` has a key of its own.
+    fn tts_own_key(&self) -> bool {
+        self.editor
+            .form
+            .config()
+            .tts
+            .as_ref()
+            .and_then(|t| t.api_key.as_deref())
+            .is_some_and(|key| !key.is_empty())
+    }
+
+    /// The provider key read aloud relies on: its backend's, while `[tts]
+    /// api_key` is empty and the backend is a cloud one.
+    fn tts_key(&self) -> Option<&'static str> {
+        if self.tts_own_key() {
+            return None;
+        }
+        Some(match Provider::of_backend(&self.tts_backend())? {
+            Provider::Groq => "groq.api_key",
+            Provider::OpenAi => "openai.api_key",
+            Provider::Deepgram => "deepgram.api_key",
+        })
+    }
+
+    fn tts_backend(&self) -> String {
+        self.editor
+            .form
+            .config()
+            .tts
+            .as_ref()
+            .map_or("groq", |t| t.backend.as_str())
+            .to_string()
+    }
+
+    /// The entry Jarvis set up: the last of `[[agents]]`.
+    fn jarvis(&self) -> Option<usize> {
+        if !self.set_up.contains_key(&Step::Jarvis) {
+            return None;
+        }
+        self.editor.form.entries("agents").len().checked_sub(1)
     }
 
     /// The step is local whisper's model.
@@ -413,7 +621,7 @@ impl Setup {
     fn target(&self) -> Option<Target> {
         match self.step {
             Step::Key => Some(Target::Backend(self.backend())),
-            Step::Llm => Some(Target::Llm),
+            Step::Command if self.filling => Some(Target::Llm),
             _ => None,
         }
     }
@@ -445,6 +653,7 @@ impl Setup {
             },
             _ => match self.step {
                 Step::Existing => self.choice_key(action),
+                step if step.optional() && !self.filling => self.choice_key(action),
                 Step::Checks => self.checks_key(action),
                 Step::Review => Reply::default(),
                 _ if self.model_step() => self.model_key(action),
@@ -468,19 +677,31 @@ impl Setup {
         self.editor_key(action)
     }
 
-    /// A key the row editor takes, and what follows from a changed answer.
+    /// A key the row editor takes, and what follows from a changed answer:
+    /// the test or the sample is moot, the mic follows the device, and a
+    /// row that comes or goes with a value (the sidecar's URL, recording's
+    /// key) does.
     fn editor_key(&mut self, action: Action) -> Reply {
         let device = self.editor.form.config().audio.device.clone();
         let outcome = self.editor.key(action);
         let changed = outcome.flash.is_some();
         let mut reply = Reply::from_outcome(outcome);
         if changed {
-            if matches!(self.step, Step::Key | Step::Llm) {
+            if matches!(self.step, Step::Key | Step::Command) {
                 self.test = None;
+            }
+            if self.step == Step::ReadAloud {
+                self.sample = None;
             }
             let now = self.editor.form.config().audio.device.clone();
             if self.step == Step::Mic && now != device {
                 reply.mic = Some(Some(now));
+            }
+            if matches!(self.step, Step::Recording | Step::ReadAloud)
+                && self.editor.mode() == Mode::Browse
+            {
+                let rows = self.rows();
+                self.editor.pin_at(rows);
             }
         }
         reply
@@ -490,29 +711,74 @@ impl Setup {
         match self.step {
             Step::Existing => {
                 if self.cursor == 0 {
+                    if !self.fresh {
+                        self.keep_keys();
+                    }
                     self.fresh = true;
                     self.go(Step::Backend)
                 } else {
                     self.go(Step::Checks)
                 }
             }
-            Step::Llm => {
-                self.skipped_llm = false;
-                self.go(Step::Review)
+            step if step.optional() && !self.filling => {
+                if self.cursor == 0 {
+                    self.start_mode()
+                } else {
+                    self.skip()
+                }
+            }
+            step if step.optional() => {
+                if let Some(why) = self.missing() {
+                    return Reply::say(Tone::Warn, why);
+                }
+                if step == Step::Jarvis {
+                    self.absolute_dir();
+                }
+                let note = self.harness_note();
+                let mut reply = self.go_after();
+                if let Some(note) = note {
+                    reply.status = Some(Notice::new(Tone::Warn, note));
+                }
+                reply
+            }
+            Step::Key if self.model_step() => {
+                let name = self.whisper_model().name;
+                match &self.editor.lists.models {
+                    Listed::NotAsked | Listed::Looking => Reply::say(
+                        Tone::Muted,
+                        "looking for the models already downloaded: enter again in a moment",
+                    ),
+                    _ if self.has_model(name) => self.go_after(),
+                    _ => self.download_model(name, true),
+                }
             }
             Step::Review => Reply::effect(Effect::WriteSetup { overwrite: false }),
             Step::Checks => Reply {
                 finish: true,
                 ..Reply::default()
             },
-            step => match step.after() {
-                Some(to) => self.go(to),
-                None => Reply::default(),
-            },
+            _ => self.go_after(),
+        }
+    }
+
+    /// On to the step after this one.
+    fn go_after(&mut self) -> Reply {
+        match self.step.after() {
+            Some(to) => self.go(to),
+            None => Reply::default(),
         }
     }
 
     fn previous(&mut self) -> Reply {
+        // From an optional step's rows, its question.
+        if self.step.optional() && self.filling {
+            let mut reply = self.leave();
+            self.filling = false;
+            self.cursor = 0;
+            self.editor.pin_at(Vec::new());
+            reply.moved = true;
+            return reply;
+        }
         let Some(to) = self.back.pop() else {
             return Reply::say(Tone::Muted, "this is the first step");
         };
@@ -520,6 +786,7 @@ impl Setup {
         self.step = to;
         self.cursor = 0;
         reply.absorb(self.enter());
+        reply.moved = true;
         reply
     }
 
@@ -530,6 +797,7 @@ impl Setup {
         self.step = to;
         self.cursor = 0;
         reply.absorb(self.enter());
+        reply.moved = true;
         reply
     }
 
@@ -537,18 +805,23 @@ impl Setup {
     fn leave(&mut self) -> Reply {
         self.test = None;
         self.picker = None;
-        match self.step {
-            Step::Mic => Reply {
-                mic: Some(None),
-                ..Reply::default()
-            },
-            _ => Reply::default(),
+        let mut reply = Reply::default();
+        if let Some(stop) = self.stop_sample() {
+            reply.absorb(stop);
         }
+        self.sample = None;
+        if self.step == Step::Mic {
+            reply.mic = Some(None);
+        }
+        reply
     }
 
-    /// What arriving at the step starts.
+    /// What arriving at the step starts. An optional step shows its rows
+    /// if it was set up, else its question.
     fn enter(&mut self) -> Reply {
-        self.editor.pin(self.fields());
+        self.filling = self.step.optional() && self.set_up.contains_key(&self.step);
+        let rows = self.rows();
+        self.editor.pin_at(rows);
         let mut reply = Reply::default();
         match self.step {
             Step::Key if self.model_step() => {
@@ -597,14 +870,20 @@ impl Setup {
 
     fn skip(&mut self) -> Reply {
         match self.step {
-            Step::Llm => {
-                // Its keys are not written: [llm] stays as the file has it.
-                self.skipped_llm = true;
-                let mut reply = self.go(Step::Review);
-                reply.status = Some(Notice::new(
-                    Tone::Muted,
-                    "skipped: [llm] stays as it is; whisrs config sets it later",
-                ));
+            step if step.optional() => {
+                // None of its keys are written: they stay as the file has
+                // them.
+                self.put_back();
+                let said = match self.existing {
+                    Some(_) => format!(
+                        "skipped {}: {} stays as config.toml has it; whisrs config sets it later",
+                        step.mode(),
+                        step.section()
+                    ),
+                    None => format!("skipped {}: whisrs config sets it later", step.mode()),
+                };
+                let mut reply = self.go_after();
+                reply.status = Some(Notice::new(Tone::Muted, said));
                 reply
             }
             Step::Checks => self.next(),
@@ -612,9 +891,319 @@ impl Setup {
         }
     }
 
+    /// Set it up: keep the answers as they are, to put back on a skip,
+    /// start the mode's own (read aloud on, Jarvis's entry), and show its
+    /// rows. Set up before, it goes on from its answers as they are.
+    fn start_mode(&mut self) -> Reply {
+        let step = self.step;
+        if !self.set_up.contains_key(&step) {
+            let before = step
+                .paths()
+                .iter()
+                .map(|path| (path.to_string(), self.editor.form.value(path).cloned()))
+                .collect();
+            self.set_up.insert(step, before);
+            match step {
+                Step::ReadAloud => self.start_read_aloud(),
+                Step::Jarvis => self.start_jarvis(),
+                _ => {}
+            }
+        }
+        self.filling = true;
+        self.cursor = 0;
+        let rows = self.rows();
+        self.editor.pin_at(rows);
+        Reply {
+            moved: true,
+            ..Reply::default()
+        }
+    }
+
+    /// Read aloud on, its backend the dictation backend's provider when
+    /// that has a voice: its key is then there already. A `[tts] api_key`
+    /// kept from the file keeps the backend it is for.
+    fn start_read_aloud(&mut self) {
+        let _ = self
+            .editor
+            .form
+            .set("tts.enabled", Some(Value::Boolean(true)));
+        if self.tts_own_key() {
+            return;
+        }
+        let provider = match self.backend().as_str() {
+            "groq" => Some("groq"),
+            "openai" | "openai-realtime" => Some("openai"),
+            "deepgram" | "deepgram-streaming" => Some("deepgram"),
+            _ => None,
+        };
+        if let Some(provider) = provider {
+            let _ = self
+                .editor
+                .form
+                .set("tts.backend", Some(Value::from(provider)));
+        }
+    }
+
+    /// Jarvis's entry, after the file's own agents, so the write appends
+    /// it and changes none of theirs: named `jarvis` unless one is, on the
+    /// first harness `PATH` has.
+    fn start_jarvis(&mut self) {
+        let mut agents: Vec<Value> = self
+            .existing
+            .as_ref()
+            .and_then(|e| Value::try_from(&e.config.agents).ok())
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let taken = agents
+            .iter()
+            .any(|a| a.get("name").and_then(Value::as_str) == Some("jarvis"));
+        let mut entry = toml::Table::new();
+        entry.insert(
+            "name".into(),
+            Value::from(if taken { "" } else { "jarvis" }),
+        );
+        let on_path = options::harnesses_on_path(&self.env);
+        let found = catalog::HARNESSES
+            .iter()
+            .map(|(name, _)| *name)
+            .find(|name| {
+                whisrs::agent::Harness::parse(name)
+                    .is_some_and(|harness| on_path.contains(harness.default_command()))
+            });
+        if let Some(harness) = found {
+            entry.insert("harness".into(), Value::from(harness));
+        }
+        agents.push(Value::Table(entry));
+        let _ = self.editor.form.set("agents", Some(Value::Array(agents)));
+    }
+
+    /// The optional step skipped: its answers back as they were before Set
+    /// it up. A key the key step asks now is that step's, and stays.
+    fn put_back(&mut self) {
+        let Some(before) = self.set_up.remove(&self.step) else {
+            return;
+        };
+        let owned: Vec<String> = self
+            .rows_of(Step::Key)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        for (path, value) in before {
+            if !owned.contains(&path) {
+                let _ = self.editor.form.set(&path, value);
+            }
+        }
+    }
+
+    /// The file's API keys, into answers that start fresh: a key is not a
+    /// default to start over from. Each comes with what says where it goes
+    /// (`[llm]`'s URL and model, `[tts]`'s backend and URL, a server's URL),
+    /// so a key is never sent somewhere else. Copied once, as the file has
+    /// them; the answers are no less clean for them.
+    fn keep_keys(&mut self) {
+        let Some(file) = self
+            .existing
+            .as_ref()
+            .and_then(|e| Value::try_from(&e.config).ok())
+        else {
+            return;
+        };
+        let clean = !self.editor.form.is_dirty();
+        for (section, table) in file.as_table().into_iter().flatten() {
+            let has_key = table
+                .get("api_key")
+                .and_then(Value::as_str)
+                .is_some_and(|key| !key.is_empty());
+            if !has_key {
+                continue;
+            }
+            let with: &[&str] = match section.as_str() {
+                "llm" => &["api_url", "model"],
+                "tts" => &["backend", "url"],
+                "openai-compatible-realtime" | "asr-sidecar" => &["url"],
+                _ => &[],
+            };
+            for key in std::iter::once(&"api_key").chain(with) {
+                if let Some(value) = table.get(*key) {
+                    let path = format!("{section}.{key}");
+                    let _ = self.editor.form.set(&path, Some(value.clone()));
+                }
+            }
+        }
+        if clean {
+            self.editor.form.mark_saved();
+        }
+    }
+
+    /// What the mode of this step still needs before `Enter` goes on, with
+    /// the way out; `None` when it is complete.
+    fn missing(&self) -> Option<String> {
+        let config = self.editor.form.config();
+        match self.step {
+            Step::Recording => {
+                let name = match recording_backend(config) {
+                    Ok(name) => name,
+                    Err(_) => {
+                        let backend = config
+                            .recording
+                            .as_ref()
+                            .and_then(|r| r.backend.as_deref())
+                            .filter(|b| !b.trim().is_empty())
+                            .unwrap_or(&config.general.backend);
+                        return Some(format!(
+                            "recording needs a backend that takes a file, not {backend}: space \
+                             picks one, or s skips recording"
+                        ));
+                    }
+                };
+                (!self.key_resolves(&name)).then(|| {
+                    format!(
+                        "recording needs a key for {name}: space types it, or s skips recording"
+                    )
+                })
+            }
+            Step::Command => (!self.llm_key_resolves()).then(|| {
+                "command mode needs an LLM key: space types it on api_key, or s skips command \
+                 mode"
+                    .to_string()
+            }),
+            Step::ReadAloud => {
+                let backend = self.tts_backend();
+                let sidecar = matches!(backend.as_str(), "tts-sidecar" | "openai-compat");
+                (!sidecar && !self.tts_own_key() && !self.key_resolves(&backend)).then(|| {
+                    format!(
+                        "read aloud needs a key for {backend}: space types it on api_key, or \
+                         s skips read aloud"
+                    )
+                })
+            }
+            Step::Jarvis => self.jarvis_missing(),
+            _ => None,
+        }
+    }
+
+    /// Whether backend `name`'s key resolves as the daemon resolves it
+    /// (its env var, then config.toml); one without a key needs none.
+    fn key_resolves(&self, name: &str) -> bool {
+        let mut config = self.editor.form.config().clone();
+        config.general.backend = name.to_string();
+        keys::key_summary_from(&config, |var| self.env.get(var).map(str::to_string))
+            != KeySummary::NotSet
+    }
+
+    /// Whether the LLM key resolves as `llm::resolve_api_key` does: `[llm]
+    /// api_key`, else `WHISRS_OPENAI_API_KEY` when set (even empty), else
+    /// `WHISRS_GROQ_API_KEY`. A server on this machine needs none.
+    fn llm_key_resolves(&self) -> bool {
+        let llm = self.editor.form.config().llm.clone().unwrap_or_default();
+        if local_url(&llm.api_url) || !llm.api_key.is_empty() {
+            return true;
+        }
+        let key = self
+            .env
+            .get("WHISRS_OPENAI_API_KEY")
+            .or_else(|| self.env.get("WHISRS_GROQ_API_KEY"))
+            .unwrap_or_default();
+        !key.is_empty()
+    }
+
+    /// What Jarvis's entry still needs: a valid name no other agent has,
+    /// and a dir that exists.
+    fn jarvis_missing(&self) -> Option<String> {
+        let n = self.jarvis()?;
+        let text = |key: &str| {
+            self.editor
+                .form
+                .value(&format!("agents.{n}.{key}"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let name = text("name");
+        if name.is_empty() {
+            return Some("Jarvis needs a name: space types one, or s skips Jarvis".to_string());
+        }
+        if !whisrs::agent::valid_agent_name(&name) {
+            return Some(format!(
+                "{name} cannot name an agent (a-z, 0-9, _ and -): space types another, or s \
+                 skips Jarvis"
+            ));
+        }
+        let taken = (0..n).any(|i| {
+            self.editor
+                .form
+                .value(&format!("agents.{i}.name"))
+                .and_then(Value::as_str)
+                .is_some_and(|other| other.trim() == name)
+        });
+        if taken {
+            return Some(format!(
+                "an agent is named {name} already: space types another name, or s skips Jarvis"
+            ));
+        }
+        let dir = text("dir");
+        if dir.is_empty() {
+            return Some(
+                "Jarvis needs a dir to work in: space types one, or s skips Jarvis".to_string(),
+            );
+        }
+        let full = complete::expand_home(&dir, self.env.get("HOME"));
+        (!Path::new(&full).is_dir())
+            .then(|| format!("{dir} is not a folder: space types another, or s skips Jarvis"))
+    }
+
+    /// Jarvis's dir, accepted relative to this terminal's folder, stored
+    /// absolute: the daemon would take it from its own (`$HOME` under
+    /// systemd). `~/...` stays as typed; the daemon expands it.
+    fn absolute_dir(&mut self) {
+        let Some(n) = self.jarvis() else {
+            return;
+        };
+        let path = format!("agents.{n}.dir");
+        let Some(dir) = self.editor.form.value(&path).and_then(Value::as_str) else {
+            return;
+        };
+        let dir = dir.trim();
+        if dir.starts_with('/') || dir == "~" || dir.starts_with("~/") {
+            return;
+        }
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        let full = whisrs::agent::absolute_dir(dir, Some(&cwd));
+        let full = Value::String(full.to_string_lossy().into_owned());
+        let _ = self.editor.form.set(&path, Some(full));
+    }
+
+    /// Jarvis's harness when `PATH` does not have it: a warning, not a
+    /// refusal.
+    fn harness_note(&self) -> Option<String> {
+        if self.step != Step::Jarvis {
+            return None;
+        }
+        let path = format!("agents.{}.harness", self.jarvis()?);
+        let harness = self.editor.form.effective(&path)?.as_str()?.to_string();
+        let field = schema::entry_row("agents", "harness");
+        let note = options::options(field, &path, &self.editor.form, &self.editor.lists)
+            .find(&harness)?
+            .note
+            .clone()?;
+        Some(format!(
+            "{harness} is {note}: Jarvis cannot start it until it is"
+        ))
+    }
+
     fn test(&mut self) -> Reply {
+        if self.step == Step::ReadAloud && self.filling {
+            return self.say();
+        }
         let Some(target) = self.target() else {
-            return Reply::say(Tone::Muted, "t tests a key: on the key and LLM steps");
+            return Reply::say(
+                Tone::Muted,
+                "t tests a key on the key and command mode steps, and says a sample on read \
+                 aloud",
+            );
         };
         self.test = Some(Test::Running);
         Reply::effect(Effect::TestKey {
@@ -624,10 +1213,55 @@ impl Setup {
         })
     }
 
+    /// `t` on read aloud: say [`SAMPLE`] with the voice picked.
+    fn say(&mut self) -> Reply {
+        if let Some(why) = self.missing() {
+            return Reply::say(Tone::Warn, why);
+        }
+        self.samples += 1;
+        let id = self.samples;
+        self.sample = Some(Sample::Playing { id });
+        Reply::effect(Effect::Speak { id })
+    }
+
+    /// Stop the sample being said, if one is: any key does.
+    pub fn stop_sample(&mut self) -> Option<Reply> {
+        if !matches!(self.sample, Some(Sample::Playing { .. })) {
+            return None;
+        }
+        self.sample = Some(Sample::Stopped);
+        Some(Reply {
+            effects: vec![Effect::StopSpeaking],
+            status: Some(Notice::new(Tone::Muted, "stopped")),
+            ..Reply::default()
+        })
+    }
+
+    /// Sample `id` ended: said, or why not. One stopped or replaced since
+    /// says nothing.
+    pub fn spoke(&mut self, id: u64, said: Result<(), String>) -> Option<Notice> {
+        if self.sample != Some(Sample::Playing { id }) {
+            return None;
+        }
+        match said {
+            Ok(()) => {
+                self.sample = Some(Sample::Said);
+                None
+            }
+            Err(why) => {
+                self.sample = Some(Sample::Failed(why.clone()));
+                Some(Notice::new(
+                    Tone::Error,
+                    format!("the sample failed: {why}"),
+                ))
+            }
+        }
+    }
+
     /// A key test of the step came back.
     pub fn tested(&mut self, tested: Tested) -> Notice {
         let label = match self.step {
-            Step::Llm => "LLM key".to_string(),
+            Step::Command => "LLM key".to_string(),
             _ => format!("{} test", self.backend()),
         };
         let notice = config::test_notice(&label, &tested);
@@ -635,7 +1269,8 @@ impl Setup {
         notice
     }
 
-    /// The first step's choice: start fresh, or only the checks.
+    /// The first step's choice, or an optional step's question: the first
+    /// row or the second.
     fn choice_key(&mut self, action: Action) -> Reply {
         match action {
             Action::Up | Action::First => self.cursor = 0,
@@ -735,8 +1370,23 @@ impl Setup {
         }
     }
 
-    /// Use model `name`: downloaded, it is set; else it downloads.
+    /// Use model `name`: downloaded, it is set; else it downloads, and
+    /// the step stays.
     fn pick_model(&mut self, name: &str) -> Reply {
+        if self.has_model(name) {
+            if let Some(at) = catalog::WHISPER_MODELS.iter().position(|m| m.name == name) {
+                self.model = at;
+            }
+            self.set_model();
+            self.test = None;
+            return Reply::say(Tone::Ok, format!("using {}", model::file_name(name)));
+        }
+        self.download_model(name, false)
+    }
+
+    /// Download model `name`, set as the model; with `go_on`, the wizard
+    /// goes on once it is done.
+    fn download_model(&mut self, name: &str, go_on: bool) -> Reply {
         let before = (
             self.editor
                 .form
@@ -749,9 +1399,6 @@ impl Setup {
         }
         self.set_model();
         self.test = None;
-        if self.has_model(name) {
-            return Reply::say(Tone::Ok, format!("using {}", model::file_name(name)));
-        }
         let id = model::next_id();
         self.download = Some(Downloading {
             id,
@@ -759,6 +1406,7 @@ impl Setup {
             done: 0,
             total: None,
             before,
+            go_on,
         });
         Reply {
             effects: vec![Effect::Download {
@@ -782,7 +1430,7 @@ impl Setup {
         };
         let part = model::part_path(&self.models, &download.name, download.id);
         let name = model::file_name(&download.name);
-        self.put_back(download.before);
+        self.put_back_model(download.before);
         Reply {
             effects: vec![Effect::CancelDownload(download.id)],
             status: Some(Notice::new(
@@ -795,7 +1443,7 @@ impl Setup {
     }
 
     /// Put back the model path and pick a download replaced.
-    fn put_back(&mut self, before: (Option<Value>, usize)) {
+    fn put_back_model(&mut self, before: (Option<Value>, usize)) {
         let (path, model) = before;
         self.model = model;
         let _ = self.editor.form.set("local-whisper.model_path", path);
@@ -817,18 +1465,34 @@ impl Setup {
             Download::Done { result, .. } => {
                 let download = self.download.take().expect("the running download");
                 let name = download.name.clone();
-                if result.is_err() {
-                    self.put_back(download.before);
+                // A failed one stays the choice, for Enter to try again;
+                // only a cancelled one gives way to the model before it.
+                if matches!(result, Err(DownloadError::Cancelled)) {
+                    self.put_back_model(download.before);
                 }
                 let mut reply = Reply::effect(Effect::List(ListKind::Models));
-                reply.status = Some(match result {
-                    Ok(path) => Notice::new(
-                        Tone::Ok,
-                        format!(
-                            "downloaded {}",
-                            tilde(&path, self.env.get("HOME")).display()
-                        ),
-                    ),
+                let status = match result {
+                    Ok(path) => {
+                        // On disk now, before the listing says so.
+                        let file = ModelFile {
+                            path: path.clone(),
+                            size: download.total.unwrap_or(download.done),
+                        };
+                        match &mut self.editor.lists.models {
+                            Listed::Ready(files) => files.push(file),
+                            other => *other = Listed::Ready(vec![file]),
+                        }
+                        if download.go_on {
+                            reply.absorb(self.go_after());
+                        }
+                        Notice::new(
+                            Tone::Ok,
+                            format!(
+                                "downloaded {}",
+                                tilde(&path, self.env.get("HOME")).display()
+                            ),
+                        )
+                    }
                     Err(DownloadError::Cancelled) => Notice::new(
                         Tone::Muted,
                         format!(
@@ -836,10 +1500,12 @@ impl Setup {
                             model::file_name(&name)
                         ),
                     ),
-                    Err(DownloadError::Failed(why)) => {
-                        Notice::new(Tone::Error, format!("the download failed: {why}"))
-                    }
-                });
+                    Err(DownloadError::Failed(why)) => Notice::new(
+                        Tone::Error,
+                        format!("the download failed: {why}; enter tries again"),
+                    ),
+                };
+                reply.status = Some(status);
                 reply
             }
         }
@@ -872,27 +1538,54 @@ impl Setup {
 
     /// The keys a write sets, from the answers as they are now: each answer
     /// step's rows for the backend answered, the whisper model path on its
-    /// step, the LLM step's only when it was not skipped.
+    /// step, and an optional step's only when it was set up: its rows, read
+    /// aloud's `enabled`, Jarvis's `[[agents]]` (the file's own entries and
+    /// the new one, so only that one is added), and the provider key a mode
+    /// counts on (read aloud's, with no `[tts] api_key`), so a mode judged
+    /// complete on a key has it written. Each key once.
     pub fn asked(&self) -> Vec<String> {
-        let mut keys = Vec::new();
-        for step in [
-            Step::Backend,
-            Step::Key,
-            Step::Language,
-            Step::Mic,
-            Step::Extras,
-            Step::Typing,
-            Step::Llm,
-        ] {
-            if step == Step::Llm && self.skipped_llm {
+        let mut keys: Vec<String> = Vec::new();
+        for step in Step::all() {
+            if !step.answers() && !self.set_up.contains_key(&step) {
                 continue;
             }
-            keys.extend(self.fields_of(step).iter().map(|f| f.path.to_string()));
-            if step == Step::Key && matches!(self.backend().as_str(), "local-whisper" | "local") {
-                keys.push("local-whisper.model_path".to_string());
+            let mut add: Vec<String> = match step {
+                Step::Jarvis => vec!["agents".to_string()],
+                _ => self
+                    .rows_of(step)
+                    .into_iter()
+                    .map(|(_, path)| path)
+                    .collect(),
+            };
+            match step {
+                Step::Key if matches!(self.backend().as_str(), "local-whisper" | "local") => {
+                    add.push("local-whisper.model_path".to_string());
+                }
+                Step::Recording => add.extend(self.recording_relies_on().map(str::to_string)),
+                Step::ReadAloud => {
+                    add.push("tts.enabled".to_string());
+                    add.extend(self.tts_key().map(str::to_string));
+                }
+                _ => {}
+            }
+            for key in add {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
             }
         }
         keys
+    }
+
+    /// The provider key recording counts on: its backend's, whoever's row
+    /// shows it.
+    fn recording_relies_on(&self) -> Option<&'static str> {
+        let name = recording_backend(self.editor.form.config()).ok()?;
+        Some(match Provider::of_backend(&name)? {
+            Provider::Groq => "groq.api_key",
+            Provider::OpenAi => "openai.api_key",
+            Provider::Deepgram => "deepgram.api_key",
+        })
     }
 
     /// What the write changes in the file there: each asked key whose value
@@ -908,6 +1601,9 @@ impl Setup {
                     let (old, new) = (before.effective(&key), after.effective(&key));
                     if old == new {
                         return None;
+                    }
+                    if key == "agents" {
+                        return Some(("[[agents]]".to_string(), names(old), names(new)));
                     }
                     // As config.toml spells it: two rows can share a label.
                     let label = match key.split_once('.') {
@@ -1142,8 +1838,9 @@ impl Setup {
                 (
                     "A config is there".to_string(),
                     format!(
-                        "{} has backend {backend}. Start fresh asks every question again and \
-                         writes the answers over it; System checks only looks at the machine.",
+                        "{} has backend {backend}. Start fresh asks every question again, \
+                         keeping the API keys it has, and writes the answers over it; System \
+                         checks only looks at the machine.",
                         self.shown_path()
                     ),
                 )
@@ -1193,9 +1890,9 @@ impl Setup {
                 ),
                 _ => (
                     "Whisper model".to_string(),
-                    "whisper.cpp runs on this machine, offline. Space lists the models with \
-                     their sizes; picking one that is not downloaded yet downloads it. The .en \
-                     ones know English only, and know it better."
+                    "whisper.cpp runs on this machine, offline. h/l changes the model, space \
+                     lists them with their sizes; enter downloads one not on disk yet and goes \
+                     on once it is done. The .en ones know English only, and know it better."
                         .to_string(),
                 ),
             },
@@ -1221,12 +1918,37 @@ impl Setup {
                 "Typing".to_string(),
                 "How whisrs types the text. auto suits most setups.".to_string(),
             ),
-            Step::Llm => (
-                "Command mode (optional)".to_string(),
-                "Select text, press a hotkey and say what to do: an LLM rewrites it. s skips \
-                 this and keeps [llm] as config.toml has it; whisrs config sets it later."
+            Step::Recording => (
+                "Recording (optional)".to_string(),
+                "Record a call or a meeting, your mic and what the speakers play: whisrs \
+                 transcribes it after you stop."
                     .to_string(),
             ),
+            Step::Command => (
+                "Command mode (optional)".to_string(),
+                "Select text, press a hotkey and say what to do: an LLM rewrites it.".to_string(),
+            ),
+            Step::ReadAloud => (
+                "Read aloud (optional)".to_string(),
+                "Select text and press a hotkey: whisrs reads it aloud. Jarvis speaks its \
+                 replies with it too."
+                    .to_string(),
+            ),
+            Step::Jarvis => {
+                let mut text = "Press a hotkey and talk to a coding agent (Claude Code, \
+                                OpenCode, Codex or Copilot) working in a folder of yours."
+                    .to_string();
+                let spoken = self.set_up.contains_key(&Step::ReadAloud)
+                    || self
+                        .existing
+                        .as_ref()
+                        .and_then(|e| e.config.tts.as_ref())
+                        .is_some_and(|t| t.enabled);
+                if !spoken {
+                    text.push_str(" Read aloud is not on, so you would not hear its replies.");
+                }
+                ("Jarvis (optional)".to_string(), text)
+            }
             Step::Review => (
                 "Review".to_string(),
                 format!(
@@ -1321,23 +2043,81 @@ impl Setup {
             .unwrap_or("auto")
             .to_string();
         rows.push(("typing".to_string(), Shown::plain(typing)));
-        rows.push((
-            "LLM".to_string(),
-            match &config.llm {
-                _ if self.skipped_llm && self.existing.is_some() => {
-                    Shown::muted("skipped: as config.toml has it")
-                }
-                _ if self.skipped_llm => Shown::muted("skipped"),
-                Some(llm) => Shown::plain(format!("{} {sep} {}", llm.model, llm.api_url)),
-                None => Shown::muted("not set"),
-            },
-        ));
+        for step in Step::all().into_iter().filter(|s| s.optional()) {
+            let value = if self.set_up.contains_key(&step) {
+                Shown::plain("set up").then(self.mode_summary(step, sep), Tone::Muted)
+            } else if self.existing.is_some() {
+                Shown::muted("skipped: as config.toml has it")
+            } else {
+                Shown::muted("skipped")
+            };
+            rows.push((step.mode().to_string(), value));
+        }
         rows
+    }
+
+    /// A mode set up, as the review sums it up: its main values.
+    fn mode_summary(&self, step: Step, sep: &str) -> String {
+        let form = &self.editor.form;
+        let text = |path: &str| {
+            form.effective(path)
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_string)
+        };
+        let hotkey = |path: &str| text(path).unwrap_or_else(|| "no hotkey".to_string());
+        let parts = match step {
+            Step::Recording => vec![
+                recording_backend(form.config()).unwrap_or_else(|_| "no backend".to_string()),
+                hotkey("hotkeys.recording"),
+            ],
+            Step::Command => {
+                let url = text("llm.api_url").unwrap_or_default();
+                let host = reqwest::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or(url);
+                vec![
+                    text("llm.model").unwrap_or_default(),
+                    host,
+                    hotkey("hotkeys.command"),
+                ]
+            }
+            Step::ReadAloud => {
+                let backend = self.tts_backend();
+                let voice = text("tts.voice")
+                    .or_else(|| whisrs::tts::default_voice(&backend).map(str::to_string))
+                    .or_else(|| text("tts.model"))
+                    .or_else(|| whisrs::tts::default_model(&backend).map(str::to_string))
+                    .unwrap_or_default();
+                vec![backend, voice, hotkey("hotkeys.speak")]
+            }
+            Step::Jarvis => match self.jarvis() {
+                Some(n) => ["name", "harness", "dir"]
+                    .iter()
+                    .filter_map(|key| text(&format!("agents.{n}.{key}")))
+                    .collect(),
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        format!("{sep} {}", parts.join(&format!(" {sep} ")))
     }
 
     /// What the write will do, and what it would refuse.
     fn review_notes(&self) -> Vec<Notice> {
         let mut notes = Vec::new();
+        let local = matches!(self.backend().as_str(), "local-whisper" | "local");
+        if local && !self.has_model(self.whisper_model().name) {
+            notes.push(Notice::new(
+                Tone::Warn,
+                format!(
+                    "{} is not downloaded, and the daemon cannot start without it: backspace \
+                     back to the model step, where enter downloads it",
+                    model::file_name(self.whisper_model().name)
+                ),
+            ));
+        }
         // As the write judges it: a missing key is a warning there.
         match self.editor.form.config().validate_to_write() {
             Ok(warnings) => notes.extend(
@@ -1394,6 +2174,7 @@ impl Reply {
         }
         self.leave |= other.leave;
         self.finish |= other.finish;
+        self.moved |= other.moved;
     }
 }
 
@@ -1417,6 +2198,48 @@ fn shown_value(value: Option<&Value>, secret: bool) -> String {
     }
 }
 
+/// The names of a list of `[[agents]]`, as the review shows it.
+fn names(agents: Option<&Value>) -> String {
+    let names: Vec<&str> = agents
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            entry
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("unnamed")
+        })
+        .collect();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// Whether `url` is a server on this machine, which needs no key.
+fn local_url(url: &str) -> bool {
+    reqwest::Url::parse(url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]" | "::1"))
+}
+
+/// The backend recordings are transcribed with, or why there is none: one
+/// that takes a file (`deepgram-streaming` is `deepgram`).
+#[cfg(feature = "recording")]
+fn recording_backend(config: &whisrs::Config) -> Result<String, String> {
+    whisrs::transcription::factory::recording_backend_name(config).map_err(|e| e.to_string())
+}
+
+/// Built without recording, there is no recording step to ask it.
+#[cfg(not(feature = "recording"))]
+fn recording_backend(_: &whisrs::Config) -> Result<String, String> {
+    Err(schema::RECORDING_MISSING.to_string())
+}
+
 pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
     let Some(setup) = &app.setup else {
         return;
@@ -1432,7 +2255,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
     let after = setup.lines_after(app, width, ui);
     let help_room = width.saturating_sub(2).max(1);
     let help = if editor_rows > 0 && setup.mode() == Mode::Browse {
-        wrap(&config::row_help(&setup.editor), help_room)
+        wrap(&setup.help(), help_room)
     } else if setup.step == Step::Checks {
         // The focused check in full: its row is one line.
         setup
@@ -1460,7 +2283,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         return frame::too_small(f, ui);
     };
     let name = match setup.step.number() {
-        Some(n) => format!("setup {n}/{STEPS}"),
+        Some(n) => format!("setup {n}/{}", Step::count()),
         None => "setup".to_string(),
     };
     let body = frame::draw(
@@ -1554,7 +2377,86 @@ impl Setup {
         match self.step {
             Step::Existing | Step::Review | Step::Checks => 0,
             _ if self.model_step() => 0,
-            _ => self.fields().len(),
+            _ => self.rows().len(),
+        }
+    }
+
+    /// The help of the row with the cursor; an optional mode's hotkey adds
+    /// that it can stay unset, bound in the compositor instead.
+    fn help(&self) -> String {
+        let mut text = config::row_help(&self.editor);
+        let Some((field, path)) = self.editor.focused() else {
+            return text;
+        };
+        if !self.step.optional() || !matches!(field.kind, Kind::Hotkey { .. }) {
+            return text;
+        }
+        let name = || {
+            self.jarvis()
+                .and_then(|n| {
+                    self.editor
+                        .form
+                        .value(&format!("agents.{n}.name"))
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "<name>".to_string())
+        };
+        let command = match path.rsplit('.').next().unwrap_or_default() {
+            "recording" => "whisrs recording toggle".to_string(),
+            "command" => "whisrs command".to_string(),
+            "speak" => "whisrs speak".to_string(),
+            "new_session_hotkey" => format!("whisrs agent {} --new", name()),
+            _ => format!("whisrs agent {}", name()),
+        };
+        text.push_str(&format!(
+            " Set one here, or leave it unset and bind {command} in your compositor."
+        ));
+        text
+    }
+
+    /// An optional step's question: its two rows, each with what it means.
+    fn question(&self) -> [(&'static str, String); 2] {
+        let kept = |section: &str| match self.existing {
+            Some(_) => format!("{section} stays as config.toml has it"),
+            None => "whisrs config sets it later".to_string(),
+        };
+        let theirs: Vec<String> = self
+            .existing
+            .as_ref()
+            .map(|e| {
+                e.config
+                    .agents
+                    .iter()
+                    .map(|a| format!("{} ({})", a.name, a.harness))
+                    .collect()
+            })
+            .unwrap_or_default();
+        match self.step {
+            Step::Recording => [
+                ("Set it up", "your name, a backend, a hotkey".to_string()),
+                ("Skip", kept("[recording]")),
+            ],
+            Step::Command => [
+                ("Set it up", "an LLM, its key, a hotkey".to_string()),
+                ("Skip", kept("[llm]")),
+            ],
+            Step::ReadAloud => [
+                ("Set it up", "a voice, its key, a hotkey".to_string()),
+                ("Skip", kept("[tts]")),
+            ],
+            Step::Jarvis if theirs.is_empty() => [
+                (
+                    "Set it up",
+                    "a name, a coding agent, its folder, hotkeys".to_string(),
+                ),
+                ("Skip", kept("[[agents]]")),
+            ],
+            _ => [
+                ("Add one", format!("beside {}", theirs.join(", "))),
+                ("Keep as it is", theirs.join(", ")),
+            ],
         }
     }
 
@@ -1565,6 +2467,13 @@ impl Setup {
         // The choice's names are longer than a label.
         let labels = match self.step {
             Step::Existing => "System checks only".len() + 2,
+            step if step.optional() && !self.filling => "Keep as it is".len() + 2,
+            Step::Review => self
+                .review(ui)
+                .iter()
+                .map(|(label, _)| crate::tui::widgets::width(label) + 2)
+                .max()
+                .map_or(LABEL_WIDTH, |w| w.max(LABEL_WIDTH)),
             _ => self.label_width(),
         };
         let row = |label: &str, value: Shown, focused: bool, choice: bool, flash: bool| {
@@ -1624,7 +2533,19 @@ impl Setup {
                 }
                 lines.push(self.test_line(width, ui));
             }
-            Step::Key | Step::Llm => lines.push(self.test_line(width, ui)),
+            step if step.optional() && !self.filling => {
+                for (i, (name, about)) in self.question().into_iter().enumerate() {
+                    lines.push(row(
+                        name,
+                        Shown::muted(about),
+                        i == self.cursor,
+                        false,
+                        false,
+                    ));
+                }
+            }
+            Step::Key | Step::Command => lines.push(self.test_line(width, ui)),
+            Step::ReadAloud => lines.push(self.sample_line(width, ui)),
             Step::Mic => {
                 lines.push(Line::default());
                 lines.extend(app.mic.lines(width, ui));
@@ -1746,14 +2667,13 @@ impl Setup {
     /// The label column: the editor's, where its rows are on screen, so
     /// setup's own lines line up under them.
     fn label_width(&self) -> usize {
-        let fields = if self.editor_rows() > 0 {
-            self.fields()
+        let rows = if self.editor_rows() > 0 {
+            self.rows()
         } else {
             Vec::new()
         };
-        fields
-            .iter()
-            .map(|field| crate::tui::widgets::width(field.label) + 2)
+        rows.iter()
+            .map(|(field, _)| crate::tui::widgets::width(field.label) + 2)
             .max()
             .map_or(LABEL_WIDTH, |w| w.min(24))
     }
@@ -1761,7 +2681,7 @@ impl Setup {
     /// What `t` does on this step, before it ran.
     fn test_hint(&self) -> &'static str {
         match (self.step, self.backend().as_str()) {
-            (Step::Llm, _) => "t tests the key, sending no audio",
+            (Step::Command, _) => "t tests the key, sending no audio",
             (_, "asr-sidecar" | "asr" | "vibevoice") => {
                 "t sends the sidecar half a second of silence"
             }
@@ -1787,12 +2707,43 @@ impl Setup {
                 (tested.outcome.to_string(), tone)
             }
         };
+        self.note_line("test", &text, tone, width, ui)
+    }
+
+    /// The sample line of read aloud: what `t` says, while it says it, and
+    /// how that ended.
+    fn sample_line(&self, width: usize, ui: &Ui) -> Line<'static> {
+        let (text, tone) = match &self.sample {
+            None => (format!("t says \"{SAMPLE}\""), Tone::Muted),
+            Some(Sample::Playing { .. }) => (
+                format!(
+                    "{} speaking: any key stops it",
+                    ui.glyphs.spinner[self.spin % ui.glyphs.spinner.len()]
+                ),
+                Tone::Muted,
+            ),
+            Some(Sample::Said) => ("said it".to_string(), Tone::Ok),
+            Some(Sample::Stopped) => ("stopped".to_string(), Tone::Muted),
+            Some(Sample::Failed(why)) => (why.clone(), Tone::Error),
+        };
+        self.note_line("sample", &text, tone, width, ui)
+    }
+
+    /// A line under the rows, lined up with them: `label`, then `text`.
+    fn note_line(
+        &self,
+        label: &str,
+        text: &str,
+        tone: Tone,
+        width: usize,
+        ui: &Ui,
+    ) -> Line<'static> {
         let labels = self.label_width();
         let room = width.saturating_sub(labels + 2);
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{:<labels$}", "test"), ui.theme.muted),
-            Span::styled(fit(&text, room, ui.glyphs.ellipsis), tone.style(ui.theme)),
+            Span::styled(format!("{label:<labels$}"), ui.theme.muted),
+            Span::styled(fit(text, room, ui.glyphs.ellipsis), tone.style(ui.theme)),
         ])
     }
 
@@ -1819,9 +2770,14 @@ impl Setup {
         let mut hints: Vec<(String, String)> = Vec::new();
         if self.download.is_some() {
             hints.push(pair("esc", "cancel the download"));
+        } else if matches!(self.sample, Some(Sample::Playing { .. })) {
+            hints.push(pair("any key", "stop"));
         } else {
             match self.step {
                 Step::Existing => {
+                    hints.extend([pair("j/k", "move"), pair("enter", "choose")]);
+                }
+                step if step.optional() && !self.filling => {
                     hints.extend([pair("j/k", "move"), pair("enter", "choose")]);
                 }
                 Step::Review => hints.push(pair("enter", "write")),
@@ -1832,7 +2788,11 @@ impl Setup {
                 ]),
                 _ if self.model_step() => {
                     hints.extend([pair("h/l", "change"), pair("space", "pick")]);
-                    hints.push(pair("enter", "next"));
+                    if self.has_model(self.whisper_model().name) {
+                        hints.push(pair("enter", "next"));
+                    } else {
+                        hints.push(pair("enter", "download and go on"));
+                    }
                 }
                 _ => {
                     if let Some((field, _)) = self.editor.focused() {
@@ -1845,7 +2805,10 @@ impl Setup {
             if self.target().is_some() {
                 hints.push(pair("t", "test"));
             }
-            if matches!(self.step, Step::Llm | Step::Checks) {
+            if self.step == Step::ReadAloud && self.filling {
+                hints.push(pair("t", "say a sample"));
+            }
+            if self.step.optional() || self.step == Step::Checks {
                 hints.push(pair("s", "skip"));
             }
             if self.step != Step::Existing {

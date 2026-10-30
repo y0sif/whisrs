@@ -759,23 +759,32 @@ const HOTKEYS: &[Field] = &[
         HOTKEY,
         "Cancel dictation and discard the audio.",
     ),
-    field(
-        "hotkeys.command",
-        "command",
-        HOTKEY,
-        "Command mode: speak an instruction, the LLM rewrites the selection.",
-    ),
-    field(
-        "hotkeys.speak",
-        "speak",
-        HOTKEY,
-        "Read the selection aloud ([tts]).",
-    ),
+    field("hotkeys.command", "command", HOTKEY, COMMAND_HOTKEY),
+    field("hotkeys.speak", "speak", HOTKEY, SPEAK_HOTKEY),
     gated(
         "hotkeys.recording",
         "recording",
         HOTKEY,
-        "Start and stop a recording of mic and system audio.",
+        RECORDING_HOTKEY,
+        Gate::Recording,
+    ),
+];
+
+const COMMAND_HOTKEY: &str = "Command mode: speak an instruction, the LLM rewrites the selection.";
+const SPEAK_HOTKEY: &str = "Read the selection aloud ([tts]).";
+const RECORDING_HOTKEY: &str = "Start and stop a recording of mic and system audio.";
+
+/// The modes' hotkeys as setup shows them, each on its own mode's step,
+/// labelled `hotkey` there (as an agent's is). The same keys as in
+/// [`HOTKEYS`].
+const MODE_HOTKEYS: &[Field] = &[
+    field("hotkeys.command", "hotkey", HOTKEY, COMMAND_HOTKEY),
+    field("hotkeys.speak", "hotkey", HOTKEY, SPEAK_HOTKEY),
+    gated(
+        "hotkeys.recording",
+        "hotkey",
+        HOTKEY,
+        RECORDING_HOTKEY,
         Gate::Recording,
     ),
 ];
@@ -871,7 +880,7 @@ const TTS: &[Field] = &[
         "tts.backend",
         "backend",
         Kind::Choice(catalog::TTS_BACKENDS),
-        "tts-sidecar is a local OpenAI-compatible server at the url below.",
+        "Who reads the text: a cloud voice, or tts-sidecar, your own OpenAI-compatible server.",
     ),
     field(
         "tts.model",
@@ -1348,6 +1357,29 @@ pub fn find(path: &str) -> Option<&'static Field> {
 /// [`find`], for a screen that edits a few known rows.
 pub fn row(path: &str) -> &'static Field {
     find(path).unwrap_or_else(|| panic!("no row {path}"))
+}
+
+/// A mode's hotkey (`hotkeys.speak`) as setup shows it on the mode's
+/// step: [`MODE_HOTKEYS`].
+pub fn mode_hotkey(path: &str) -> &'static Field {
+    MODE_HOTKEYS
+        .iter()
+        .find(|field| field.path == path)
+        .unwrap_or_else(|| panic!("no mode hotkey {path}"))
+}
+
+/// The row of `key` in an entry of the array of tables `list` (`agents`,
+/// `dir`), for a screen that edits one entry's rows.
+pub fn entry_row(list: &str, key: &str) -> &'static Field {
+    SECTIONS
+        .iter()
+        .find_map(|section| match section.body {
+            Body::Entries(entries) if entries.path == list => {
+                entries.fields.iter().find(|field| field.path == key)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no {list} row {key}"))
 }
 
 #[cfg(test)]

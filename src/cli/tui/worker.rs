@@ -1,6 +1,7 @@
 //! The TUI's threads: the daemon poll, the restart after a save, the lists
 //! a picker needs (sound devices, model files), the API key test, the model
-//! download, the microphone capture and setup's system checks. Every request
+//! download, the microphone capture, read aloud's sample and setup's system
+//! checks. Every request
 //! to the daemon, the network or the sound server is made here, never on the
 //! loop that draws and reads keys: a blocking connect to a daemon that
 //! stopped accepting has no timeout, a sound server can be slow to answer,
@@ -13,7 +14,8 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use whisrs::config::setup::key_test::{self, Endpoints, Target};
+use whisrs::audio::playback::{play_wav_stream, StreamChunk};
+use whisrs::config::setup::key_test::{self, Endpoints, Provider, Target};
 use whisrs::config::setup::uinput::Uinput;
 use whisrs::config::setup::unit::UnitFile;
 use whisrs::config::setup::{gnome, keybind, mic, model, uinput, unit, Run};
@@ -80,7 +82,8 @@ pub struct Lister {
 }
 
 /// What the setup and Mic workers reach: the key test's endpoints, the
-/// model server, and the microphone (functions, so a test stands in).
+/// model server, the microphone and the speakers (functions, so a test
+/// stands in).
 #[derive(Clone)]
 pub struct Tools {
     pub endpoints: Endpoints,
@@ -88,6 +91,9 @@ pub struct Tools {
     pub open_mic: OpenMic,
     /// Called holding [`stderr_lock`].
     pub probe: fn(&str) -> Result<mic::Probe, mic::ProbeError>,
+    /// Says read aloud's sample with a config's `[tts]` until it ends or
+    /// the flag is set ([`say_sample`]).
+    pub say: fn(&Config, &Env, Arc<AtomicBool>) -> Result<(), String>,
     pub machine: Machine,
 }
 
@@ -98,6 +104,7 @@ impl Tools {
             models_from: model::BASE_URL.to_string(),
             open_mic: open_live_mic,
             probe: mic::probe,
+            say: say_sample,
             machine: Machine::real(),
         }
     }
@@ -152,6 +159,8 @@ pub struct Workers {
     downloads: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
     /// The running capture's stop flag.
     mic: Mutex<Option<Arc<AtomicBool>>>,
+    /// The sample being said's stop flag.
+    speech: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Workers {
@@ -175,6 +184,7 @@ impl Workers {
             tools,
             downloads: Arc::default(),
             mic: Mutex::new(None),
+            speech: Mutex::new(None),
         };
         let (tx, socket, older) = (
             workers.tx.clone(),
@@ -339,6 +349,28 @@ impl Workers {
     pub fn mic_stop(&self) {
         if let Some(stop) = lock(&self.mic).take() {
             stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Say read aloud's sample with `config`'s `[tts]` on a thread of its
+    /// own, until it ends, [`Workers::stop_speaking`] or the next one; how
+    /// it ended comes back as [`Msg::Spoke`], tagged `id`.
+    pub fn speak(&self, id: u64, config: Config) {
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Some(old) = lock(&self.speech).replace(Arc::clone(&stop)) {
+            old.store(true, Ordering::Release);
+        }
+        let (tx, env, say) = (self.tx.clone(), self.env.clone(), self.tools.say);
+        std::thread::spawn(move || {
+            let said = say(&config, &env, stop);
+            let _ = tx.send(Msg::Spoke { id, said });
+        });
+    }
+
+    /// Stop the sample being said.
+    pub fn stop_speaking(&self) {
+        if let Some(stop) = lock(&self.speech).take() {
+            stop.store(true, Ordering::Release);
         }
     }
 
@@ -630,6 +662,98 @@ pub fn list(kind: ListKind, lister: &Lister) -> Listing {
         ListKind::Models => {
             Listing::Models(options::model_files(&lister.models, lister.home.as_deref()))
         }
+    }
+}
+
+/// Say setup's [`SAMPLE`](super::screens::setup::SAMPLE) with `config`'s
+/// `[tts]`, as the daemon reads aloud: the lib's TTS backend, its body
+/// streamed into playback. The key is resolved from `env` as the daemon
+/// resolves it ([`tts_key`]). Synthesis runs on a runtime of this thread's
+/// own, playback on a thread of its own; `stop` ends both.
+fn say_sample(config: &Config, env: &Env, stop: Arc<AtomicBool>) -> Result<(), String> {
+    let one_line = |e: whisrs::WhisrsError| e.to_string().replace('\n', " ");
+    let tts = config.tts.clone().unwrap_or_default();
+    let backend = whisrs::tts::create_backend(&tts, tts_key(config, env)).map_err(one_line)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start the speech: {e}"))?;
+    runtime.block_on(async move {
+        let text = super::screens::setup::SAMPLE;
+        let Some(audio) = until_stopped(backend.synthesize(text), &stop).await else {
+            return Ok(());
+        };
+        let mut audio = audio.map_err(one_line)?;
+        let (chunk_tx, chunks) = std::sync::mpsc::channel();
+        let (first_audio, _) = tokio::sync::oneshot::channel();
+        let player_stop = Arc::clone(&stop);
+        let player = std::thread::spawn(move || {
+            // The output device may print to stderr as it opens.
+            let _one = stderr_lock();
+            play_wav_stream(chunks, player_stop, None, first_audio)
+        });
+        loop {
+            // On stop, no end marker: the player takes the hang-up as one.
+            let Some(next) = until_stopped(audio.next_chunk(), &stop).await else {
+                break;
+            };
+            let (chunk, last) = match next {
+                Ok(Some(data)) => (StreamChunk::Data(data), false),
+                Ok(None) => (StreamChunk::End, true),
+                Err(e) => (StreamChunk::Error(one_line(e)), true),
+            };
+            if chunk_tx.send(chunk).is_err() || last {
+                break;
+            }
+        }
+        drop(chunk_tx);
+        match player.join() {
+            Ok(played) => played.map_err(one_line),
+            Err(_) => Err("the playback stopped unexpectedly".to_string()),
+        }
+    })
+}
+
+/// `future`, unless `stop` is set first.
+async fn until_stopped<T>(
+    future: impl std::future::Future<Output = T>,
+    stop: &AtomicBool,
+) -> Option<T> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            out = &mut future => return Some(out),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if stop.load(Ordering::Acquire) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// The key `[tts]` speaks with, as the daemon's `resolve_tts_api_key`
+/// resolves it, from `env`: `[tts] api_key`, else the backend provider's
+/// env var, then its key in config.toml; none for a local server.
+fn tts_key(config: &Config, env: &Env) -> Option<String> {
+    let tts = config.tts.as_ref();
+    if let Some(key) = tts
+        .and_then(|t| t.api_key.as_deref())
+        .filter(|k| !k.is_empty())
+    {
+        return Some(key.to_string());
+    }
+    let provider = match tts.map_or("groq", |t| t.backend.as_str()) {
+        "tts-sidecar" | "openai-compat" => return None,
+        backend => Provider::of_backend(backend).unwrap_or(Provider::Groq),
+    };
+    if let Some(key) = env.get(provider.env_var()).filter(|k| !k.is_empty()) {
+        return Some(key.to_string());
+    }
+    match provider {
+        Provider::Groq => config.groq.as_ref().map(|g| g.api_key.clone()),
+        Provider::OpenAi => config.openai.as_ref().map(|o| o.api_key.clone()),
+        Provider::Deepgram => config.deepgram.as_ref().map(|d| d.api_key.clone()),
     }
 }
 
@@ -980,6 +1104,7 @@ mod list_tests {
             tools: Tools::real(),
             downloads: Arc::default(),
             mic: Mutex::new(None),
+            speech: Mutex::new(None),
         };
         workers.list(ListKind::Devices);
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -1147,6 +1272,7 @@ mod list_tests {
             },
             downloads: Arc::default(),
             mic: Mutex::new(None),
+            speech: Mutex::new(None),
         };
         workers.mic_start(7, "nope".into());
         let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -1192,6 +1318,7 @@ mod list_tests {
             },
             downloads: Arc::default(),
             mic: Mutex::new(None),
+            speech: Mutex::new(None),
         };
         {
             // Another probe, or a listing, holds the lock meanwhile.
@@ -1215,6 +1342,88 @@ mod list_tests {
             .try_iter()
             .all(|msg| !matches!(msg, Msg::Mic { session: 1, .. })));
         assert_eq!(*lock(&PROBED), ["second"]);
+    }
+
+    /// Says until stopped, then says it was.
+    fn say_until_stopped(_: &Config, _: &Env, stop: Arc<AtomicBool>) -> Result<(), String> {
+        while !stop.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err("stopped".to_string())
+    }
+
+    /// Read aloud's sample is said on a thread of its own, and stops when
+    /// asked or when the next one starts; each end comes back tagged.
+    #[test]
+    fn the_sample_stops_when_asked_or_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers = Workers {
+            tx,
+            socket: dir.path().join("whisrs.sock"),
+            service: ServiceManager::None,
+            lister: Lister {
+                devices: two,
+                models: dir.path().to_path_buf(),
+                home: None,
+            },
+            older: Arc::new(AtomicBool::new(false)),
+            env: Env::default(),
+            tools: Tools {
+                say: say_until_stopped,
+                ..Tools::real()
+            },
+            downloads: Arc::default(),
+            mic: Mutex::new(None),
+            speech: Mutex::new(None),
+        };
+        let config: Config = toml::from_str("").unwrap();
+        let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Spoke { id, said } => (id, said),
+            _ => panic!("not the sample's end"),
+        };
+        workers.speak(1, config.clone());
+        workers.stop_speaking();
+        assert_eq!(next(), (1, Err("stopped".to_string())));
+        workers.speak(2, config.clone());
+        workers.speak(3, config);
+        assert_eq!(next(), (2, Err("stopped".to_string())));
+        workers.stop_speaking();
+        assert_eq!(next(), (3, Err("stopped".to_string())));
+    }
+
+    /// The sample's key is the one the daemon would read aloud with:
+    /// `[tts] api_key`, else the provider's env var, then its config.toml
+    /// key; a local server needs none.
+    #[test]
+    fn the_sample_key_resolves_as_the_daemon_resolves_it() {
+        let key = |toml: &str, env: &[(&str, &str)]| {
+            let config: Config = toml::from_str(toml).unwrap();
+            tts_key(&config, &Env::from_pairs(env))
+        };
+        let groq = "[groq]\napi_key = \"gsk_file\"\n";
+        assert_eq!(key(groq, &[]).as_deref(), Some("gsk_file"));
+        assert_eq!(
+            key(groq, &[("WHISRS_GROQ_API_KEY", "gsk_env")]).as_deref(),
+            Some("gsk_env")
+        );
+        assert_eq!(
+            key(groq, &[("WHISRS_GROQ_API_KEY", "")]).as_deref(),
+            Some("gsk_file")
+        );
+        let deepgram = "[tts]\nbackend = \"deepgram\"\n[deepgram]\napi_key = \"dg_file\"\n";
+        assert_eq!(
+            key(deepgram, &[("WHISRS_GROQ_API_KEY", "gsk_env")]).as_deref(),
+            Some("dg_file")
+        );
+        let own = "[tts]\nbackend = \"openai\"\napi_key = \"sk_tts\"\n";
+        assert_eq!(
+            key(own, &[("WHISRS_OPENAI_API_KEY", "sk_env")]).as_deref(),
+            Some("sk_tts")
+        );
+        let sidecar = "[tts]\nbackend = \"tts-sidecar\"\n[groq]\napi_key = \"gsk_file\"\n";
+        assert_eq!(key(sidecar, &[]), None);
+        assert_eq!(key("", &[]), None);
     }
 
     fn fake_machine() -> Machine {

@@ -1,6 +1,6 @@
 
    ╭────────────────────────────────────────────────────╮
-   │ whisrs ▁▃▅▃▁                        setup 9/9 · ○  │
+   │ whisrs ▁▃▅▃▁                      setup 12/12 · ○  │
    │                                                    │
    │   System checks                                    │
    │   What dictation needs on this machine. Space      │

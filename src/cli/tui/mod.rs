@@ -462,6 +462,16 @@ fn perform(
                 let failed = suspend_for_sudo(terminal, &app.env)?;
                 app.update(Msg::Fixed(failed))
             }
+            Effect::Speak { id } => {
+                if let Some(setup) = &app.setup {
+                    workers.speak(id, setup.editor.form.config().clone());
+                }
+                None
+            }
+            Effect::StopSpeaking => {
+                workers.stop_speaking();
+                None
+            }
             Effect::Save | Effect::SaveOver => {
                 let overwrite = next == Effect::SaveOver;
                 let saved = screens::config::save(&app.config, &app.paths, overwrite);

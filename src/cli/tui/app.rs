@@ -108,6 +108,11 @@ pub enum Msg {
     /// The answer to [`Effect::WriteSetup`], and the file read once more
     /// for setup to edit on from.
     SetupWritten(Result<Saved, SaveError>, Option<Loaded>),
+    /// Read aloud's sample `id` ended: said, or why not.
+    Spoke {
+        id: u64,
+        said: Result<(), String>,
+    },
     /// A spinner's next frame.
     Tick,
 }
@@ -175,6 +180,13 @@ pub enum Effect {
     /// Run the uinput fix with sudo, in the plain terminal; answered with
     /// [`Msg::Fixed`].
     FixUinput,
+    /// Say read aloud's sample with setup's `[tts]` as sample `id`;
+    /// answered with [`Msg::Spoke`].
+    Speak {
+        id: u64,
+    },
+    /// Stop the sample being said.
+    StopSpeaking,
     /// Each in turn.
     All(Vec<Effect>),
 }
@@ -509,6 +521,12 @@ impl App {
                 None
             }
             Msg::SetupWritten(written, again) => self.setup_written(written, again),
+            Msg::Spoke { id, said } => {
+                if let Some(notice) = self.setup.as_mut()?.spoke(id, said) {
+                    self.status = Some(notice);
+                }
+                None
+            }
             Msg::Tick => {
                 self.ticks += 1;
                 self.config.spin = self.ticks;
@@ -607,8 +625,8 @@ impl App {
                         )
                     })
                     .unwrap_or_default();
-                self.status = Some(Notice::new(Tone::Ok, format!("wrote {file}{kept}")));
-                let reply = self.setup.as_mut()?.written(again);
+                let mut reply = self.setup.as_mut()?.written(again);
+                reply.status = Some(Notice::new(Tone::Ok, format!("wrote {file}{kept}")));
                 let effect = self.reply(reply);
                 if self.daemon_up() == Some(true) {
                     // The daemon runs the old config until it restarts.
@@ -627,20 +645,23 @@ impl App {
                 None
             }
             Err(SaveError::Reread(why)) => {
-                self.status = Some(Notice::new(
+                let mut reply = self.setup.as_mut()?.written(again);
+                reply.status = Some(Notice::new(
                     Tone::Warn,
                     format!("written, but reading it back failed: {why}"),
                 ));
-                let reply = self.setup.as_mut()?.written(again);
                 self.reply(reply)
             }
         }
     }
 
-    /// Do what setup's reply asks.
+    /// Do what setup's reply asks. A step change clears what the step
+    /// before said, unless it says something itself.
     fn reply(&mut self, reply: Reply) -> Option<Effect> {
         if let Some(status) = reply.status {
             self.status = Some(status);
+        } else if reply.moved {
+            self.status = None;
         }
         if reply.flash.is_some() {
             self.flash = reply.flash;
@@ -694,6 +715,9 @@ impl App {
         let mut effects = Vec::new();
         if setup.step == setup::Step::Mic {
             effects.push(Effect::MicStop);
+        }
+        if matches!(setup.sample, Some(setup::Sample::Playing { .. })) {
+            effects.push(Effect::StopSpeaking);
         }
         if let Some((id, part)) = setup.partial() {
             self.orphans.push((id, part));
@@ -753,6 +777,12 @@ impl App {
 
     fn key(&mut self, key: KeyEvent) -> Option<Effect> {
         self.flash = None;
+        // A sample being said stops at any key, which does nothing else.
+        if self.dialog.is_none() && self.screen() == Screen::Setup {
+            if let Some(reply) = self.setup.as_mut().and_then(Setup::stop_sample) {
+                return self.reply(reply);
+            }
+        }
         let mode = if self.dialog.is_some() {
             Mode::Dialog
         } else {
@@ -1354,8 +1384,14 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
                     ("space", "open the row's list or input, or flip a toggle"),
                     ("h l", "change the row in place"),
                     ("j k", "move between the rows"),
-                    ("t", "test the key: one request, no audio"),
-                    ("s", "skip an optional step"),
+                    (
+                        "t",
+                        "test the key: one request, no audio; on read aloud, say a sample",
+                    ),
+                    (
+                        "s",
+                        "skip an optional step, even midway: none of its keys are written",
+                    ),
                     ("esc", "leave setup, asking about unwritten answers"),
                     ("q", "quit, asking the same"),
                 ],

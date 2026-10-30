@@ -299,9 +299,9 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
                         merge_table(doc.as_table_mut(), fresh.as_table(), &preserved);
                         doc.to_string()
                     };
-                    let fresh =
+                    let (fresh, written) =
                         changes_only(&fresh_full, &after, &before, Some(existing.as_table()));
-                    checked(merged(&fresh), &after, || merged(&fresh_full))
+                    checked(merged(&fresh), &written, || merged(&fresh_full))
                 }
                 // A file with no preserve set cannot be merged into: the
                 // stale-key pass would delete every section the struct does not
@@ -318,8 +318,8 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
                 Err(reason) => {
                     let reason = reason.summary(existing_str);
                     regenerated = Some(backup_and_regenerate(config_path, existing_str, reason)?);
-                    let fresh = changes_only(&fresh_full, &after, &nothing, None);
-                    checked(from_nothing(&fresh), &after, || fresh_str.clone())
+                    let (fresh, written) = changes_only(&fresh_full, &after, &nothing, None);
+                    checked(from_nothing(&fresh), &written, || fresh_str.clone())
                 }
             },
             // Unparseable on-disk file: there is no layout to preserve, so
@@ -334,15 +334,15 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
                     e.span(),
                 );
                 regenerated = Some(backup_and_regenerate(config_path, existing_str, reason)?);
-                let fresh = changes_only(&fresh_full, &after, &nothing, None);
-                checked(from_nothing(&fresh), &after, || fresh_str.clone())
+                let (fresh, written) = changes_only(&fresh_full, &after, &nothing, None);
+                checked(from_nothing(&fresh), &written, || fresh_str.clone())
             }
         },
         // First-time setup: nothing on disk yet, so what differs from an empty
         // file is what is written.
         None => {
-            let fresh = changes_only(&fresh_full, &after, &nothing, None);
-            checked(from_nothing(&fresh), &after, || fresh_str.clone())
+            let (fresh, written) = changes_only(&fresh_full, &after, &nothing, None);
+            checked(from_nothing(&fresh), &written, || fresh_str.clone())
         }
     };
 
@@ -441,13 +441,14 @@ fn checked(output: String, after: &toml::Table, full: impl FnOnce() -> String) -
 /// (what the file says now), plus the unchanged leaves `disk` (the file's
 /// document) already has, which the merge then leaves alone. A changed leaf
 /// equal to its default is cut too: the merge removes it from the file. An
-/// absent section with nothing changed in it stays absent.
+/// absent section with nothing changed in it stays absent. Also what the
+/// cut file reads back as: `after` without the tables left out.
 fn changes_only(
     fresh: &DocumentMut,
     after: &toml::Table,
     before: &toml::Table,
     disk: Option<&Table>,
-) -> DocumentMut {
+) -> (DocumentMut, toml::Table) {
     let raw: toml::Table = toml::from_str(SECTION_DEFAULTS).expect("the section defaults parse");
     let defaults = toml::from_str::<Config>(SECTION_DEFAULTS)
         .ok()
@@ -461,7 +462,35 @@ fn changes_only(
     let keep = keep_changes(after, sides, "", &raw);
     let mut fresh = fresh.clone();
     retain(fresh.as_table_mut(), &keep);
-    fresh
+    (fresh, as_written(after, &keep, Some(before)))
+}
+
+/// `after` as a file cut to `keep` reads back: without the tables that are
+/// in neither `keep` nor `before`, which [`keep_with`] leaves out as new
+/// and empty.
+fn as_written(
+    after: &toml::Table,
+    keep: &toml::Table,
+    before: Option<&toml::Table>,
+) -> toml::Table {
+    after
+        .iter()
+        .filter_map(|(key, value)| {
+            let was = before.and_then(|b| b.get(key));
+            match (value, keep.get(key)) {
+                (toml::Value::Table(table), Some(toml::Value::Table(kept))) => Some((
+                    key.clone(),
+                    toml::Value::Table(as_written(
+                        table,
+                        kept,
+                        was.and_then(toml::Value::as_table),
+                    )),
+                )),
+                (toml::Value::Table(_), None) if was.is_none() => None,
+                _ => Some((key.clone(), value.clone())),
+            }
+        })
+        .collect()
 }
 
 use toml_edit::TableLike;
@@ -510,9 +539,10 @@ fn keep_with(
                 };
                 let kept = keep_with(table, inner, &child, raw, &[]);
                 // A table the file does not have stays out unless something
-                // in it changed, or it is new as a whole (an optional section
-                // set, with every key at its default: the header says so).
-                if !kept.is_empty() || disk.is_some() || was.is_none() {
+                // in it changed: a write never adds one that ends up empty
+                // (an optional section set with every key at its default
+                // was a bare `[llm]`). One the file has keeps its header.
+                if !kept.is_empty() || disk.is_some() {
                     keep.insert(key.clone(), toml::Value::Table(kept));
                 }
             }
@@ -1006,7 +1036,15 @@ fn merge_array_of_tables(
                 merge_table(&mut table, fresh_table, preserved.element(i));
                 merged.push(table);
             }
-            None => merged.push(fresh_table.clone()),
+            None => {
+                // Right after the entry before it, not where the fresh
+                // document had it: after `[replacements]` at the end.
+                let mut table = fresh_table.clone();
+                if let Some(at) = merged.last().and_then(Table::position) {
+                    table.set_position(at);
+                }
+                merged.push(table);
+            }
         }
     }
 
@@ -1239,6 +1277,32 @@ model = "whisper-large-v3-turbo"
         assert_eq!(reparsed.llm_commands[0].instruction, "Translate to French.");
     }
 
+    /// An entry added to an array of tables goes right after the file's
+    /// last one, not to the end of the file past the sections after it.
+    #[test]
+    fn an_added_entry_follows_the_last_one() {
+        const BEFORE: &str = r#"[[agents]]
+name = "jarvis"
+dir = "/tmp"
+
+[replacements]
+"package build" = "PKGBUILD"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, BEFORE).unwrap();
+        let mut config = parse_config(BEFORE);
+        let mut kitt = config.agents[0].clone();
+        kitt.name = "kitt".to_string();
+        config.agents.push(kitt);
+        write_config_to(&config, &path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[[agents]]\nname = \"jarvis\"\ndir = \"/tmp\"\n\n[[agents]]\nname = \"kitt\"\n\
+             dir = \"/tmp\"\n\n[replacements]\n\"package build\" = \"PKGBUILD\"\n"
+        );
+    }
+
     /// A `whisrs config` save keeps the user's `[[agents]]` entries and their
     /// comments (defaults are filled in, as in every other section).
     #[test]
@@ -1298,6 +1362,44 @@ args = ["--model", "haiku"]
         over.audio.device = "mic".to_string();
         write_config_to(&over, &path).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), sparse);
+    }
+
+    /// A table the file does not have is never added empty: an optional
+    /// section with every key at its default (`[llm]` from a setup that
+    /// answered command mode with the defaults) stays out, on a first write
+    /// and over a file, a nested one too. A table the file has keeps its
+    /// header when its keys go, as it keeps what the header means.
+    #[test]
+    fn a_new_table_with_nothing_in_it_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config: Config = toml::from_str("").unwrap();
+        config.general.language = "de".to_string();
+        config.llm = Some(crate::llm::LlmConfig::default());
+        config.hotkeys = Some(Default::default());
+        write_config_to(&config, &path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[general]\nlanguage = \"de\"\n"
+        );
+
+        let sparse = "# mine\n[audio]\ndevice = \"mic\"\n";
+        fs::write(&path, sparse).unwrap();
+        let mut config: Config = toml::from_str(sparse).unwrap();
+        config.llm = Some(crate::llm::LlmConfig::default());
+        config.overlay = Some(crate::OverlayConfig {
+            colors: Some(toml::from_str("").unwrap()),
+            ..Default::default()
+        });
+        write_config_to(&config, &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), sparse);
+
+        let with = "[llm]\napi_key = \"sk-1234\"\n";
+        fs::write(&path, with).unwrap();
+        let mut config: Config = toml::from_str(with).unwrap();
+        config.llm.as_mut().unwrap().api_key = String::new();
+        write_config_to(&config, &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[llm]\n");
     }
 
     /// A key set back to its default leaves the file; a comment above it

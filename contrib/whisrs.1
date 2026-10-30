@@ -20,10 +20,15 @@ subcommand runs an onboarding wizard and does not require the daemon.
 Open the onboarding wizard, a full\-screen TUI, one step at a time: the
 transcription backend; its API key (with a test, below), its server, or a
 whisper.cpp model to download with a progress bar
-.RB ( Esc
+.RB ( Enter
+downloads one not on disk and goes on once it is done,
+.B Esc
 cancels it and leaves no partial file); the language; the microphone, with
 a live level meter; filler removal, tones, the overlay and its theme; the
-typing backend; and, optionally, an LLM for command mode. A review then
+typing backend; then the optional modes, each asked first (Set it up or
+Skip): recording, command mode, read aloud and Jarvis (one
+.B [[agents]]
+entry, added after the file's own). A review then
 writes
 .I config.toml
 through the same save as
@@ -63,18 +68,22 @@ a
 variable wins over a backend's key in the file, and fills in for an empty
 .B [llm] api_key
 (an ASR sidecar is sent half a second of silence; a whisper model file is
-checked to be one),
+checked to be one); on read aloud it says a sample sentence with the voice
+picked, and any key stops it,
 .B s
-skips an optional step (a skipped LLM step leaves
-.B [llm]
-as it is), and
+skips an optional step, at its question or midway (none of a skipped
+mode's keys are written:
+.BR [llm] ,
+.B [tts]
+and the rest stay as they are), and
 .B Esc
 or
 .B q
 leave, asking first about answers not written yet. With a config already
-there, it offers to start fresh (the answers start from the defaults) or
-only check the machine. The write changes only the keys setup asked about,
-leaving the rest of the file, comments included, as it is; the review lists
+there, it offers to start fresh (the answers start from the defaults, with
+the file's API keys kept) or only check the machine. The write changes only
+the keys setup asked about, leaving the rest of the file, comments
+included, as it is; the review lists
 each key that changes, a key masked, and the old file is first kept as
 .I config.toml.bak
 (0600). A missing API key is a warning, not a refusal: the daemon then needs

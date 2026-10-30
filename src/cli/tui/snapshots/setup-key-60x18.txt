@@ -1,5 +1,5 @@
    ╭────────────────────────────────────────────────────╮
-   │ whisrs ▁▃▅▃▁                        setup 2/9 · ○  │
+   │ whisrs ▁▃▅▃▁                       setup 2/12 · ○  │
    │                                                    │
    │   Groq API key                                     │
    │   Get one free at console.groq.com/keys. It is     │

@@ -1,22 +1,23 @@
 
 
 
-
-
    ╭──────────────────────────────────────────────────────────────────────────────────╮
-   │ whisrs ▁▃▅▃▁                                                      setup 8/9 · ○  │
+   │ whisrs ▁▃▅▃▁                                                    setup 11/12 · ○  │
    │                                                                                  │
    │   Review                                                                         │
    │   Enter writes ~/config.toml (0600). Backspace goes back to change an answer.    │
    │                                                                                  │
-   │   backend     groq                                                               │
-   │   key         set ****4321                                                       │
-   │   model       whisper-large-v3-turbo                                             │
-   │   language    en                                                                 │
-   │   mic         default                                                            │
-   │   extras      fillers on · tones on · overlay off · theme carbon                 │
-   │   typing      auto                                                               │
-   │   LLM         skipped: as config.toml has it                                     │
+   │   backend       groq                                                             │
+   │   key           set ****4321                                                     │
+   │   model         whisper-large-v3-turbo                                           │
+   │   language      en                                                               │
+   │   mic           default                                                          │
+   │   extras        fillers on · tones on · overlay off · theme carbon               │
+   │   typing        auto                                                             │
+   │   recording     skipped: as config.toml has it                                   │
+   │   command mode  skipped: as config.toml has it                                   │
+   │   read aloud    skipped: as config.toml has it                                   │
+   │   Jarvis        skipped: as config.toml has it                                   │
    │                                                                                  │
    │   What changes in config.toml:                                                   │
    │   [general] backend              deepgram → groq                                 │
@@ -30,11 +31,10 @@
    │   the file is kept as ~/config.toml.bak first; only the keys above change,       │
    │   and the rest of it, comments too, stays as it is                               │
    │                                                                                  │
-   │   skipped: [llm] stays as it is; whisrs config sets it later                     │
+   │   skipped Jarvis: [[agents]] stays as config.toml has it; whisrs config sets it  │
+   │   later                                                                          │
    ╰──────────────────────────────────────────────────────────────────────────────────╯
      enter write · backspace back · esc leave
-
-
 
 
 

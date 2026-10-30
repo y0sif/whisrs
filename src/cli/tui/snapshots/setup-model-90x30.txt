@@ -6,12 +6,12 @@
 
 
    ╭──────────────────────────────────────────────────────────────────────────────────╮
-   │ whisrs ▁▃▅▃▁                                                      setup 2/9 · ○  │
+   │ whisrs ▁▃▅▃▁                                                     setup 2/12 · ○  │
    │                                                                                  │
    │   Whisper model                                                                  │
-   │   whisper.cpp runs on this machine, offline. Space lists the models with their   │
-   │   sizes; picking one that is not downloaded yet downloads it. The .en ones know  │
-   │   English only, and know it better.                                              │
+   │   whisper.cpp runs on this machine, offline. h/l changes the model, space lists  │
+   │   them with their sizes; enter downloads one not on disk yet and goes on once    │
+   │   it is done. The .en ones know English only, and know it better.                │
    │                                                                                  │
    │ ▌ model       ◂ tiny.en 78 MB · English, fastest, rough ▸                        │
    │   file        ~/models/ggml-tiny.en.bin · not downloaded                         │

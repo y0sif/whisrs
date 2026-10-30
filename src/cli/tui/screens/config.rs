@@ -540,9 +540,9 @@ pub struct ConfigScreen {
     env: Env,
     /// Rows whose label or path holds this, in any case.
     filter: String,
-    /// Only these rows, in this order, and no section list: the wizard's
-    /// step, or the Mic screen's device.
-    pinned: Option<Vec<&'static Field>>,
+    /// Only these rows (each at its path), in this order, and no section
+    /// list: the wizard's step, or the Mic screen's device.
+    pinned: Option<Vec<(&'static Field, String)>>,
     /// Where the section list was before [`ConfigScreen::pin`].
     unpinned: Option<(usize, Focus, Vec<View>)>,
     /// The key tests of the rows, by path. A changed value drops its own.
@@ -579,14 +579,37 @@ impl ConfigScreen {
     /// edits a few rows of the config (setup's steps, the Mic screen);
     /// [`ConfigScreen::unpin`] puts the section list back as it was.
     pub fn pin(&mut self, fields: Vec<&'static Field>) {
-        if self.pinned.is_none() {
-            self.unpinned = Some((self.section, self.focus, self.views.clone()));
+        self.pin_at(
+            fields
+                .into_iter()
+                .map(|field| (field, field.path.to_string()))
+                .collect(),
+        );
+    }
+
+    /// [`ConfigScreen::pin`] with each row at a path of its own: an
+    /// entry's fields (`agents.1.dir`). Pinned again (a row came or went
+    /// with a value), the cursor stays on its row. An agent's harness notes
+    /// when it is not on `PATH`, looked up here.
+    pub fn pin_at(&mut self, rows: Vec<(&'static Field, String)>) {
+        let kept = match self.pinned {
+            Some(_) => self.focused().map(|(_, path)| path),
+            None => {
+                self.unpinned = Some((self.section, self.focus, self.views.clone()));
+                None
+            }
+        };
+        if rows.iter().any(|(_, path)| path.starts_with("agents.")) {
+            self.lists.on_path = Some(options::harnesses_on_path(&self.env));
         }
+        let cursor = kept
+            .and_then(|kept| rows.iter().position(|(_, path)| *path == kept))
+            .unwrap_or(0);
         self.close();
-        self.pinned = Some(fields);
+        self.pinned = Some(rows);
         self.section = 0;
         self.focus = Focus::Detail;
-        self.views = vec![View::Section { cursor: 0 }];
+        self.views = vec![View::Section { cursor }];
     }
 
     pub fn unpin(&mut self) {
@@ -773,12 +796,12 @@ impl ConfigScreen {
 
     /// The rows of the detail pane's current level.
     fn items(&self) -> Vec<Item> {
-        if let Some(fields) = &self.pinned {
-            return fields
+        if let Some(rows) = &self.pinned {
+            return rows
                 .iter()
-                .map(|field| Item::Field {
+                .map(|(field, path)| Item::Field {
                     field,
-                    path: field.path.to_string(),
+                    path: path.clone(),
                 })
                 .collect();
         }
@@ -872,7 +895,9 @@ impl ConfigScreen {
     /// Whether `path` is an entry's key shown outside its form (the Hotkeys
     /// section).
     fn borrowed(&self, path: &str) -> bool {
-        matches!(self.view(), View::Section { .. }) && entry_index(path).is_some()
+        self.pinned.is_none()
+            && matches!(self.view(), View::Section { .. })
+            && entry_index(path).is_some()
     }
 
     fn list(&self, path: &str) -> Vec<String> {
@@ -1520,11 +1545,16 @@ impl ConfigScreen {
         }
     }
 
-    /// The hotkey dialog's title: `toggle hotkey`, `jarvis hotkey`.
+    /// The hotkey dialog's title: `toggle hotkey`, `jarvis hotkey`. A
+    /// `[hotkeys]` key is named as its section names it, whatever its row
+    /// is labelled (setup's `hotkey`).
     fn hotkey_title(&self, field: &Field, path: &str) -> String {
         match entry_index(path) {
             Some((list, index)) => format!("{} {}", self.name_of(list, index), field.label),
-            None => format!("{} hotkey", field.label),
+            None => {
+                let label = schema::find(path).map_or(field.label, |row| row.label);
+                format!("{label} hotkey")
+            }
         }
     }
 
@@ -2088,6 +2118,10 @@ fn shown(screen: &ConfigScreen, field: &Field, path: &str, env: &Env, ui: &Ui) -
             "{:.2}",
             value.and_then(Value::as_float).unwrap_or(0.0)
         )),
+        // A path that must be set, and is not: say so, not `empty`.
+        Kind::Path { unset: None, .. } if text.is_none_or(|text| text.trim().is_empty()) => {
+            Shown::muted("not set")
+        }
         Kind::Text { unset, .. } | Kind::Path { unset, .. } => typed(text, *unset, ui),
         Kind::Suggest {
             unset: Some(unset), ..
@@ -4320,7 +4354,8 @@ mod tests {
         );
     }
 
-    /// Tab completes a typed path in a path input.
+    /// Tab completes a typed path in a path input. A path the entry
+    /// needs, not set yet, says so, not `empty`.
     #[test]
     fn a_path_input_completes_with_tab() {
         let mut fixture = app("[[agents]]\nname = \"jarvis\"\n");
@@ -4329,6 +4364,12 @@ mod tests {
         open(&mut fixture, "Agents");
         press(&mut fixture.app, "\n");
         to_row(&mut fixture, "dir");
+        let form = drawn(&fixture).join("\n");
+        assert!(
+            form.lines()
+                .any(|r| r.contains("dir") && r.contains("not set") && !r.contains("empty")),
+            "{form}"
+        );
         press(&mut fixture.app, "\n");
         type_text(&mut fixture.app, &format!("{}/Doc", root.display()));
         chord(&mut fixture.app, KeyCode::Tab, KeyModifiers::NONE);
