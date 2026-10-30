@@ -150,8 +150,8 @@ it prints where to edit the file and exits 1, changing nothing. Unlike
 .B setup
 this does not touch udev rules, the systemd unit, or compositor keybindings.
 .B Esc
-goes up to Home, which also opens Setup and the Mic test: a live level
-meter of the
+goes up to Home, which also opens Setup, Recordings, History and the Mic
+test: a live level meter of the
 .B [audio] device
 (from \-60 to 0 dBFS, with the silence gate and the peak held), where
 .B h
@@ -164,6 +164,12 @@ pick the device and
 writes only
 .B [audio] device
 (other unsaved edits stay unsaved), then restarts the daemon if it is idle.
+Recordings lists the recordings, newest first, previews one and opens its
+transcript, and retries, copies, names a speaker of, summarizes or deletes
+it through the daemon (a delete, and a retry of a transcribed recording,
+ask first). History shows what dictation typed, newest first. Both filter
+with
+.BR / .
 .TP
 .B toggle
 Start or stop dictation. If idle, begins audio capture. If recording,
@@ -502,6 +508,24 @@ recording being transcribed, and a notification says when it is done; if it
 fails, the recording keeps the summary it had and notes why. A summary
 interrupted by a shutdown is made at the next start. One job runs at a
 time: a running summary delays the next transcription until it ends.
+.TP
+\fBdelete\fR \fIID\fR [\fB\-y\fR, \fB\-\-yes\fR]
+Delete the recording for good: its folder, with its audio, transcript and
+summary. The id is a full id or a unique id prefix, never
+.BR last ,
+so the newest recording is not deleted by mistake; the prefix is resolved
+first, and the daemon is sent the whole id, which it requires. On a terminal it names
+what goes and asks
+.B [y/N]
+first, keeping it unless the answer is
+.B y
+or
+.BR yes ;
+.B \-\-yes
+deletes without asking, and is needed off a terminal, where it otherwise
+refuses. The daemon refuses a recording while it is being recorded, is
+queued or being processed (a summary included), or is held by a rename or
+the audio retention sweep.
 .RE
 .IP
 .BR list ,

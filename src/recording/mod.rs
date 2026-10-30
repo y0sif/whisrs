@@ -124,6 +124,14 @@ pub struct RecordingOptions {
     /// Its new name; blank clears the name the user gave it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The id is a recording's whole id: no prefix, no `last`. The TUI
+    /// sends it with every action, since the prefix of a recording deleted
+    /// meanwhile can name its sibling (`..._1402` and `..._1402-2`). Left
+    /// out by the CLI, which resolves what was typed itself, so its
+    /// messages are as before; a daemon older than it ignores it. A delete
+    /// always takes the whole id.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exact: bool,
 }
 
 impl RecordingOptions {
@@ -165,6 +173,7 @@ impl RecordingOptions {
                     n => naming::validate_person_name(n),
                 })
                 .transpose()?,
+            exact: self.exact,
         })
     }
 
@@ -195,6 +204,9 @@ pub enum RecordingAction {
     /// Summarize a transcribed recording now (`whisrs recording summarize`),
     /// without transcribing it again.
     Summarize,
+    /// Delete a recording's folder for good (`whisrs recording delete`): its
+    /// audio, transcript and summary. Takes its id, never `last`.
+    Delete,
 }
 
 /// Daemon-level recording phase, reported over IPC and to the tray.

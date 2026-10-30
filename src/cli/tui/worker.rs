@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use whisrs::config::setup::{gnome, keybind, mic, model, uinput, unit, Run};
 use whisrs::Config;
 
 use whisrs::agent::{AgentAction, AgentPhase};
-use whisrs::recording::{RecordingAction, RecordingOptions, RecordingPhase};
+use whisrs::recording::{RecordingAction, RecordingOptions, RecordingPhase, RecordingStatus};
 use whisrs::service::ServiceManager;
 use whisrs::{Command, InfoAnswer, RequestError, Response, RestartOutcome, State};
 
@@ -31,7 +31,9 @@ use whisrs::audio::device::InputDeviceInfo;
 use super::app::{MicEvent, Msg, Origin};
 use super::options::{self, Device, Listing};
 use super::schema::ListKind;
+use super::screens::history;
 use super::screens::mic::analysis;
+use super::screens::recordings::{self, Act, Wanted};
 use super::screens::setup::{Checks, SystemAction};
 use super::Env;
 
@@ -40,6 +42,10 @@ const POLL_EVERY: Duration = Duration::from_secs(2);
 
 /// How long one answer may take.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long the daemon may take over a recording's action: a retry repairs
+/// the tracks first, a delete removes a folder of hours of audio.
+const ACT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Every how many polls a daemon known to be older is asked `info` again:
 /// one restarted outside the TUI (`whisrs restart`, a new install) may know
@@ -161,6 +167,9 @@ pub struct Workers {
     mic: Mutex<Option<Arc<AtomicBool>>>,
     /// The sample being said's stop flag.
     speech: Mutex<Option<Arc<AtomicBool>>>,
+    /// Wakes the recordings folder's reader for a read now; dropped, it
+    /// stops.
+    recordings: Mutex<Option<Sender<()>>>,
 }
 
 impl Workers {
@@ -185,6 +194,7 @@ impl Workers {
             downloads: Arc::default(),
             mic: Mutex::new(None),
             speech: Mutex::new(None),
+            recordings: Mutex::new(None),
         };
         let (tx, socket, older) = (
             workers.tx.clone(),
@@ -392,6 +402,136 @@ impl Workers {
             let done = act(action, &dirs, &checks, &run);
             let _ = tx.send(Msg::SystemDone(action, done));
         });
+    }
+}
+
+impl Workers {
+    /// Read the recordings folder (`[recording] dir` of config.toml at
+    /// `config`, else the one under the data folder `data`) on a thread of
+    /// its own: now, every [`POLL_EVERY`] and when woken
+    /// ([`Workers::refresh_recordings`]), sending [`Msg::Recordings`] when
+    /// what it read changed, until [`Workers::stop_recordings`].
+    pub fn watch_recordings(&self, config: PathBuf, data: PathBuf) {
+        let (wake, woken) = mpsc::channel();
+        // The reader before it stops at its next wake.
+        *lock(&self.recordings) = Some(wake);
+        let (tx, socket) = (self.tx.clone(), self.socket.clone());
+        std::thread::spawn(move || {
+            let mut last = None;
+            let mut parsed = recordings::Parsed::default();
+            loop {
+                let folder = recordings::read_folder(
+                    &config,
+                    &data,
+                    chrono::Local::now(),
+                    || recording_status(&socket),
+                    &mut parsed,
+                );
+                if last.as_ref() != Some(&folder) {
+                    if tx.send(Msg::Recordings(folder.clone())).is_err() {
+                        return;
+                    }
+                    last = Some(folder);
+                }
+                match woken.recv_timeout(POLL_EVERY) {
+                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        });
+    }
+
+    /// Read the recordings folder now: an action changed it.
+    pub fn refresh_recordings(&self) {
+        if let Some(wake) = lock(&self.recordings).as_ref() {
+            let _ = wake.send(());
+        }
+    }
+
+    pub fn stop_recordings(&self) {
+        lock(&self.recordings).take();
+    }
+
+    /// Read one recording whole on a thread of its own; it comes back as
+    /// [`Msg::RecordingRead`].
+    pub fn read_recording(&self, wanted: Wanted) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let detail = recordings::read_detail(&wanted.dir);
+            let _ = tx.send(Msg::RecordingRead {
+                id: wanted.id,
+                stamp: wanted.stamp,
+                detail,
+            });
+        });
+    }
+
+    /// Ask the daemon to do `act` on a thread of its own; the answer comes
+    /// back as [`Msg::Acted`].
+    pub fn recording(&self, act: Act) {
+        let (tx, socket, service) = (self.tx.clone(), self.socket.clone(), self.service);
+        std::thread::spawn(move || {
+            let answer = act_on(&socket, service, &act);
+            let _ = tx.send(Msg::Acted { act, answer });
+        });
+    }
+
+    /// Read the dictation history at `path`; it comes back as
+    /// [`Msg::HistoryRead`].
+    pub fn read_history(&self, path: PathBuf) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let read = history::read(&path, chrono::Local::now());
+            let _ = tx.send(Msg::HistoryRead(read));
+        });
+    }
+}
+
+/// What the daemon queues and processes now, from `recording status`;
+/// `None` when it does not answer (not running, older, built without
+/// recordings).
+fn recording_status(socket: &Path) -> Option<RecordingStatus> {
+    let status = Command::Recording {
+        action: RecordingAction::Status,
+        title: None,
+        id: None,
+        options: RecordingOptions::default(),
+    };
+    match whisrs::request_blocking_at(socket, &status, Some(ANSWER_TIMEOUT)) {
+        Ok(Response::Recording { recording }) => Some(recording),
+        _ => None,
+    }
+}
+
+/// Ask the daemon at `socket` to do `act`: done, or why not, in words for
+/// the status line.
+fn act_on(socket: &Path, service: ServiceManager, act: &Act) -> Result<(), String> {
+    let cmd = Command::Recording {
+        action: act.action,
+        title: None,
+        id: Some(act.id.clone()),
+        options: act.options.clone(),
+    };
+    match whisrs::request_blocking_at(socket, &cmd, Some(ACT_TIMEOUT)) {
+        Ok(Response::Recording { .. }) => Ok(()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("whisrsd gave an answer this whisrs does not know".to_string()),
+        Err(RequestError::NotRunning(_)) => Err(format!(
+            "cannot {}: whisrsd is not running. Start it with {}",
+            act.verb(),
+            service.enable_hint().unwrap_or(service.manual_start_hint())
+        )),
+        // Delete is the one action newer than the rest: an older daemon
+        // hangs up on it.
+        Err(RequestError::Closed) if act.action == RecordingAction::Delete => Err(
+            "whisrsd closed the connection without answering. It may be older than this \
+             whisrs and not know delete: restart it (whisrs restart)"
+                .to_string(),
+        ),
+        Err(RequestError::Closed) => {
+            Err("whisrsd closed the connection without answering".to_string())
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1105,6 +1245,7 @@ mod list_tests {
             downloads: Arc::default(),
             mic: Mutex::new(None),
             speech: Mutex::new(None),
+            recordings: Mutex::new(None),
         };
         workers.list(ListKind::Devices);
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -1273,6 +1414,7 @@ mod list_tests {
             downloads: Arc::default(),
             mic: Mutex::new(None),
             speech: Mutex::new(None),
+            recordings: Mutex::new(None),
         };
         workers.mic_start(7, "nope".into());
         let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -1319,6 +1461,7 @@ mod list_tests {
             downloads: Arc::default(),
             mic: Mutex::new(None),
             speech: Mutex::new(None),
+            recordings: Mutex::new(None),
         };
         {
             // Another probe, or a listing, holds the lock meanwhile.
@@ -1376,6 +1519,7 @@ mod list_tests {
             downloads: Arc::default(),
             mic: Mutex::new(None),
             speech: Mutex::new(None),
+            recordings: Mutex::new(None),
         };
         let config: Config = toml::from_str("").unwrap();
         let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -1624,7 +1768,12 @@ mod tests {
                 let cmd: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 let name = cmd["cmd"].as_str().unwrap_or_default();
                 let action = cmd["action"].as_str().map(|a| format!(" {a}"));
-                seen.push(format!("{name}{}", action.unwrap_or_default()));
+                let id = cmd["id"].as_str().map(|id| format!(" {id}"));
+                seen.push(format!(
+                    "{name}{}{}",
+                    action.unwrap_or_default(),
+                    id.unwrap_or_default()
+                ));
                 match meet {
                     Answer(answer) => {
                         let frame = whisrs::encode_message(&answer).unwrap();
@@ -1665,6 +1814,105 @@ mod tests {
                 ..Default::default()
             },
         })
+    }
+
+    /// A recording's action goes to the daemon by the full id; its answer,
+    /// its refusal, a hang-up (an older daemon) and no daemon at all each
+    /// read as the status line says them.
+    #[test]
+    fn a_recording_action_is_asked_of_the_daemon() {
+        let act = Act {
+            action: RecordingAction::Delete,
+            id: "2026-10-27_1402_standup".into(),
+            options: RecordingOptions::default(),
+            label: "\"Standup\"".into(),
+        };
+        let refusal = "recording 2026-10-27_1402_standup is queued for transcription: delete \
+                       it once that is done";
+        let (_dir, path, daemon) = fake_daemon(vec![
+            recording(RecordingPhase::Idle),
+            Answer(Response::Error {
+                message: refusal.into(),
+            }),
+            HangUp,
+            HangUp,
+        ]);
+        let systemd = ServiceManager::Systemd;
+        assert_eq!(act_on(&path, systemd, &act), Ok(()));
+        assert_eq!(act_on(&path, systemd, &act), Err(refusal.to_string()));
+        let older = act_on(&path, systemd, &act).unwrap_err();
+        assert!(older.contains("may be older than this whisrs"), "{older}");
+        // Copy is older than any daemon that has recordings: a hang-up is
+        // no sign of an older one.
+        let copy = Act {
+            action: RecordingAction::Copy,
+            ..act.clone()
+        };
+        assert_eq!(
+            act_on(&path, systemd, &copy),
+            Err("whisrsd closed the connection without answering".to_string())
+        );
+        let mut asked = vec!["recording delete 2026-10-27_1402_standup"; 3];
+        asked.push("recording copy 2026-10-27_1402_standup");
+        assert_eq!(daemon.join(), asked);
+        let down = act_on(&path.with_file_name("none.sock"), systemd, &act).unwrap_err();
+        assert_eq!(
+            down,
+            "cannot delete: whisrsd is not running. Start it with systemctl --user enable --now \
+             whisrs.service"
+        );
+    }
+
+    /// The recordings folder `[recording] dir` names is read at once, again
+    /// when woken, and the reader stops when told to.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn the_recordings_folder_is_watched_until_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("recordings");
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!("[recording]\ndir = \"{}\"\n", root.display()),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers = Workers {
+            tx,
+            socket: dir.path().join("whisrs.sock"),
+            service: ServiceManager::None,
+            lister: Lister {
+                devices: Vec::new,
+                models: dir.path().to_path_buf(),
+                home: None,
+            },
+            older: Arc::new(AtomicBool::new(false)),
+            env: Env::default(),
+            tools: Tools::real(),
+            downloads: Arc::default(),
+            mic: Mutex::new(None),
+            speech: Mutex::new(None),
+            recordings: Mutex::new(None),
+        };
+        let read = || match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Msg::Recordings(Ok(items))) => items,
+            _ => panic!("no read of the folder"),
+        };
+        workers.watch_recordings(config, dir.path().join("data"));
+        assert!(read().is_empty());
+        let (id, made) =
+            whisrs::recording::store::create(&root, chrono::Local::now(), Some("new")).unwrap();
+        let meta = whisrs::recording::RecordingMeta::new(
+            id.clone(),
+            Some("new".into()),
+            chrono::Local::now(),
+        );
+        whisrs::recording::store::write_meta(&made, &meta).unwrap();
+        workers.refresh_recordings();
+        assert_eq!(read()[0].id, id);
+        workers.stop_recordings();
+        workers.refresh_recordings();
+        assert!(lock(&workers.recordings).is_none());
     }
 
     /// After one hang-up on `info`, an older daemon is asked `status` only,

@@ -327,6 +327,15 @@ enum RecordingCmd {
         /// Recording id, a unique id prefix, or `last`
         id: String,
     },
+    /// Delete a recording for good: its audio, transcript and summary. Asks
+    /// first on a terminal
+    Delete {
+        /// Recording id, or a unique id prefix (never `last`)
+        id: String,
+        /// Delete without asking; needed when not on a terminal
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 /// `whisrs recording ...` in a build without the recording feature: it takes
@@ -795,7 +804,8 @@ async fn request(cmd: Command) -> anyhow::Result<Response> {
 }
 
 /// Whether a daemon older than this whisrs may not parse `cmd`: `speak-text`,
-/// `agent` and `agent-event` are new with agent mode, `info` after it.
+/// `agent` and `agent-event` are new with agent mode, `info` and `recording
+/// delete` after it.
 fn older_daemon_cannot_parse(cmd: &Command) -> bool {
     matches!(
         cmd,
@@ -803,6 +813,10 @@ fn older_daemon_cannot_parse(cmd: &Command) -> bool {
             | Command::Agent { .. }
             | Command::AgentEvent { .. }
             | Command::Info
+            | Command::Recording {
+                action: whisrs::recording::RecordingAction::Delete,
+                ..
+            }
     )
 }
 
@@ -857,6 +871,7 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
             name_options(speaker, &name),
         ),
         RecordingCmd::Summarize { id } => (RecordingAction::Summarize, None, Some(id), none()),
+        RecordingCmd::Delete { id, yes } => return recording_delete(&id, yes).await,
         RecordingCmd::List { json } => return recording_list(json),
         RecordingCmd::Show { id, format } => return recording_show(&id, format),
         RecordingCmd::Path { id } => {
@@ -891,6 +906,116 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
         other => exit_with_error(&format!("unexpected daemon response: {other:?}")),
     }
     Ok(())
+}
+
+/// `whisrs recording delete`: resolved here (a unique prefix works, `last`
+/// never does), asked on a terminal (`--yes` skips it, and is needed off
+/// one), then deleted by the daemon by its full id, which refuses it while
+/// it is busy.
+#[cfg(feature = "recording")]
+async fn recording_delete(query: &str, yes: bool) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    if let Some(refusal) = delete_refusal(query) {
+        exit_with_error(&refusal);
+    }
+    let (dir, meta) = match store::resolve_meta(&recordings_root(), query) {
+        Ok(found) => found,
+        Err(e) => exit_with_error(&format!("{e:#}")),
+    };
+    let question = delete_question_for(&dir, &meta);
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let stdin = std::io::stdin();
+    match confirm_delete(
+        yes,
+        tty,
+        &question,
+        &meta.id,
+        stdin.lock(),
+        std::io::stdout(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("Kept {}.", meta.id);
+            return Ok(());
+        }
+        Err(refusal) => exit_with_error(&refusal),
+    }
+    let response = request(Command::Recording {
+        action: RecordingAction::Delete,
+        title: None,
+        id: Some(meta.id.clone()),
+        options: RecordingOptions::default(),
+    })
+    .await?;
+    match response {
+        Response::Recording { .. } => println!("Deleted {} ({}).", meta.id, dir.display()),
+        Response::Error { message } => exit_with_error(&message),
+        other => exit_with_error(&format!("unexpected daemon response: {other:?}")),
+    }
+    Ok(())
+}
+
+/// Why `whisrs recording delete <query>` is refused before anything is
+/// read: `last` is never what it deletes.
+#[cfg(feature = "recording")]
+fn delete_refusal(query: &str) -> Option<String> {
+    query.trim().eq_ignore_ascii_case("last").then(|| {
+        "delete takes the recording's id, not \"last\", so the newest recording is never \
+         deleted by mistake: whisrs recording list shows the ids"
+            .to_string()
+    })
+}
+
+/// The question a delete asks about the recording in `dir`, naming what of
+/// it is there to lose.
+#[cfg(feature = "recording")]
+fn delete_question_for(dir: &std::path::Path, meta: &RecordingMeta) -> String {
+    let audio = !meta.audio_deleted && meta.tracks.iter().any(|t| dir.join(&t.file).exists());
+    let transcript = store::transcript_path(dir, &meta.id).exists();
+    let duration = recording_duration_secs(meta).map(tui::duration_label);
+    tui::delete_question(
+        meta.title.as_deref().filter(|t| !t.trim().is_empty()),
+        &meta.id,
+        duration.as_deref(),
+        tui::Holds {
+            audio,
+            transcript,
+            summary: meta.summary.is_some(),
+        },
+    )
+}
+
+/// Ask `question` on `output` and read the answer from `input`: only `y` or
+/// `yes` deletes. Off a terminal it asks nothing and refuses, unless `yes`
+/// was given, which deletes without asking.
+#[cfg(feature = "recording")]
+fn confirm_delete(
+    yes: bool,
+    tty: bool,
+    question: &str,
+    id: &str,
+    mut input: impl std::io::BufRead,
+    mut output: impl std::io::Write,
+) -> Result<bool, String> {
+    if yes {
+        return Ok(true);
+    }
+    if !tty {
+        return Err(format!(
+            "whisrs recording delete asks before it deletes, and this is not a terminal: \
+             whisrs recording delete {id} --yes deletes it without asking"
+        ));
+    }
+    let _ = write!(output, "{question} [y/N] ");
+    let _ = output.flush();
+    let mut answer = String::new();
+    if input.read_line(&mut answer).is_err() {
+        return Ok(false);
+    }
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// The recordings root: `[recording] dir` from config.toml, else the default
@@ -1207,7 +1332,18 @@ mod tests {
             payload: serde_json::json!({}),
         }));
         assert!(older_daemon_cannot_parse(&Command::Info));
+        let recording = |action| Command::Recording {
+            action,
+            title: None,
+            id: Some("2026-10-27_1402_standup".into()),
+            options: Default::default(),
+        };
+        assert!(older_daemon_cannot_parse(&recording(
+            whisrs::recording::RecordingAction::Delete
+        )));
         for old in [
+            recording(whisrs::recording::RecordingAction::Copy),
+            recording(whisrs::recording::RecordingAction::Retry),
             Command::Toggle { language: None },
             Command::Cancel,
             Command::Status,
@@ -1419,6 +1555,7 @@ mod tests {
             ],
             &["recording", "toggle", "--num-speakers", "99"],
             &["recording", "show", "last", "-f", "txt"],
+            &["recording", "delete", "2026-10", "--yes"],
             &["recording", "bogus", "--flag"],
         ] {
             let argv: Vec<&str> = std::iter::once("whisrs")
@@ -1778,6 +1915,118 @@ mod tests {
                 let argv = ["whisrs", "recording", action];
                 assert!(Cli::try_parse_from(argv).is_err(), "{action} needs an id");
             }
+        }
+
+        /// `delete` takes the id and `--yes` (`-y`), and needs the id.
+        #[test]
+        fn recording_delete_parses() {
+            for (args, yes) in [
+                (&["delete", "2026-10"][..], false),
+                (&["delete", "2026-10", "--yes"], true),
+                (&["delete", "-y", "2026-10"], true),
+            ] {
+                match parse_recording(args) {
+                    RecordingCmd::Delete { id, yes: given } => {
+                        assert_eq!((id.as_str(), given), ("2026-10", yes), "{args:?}")
+                    }
+                    _ => panic!("expected delete"),
+                }
+            }
+            assert!(Cli::try_parse_from(["whisrs", "recording", "delete"]).is_err());
+        }
+
+        /// `last` is never what a delete takes, in any case; a prefix is
+        /// left to the lookup.
+        #[test]
+        fn a_delete_never_takes_last() {
+            for last in ["last", " LAST "] {
+                let refusal = delete_refusal(last).expect("refused");
+                assert!(refusal.contains("not \"last\""), "{refusal}");
+                assert!(refusal.contains("whisrs recording list"), "{refusal}");
+            }
+            assert_eq!(delete_refusal("2026-10-27"), None);
+        }
+
+        /// Off a terminal a delete asks nothing and refuses unless `--yes`,
+        /// which deletes without asking; on one it asks `[y/N]` and only
+        /// `y` or `yes` deletes.
+        #[test]
+        fn a_delete_asks_on_a_terminal_and_refuses_off_one() {
+            let question = "Delete \"Standup\" (32m): audio. This cannot be undone.";
+            let id = "2026-10-27_1402_standup";
+            let mut out = Vec::new();
+            let refusal =
+                confirm_delete(false, false, question, id, &b"y\n"[..], &mut out).unwrap_err();
+            assert!(refusal.contains("this is not a terminal"), "{refusal}");
+            assert!(
+                refusal.contains("whisrs recording delete 2026-10-27_1402_standup --yes"),
+                "{refusal}"
+            );
+            assert!(out.is_empty(), "nothing asked");
+            assert_eq!(
+                confirm_delete(true, false, question, id, &b""[..], &mut out),
+                Ok(true)
+            );
+            assert_eq!(
+                confirm_delete(true, true, question, id, &b"n\n"[..], &mut out),
+                Ok(true),
+                "--yes does not ask"
+            );
+            assert!(out.is_empty());
+            for (answer, delete) in [
+                ("y\n", true),
+                (" YES \n", true),
+                ("\n", false),
+                ("n\n", false),
+                ("yeah\n", false),
+                ("", false),
+            ] {
+                let mut out = Vec::new();
+                assert_eq!(
+                    confirm_delete(false, true, question, id, answer.as_bytes(), &mut out),
+                    Ok(delete),
+                    "{answer:?}"
+                );
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    format!("{question} [y/N] ")
+                );
+            }
+        }
+
+        /// The question names the recording and only what of it is on disk.
+        #[test]
+        fn the_delete_question_names_what_is_on_disk() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (id, dir) = store::create(tmp.path(), at(14, 2), Some("Standup")).unwrap();
+            let mut meta = RecordingMeta::new(id.clone(), Some("Standup".into()), at(14, 2));
+            meta.status = RecordingState::Done;
+            meta.ended_at = Some(at(14, 34));
+            meta.tracks = vec![whisrs::recording::TrackMeta {
+                kind: whisrs::recording::TrackKind::Mic,
+                file: "audio/mic.wav".into(),
+                device: "default".into(),
+                offset_ms: 0,
+                samples: 0,
+            }];
+            meta.summary = Some("Shipped.".into());
+            std::fs::write(store::transcript_path(&dir, &id), "# Standup\n").unwrap();
+            assert_eq!(
+                delete_question_for(&dir, &meta),
+                "Delete \"Standup\" (32m): transcript and summary. This cannot be undone."
+            );
+            std::fs::write(dir.join("audio/mic.wav"), b"RIFF").unwrap();
+            assert_eq!(
+                delete_question_for(&dir, &meta),
+                "Delete \"Standup\" (32m): audio, transcript and summary. This cannot be undone."
+            );
+            meta.audio_deleted = true;
+            meta.title = None;
+            meta.summary = None;
+            assert_eq!(
+                delete_question_for(&dir, &meta),
+                format!("Delete {id} (32m): transcript. This cannot be undone.")
+            );
         }
 
         #[test]

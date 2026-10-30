@@ -113,6 +113,27 @@ fn hotkeys_section_snapshots() {
     }
 }
 
+/// On Home a notice is never cut: in one pane, the info rows that do not
+/// fit go from the bottom first.
+#[test]
+fn a_notice_is_never_cut_on_home() {
+    let fixture = home();
+    let short = rows(&draw(&fixture.app, 60, 18));
+    assert!(short
+        .iter()
+        .any(|r| r.contains("! unknown key [general] silense_timeout_ms is")));
+    assert!(short
+        .iter()
+        .any(|r| r.trim_matches(['\u{2502}', ' ']) == "ignored"));
+    assert!(!short.iter().any(|r| r.contains("built with")));
+    assert!(short.iter().any(|r| r.contains("hotkeys")));
+    let tall = rows(&draw(&fixture.app, 60, 24));
+    assert!(tall.iter().any(|r| r.contains("built with")));
+    assert!(tall
+        .iter()
+        .any(|r| r.trim_matches(['\u{2502}', ' ']) == "ignored"));
+}
+
 #[test]
 fn home_snapshots() {
     let fixture = home();
@@ -256,4 +277,21 @@ fn no_size_panics() {
             }
         }
     }
+}
+
+/// Built without the recording feature, Recordings says so and reads
+/// nothing.
+#[cfg(not(feature = "recording"))]
+#[test]
+fn recordings_say_the_feature_is_missing() {
+    use super::app::Effect;
+    let mut fixture = mockup();
+    assert!(!fixture.app.recordings.built);
+    press(&mut fixture.app, "\x1bjj");
+    assert!(press(&mut fixture.app, "\n").is_empty(), "nothing to read");
+    let drawn = rows(&draw(&fixture.app, 90, 30));
+    assert!(drawn
+        .iter()
+        .any(|r| r.contains("built without the recording feature")));
+    assert_eq!(press(&mut fixture.app, "\x1b"), [Effect::StopRecordings]);
 }

@@ -4,13 +4,14 @@
 
 
 
-
    ╭─────────────────────────────────────────────────────────────────────────────────╮
    │ whisrs ▁▃▅▃▁                                                          home · ●  │
    │                                                                                 │
    │   Setup                                                                         │
    │ ▌ Config                                                                        │
    │   Mic test                                                                      │
+   │   Recordings                                                                    │
+   │   History                                                                       │
    │                                                                                 │
    │   daemon      running · idle · v0.2.0                                           │
    │   backend     deepgram-streaming                                                │
@@ -21,7 +22,6 @@
    │   ! unknown key [general] silense_timeout_ms is ignored                         │
    ╰─────────────────────────────────────────────────────────────────────────────────╯
      j/k move · enter open · ? help · q quit
-
 
 
 

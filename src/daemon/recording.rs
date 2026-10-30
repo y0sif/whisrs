@@ -579,6 +579,36 @@ impl RecordingRuntime {
             .retain(|h| h != id);
     }
 
+    /// Hold recording `id` for its delete, refusing it while it is
+    /// captured, processed, queued or held, summary jobs included: stricter
+    /// than [`Self::hold`], since a summary job reading the recording would
+    /// write into a folder that is gone. The check and the hold are one
+    /// step under the view lock. Follow with [`Self::release`].
+    fn hold_to_delete(&self, id: &str) -> Result<()> {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if view.capturing.as_ref().is_some_and(|r| r.id == id) {
+            bail!("recording {id} is still being recorded");
+        }
+        let doing = match (
+            view.processing.as_ref().filter(|p| p.id == id),
+            view.queued.iter().find(|q| q.id == id),
+        ) {
+            (Some(running), _) if running.job == Job::Summarize => Some("being summarized"),
+            (Some(_), _) => Some("being transcribed"),
+            (None, Some(queued)) if queued.job == Job::Summarize => Some("queued for a summary"),
+            (None, Some(_)) => Some("queued for transcription"),
+            (None, None) => None,
+        };
+        if let Some(doing) = doing {
+            bail!("recording {id} is {doing}: delete it once that is done");
+        }
+        if view.held.iter().any(|h| h == id) {
+            bail!("recording {id} is busy (being renamed or cleaned up); try again");
+        }
+        view.held.push(id.to_string());
+        Ok(())
+    }
+
     /// Hand a reserved recording to the worker. A recording waiting for the
     /// network is no longer shown as waiting once it is queued.
     fn dispatch(&self, recording: ActiveRecording) -> Result<()> {
@@ -634,6 +664,23 @@ fn notify(context: &DaemonContext, body: &str) {
 
 fn recordings_root(config: &Config) -> PathBuf {
     store::recordings_dir_from(RecordingConfig::effective(config).dir.as_deref())
+}
+
+/// The recording `query` names in the recordings folder, read: by
+/// [`store::resolve`] (`last`, an id or a unique prefix), or with `exact`
+/// by its whole id only. A prefix would land on a sibling once the one it
+/// was meant for is gone: `..._1402` deleted, `..._1402-2` matches.
+fn find_recording(config: &Config, query: &str, exact: bool) -> Result<(PathBuf, RecordingMeta)> {
+    let root = recordings_root(config);
+    let dir = store::resolve(&root, query)?;
+    let meta = store::read_meta(&dir)?;
+    if exact && meta.id != query.trim() {
+        bail!(
+            "no recording has the id {}: it may have been deleted",
+            query.trim()
+        );
+    }
+    Ok((dir, meta))
 }
 
 /// The mic track's device: `[recording] mic_device`, else `[audio] device`.
@@ -729,9 +776,15 @@ pub(crate) async fn handle_recording(
         RecordingAction::Cancel => cancel(&context).await,
         RecordingAction::Status => Ok(()),
         RecordingAction::Retry => retry(&context, id.as_deref().unwrap_or("last"), &options).await,
-        RecordingAction::Copy => copy(&context, id.as_deref().unwrap_or("last")).await,
+        RecordingAction::Copy => {
+            copy(&context, id.as_deref().unwrap_or("last"), options.exact).await
+        }
         RecordingAction::Name => name(&context, id.as_deref().unwrap_or("last"), &options).await,
-        RecordingAction::Summarize => summarize(&context, id.as_deref().unwrap_or("last")).await,
+        RecordingAction::Summarize => {
+            summarize(&context, id.as_deref().unwrap_or("last"), options.exact).await
+        }
+        // No default to `last`: a delete names what it deletes.
+        RecordingAction::Delete => delete(&context, id.as_deref()).await,
     };
     match result {
         Ok(()) => recording_response(&context),
@@ -1486,9 +1539,7 @@ async fn retry(
     query: &str,
     options: &RecordingOptions,
 ) -> Result<()> {
-    let root = recordings_root(&context.config);
-    let dir = store::resolve(&root, query)?;
-    let meta = store::read_meta(&dir)?;
+    let (dir, meta) = find_recording(&context.config, query, options.exact)?;
     let recording_id = context
         .recording
         .session
@@ -1552,9 +1603,7 @@ async fn name(context: &Arc<DaemonContext>, query: &str, options: &RecordingOpti
     let (Some(speaker), Some(name)) = (options.speaker.clone(), options.name.clone()) else {
         bail!("naming a speaker needs the speaker and its name (an empty name clears it)");
     };
-    let root = recordings_root(&context.config);
-    let dir = store::resolve(&root, query)?;
-    let meta = store::read_meta(&dir)?;
+    let (dir, meta) = find_recording(&context.config, query, options.exact)?;
     // Checked before the hold too, so one never holds back the stop of a
     // recording in progress.
     whisrs::recording::naming::ensure_transcribed(&meta)?;
@@ -1588,10 +1637,8 @@ async fn name(context: &Arc<DaemonContext>, query: &str, options: &RecordingOpti
 /// summarize`), whatever `[recording] summary` says ([`queue_summary`]).
 /// One without a transcript, or a config without an `[llm]`, is refused
 /// before anything is queued.
-async fn summarize(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
-    let root = recordings_root(&context.config);
-    let dir = store::resolve(&root, query)?;
-    let meta = store::read_meta(&dir)?;
+async fn summarize(context: &Arc<DaemonContext>, query: &str, exact: bool) -> Result<()> {
+    let (dir, meta) = find_recording(&context.config, query, exact)?;
     summary::ensure_summarizable(&meta, &context.config)?;
     queue_summary(
         context,
@@ -1633,10 +1680,8 @@ async fn queue_summary(
     Ok(())
 }
 
-async fn copy(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
-    let root = recordings_root(&context.config);
-    let dir = store::resolve(&root, query)?;
-    let meta = store::read_meta(&dir)?;
+async fn copy(context: &Arc<DaemonContext>, query: &str, exact: bool) -> Result<()> {
+    let (dir, meta) = find_recording(&context.config, query, exact)?;
     let path = store::transcript_path(&dir, &meta.id);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -1659,6 +1704,64 @@ async fn copy(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
         .context("clipboard task panicked")?
         .context("failed to copy the transcript to the clipboard")?;
     notify(context, "Recording transcript copied to the clipboard");
+    Ok(())
+}
+
+/// Delete a recording's folder for good (`whisrs recording delete`): its
+/// audio, transcript, summary and chunk cache. The id is required, whole
+/// (the CLI resolves a prefix itself, and sends the whole id), and never
+/// `last`, so a delete never lands on another recording than the one asked
+/// about: not the newest, and not a sibling a stale prefix matches. Refused
+/// while the recording is captured or still on its way to the queue (its
+/// `recording.json` says `recording` or `processing`), and while it is
+/// queued, processed or held ([`RecordingRuntime::hold_to_delete`]); held
+/// while the folder goes, so nothing queues or rewrites it meanwhile.
+async fn delete(context: &Arc<DaemonContext>, query: Option<&str>) -> Result<()> {
+    let Some(query) = query.map(str::trim).filter(|q| !q.is_empty()) else {
+        bail!("which recording? Give its id: whisrs recording delete <id> (whisrs recording list shows them)");
+    };
+    if query.eq_ignore_ascii_case("last") {
+        bail!(
+            "delete takes the recording's id, not \"last\", so the newest recording is never \
+             deleted by mistake: whisrs recording list shows the ids"
+        );
+    }
+    let (dir, meta) = find_recording(&context.config, query, true)?;
+    let live = context
+        .recording
+        .session
+        .lock()
+        .await
+        .as_ref()
+        .map(|s| s.meta.id.clone());
+    if live.as_deref() == Some(meta.id.as_str()) {
+        bail!(
+            "recording {} is being recorded: stop it first, or cancel it (whisrs recording \
+             cancel), which deletes it",
+            meta.id
+        );
+    }
+    // A stop writes `processing` before it takes the recording off the
+    // view and queues it: on disk, that moment is never `done`.
+    match meta.status {
+        RecordingState::Recording => bail!("recording {} is still being recorded", meta.id),
+        RecordingState::Processing => bail!(
+            "recording {} is being transcribed: delete it once that is done",
+            meta.id
+        ),
+        RecordingState::Done | RecordingState::Failed | RecordingState::Waiting => {}
+    }
+    context.recording.hold_to_delete(&meta.id)?;
+    let gone = dir.clone();
+    let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&gone))
+        .await
+        .context("the delete panicked")
+        .and_then(|r| r.with_context(|| format!("failed to delete {}", dir.display())));
+    context.recording.release(&meta.id);
+    removed?;
+    // One waiting for the network is not tried again.
+    context.recording.hide_waiting(&meta.id);
+    info!("recording {} deleted: {}", meta.id, dir.display());
     Ok(())
 }
 
@@ -2122,6 +2225,12 @@ async fn retry_waiting(context: &Arc<DaemonContext>, now: DateTime<Local>, start
                 context.recording.hide_waiting(&id);
                 continue;
             }
+            // Deleted since it was listed (`whisrs recording delete`).
+            Err(_) if !recording.dir.exists() => {
+                debug!("recording {id} is gone; not trying it again");
+                context.recording.hide_waiting(&id);
+                continue;
+            }
             Err(e) => {
                 warn!("failed to read recording {id}: {e:#}");
                 context.recording.hide_waiting(&id);
@@ -2410,12 +2519,23 @@ async fn resume_summaries(context: &Arc<DaemonContext>) {
                 "recording {id}: its automatic summary is not made: [recording] summary is \
                  off now"
             );
+            // Held while recording.json is rewritten, so a delete cannot
+            // remove the folder under the write; one that is busy keeps its
+            // mark until the next start.
+            if context.recording.hold(&id).is_err() {
+                continue;
+            }
+            let held = Held {
+                context: Arc::clone(context),
+                id: id.clone(),
+            };
             let clear_dir = dir.clone();
             if let Ok(Err(e)) =
                 tokio::task::spawn_blocking(move || summary::clear_pending(&clear_dir)).await
             {
                 warn!("recording {id}: failed to clear its pending summary: {e:#}");
             }
+            drop(held);
             continue;
         }
         info!("recording {id}: resuming its interrupted summary");
@@ -5629,5 +5749,314 @@ mod tests {
         drop(next_tx);
         stop(&context, None, EndReason::Stopped).await.unwrap();
         assert!(!context.recording.is_capturing());
+    }
+
+    /// `recording delete` of `id`, as the CLI sends it.
+    async fn delete_recording(context: &Arc<DaemonContext>, id: Option<&str>) -> Response {
+        handle_recording(
+            Arc::clone(context),
+            RecordingAction::Delete,
+            None,
+            id.map(str::to_string),
+            RecordingOptions::default(),
+        )
+        .await
+    }
+
+    /// A transcribed recording titled `title` in `root`, its mic track on
+    /// disk.
+    fn done_recording(root: &Path, title: &str) -> (String, PathBuf) {
+        let (id, dir) = store::create(root, Local::now(), Some(title)).unwrap();
+        let mut meta = RecordingMeta::new(id.clone(), Some(title.into()), Local::now());
+        meta.status = RecordingState::Done;
+        meta.ended_at = Some(Local::now());
+        meta.tracks.push(track_meta(TrackKind::Mic, "test".into()));
+        store::write_meta(&dir, &meta).unwrap();
+        std::fs::write(
+            store::audio_path(&dir, TrackKind::Mic),
+            whisrs::audio::wav::encode_wav(&[0; 1600]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(store::transcript_path(&dir, &id), "# done\n").unwrap();
+        (id, dir)
+    }
+
+    /// A delete takes the whole folder and nothing else, by its whole id
+    /// only (a unique prefix is refused), and holds nothing after. An id
+    /// that matches nothing, the deleted one's included, is an error.
+    #[tokio::test]
+    async fn a_delete_removes_the_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+        let (id, dir) = done_recording(tmp.path(), "standup");
+        let (kept, kept_dir) = done_recording(tmp.path(), "planning");
+
+        let prefix = &id[..id.len() - 3];
+        refused(
+            delete_recording(&context, Some(prefix)).await,
+            &format!("no recording has the id {prefix}"),
+        );
+        assert!(dir.exists());
+        let response = delete_recording(&context, Some(&id)).await;
+        assert!(
+            matches!(response, Response::Recording { .. }),
+            "{response:?}"
+        );
+        assert!(!dir.exists());
+        assert!(kept_dir.exists(), "only that one");
+        assert_eq!(store::read_meta(&kept_dir).unwrap().id, kept);
+        assert!(queue.try_recv().is_err(), "nothing queued");
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+        assert!(context.recording.hold(&id).is_ok(), "not left held");
+        context.recording.release(&id);
+
+        refused(
+            delete_recording(&context, Some(&id)).await,
+            "no recording matches",
+        );
+        refused(
+            delete_recording(&context, Some("2099-01-01")).await,
+            "no recording matches",
+        );
+        // A recording waiting for the network goes too, and is not tried
+        // again.
+        let (waiting, waiting_dir) = done_recording(tmp.path(), "offline");
+        let mut meta = store::read_meta(&waiting_dir).unwrap();
+        meta.status = RecordingState::Waiting;
+        store::write_meta(&waiting_dir, &meta).unwrap();
+        context
+            .recording
+            .show_waiting(ActiveRecording::from_meta(&waiting_dir, &meta));
+        let response = delete_recording(&context, Some(&waiting)).await;
+        assert!(
+            matches!(response, Response::Recording { .. }),
+            "{response:?}"
+        );
+        assert!(!waiting_dir.exists());
+        assert!(context.recording.status().waiting.is_empty());
+        retry_waiting(&context, Local::now(), false).await;
+        assert!(queue.try_recv().is_err());
+    }
+
+    /// A delete names its recording (no id, or `last`, is refused) and
+    /// waits until nothing else has it: the live recording, one on its way
+    /// to the queue, one queued or processed for a transcription or a
+    /// summary, and one held. The folder stays through every refusal.
+    #[tokio::test]
+    async fn a_delete_is_refused_while_the_recording_is_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context(tmp.path(), working_backend());
+        refused(delete_recording(&context, None).await, "which recording?");
+        refused(
+            delete_recording(&context, Some("  ")).await,
+            "which recording?",
+        );
+        let (id, dir) = done_recording(tmp.path(), "standup");
+        for last in ["last", " LAST "] {
+            refused(delete_recording(&context, Some(last)).await, "not \"last\"");
+        }
+        let meta = store::read_meta(&dir).unwrap();
+        let active = ActiveRecording::from_meta(&dir, &meta);
+
+        // Queued for a retry, then being transcribed.
+        context.recording.reserve(&active).unwrap();
+        refused(
+            delete_recording(&context, Some(&id)).await,
+            "is queued for transcription",
+        );
+        context.recording.update(|v| {
+            v.queued.clear();
+            v.processing = Some(active.clone());
+        });
+        refused(
+            delete_recording(&context, Some(&id)).await,
+            "is being transcribed: delete it once that is done",
+        );
+        context.recording.update(|v| v.processing = None);
+
+        // A summary queued (marked pending on disk), then running.
+        queue_summary(&context, active.clone(), SummaryRequest::Asked)
+            .await
+            .unwrap();
+        refused(
+            delete_recording(&context, Some(&id)).await,
+            "is queued for a summary",
+        );
+        context.recording.update(|v| {
+            v.processing = v.queued.pop();
+        });
+        refused(
+            delete_recording(&context, Some(&id)).await,
+            "is being summarized",
+        );
+        context.recording.update(|v| v.processing = None);
+
+        // Held by a rename or the sweep.
+        context.recording.hold(&id).unwrap();
+        refused(delete_recording(&context, Some(&id)).await, "is busy");
+        context.recording.release(&id);
+
+        // Stopped, its `recording.json` says processing, and it is not
+        // queued yet; or left `recording` by a crash recovery has not
+        // reached.
+        for (state, want) in [
+            (RecordingState::Processing, "is being transcribed"),
+            (RecordingState::Recording, "is still being recorded"),
+        ] {
+            let mut meta = store::read_meta(&dir).unwrap();
+            meta.status = state;
+            store::write_meta(&dir, &meta).unwrap();
+            refused(delete_recording(&context, Some(&id)).await, want);
+        }
+        assert!(dir.exists());
+
+        // The recording in progress.
+        let (session, tx) = fed_session(tmp.path(), "live");
+        let (live, live_dir) = (session.meta.id.clone(), session.dir.clone());
+        show_recording(&context, session).await;
+        refused(
+            delete_recording(&context, Some(&live)).await,
+            "is being recorded: stop it first",
+        );
+        assert!(live_dir.exists());
+        drop(tx);
+        assert!(dir.exists(), "every refusal kept the folder");
+    }
+
+    /// A recording made at `started` with no title, done, in `root`.
+    fn untitled_at(root: &Path, started: DateTime<Local>) -> (String, PathBuf) {
+        let (id, dir) = store::create(root, started, None).unwrap();
+        let mut meta = RecordingMeta::new(id.clone(), None, started);
+        meta.status = RecordingState::Done;
+        meta.ended_at = Some(started + chrono::Duration::minutes(5));
+        store::write_meta(&dir, &meta).unwrap();
+        std::fs::write(store::transcript_path(&dir, &id), "# done\n").unwrap();
+        (id, dir)
+    }
+
+    /// Two recordings of one minute are `..._1402` and `..._1402-2`. Once
+    /// the first is deleted, a second delete sent for it (a stale row, a
+    /// prompt left open) is refused: it never lands on the sibling its id
+    /// is now a unique prefix of.
+    #[tokio::test]
+    async fn a_second_delete_never_takes_the_sibling() {
+        use chrono::TimeZone;
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context(tmp.path(), working_backend());
+        let started = Local.with_ymd_and_hms(2026, 10, 30, 14, 2, 0).unwrap();
+        let (first, first_dir) = untitled_at(tmp.path(), started);
+        let (second, second_dir) = untitled_at(tmp.path(), started);
+        assert_eq!(
+            (first.as_str(), second.as_str()),
+            ("2026-10-30_1402", "2026-10-30_1402-2")
+        );
+        let response = delete_recording(&context, Some(&first)).await;
+        assert!(
+            matches!(response, Response::Recording { .. }),
+            "{response:?}"
+        );
+        assert!(!first_dir.exists());
+        refused(
+            delete_recording(&context, Some(&first)).await,
+            "no recording has the id 2026-10-30_1402: it may have been deleted",
+        );
+        assert!(second_dir.exists(), "the sibling is left alone");
+    }
+
+    /// The TUI sends `exact` with every action: then only a whole id
+    /// names a recording, so a deleted one's id is refused for a retry, a
+    /// rename, a copy and a summary instead of reaching its sibling. The
+    /// CLI leaves it out, and a prefix still names one recording.
+    #[tokio::test]
+    async fn an_exact_id_never_takes_the_sibling() {
+        use chrono::TimeZone;
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context_with(
+            tmp.path(),
+            working_backend(),
+            "[llm]\napi_key = \"k\"\napi_url = \"http://127.0.0.1:1/v1/chat/completions\"\n",
+        );
+        let started = Local.with_ymd_and_hms(2026, 10, 30, 14, 2, 0).unwrap();
+        let (first, first_dir) = untitled_at(tmp.path(), started);
+        let (second, second_dir) = untitled_at(tmp.path(), started);
+        std::fs::remove_dir_all(&first_dir).unwrap();
+        let before = std::fs::read(second_dir.join("recording.json")).unwrap();
+        let exact = |action: RecordingAction, extra: &str| {
+            let json = format!(
+                r#"{{"cmd":"recording","action":"{}","id":"{first}","exact":true{extra}}}"#,
+                serde_json::to_value(action).unwrap().as_str().unwrap()
+            );
+            options_from_ipc(&json)
+        };
+        for (action, extra) in [
+            (RecordingAction::Retry, ""),
+            (RecordingAction::Copy, ""),
+            (RecordingAction::Summarize, ""),
+            (RecordingAction::Name, r#","speaker":"me","name":"Sarah""#),
+        ] {
+            let options = exact(action, extra);
+            assert!(options.exact);
+            let response = handle_recording(
+                Arc::clone(&context),
+                action,
+                None,
+                Some(first.clone()),
+                options,
+            )
+            .await;
+            refused(response, "no recording has the id 2026-10-30_1402");
+        }
+        assert!(queue.try_recv().is_err(), "nothing queued");
+        assert_eq!(
+            std::fs::read(second_dir.join("recording.json")).unwrap(),
+            before,
+            "the sibling is untouched"
+        );
+        // Exact and whole: it goes through.
+        let response = handle_recording(
+            Arc::clone(&context),
+            RecordingAction::Summarize,
+            None,
+            Some(second.clone()),
+            RecordingOptions {
+                exact: true,
+                ..RecordingOptions::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(response, Response::Recording { .. }),
+            "{response:?}"
+        );
+        assert!(store::read_meta(&second_dir)
+            .unwrap()
+            .summary_pending
+            .is_some());
+        // Without it (the CLI's message), the prefix still resolves.
+        let found = find_recording(&context.config, &first, false).unwrap();
+        assert_eq!(found.1.id, second);
+    }
+
+    /// An automatic summary left pending at a start with `summary` off has
+    /// its mark cleared under a hold: one held by a delete keeps it.
+    #[tokio::test]
+    async fn a_pending_mark_is_cleared_only_under_a_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context(tmp.path(), working_backend());
+        let (id, dir) = done_recording(tmp.path(), "standup");
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.summary_pending = Some(SummaryRequest::Auto);
+        store::write_meta(&dir, &meta).unwrap();
+        context.recording.hold_to_delete(&id).unwrap();
+        resume_summaries(&context).await;
+        assert_eq!(
+            store::read_meta(&dir).unwrap().summary_pending,
+            Some(SummaryRequest::Auto),
+            "left alone while held"
+        );
+        context.recording.release(&id);
+        resume_summaries(&context).await;
+        assert_eq!(store::read_meta(&dir).unwrap().summary_pending, None);
+        assert!(context.recording.hold(&id).is_ok(), "not left held");
     }
 }

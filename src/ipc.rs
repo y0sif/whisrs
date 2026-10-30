@@ -950,6 +950,74 @@ mod tests {
         assert_eq!(id.as_deref(), Some("last"));
     }
 
+    /// `exact` goes on the wire only when set, so a message without it (the
+    /// CLI's) is as before, and reads back as false when left out.
+    #[test]
+    fn recording_exact_is_sent_only_when_set() {
+        let plain = Command::Recording {
+            action: RecordingAction::Copy,
+            title: None,
+            id: Some("2026-10-27_1402_standup".to_string()),
+            options: RecordingOptions::default(),
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"cmd":"recording","action":"copy","id":"2026-10-27_1402_standup"}"#
+        );
+        let exact = Command::Recording {
+            action: RecordingAction::Copy,
+            title: None,
+            id: Some("2026-10-27_1402_standup".to_string()),
+            options: RecordingOptions {
+                exact: true,
+                ..RecordingOptions::default()
+            },
+        };
+        let json = serde_json::to_string(&exact).unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"recording","action":"copy","id":"2026-10-27_1402_standup","exact":true}"#
+        );
+        let Command::Recording { options, .. } = serde_json::from_str(&json).unwrap() else {
+            panic!("not a recording command");
+        };
+        assert!(options.exact);
+        // A field the options do not know is ignored, as an older daemon
+        // ignores `exact`.
+        let Command::Recording { options, .. } =
+            serde_json::from_str(r#"{"cmd":"recording","action":"copy","id":"x","later":1}"#)
+                .unwrap()
+        else {
+            panic!("not a recording command");
+        };
+        assert_eq!(options, RecordingOptions::default());
+    }
+
+    /// `delete` is an action of its own and carries the full id.
+    #[test]
+    fn recording_delete_roundtrip() {
+        let json = r#"{"cmd":"recording","action":"delete","id":"2026-10-27_1402_standup"}"#;
+        let Command::Recording {
+            action,
+            title,
+            id,
+            options,
+        } = serde_json::from_str(json).unwrap()
+        else {
+            panic!("not a recording command");
+        };
+        assert_eq!(action, RecordingAction::Delete);
+        assert_eq!(id.as_deref(), Some("2026-10-27_1402_standup"));
+        let back = serde_json::to_string(&Command::Recording {
+            action,
+            title,
+            id,
+            options,
+        })
+        .unwrap();
+        assert_eq!(back, json);
+    }
+
     #[test]
     fn recording_response_roundtrip() {
         let status = RecordingStatus {

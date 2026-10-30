@@ -400,8 +400,9 @@ async fn handle_connection(
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let cmd: Command = read_message(&mut reader).await?;
-    // The TUI asks `info` every 2 s while it is open.
-    if matches!(cmd, Command::Info) {
+    // The TUI asks `info` every 2 s while it is open, and `recording
+    // status` as often while its Recordings screen shows one in flight.
+    if matches!(cmd, Command::Info) || is_recording_status(&cmd) {
         debug!("received command: {}", cmd.log_summary());
     } else {
         info!("received command: {}", cmd.log_summary());
@@ -429,7 +430,18 @@ async fn handle_connection(
 /// claims), but nothing waits on that: the tray and the overlays catch up at
 /// the next publish, and the hooks and the reply queue are woken by changes.
 fn is_read_only(cmd: &Command) -> bool {
-    matches!(cmd, Command::Status | Command::Info | Command::Log { .. })
+    matches!(cmd, Command::Status | Command::Info | Command::Log { .. }) || is_recording_status(cmd)
+}
+
+/// `recording status`, which only reads the recording view.
+fn is_recording_status(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Recording {
+            action: whisrs::recording::RecordingAction::Status,
+            ..
+        }
+    )
 }
 
 async fn handle_command(
@@ -704,7 +716,18 @@ mod tests {
         assert!(is_read_only(&Command::Status));
         assert!(is_read_only(&Command::Info));
         assert!(is_read_only(&Command::Log { limit: 5 }));
+        let recording = |action| Command::Recording {
+            action,
+            title: None,
+            id: None,
+            options: Default::default(),
+        };
+        assert!(is_read_only(&recording(
+            whisrs::recording::RecordingAction::Status
+        )));
         for changes in [
+            recording(whisrs::recording::RecordingAction::Delete),
+            recording(whisrs::recording::RecordingAction::Toggle),
             Command::Toggle { language: None },
             Command::Cancel,
             Command::ClearHistory,
@@ -751,6 +774,7 @@ mod tests {
             RecordingAction::Copy,
             RecordingAction::Name,
             RecordingAction::Summarize,
+            RecordingAction::Delete,
         ] {
             let json = serde_json::to_string(&serde_json::json!({
                 "cmd": "recording",

@@ -227,7 +227,7 @@ For the full reference (overlay, `[input]`, `[tts]`, `[llm]`, `[hotkeys]`, `[hoo
 
 ```
 whisrs setup     # Onboarding wizard (TUI): backend, key or model download, mic, service, keybinding
-whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle. Esc goes to Home, which opens Setup, Config and a Mic test (a live level meter; its w saves only [audio] device)
+whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle. Esc goes to Home, which opens Setup, Config, a Mic test (a live level meter; its w saves only [audio] device), Recordings (list, preview and transcript; retry, copy, name a speaker, summarize, delete) and History (what dictation typed)
 whisrs toggle    # Start/stop dictation (uses general.language)
 whisrs toggle -l en  # Start/stop dictation, overriding the language for this session
 whisrs cancel    # Cancel dictation, discard audio
@@ -242,6 +242,7 @@ whisrs agent jarvis            # Talk to a coding agent (see [[agents]]); --text
 whisrs recording start -t "Standup"   # Record mic + system audio; stop | toggle | cancel | status
 whisrs recording show last            # Print the latest recording's transcript (list | path | copy | retry)
 whisrs recording summarize last       # Summarize a transcript with the [llm] (or [recording] summary = true for each)
+whisrs recording delete 2026-10-27    # Delete a recording for good, by its id or a unique prefix (asks first; --yes off a terminal)
 whisrs mcp                            # Read-only MCP server (stdio) for agents: claude mcp add whisrs -- whisrs mcp
 whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries

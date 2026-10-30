@@ -17,10 +17,12 @@ use super::keys::{self, Action, Mode};
 use super::options::Listing;
 use super::schema::{self, ListKind};
 use super::screens::config::{ConfigScreen, Found, Loaded, SaveError, Saved, Test};
+use super::screens::history::{Dictation, History};
 use super::screens::mic::analysis::MicReading;
 use super::screens::mic::{self, Meter};
+use super::screens::recordings::{self, Act, Detail, Item, Recordings, Wanted};
 use super::screens::setup::{self, Checks, Existing, Reply, Setup, SystemAction};
-use super::screens::{config, home};
+use super::screens::{config, history, home};
 use super::widgets::{dialog, frame, Notice, Tone, Ui};
 use super::worker::{DaemonView, Download, RestartReport};
 use super::{tilde, Entry, Env, Paths};
@@ -32,6 +34,8 @@ pub enum Screen {
     Config,
     Setup,
     Mic,
+    Recordings,
+    History,
 }
 
 /// Which screen asked for a key test.
@@ -115,6 +119,21 @@ pub enum Msg {
     },
     /// A spinner's next frame.
     Tick,
+    /// The recordings folder, read.
+    Recordings(Result<Vec<Item>, String>),
+    /// One recording read whole, at the stamp it was asked at.
+    RecordingRead {
+        id: String,
+        stamp: Option<std::time::SystemTime>,
+        detail: Result<Detail, String>,
+    },
+    /// The daemon's answer to [`Effect::Recording`]: done, or why not.
+    Acted {
+        act: Act,
+        answer: Result<(), String>,
+    },
+    /// The dictation history, read.
+    HistoryRead(Result<Vec<Dictation>, String>),
 }
 
 /// What the loop runs for the app.
@@ -187,6 +206,18 @@ pub enum Effect {
     },
     /// Stop the sample being said.
     StopSpeaking,
+    /// Read the recordings folder now and every 2 s while Recordings is
+    /// open; answered with [`Msg::Recordings`] when it changed.
+    WatchRecordings,
+    /// Read it again now: an action was answered.
+    RefreshRecordings,
+    StopRecordings,
+    /// Read one recording whole; answered with [`Msg::RecordingRead`].
+    ReadRecording(Wanted),
+    /// Ask the daemon to act on a recording; answered with [`Msg::Acted`].
+    Recording(Act),
+    /// Read the dictation history; answered with [`Msg::HistoryRead`].
+    ReadHistory,
     /// Each in turn.
     All(Vec<Effect>),
 }
@@ -208,6 +239,8 @@ pub enum HelpFor {
     Hotkey,
     Setup,
     Mic,
+    Recordings,
+    History,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +269,16 @@ pub enum Dialog {
     SetupChanged(&'static str),
     /// Mic's write found this file changed since it was read.
     DeviceChanged(&'static str),
+    /// Delete this recording for good? Keep by default.
+    DeleteRecording {
+        act: Act,
+        question: String,
+    },
+    /// Transcribe this transcribed recording again? Keep by default.
+    RetryRecording {
+        act: Act,
+        lines: Vec<String>,
+    },
 }
 
 pub struct App {
@@ -250,6 +293,8 @@ pub struct App {
     pub setup: Option<Setup>,
     /// The microphone meter of the Mic screen and setup's mic step.
     pub mic: Meter,
+    pub recordings: Recordings,
+    pub history: History,
     /// The last capture started.
     mic_session: u64,
     /// Spinner frames so far.
@@ -324,6 +369,8 @@ impl App {
             home,
             setup: None,
             mic: Meter::default(),
+            recordings: Recordings::new(cfg!(feature = "recording")),
+            history: History::default(),
             mic_session: 0,
             ticks: 0,
             orphans: Vec::new(),
@@ -534,6 +581,39 @@ impl App {
                     setup.spin = self.ticks;
                     setup.editor.spin = self.ticks;
                 }
+                None
+            }
+            Msg::Recordings(folder) => {
+                let wanted = self.recordings.read(folder);
+                if self.screen() == Screen::Recordings {
+                    wanted.map(Effect::ReadRecording)
+                } else {
+                    None
+                }
+            }
+            Msg::RecordingRead { id, stamp, detail } => {
+                self.recordings.detail_read(id, stamp, detail);
+                None
+            }
+            Msg::Acted { act, answer } => {
+                self.status = Some(match &answer {
+                    Ok(()) => Notice::new(Tone::Ok, act.done()),
+                    Err(why) => Notice::new(Tone::Error, why.clone()),
+                });
+                let wanted = self.recordings.acted(&act, answer.is_ok());
+                if self.screen() != Screen::Recordings {
+                    return None;
+                }
+                Some(match wanted {
+                    Some(wanted) => Effect::All(vec![
+                        Effect::RefreshRecordings,
+                        Effect::ReadRecording(wanted),
+                    ]),
+                    None => Effect::RefreshRecordings,
+                })
+            }
+            Msg::HistoryRead(entries) => {
+                self.history.read(entries);
                 None
             }
         }
@@ -775,6 +855,96 @@ impl App {
         Some(Effect::MicStop)
     }
 
+    /// Open Recordings: the folder is read now and then every 2 s, unless
+    /// this whisrs has no recordings to read.
+    fn open_recordings(&mut self) -> Option<Effect> {
+        self.stack.push(Screen::Recordings);
+        self.status = None;
+        self.recordings.opened();
+        self.recordings.built.then_some(Effect::WatchRecordings)
+    }
+
+    fn open_history(&mut self) -> Option<Effect> {
+        self.stack.push(Screen::History);
+        self.status = None;
+        self.history.opened();
+        Some(Effect::ReadHistory)
+    }
+
+    /// Take what a key on Recordings asked for.
+    fn recordings_reply(&mut self, reply: recordings::Reply) -> Option<Effect> {
+        if let Some(status) = reply.status {
+            self.status = Some(status);
+        }
+        let mut effects = Vec::new();
+        if let Some(wanted) = reply.read {
+            effects.push(Effect::ReadRecording(wanted));
+        }
+        if let Some(dialog) = reply.dialog {
+            // Nothing to ask about while the daemon that would do it is
+            // down, or still at an action on the same recording.
+            let refused = match &dialog {
+                Dialog::DeleteRecording { act, .. } | Dialog::RetryRecording { act, .. } => {
+                    self.refusal(act)
+                }
+                _ => None,
+            };
+            match refused {
+                Some(notice) => self.status = Some(notice),
+                None => self.dialog = Some(dialog),
+            }
+        }
+        if let Some(act) = reply.act {
+            effects.extend(self.act(act));
+        }
+        if reply.leave {
+            self.stack.pop();
+            self.home.point(Screen::Recordings);
+            effects.push(Effect::StopRecordings);
+        }
+        match effects.len() {
+            0 => None,
+            1 => effects.pop(),
+            _ => Some(Effect::All(effects)),
+        }
+    }
+
+    /// Send `act` to the daemon, unless it is known to be down (then say
+    /// so, with the command that starts it, as Home does) or has not
+    /// answered an action on that recording yet.
+    fn act(&mut self, act: Act) -> Option<Effect> {
+        if let Some(refusal) = self.refusal(&act) {
+            self.status = Some(refusal);
+            return None;
+        }
+        self.status = Some(Notice::new(Tone::Muted, act.asking()));
+        self.recordings.sent(&act.id);
+        Some(Effect::Recording(act))
+    }
+
+    /// Why `act` is not sent now, if it is not.
+    fn refusal(&self, act: &Act) -> Option<Notice> {
+        if self.daemon == DaemonView::Down {
+            let start = self
+                .service
+                .enable_hint()
+                .unwrap_or(self.service.manual_start_hint());
+            return Some(Notice::new(
+                Tone::Error,
+                format!(
+                    "cannot {}: whisrsd is not running. Start it with {start}",
+                    act.verb()
+                ),
+            ));
+        }
+        self.recordings.is_busy(&act.id).then(|| {
+            Notice::new(
+                Tone::Warn,
+                format!("still working on {}: wait for whisrsd's answer", act.label),
+            )
+        })
+    }
+
     fn key(&mut self, key: KeyEvent) -> Option<Effect> {
         self.flash = None;
         // A sample being said stops at any key, which does nothing else.
@@ -790,6 +960,8 @@ impl App {
                 Screen::Config | Screen::Mic => self.config.mode(),
                 Screen::Setup => self.setup.as_ref().map_or(Mode::Browse, Setup::mode),
                 Screen::Home => Mode::Browse,
+                Screen::Recordings => self.recordings.mode(),
+                Screen::History => self.history.mode(),
             }
         };
         let action = keys::action(key, mode)?;
@@ -808,6 +980,13 @@ impl App {
         };
         if let (Action::Help, Some(help)) = (action, help) {
             self.dialog = Some(Dialog::Help(help));
+            return None;
+        }
+        if mode == Mode::Read && action == Action::Help {
+            self.dialog = Some(Dialog::Help(match self.screen() {
+                Screen::History => HelpFor::History,
+                _ => HelpFor::Recordings,
+            }));
             return None;
         }
         if mode == Mode::Browse {
@@ -835,6 +1014,8 @@ impl App {
                     None
                 }
                 Screen::Mic => self.open_mic(),
+                Screen::Recordings => self.open_recordings(),
+                Screen::History => self.open_history(),
                 // Setup writes config.toml itself: Config's edits first.
                 Screen::Setup if self.config.form.is_dirty() => {
                     self.dialog = Some(Dialog::Unsaved(After::Setup));
@@ -872,6 +1053,24 @@ impl App {
                 let reply = self.setup.as_mut()?.key(action);
                 self.reply(reply)
             }
+            Screen::Recordings => {
+                // The daemon runs on the file as saved, not on unsaved edits.
+                let summary_on = self
+                    .config
+                    .form
+                    .saved("recording.summary")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false);
+                let reply = self.recordings.key(action, summary_on);
+                self.recordings_reply(reply)
+            }
+            Screen::History => {
+                if self.history.key(action) {
+                    self.stack.pop();
+                    self.home.point(Screen::History);
+                }
+                None
+            }
         }
     }
 
@@ -896,6 +1095,25 @@ impl App {
     fn dialog_key(&mut self, dialog: Dialog, action: Action) -> Option<Effect> {
         match (&dialog, action) {
             (Dialog::Help(_), _) => None,
+            (
+                Dialog::DeleteRecording { act, .. } | Dialog::RetryRecording { act, .. },
+                Action::Type('y'),
+            ) => {
+                let act = act.clone();
+                self.act(act)
+            }
+            // Keep is the default: anything else.
+            (Dialog::DeleteRecording { act, .. }, _) => {
+                self.status = Some(Notice::new(Tone::Muted, format!("kept {}", act.label)));
+                None
+            }
+            (Dialog::RetryRecording { act, .. }, _) => {
+                self.status = Some(Notice::new(
+                    Tone::Muted,
+                    format!("{} keeps its transcript", act.label),
+                ));
+                None
+            }
             (Dialog::Unsaved(after), Action::Type('w')) => {
                 self.pending = Some(*after);
                 self.save()
@@ -1251,6 +1469,8 @@ impl App {
             Screen::Config => config::view(self, f, ui),
             Screen::Setup => setup::view(self, f, ui),
             Screen::Mic => mic::view(self, f, ui),
+            Screen::Recordings => recordings::view(self, f, ui),
+            Screen::History => history::view(self, f, ui),
         }
         if let Some(dialog) = &self.dialog {
             // The box's border and padding off.
@@ -1261,6 +1481,8 @@ impl App {
                 Dialog::Help(HelpFor::Hotkey) => "hotkey keys",
                 Dialog::Help(HelpFor::Setup) => "setup keys",
                 Dialog::Help(HelpFor::Mic) => "mic keys",
+                Dialog::Help(HelpFor::Recordings) => "recordings keys",
+                Dialog::Help(HelpFor::History) => "history keys",
                 _ => "",
             };
             dialog::draw_titled(f, area, ui, title, dialog_lines(dialog, ui, width));
@@ -1292,6 +1514,8 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
         }
         Line::from(spans)
     };
+    // A question reads best in short lines.
+    let question_width = width.clamp(1, 64);
     match dialog {
         Dialog::Unsaved(_) => vec![
             Line::from("Unsaved changes to config.toml."),
@@ -1345,6 +1569,31 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
             Line::default(),
             keys(&[("o", "write over it"), ("esc", "cancel")]),
         ],
+        Dialog::DeleteRecording { question, .. } => {
+            let mut lines: Vec<Line<'static>> = crate::tui::widgets::wrap(question, question_width)
+                .into_iter()
+                .map(Line::from)
+                .collect();
+            lines.push(Line::default());
+            lines.push(keys(&[("y", "delete"), ("n", "keep")]));
+            lines
+        }
+        Dialog::RetryRecording { lines: text, .. } => {
+            let mut lines = Vec::new();
+            for (i, paragraph) in text.iter().enumerate() {
+                if i == 1 {
+                    lines.push(Line::default());
+                }
+                lines.extend(
+                    crate::tui::widgets::wrap(paragraph, question_width)
+                        .into_iter()
+                        .map(Line::from),
+                );
+            }
+            lines.push(Line::default());
+            lines.push(keys(&[("y", "retry"), ("n", "keep")]));
+            lines
+        }
         Dialog::Help(help) => {
             const KEY: usize = 10;
             let rows: &[(&str, &str)] = match help {
@@ -1403,6 +1652,34 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
                         "save it as [audio] device, then restart the daemon if idle",
                     ),
                     ("esc", "back to Home; the capture stops"),
+                    ("q", "quit, asking first about unsaved edits"),
+                ],
+                HelpFor::Recordings => &[
+                    ("j k", "move; in a transcript, scroll it"),
+                    ("ctrl+d u", "half a page; pgdn pgup a page, g G the ends"),
+                    ("enter", "open the transcript; esc back to the list"),
+                    (
+                        "r",
+                        "transcribe again: a failed one at once, a transcribed one asks first",
+                    ),
+                    ("c", "copy the transcript to the clipboard"),
+                    ("n", "name a speaker: pick it, then type the name"),
+                    ("S", "summarize it with the [llm]"),
+                    ("d", "delete it for good, asking first"),
+                    ("/", "filter by title, id, speaker or date"),
+                    ("esc", "clear the filter, else back to Home"),
+                    ("q", "quit, asking first about unsaved edits"),
+                    (
+                        "",
+                        "Every action is the daemon's: it says why when it cannot.",
+                    ),
+                ],
+                HelpFor::History => &[
+                    ("j k", "move; in a dictation, scroll it"),
+                    ("ctrl+d u", "half a page; pgdn pgup a page, g G the ends"),
+                    ("enter", "the whole text; esc back to the list"),
+                    ("/", "filter by the text"),
+                    ("esc", "clear the filter, else back to Home"),
                     ("q", "quit, asking first about unsaved edits"),
                 ],
                 HelpFor::Hotkey => &[

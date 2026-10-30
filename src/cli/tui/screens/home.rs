@@ -19,6 +19,8 @@ const SCREENS: &[(Screen, &str)] = &[
     (Screen::Setup, "Setup"),
     (Screen::Config, "Config"),
     (Screen::Mic, "Mic test"),
+    (Screen::Recordings, "Recordings"),
+    (Screen::History, "History"),
 ];
 
 /// The list's width in the two-pane layout: the gutter, a space and a
@@ -59,19 +61,27 @@ impl Home {
 pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
     let area = f.area();
     let two_panes = area.width >= frame::TWO_PANES;
-    let info = info_rows(app, ui);
+    let mut info = info_rows(app, ui);
     let width = frame::body_width(area.width).saturating_sub(2);
     let messages = app.messages(ui, usize::from(width));
-    let rows = if two_panes {
-        SCREENS.len().max(info.len())
-    } else {
-        SCREENS.len() + 1 + info.len()
+    let rows = |info: usize| match (two_panes, info) {
+        (true, _) => SCREENS.len().max(info),
+        (false, 0) => SCREENS.len(),
+        (false, _) => SCREENS.len() + 1 + info,
     };
     let foot = if messages.is_empty() {
         0
     } else {
         messages.len() + 1
     };
+    // What does not fit goes from the bottom of the info, which says the
+    // least there (built with, then the hotkeys, ...): a notice is never
+    // cut.
+    let room = usize::from(frame::max_body(area));
+    while !info.is_empty() && rows(info.len()) + foot > room {
+        info.pop();
+    }
+    let rows = rows(info.len());
     let Some(placed) = frame::place(area, Some((rows + foot) as u16)) else {
         return frame::too_small(f, ui);
     };

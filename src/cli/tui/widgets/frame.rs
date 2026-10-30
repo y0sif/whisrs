@@ -29,6 +29,12 @@ pub fn body_width(area_width: u16) -> u16 {
         .saturating_sub(5)
 }
 
+/// The most rows a body gets in `area`: what [`place`] leaves inside the
+/// border, under the header, above the footer.
+pub fn max_body(area: Rect) -> u16 {
+    area.height.saturating_sub(5)
+}
+
 /// Where a screen goes.
 pub struct Placed {
     pub frame: Rect,
@@ -269,6 +275,9 @@ mod tests {
         assert_eq!(at(60, 18), Some(Rect::new(3, 0, 54, 17)));
         assert_eq!(at(90, 30), Some(Rect::new(3, 0, 84, 29)));
         assert_eq!(at(200, 60), Some(Rect::new(50, 0, 100, 59)));
+        // As tall as fits, the body has `max_body` rows.
+        let tall = place(Rect::new(0, 0, 60, 18), None).unwrap();
+        assert_eq!(tall.frame.height - 4, max_body(Rect::new(0, 0, 60, 18)));
         // A short body is centred vertically, with the footer under it.
         let placed = place(Rect::new(0, 0, 90, 30), Some(8)).unwrap();
         assert_eq!(placed.frame, Rect::new(3, 8, 84, 12));

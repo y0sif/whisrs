@@ -65,6 +65,12 @@ impl Form {
             .expect("the baseline was serialized from a config");
     }
 
+    /// The value at `path` in the config as last loaded or saved, unsaved
+    /// edits left out: what the daemon runs on.
+    pub fn saved(&self, path: &str) -> Option<&Value> {
+        lookup(&self.baseline, path)
+    }
+
     /// The value at `path` in the config, if it has one.
     pub fn value(&self, path: &str) -> Option<&Value> {
         lookup(&self.table, path)

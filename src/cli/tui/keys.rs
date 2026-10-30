@@ -43,6 +43,15 @@ pub enum Action {
     Skip,
     /// `Backspace` on the rows: the wizard's previous step.
     Previous,
+    /// `Ctrl+D`, `Ctrl+U` on a reading screen: half a page.
+    HalfDown,
+    HalfUp,
+    /// A recording's actions: `r` transcribes it again, `c` copies its
+    /// transcript, `n` names a speaker, `S` summarizes it.
+    Retry,
+    Copy,
+    Name,
+    Summarize,
     // Text input.
     Type(char),
     Erase,
@@ -69,6 +78,10 @@ pub enum Mode {
     /// The hotkey dialog: `Tab` and `j`/`k` move between its parts, `Space`
     /// and `h`/`l` change one, `t` types the hotkey instead, `x` unsets it.
     Hotkey,
+    /// A reading screen (Recordings, History): its list or the text it
+    /// opened moves as rows do, `Ctrl+D`/`Ctrl+U` by half a page, and a
+    /// recording's actions have their letters (`r`, `c`, `n`, `S`, `d`).
+    Read,
 }
 
 pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
@@ -80,6 +93,8 @@ pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
             KeyCode::Char('u') if matches!(mode, Mode::Text | Mode::Picker) => Some(Action::Clear),
             KeyCode::Char('p') if mode == Mode::Picker => Some(Action::Up),
             KeyCode::Char('n') if mode == Mode::Picker => Some(Action::Down),
+            KeyCode::Char('d') if mode == Mode::Read => Some(Action::HalfDown),
+            KeyCode::Char('u') if mode == Mode::Read => Some(Action::HalfUp),
             _ => None,
         };
     }
@@ -93,8 +108,12 @@ pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
         KeyCode::Up => Some(Action::Up),
         KeyCode::Down => Some(Action::Down),
         // Only where a list moves: in a dialog a page key is no answer.
-        KeyCode::PageUp if matches!(mode, Mode::Browse | Mode::Picker) => Some(Action::PageUp),
-        KeyCode::PageDown if matches!(mode, Mode::Browse | Mode::Picker) => Some(Action::PageDown),
+        KeyCode::PageUp if matches!(mode, Mode::Browse | Mode::Picker | Mode::Read) => {
+            Some(Action::PageUp)
+        }
+        KeyCode::PageDown if matches!(mode, Mode::Browse | Mode::Picker | Mode::Read) => {
+            Some(Action::PageDown)
+        }
         _ => None,
     };
     if common.is_some() {
@@ -133,6 +152,21 @@ pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
         },
         Mode::Dialog => match key.code {
             KeyCode::Char(c) => Some(Action::Type(c.to_ascii_lowercase())),
+            _ => None,
+        },
+        Mode::Read => match key.code {
+            KeyCode::Char('j') => Some(Action::Down),
+            KeyCode::Char('k') => Some(Action::Up),
+            KeyCode::Char('g') | KeyCode::Home => Some(Action::First),
+            KeyCode::Char('G') | KeyCode::End => Some(Action::Last),
+            KeyCode::Char('q') => Some(Action::Quit),
+            KeyCode::Char('/') => Some(Action::Filter),
+            KeyCode::Char('?') => Some(Action::Help),
+            KeyCode::Char('r') => Some(Action::Retry),
+            KeyCode::Char('c') => Some(Action::Copy),
+            KeyCode::Char('n') => Some(Action::Name),
+            KeyCode::Char('S') => Some(Action::Summarize),
+            KeyCode::Char('d') => Some(Action::Delete),
             _ => None,
         },
         Mode::Browse => match key.code {
@@ -345,6 +379,47 @@ mod tests {
         assert_eq!(
             action(press(KeyCode::Backspace), Mode::Text),
             Some(Action::Erase)
+        );
+    }
+
+    /// A reading screen moves like the rows, by half a page with Ctrl+D
+    /// and Ctrl+U, and gives a recording's actions their letters; `w`, `e`
+    /// and `h`/`l` mean nothing there.
+    #[test]
+    fn a_reading_screen_has_its_own_letters() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert_eq!(action(ctrl('d'), Mode::Read), Some(Action::HalfDown));
+        assert_eq!(action(ctrl('u'), Mode::Read), Some(Action::HalfUp));
+        assert_eq!(action(ctrl('c'), Mode::Read), Some(Action::Quit));
+        assert_eq!(action(ctrl('d'), Mode::Browse), None);
+        for (c, want) in [
+            ('j', Action::Down),
+            ('G', Action::Last),
+            ('/', Action::Filter),
+            ('r', Action::Retry),
+            ('c', Action::Copy),
+            ('n', Action::Name),
+            ('S', Action::Summarize),
+            ('d', Action::Delete),
+            ('q', Action::Quit),
+        ] {
+            assert_eq!(
+                action(press(KeyCode::Char(c)), Mode::Read),
+                Some(want),
+                "{c}"
+            );
+        }
+        for c in ['w', 'e', 'h', 'l', 's', 'x'] {
+            assert_eq!(action(press(KeyCode::Char(c)), Mode::Read), None, "{c}");
+        }
+        assert_eq!(
+            action(press(KeyCode::PageDown), Mode::Read),
+            Some(Action::PageDown)
+        );
+        // In Browse, r still restarts the daemon.
+        assert_eq!(
+            action(press(KeyCode::Char('r')), Mode::Browse),
+            Some(Action::Restart)
         );
     }
 

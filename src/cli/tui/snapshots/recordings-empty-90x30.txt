@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                     recordings · ●  │
+   │                                                                                  │
+   │   No recordings yet: whisrs recording start, or your recording hotkey            │
+   │   (Alt+Shift+M)                                                                  │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     esc back · ? help
+
+
+
+
+
+
+
+
+
+
+

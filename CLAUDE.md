@@ -43,14 +43,18 @@ whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs config    # full-screen config editor (TUI): every key by section, w saves (comments kept),
-                 # t tests a key row; Esc goes to Home, which opens Setup, Config and the Mic
-                 # test (a live level meter; its w writes only [audio] device)
-                 # and restarts the daemon only while it is idle (r later), e opens config.toml
-                 # in $EDITOR. Refuses off a terminal
+                 # t tests a key row; Esc goes to Home, which opens Setup, Config, the Mic
+                 # test (a live level meter; its w writes only [audio] device), Recordings
+                 # (list, preview, transcript; r c n S d are the daemon's actions) and History
+                 # (read-only); a save restarts the daemon only while it is idle (r later), e
+                 # opens config.toml in $EDITOR. Refuses off a terminal
 whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
 whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once
 whisrs recording summarize <id>   # [llm] summary (+ title if untitled) via the queue; [recording] summary = true does it after each transcript
+whisrs recording delete <id> [--yes]   # the whole folder, for good; never `last`; asks [y/N] on a terminal, refuses off one
+                 # without --yes; sends the whole id (the daemon takes no prefix for a delete) and
+                 # refuses it while it records, is queued, processed or held
                  # (every `whisrs recording` line: feature `recording`, in the default and both release builds)
 whisrs mcp       # read-only MCP server on stdio over the recordings folder (feature `mcp`, needs `recording`; no daemon needed)
 
@@ -113,7 +117,10 @@ src/
 │   │                       #   busy skip it; an older one is asked `recording status` too), the
 │   │                       #   lists a picker needs (input devices, ggml-*.bin), the lister injected;
 │   │                       #   the key test, the model download, the mic capture (about 30 readings
-│   │                       #   a second), setup's checks and system steps
+│   │                       #   a second), setup's checks and system steps; the recordings folder
+│   │                       #   (every 2 s while Recordings is open, sent when it changed;
+│   │                       #   `recording status` asked only with one in flight), a recording read
+│   │                       #   whole, the daemon's recording actions, history.jsonl
 │   ├── widgets/            #   frame + footer, row, text input, dialog, picker (filter by word
 │   │                       #   prefix), hotkey dialog (checked by hotkey::parse_hotkey), level meter,
 │   │                       #   download progress
@@ -121,7 +128,10 @@ src/
 │   │                       #   `t` key tests; pinned rows for the wizard and Mic), setup.rs (the wizard:
 │   │                       #   steps over its own pinned ConfigScreen, review + write, system checks;
 │   │                       #   tests in setup/tests.rs), mic/ (meter; analysis.rs::analyze is the seam
-│   │                       #   the audio-quality report fills)
+│   │                       #   the audio-quality report fills), recordings/ (list, preview cached by
+│   │                       #   id + recording.json mtime, transcript, filter, r/c/n/S/d and their
+│   │                       #   dialogs; read.rs: the folder read, feature `recording`; tests.rs),
+│   │                       #   history.rs (history.jsonl, read-only)
 │   ├── testing.rs, render_tests.rs  #   fixtures; snapshots, styles, layouts (tests only)
 │   └── snapshots/          #   TestBackend row-string snapshots (WHISRS_UPDATE_SNAPSHOTS=1 rewrites)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
@@ -345,12 +355,14 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
                                      // reset (--reset) only forgets it;
                                      // list/send/reset/stop answer with an Agents response
 {"cmd": "agent-event", "payload": {...}}  // a harness hook's stdin JSON, from `whisrs agent-hook`
-{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name|summarize", "title": "...", "id": "...",
+{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name|summarize|delete", "title": "...", "id": "...",
  "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video",
  "shared_mic": true, "num_speakers": 3, "participants": ["Sarah", "Omar"],
- "speaker": "S2", "name": "Sarah"}
+ "speaker": "S2", "name": "Sarah", "exact": true}
                                      // all but action optional: title (start/toggle), id (retry/copy/name/summarize,
-                                     // default "last"), speaker + name (name; "" clears), the languages, shared_mic, num_speakers and
+                                     // default "last"; delete: id required, whole, never "last"), exact (the TUI sends it:
+                                     // the id is whole, no prefix or "last"; sent only when true, an older daemon
+                                     // ignores it), speaker + name (name; "" clears), the languages, shared_mic, num_speakers and
                                      // participants (--with) (start/toggle/retry;
                                      // a track's own language wins over "language"), others = system track
                                      // label (start/toggle). Validated by the daemon
@@ -363,20 +375,24 @@ an `Agents` variant carrying agent rows (`{"status": "agents", "agents": [...]}`
 `Info` variant (`{"status": "info", "info": {...}}`, `DaemonInfo`, every field defaulted so
 later ones are additive; an unknown `state` or `recording` is `None`). `ipc::request_blocking(cmd,
 timeout)` is the same framing on a blocking socket, for callers without a tokio runtime; its
-connect is not bounded, so the TUI only calls it from a worker thread. `status`, `info` and `log`
-skip the state broadcast after the command (they change nothing).
+connect is not bounded, so the TUI only calls it from a worker thread. `status`, `info`, `log`
+and `recording status` skip the state broadcast after the command (they change nothing), and
+`info` and `recording status` are logged at debug (the TUI polls them: `info` every 2 s,
+`recording status` every 2 s while its Recordings screen shows a recording in flight).
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
 `src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
 list/show/path` read the recordings folder directly, which keeps transcript bodies off IPC
-(as does the speaker list `whisrs recording name` prints after the daemon renamed one).
+(as does the speaker list `whisrs recording name` prints after the daemon renamed one, and
+`whisrs recording delete`, which resolves the id there to ask about it, then sends the full id).
 `whisrs mcp` reads it too, but its logic is in the library (`src/mcp.rs`); the CLI only
 starts it with `store::configured_recordings_dir()`.
 The `whisrs config` and `whisrs setup` TUI (`src/cli/tui/`) lives in the CLI so whisrsd never
 links ratatui; it reads and writes config.toml through the library (`config::write`,
-`config::vocabulary`, `config::keys`, `config::setup`), asks the daemon only `info` (or
+`config::vocabulary`, `config::keys`, `config::setup`), asks the daemon `info` (or
 `status`), and restarts it after a save through `ServiceManager::restart`, as the old editor
-did. The dialoguer wizard and its deps (`dialoguer`, `indicatif`) are gone; the daemon saves an
+did. Its Recordings screen reads the recordings folder itself, as `whisrs recording list` does,
+and sends the actions (`retry`, `copy`, `name`, `summarize`, `delete`) by full id. The dialoguer wizard and its deps (`dialoguer`, `indicatif`) are gone; the daemon saves an
 `[[llm_commands]]` instruction through `config::write::write_config`.
 `whisrs agent-hook` (hidden, run by the hooks whisrs puts in the Claude sessions it starts)
 only forwards its stdin to the daemon as `agent-event`, and always exits 0 within two seconds.

@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                     recordings · ●  │
+   │                                                                                  │
+   │   This whisrs was built without the recording feature, so there are no           │
+   │   recordings to list. Use a release build, or rebuild with `cargo install        │
+   │   whisrs --features recording`.                                                  │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     esc back · q quit
+
+
+
+
+
+
+
+
+
+

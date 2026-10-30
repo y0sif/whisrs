@@ -39,6 +39,8 @@ use whisrs::service::ServiceManager;
 
 use app::{App, Effect, Msg, Origin};
 use glyphs::Glyphs;
+#[cfg(feature = "recording")]
+pub use screens::recordings::{delete_question, duration_label, Holds};
 use theme::{Depth, Ground, Theme};
 use widgets::Ui;
 
@@ -124,6 +126,11 @@ impl Paths {
             xdg_config: dirs::config_dir().unwrap_or_else(|| PathBuf::from("~/.config")),
             xdg_data: data,
         }
+    }
+
+    /// The dictation history: `history.jsonl` in the data folder.
+    fn history(&self) -> PathBuf {
+        self.xdg_data.join("whisrs").join("history.jsonl")
     }
 
     fn setup_dirs(&self) -> worker::SetupDirs {
@@ -227,6 +234,7 @@ fn unhush_on_panic() {
 /// it in time. Whether there was a download to stop.
 fn wind_down(app: &App, workers: &worker::Workers, rx: &mpsc::Receiver<Msg>) -> bool {
     workers.mic_stop();
+    workers.stop_recordings();
     let mut left: Vec<(u64, PathBuf)> = app.orphans.clone();
     left.extend(app.setup.as_ref().and_then(|setup| setup.partial()));
     if left.is_empty() {
@@ -470,6 +478,30 @@ fn perform(
             }
             Effect::StopSpeaking => {
                 workers.stop_speaking();
+                None
+            }
+            Effect::WatchRecordings => {
+                workers.watch_recordings(app.paths.config.clone(), app.paths.xdg_data.clone());
+                None
+            }
+            Effect::RefreshRecordings => {
+                workers.refresh_recordings();
+                None
+            }
+            Effect::StopRecordings => {
+                workers.stop_recordings();
+                None
+            }
+            Effect::ReadRecording(wanted) => {
+                workers.read_recording(wanted);
+                None
+            }
+            Effect::Recording(act) => {
+                workers.recording(act);
+                None
+            }
+            Effect::ReadHistory => {
+                workers.read_history(app.paths.history());
                 None
             }
             Effect::Save | Effect::SaveOver => {

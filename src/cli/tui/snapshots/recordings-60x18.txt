@@ -1,0 +1,18 @@
+
+
+
+   ╭────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                       recordings · ●  │
+   │                                                    │
+   │ ▌ Oct 27 14:02  Standup           32m  done        │
+   │   Oct 26 10:15  1:1 planning      48m  done        │
+   │   Oct 25 09:00  (untitled)         5m  failed      │
+   │                                                    │
+   │   ! unknown key [general] silense_timeout_ms is    │
+   │     ignored                                        │
+   ╰────────────────────────────────────────────────────╯
+     enter open · r retry · c copy · n name · ? help
+
+
+
+

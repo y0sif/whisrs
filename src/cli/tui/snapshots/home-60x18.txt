@@ -4,15 +4,15 @@
    │   Setup                                            │
    │ ▌ Config                                           │
    │   Mic test                                         │
+   │   Recordings                                       │
+   │   History                                          │
    │                                                    │
    │   daemon      running · idle · v0.2.0              │
    │   backend     deepgram-streaming                   │
    │   language    en                                   │
    │   hotkeys     toggle Alt+D · recording Alt+Shift…  │
-   │   built with  local-whisper tray overlay hooks r…  │
    │                                                    │
    │   ! unknown key [general] silense_timeout_ms is    │
    │     ignored                                        │
    ╰────────────────────────────────────────────────────╯
      j/k move · enter open · ? help · q quit
-
