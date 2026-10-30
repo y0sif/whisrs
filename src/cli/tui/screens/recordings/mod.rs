@@ -857,11 +857,26 @@ impl Recordings {
         }
     }
 
-    /// `d`: asked first, no by default.
+    /// `d`: asked first, no by default. One still recording or being
+    /// transcribed is told why not, with nothing to ask: the daemon would
+    /// refuse it after the question.
     fn ask_delete(&self) -> Reply {
         let Some(entry) = self.target() else {
             return Reply::default();
         };
+        let busy = match entry.phase {
+            Phase::Recording => Some(
+                "is being recorded: stop it first, or cancel it (whisrs recording cancel), \
+                 which deletes it",
+            ),
+            Phase::Queued | Phase::Processing => {
+                Some("is being transcribed: delete it once that is done")
+            }
+            Phase::Done | Phase::Failed | Phase::Waiting => None,
+        };
+        if let Some(why) = busy {
+            return Reply::say(Tone::Warn, format!("{} {why}", entry.label()));
+        }
         let duration = entry.secs.map(duration_label);
         let question = delete_question(
             entry.title.as_deref(),

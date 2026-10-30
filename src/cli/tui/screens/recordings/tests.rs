@@ -676,6 +676,51 @@ fn a_second_action_waits_for_the_first() {
     assert_eq!(ids_of.len(), 3);
 }
 
+/// `d` on a recording still recording or being transcribed says why not,
+/// with no question and nothing sent.
+#[test]
+fn a_busy_recording_is_not_asked_about() {
+    let tmp = tempfile::tempdir().unwrap();
+    three(tmp.path());
+    let live = make(tmp.path(), at(10, 30, 11, 20), Some("Live"), true, |_| {});
+    let busy = make(tmp.path(), at(10, 30, 11, 0), Some("Busy"), true, |meta| {
+        meta.status = RecordingState::Processing;
+        meta.ended_at = Some(meta.started_at + chrono::Duration::minutes(10));
+    });
+    let id = |dir: &Path| store::read_meta(dir).unwrap().id;
+    let mut fixture = open(tmp.path());
+    let status_now = RecordingStatus {
+        phase: RecordingPhase::Recording,
+        id: Some(id(&live)),
+        queued: vec![id(&busy)],
+        ..RecordingStatus::default()
+    };
+    let effect = fixture
+        .app
+        .update(Msg::Recordings(listing(tmp.path(), Some(status_now))));
+    answer(&mut fixture, effect);
+    for (at, phase, why) in [
+        (
+            "g",
+            Phase::Recording,
+            "\"Live\" is being recorded: stop it first, or cancel it (whisrs recording \
+             cancel), which deletes it",
+        ),
+        (
+            "j",
+            Phase::Queued,
+            "\"Busy\" is being transcribed: delete it once that is done",
+        ),
+    ] {
+        keys(&mut fixture, at);
+        assert_eq!(fixture.app.recordings.focused().unwrap().phase, phase);
+        assert!(keys(&mut fixture, "d").is_empty());
+        assert_eq!(fixture.app.dialog, None);
+        let said = status(&fixture);
+        assert_eq!((said.tone, said.text.as_str()), (Tone::Warn, why));
+    }
+}
+
 /// A recording with no audio left is told so at `r`, done or failed, with
 /// no question and nothing sent.
 #[test]
