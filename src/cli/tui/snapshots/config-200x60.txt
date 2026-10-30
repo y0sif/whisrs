@@ -43,7 +43,7 @@
                                                   │                                                                                                  │
                                                   │   ! unknown key [general] silense_timeout_ms is ignored                                          │
                                                   ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
-                                                    j/k move · tab pane · enter edit · w save · e $EDITOR · / filter · ? help
+                                                    j/k move · tab pane · enter edit · w save · e $EDITOR · / filter · t test · ? help
 
 
 

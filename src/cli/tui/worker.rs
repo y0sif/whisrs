@@ -1,15 +1,23 @@
-//! The TUI's threads: the daemon poll, the restart after a save, and the
-//! lists a picker needs (sound devices, model files). Every request to the
-//! daemon, and every listing, is made here, never on the loop that draws
-//! and reads keys: a blocking connect to a daemon that stopped accepting has
-//! no timeout, a sound server can be slow to answer, and the screen must not
-//! freeze on either.
+//! The TUI's threads: the daemon poll, the restart after a save, the lists
+//! a picker needs (sound devices, model files), the API key test, the model
+//! download, the microphone capture and setup's system checks. Every request
+//! to the daemon, the network or the sound server is made here, never on the
+//! loop that draws and reads keys: a blocking connect to a daemon that
+//! stopped accepting has no timeout, a sound server can be slow to answer,
+//! and the screen must not freeze on either.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use whisrs::config::setup::key_test::{self, Endpoints, Target};
+use whisrs::config::setup::uinput::Uinput;
+use whisrs::config::setup::unit::UnitFile;
+use whisrs::config::setup::{gnome, keybind, mic, model, uinput, unit, Run};
+use whisrs::Config;
 
 use whisrs::agent::{AgentAction, AgentPhase};
 use whisrs::recording::{RecordingAction, RecordingOptions, RecordingPhase};
@@ -18,9 +26,12 @@ use whisrs::{Command, InfoAnswer, RequestError, Response, RestartOutcome, State}
 
 use whisrs::audio::device::InputDeviceInfo;
 
-use super::app::Msg;
+use super::app::{MicEvent, Msg, Origin};
 use super::options::{self, Device, Listing};
 use super::schema::ListKind;
+use super::screens::mic::analysis;
+use super::screens::setup::{Checks, SystemAction};
+use super::Env;
 
 /// How often the daemon is asked what it is doing.
 const POLL_EVERY: Duration = Duration::from_secs(2);
@@ -68,7 +79,64 @@ pub struct Lister {
     pub home: Option<String>,
 }
 
-/// The poll thread, and what starts a restart or a listing.
+/// What the setup and Mic workers reach: the key test's endpoints, the
+/// model server, and the microphone (functions, so a test stands in).
+#[derive(Clone)]
+pub struct Tools {
+    pub endpoints: Endpoints,
+    pub models_from: String,
+    pub open_mic: OpenMic,
+    /// Called holding [`stderr_lock`].
+    pub probe: fn(&str) -> Result<mic::Probe, mic::ProbeError>,
+    pub machine: Machine,
+}
+
+impl Tools {
+    pub fn real() -> Tools {
+        Tools {
+            endpoints: Endpoints::default(),
+            models_from: model::BASE_URL.to_string(),
+            open_mic: open_live_mic,
+            probe: mic::probe,
+            machine: Machine::real(),
+        }
+    }
+}
+
+/// What setup's checks and steps ask of this machine, as functions, so a
+/// test stands in for systemctl, `which` and `/dev/uinput`.
+#[derive(Clone, Copy)]
+pub struct Machine {
+    pub manager: fn() -> ServiceManager,
+    pub uinput: fn() -> Uinput,
+    pub unit: fn(ServiceManager) -> UnitFile,
+    pub unit_path: fn(ServiceManager) -> Option<PathBuf>,
+    pub enabled: fn(ServiceManager) -> bool,
+    pub active: fn(ServiceManager) -> bool,
+    pub whisrsd: fn() -> String,
+    pub whisrs: fn() -> String,
+    /// Runs the programs the steps run (systemctl, gnome-extensions).
+    pub run: fn(&str, &[&str]) -> Result<(), String>,
+}
+
+impl Machine {
+    pub fn real() -> Machine {
+        Machine {
+            manager: ServiceManager::detect,
+            uinput: uinput::check,
+            unit: unit::status,
+            unit_path: unit::path,
+            enabled: ServiceManager::service_installed,
+            active: ServiceManager::is_active,
+            whisrsd: whisrs::config::setup::which_whisrsd,
+            whisrs: whisrs::config::setup::which_whisrs,
+            run: whisrs::config::setup::system,
+        }
+    }
+}
+
+/// The poll thread, and what starts a restart, a listing, a key test, a
+/// download, a capture or a system step.
 pub struct Workers {
     tx: Sender<Msg>,
     socket: PathBuf,
@@ -78,6 +146,12 @@ pub struct Workers {
     /// `status` instead of logging an error at every poll, and `info` again
     /// now and then ([`REPROBE_EVERY`]).
     older: Arc<AtomicBool>,
+    env: Env,
+    tools: Tools,
+    /// The running downloads' cancel flags, by id.
+    downloads: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    /// The running capture's stop flag.
+    mic: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Workers {
@@ -88,6 +162,8 @@ impl Workers {
         socket: &Path,
         service: ServiceManager,
         lister: Lister,
+        env: Env,
+        tools: Tools,
     ) -> Workers {
         let workers = Workers {
             tx,
@@ -95,6 +171,10 @@ impl Workers {
             service,
             lister,
             older: Arc::new(AtomicBool::new(false)),
+            env,
+            tools,
+            downloads: Arc::default(),
+            mic: Mutex::new(None),
         };
         let (tx, socket, older) = (
             workers.tx.clone(),
@@ -150,6 +230,367 @@ impl Workers {
     }
 }
 
+impl Workers {
+    /// Test the key (or model, or server) of `target` in `config`, the key
+    /// resolved as the daemon would; the answer comes back as
+    /// [`Msg::KeyTested`].
+    pub fn test_key(&self, origin: Origin, path: String, config: Config, target: Target) {
+        let (tx, env, endpoints) = (
+            self.tx.clone(),
+            self.env.clone(),
+            self.tools.endpoints.clone(),
+        );
+        std::thread::spawn(move || {
+            let tested = key_test::check(
+                &config,
+                &target,
+                |var| env.get(var).map(str::to_string),
+                &endpoints,
+            );
+            let _ = tx.send(Msg::KeyTested {
+                origin,
+                path,
+                tested,
+            });
+        });
+    }
+
+    /// Download whisper model `name` into `dir` as download `id` (its
+    /// `.part` is `model::part_path`); its progress and end come back as
+    /// [`Msg::Download`], tagged `id`.
+    pub fn download(&self, name: String, dir: PathBuf, id: u64) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        lock(&self.downloads).insert(id, Arc::clone(&cancel));
+        let (tx, from) = (self.tx.clone(), self.tools.models_from.clone());
+        let downloads = Arc::clone(&self.downloads);
+        std::thread::spawn(move || {
+            let mut said = None::<Instant>;
+            let result = model::download_from(
+                &from,
+                &name,
+                &dir,
+                id,
+                |done, total| {
+                    // About ten a second is enough to watch.
+                    if said.is_none_or(|at| at.elapsed() >= Duration::from_millis(100)) {
+                        said = Some(Instant::now());
+                        let _ = tx.send(Msg::Download(Download::Progress { id, done, total }));
+                    }
+                },
+                &cancel,
+            );
+            lock(&downloads).remove(&id);
+            let _ = tx.send(Msg::Download(Download::Done { id, result }));
+        });
+    }
+
+    /// Stop download `id`: it ends, its `.part` removed, at its next read.
+    pub fn cancel_download(&self, id: u64) {
+        if let Some(cancel) = lock(&self.downloads).remove(&id) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Stop every download: the TUI is going.
+    pub fn cancel_downloads(&self) {
+        for (_, cancel) in lock(&self.downloads).drain() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Probe `device`, then capture from it and send about 30 readings a
+    /// second, tagged `session`, until [`Workers::mic_stop`] or the next
+    /// start. Stops on its own once the TUI is gone.
+    pub fn mic_start(&self, session: u64, device: String) {
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Some(old) = lock(&self.mic).replace(Arc::clone(&stop)) {
+            old.store(true, Ordering::Relaxed);
+        }
+        let (tx, tools) = (self.tx.clone(), self.tools.clone());
+        std::thread::spawn(move || {
+            let send = |event: MicEvent| tx.send(Msg::Mic { session, event }).is_ok();
+            // A capture started since makes this one moot. Checked before
+            // the lock and again once it is had: quick h/l presses would
+            // otherwise queue a probe each behind it.
+            let stopped = || stop.load(Ordering::Relaxed);
+            if stopped() {
+                return;
+            }
+            let probed = {
+                let _one = stderr_lock();
+                if stopped() {
+                    return;
+                }
+                (tools.probe)(&device)
+            };
+            if !send(MicEvent::Probed(probed)) || stopped() {
+                return;
+            }
+            match (tools.open_mic)(&device) {
+                Ok(mut chunks) => meter_loop(chunks.as_mut(), &stop, send, std::thread::sleep),
+                Err(why) => {
+                    send(MicEvent::Failed(why));
+                }
+            }
+        });
+    }
+
+    /// Stop the running capture.
+    pub fn mic_stop(&self) {
+        if let Some(stop) = lock(&self.mic).take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Look at the machine for setup's last step; the answer comes back as
+    /// [`Msg::Checked`].
+    pub fn checks(&self, dirs: SetupDirs, overlay: bool) {
+        let (tx, env, machine) = (self.tx.clone(), self.env.clone(), self.tools.machine);
+        std::thread::spawn(move || {
+            let checks = look(&dirs, overlay, &env, &machine);
+            let _ = tx.send(Msg::Checked(Box::new(checks)));
+        });
+    }
+
+    /// Do one of setup's system steps; the answer comes back as
+    /// [`Msg::SystemDone`].
+    pub fn system(&self, action: SystemAction, dirs: SetupDirs, checks: Checks) {
+        let (tx, run) = (self.tx.clone(), self.tools.machine.run);
+        std::thread::spawn(move || {
+            let done = act(action, &dirs, &checks, &run);
+            let _ = tx.send(Msg::SystemDone(action, done));
+        });
+    }
+}
+
+/// A download's news.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Download {
+    Progress {
+        id: u64,
+        done: u64,
+        total: Option<u64>,
+    },
+    Done {
+        id: u64,
+        result: Result<PathBuf, model::DownloadError>,
+    },
+}
+
+impl Download {
+    /// The download this is news of.
+    pub fn id(&self) -> u64 {
+        match self {
+            Download::Progress { id, .. } | Download::Done { id, .. } => *id,
+        }
+    }
+}
+
+/// The folders setup's checks look in: the compositor configs, the GNOME
+/// extensions.
+#[derive(Debug, Clone)]
+pub struct SetupDirs {
+    pub config: PathBuf,
+    pub data: PathBuf,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What setup's last step shows, looked up now on `machine`.
+fn look(dirs: &SetupDirs, overlay: bool, env: &Env, machine: &Machine) -> Checks {
+    let manager = (machine.manager)();
+    let compositor = keybind::detect_from(|key| env.get(key).map(str::to_string));
+    Checks {
+        uinput: (machine.uinput)(),
+        manager,
+        unit: (machine.unit)(manager),
+        unit_path: (machine.unit_path)(manager),
+        enabled: (machine.enabled)(manager),
+        active: (machine.active)(manager),
+        whisrsd: (machine.whisrsd)(),
+        whisrs: (machine.whisrs)(),
+        binding: compositor
+            .as_ref()
+            .and_then(|c| keybind::status(c, &dirs.config)),
+        gnome: (compositor == Some(keybind::Compositor::Gnome) && overlay)
+            .then(|| gnome::installed(&dirs.data)),
+        compositor,
+    }
+}
+
+/// Do `action` on this machine, its programs run by `run`; what to say, or
+/// why it failed.
+fn act(
+    action: SystemAction,
+    dirs: &SetupDirs,
+    checks: &Checks,
+    run: Run,
+) -> Result<Vec<String>, String> {
+    let manager = checks.manager;
+    let dest = || {
+        checks
+            .unit_path
+            .clone()
+            .ok_or_else(|| "no folder to install the service into".to_string())
+    };
+    match action {
+        SystemAction::InstallService => {
+            let dest = dest()?;
+            let mut notes = unit::write(
+                manager,
+                &dest,
+                &checks.whisrsd,
+                whisrs::config::setup::find_contrib_file,
+                Some(&dirs.config.join("rc/conf.d")),
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            notes.insert(0, format!("installed the service at {}", dest.display()));
+            unit::enable(manager, run).map_err(|e| format!("{e:#}"))?;
+            notes.push("enabled and started it".to_string());
+            Ok(notes)
+        }
+        SystemAction::EnableService => unit::enable(manager, run)
+            .map(|()| vec!["enabled and started the service".to_string()])
+            .map_err(|e| format!("{e:#}")),
+        SystemAction::Repoint => {
+            let dest = dest()?;
+            unit::repoint(&dest, &checks.whisrsd, run).map_err(|e| format!("{e:#}"))?;
+            Ok(vec![format!("repointed the service at {}", checks.whisrsd)])
+        }
+        SystemAction::Bind => {
+            let compositor = checks
+                .compositor
+                .clone()
+                .ok_or_else(|| "no compositor found".to_string())?;
+            let path = keybind::config_file(&compositor, &dirs.config)
+                .ok_or_else(|| format!("whisrs does not write {}'s config", compositor.name()))?;
+            keybind::append(&compositor, &path, &checks.whisrs).map_err(|e| format!("{e:#}"))?;
+            let reload = match compositor {
+                keybind::Compositor::Hyprland => {
+                    "Hyprland does not reload by itself: run hyprctl reload to use it."
+                }
+                _ => "Reload Sway (Mod+Shift+C) to use it.",
+            };
+            Ok(vec![format!(
+                "added {} to {}. {reload}",
+                keybind::keys(&compositor),
+                path.display()
+            )])
+        }
+        SystemAction::InstallGnome => {
+            let installed = gnome::install(gnome::source().as_deref(), &dirs.data, run)
+                .map_err(|e| format!("{e:#}"))?;
+            Ok(vec![match installed.enabled {
+                Ok(()) => format!(
+                    "installed and enabled the extension at {}; log out and back in if it does \
+                     not show",
+                    installed.path.display()
+                ),
+                Err(why) => format!(
+                    "installed the extension at {}, but enabling it failed ({why}): run \
+                     gnome-extensions enable {}",
+                    installed.path.display(),
+                    gnome::UUID
+                ),
+            }])
+        }
+    }
+}
+
+/// A microphone, as the meter reads it: one poll at a time.
+pub trait Chunks: Send {
+    fn poll(&mut self) -> Polled;
+}
+
+/// What one poll of a microphone gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Polled {
+    Chunk(Vec<i16>),
+    /// Nothing yet.
+    Waiting,
+    /// The capture stopped.
+    Ended,
+}
+
+/// Open a microphone by its `[audio] device` name.
+pub type OpenMic = fn(&str) -> Result<Box<dyn Chunks>, String>;
+
+/// The real microphone, through the daemon's own capture.
+struct LiveMic {
+    _handle: whisrs::audio::capture::AudioCaptureHandle,
+    rx: tokio::sync::mpsc::UnboundedReceiver<whisrs::audio::AudioChunk>,
+}
+
+impl Chunks for LiveMic {
+    fn poll(&mut self) -> Polled {
+        use tokio::sync::mpsc::error::TryRecvError;
+        match self.rx.try_recv() {
+            Ok(chunk) => Polled::Chunk(chunk),
+            Err(TryRecvError::Empty) => Polled::Waiting,
+            Err(TryRecvError::Disconnected) => Polled::Ended,
+        }
+    }
+}
+
+fn open_live_mic(device: &str) -> Result<Box<dyn Chunks>, String> {
+    // ALSA prints to stderr while a device opens.
+    let mut handle = quiet_stderr(|| {
+        whisrs::audio::capture::AudioCaptureHandle::start_with_level_tx(device, None)
+    })
+    .map_err(|e| format!("{e:#}"))?;
+    let rx = handle
+        .take_receiver()
+        .ok_or_else(|| "the capture gave no audio channel".to_string())?;
+    Ok(Box::new(LiveMic {
+        _handle: handle,
+        rx,
+    }))
+}
+
+/// Samples a reading is made of, at least: 33 ms at 16 kHz, for about 30
+/// readings a second.
+const WINDOW: usize = 533;
+
+/// How long the meter waits when a poll had nothing.
+const NAP: Duration = Duration::from_millis(5);
+
+/// Read `chunks` until `stop`, sending a reading for every [`WINDOW`] of
+/// audio (the latest audio at once when more came); a `send` that fails
+/// (the TUI is gone) ends it too.
+pub fn meter_loop(
+    chunks: &mut dyn Chunks,
+    stop: &AtomicBool,
+    mut send: impl FnMut(MicEvent) -> bool,
+    sleep: impl Fn(Duration),
+) {
+    let mut pending: Vec<i16> = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        match chunks.poll() {
+            Polled::Chunk(chunk) => {
+                pending.extend_from_slice(&chunk);
+                continue;
+            }
+            Polled::Ended => {
+                send(MicEvent::Failed("the microphone stopped".to_string()));
+                return;
+            }
+            Polled::Waiting => {}
+        }
+        if pending.len() >= WINDOW {
+            let reading = analysis::analyze(&pending, whisrs::audio::capture::SAMPLE_RATE);
+            pending.clear();
+            if !send(MicEvent::Reading(reading, Instant::now())) {
+                return;
+            }
+        }
+        sleep(NAP);
+    }
+}
+
 /// [`list`], with a panic in it caught: it becomes the list's failure, so
 /// the picker says so and the list can be asked for again. `true` when it
 /// panicked: the panic hook gave the terminal back on the way, and the TUI
@@ -192,14 +633,16 @@ pub fn list(kind: ListKind, lister: &Lister) -> Listing {
     }
 }
 
-/// The sound server's inputs, with stderr shut while they are listed: ALSA
-/// and PulseAudio print to it, which would land on the TUI's screen.
+/// The sound server's inputs. ALSA and PulseAudio print to stderr while
+/// they are listed, which is on `/dev/null` for the TUI's run ([`hush`]).
 pub fn list_devices_quietly() -> Vec<InputDeviceInfo> {
     quiet_stderr(whisrs::audio::device::list_input_devices)
 }
 
-/// Held while file descriptor 2 may be on `/dev/null`, and around handing
-/// it to a child (`$EDITOR`), which then waits for a listing to put it back.
+/// Held while something may print to stderr (a listing, a device opening),
+/// and while the real stderr is handed to a child (`$EDITOR`, sudo), so the
+/// two never meet: the child waits for the listing, or the listing for the
+/// child. Never held while waiting for another lock, so it cannot deadlock.
 pub fn stderr_lock() -> std::sync::MutexGuard<'static, ()> {
     static QUIET: std::sync::Mutex<()> = std::sync::Mutex::new(());
     QUIET
@@ -207,39 +650,87 @@ pub fn stderr_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Run `f` with file descriptor 2 on `/dev/null`, and put it back after,
-/// a panic in `f` too. One at a time: two overlapping would put back each
-/// other's `/dev/null`.
+/// Run `f` holding [`stderr_lock`]: whatever it prints goes to `/dev/null`
+/// for the run, never into a suspend's real stderr.
 fn quiet_stderr<T>(f: impl FnOnce() -> T) -> T {
-    use std::os::fd::AsRawFd;
+    let _one = stderr_lock();
+    f()
+}
 
-    /// Puts the saved descriptor back on 2 when dropped.
-    struct Restore(libc::c_int);
+/// The real stderr, kept while file descriptor 2 is on `/dev/null`; -1 when
+/// it is not ([`hush`] has not run, or [`Hushed`] was dropped).
+static REAL_STDERR: AtomicI32 = AtomicI32::new(-1);
 
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            // SAFETY: `self.0` is a descriptor this owns; 2 always exists.
+/// Puts the real stderr back on 2 for good when dropped.
+#[must_use]
+pub struct Hushed(());
+
+impl Drop for Hushed {
+    fn drop(&mut self) {
+        let saved = REAL_STDERR.swap(-1, Ordering::SeqCst);
+        if saved >= 0 {
+            // SAFETY: `saved` is the descriptor `hush` made and owns.
             unsafe {
-                libc::dup2(self.0, 2);
-                libc::close(self.0);
+                libc::dup2(saved, 2);
+                libc::close(saved);
             }
         }
     }
+}
 
-    let _one = stderr_lock();
-    let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") else {
-        return f();
-    };
-    // SAFETY: plain descriptor calls. The copy is close-on-exec, so no child
-    // started meanwhile inherits it.
-    let saved = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 0) };
-    if saved < 0 {
-        return f();
+/// Point file descriptor 2 at `/dev/null` for the TUI's run: ALSA, PipeWire
+/// and anything else that prints to stderr would land on the screen. The
+/// real one is kept (close-on-exec, so no child inherits it) and comes back
+/// when the guard drops, for a suspend ([`speaking`]) and in a panic
+/// ([`unhush`]).
+pub fn hush() -> Hushed {
+    if REAL_STDERR.load(Ordering::SeqCst) < 0 {
+        // SAFETY: plain descriptor calls on 2, which always exists.
+        let saved = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 0) };
+        if saved >= 0 {
+            REAL_STDERR.store(saved, Ordering::SeqCst);
+            rehush();
+        }
     }
-    let _back = Restore(saved);
-    // SAFETY: as above; `null` outlives the call.
-    unsafe { libc::dup2(null.as_raw_fd(), 2) };
-    f()
+    Hushed(())
+}
+
+/// The real stderr back on 2, the run still on: for the panic hook, and a
+/// suspend. Takes no lock, so a panic while one is held cannot deadlock.
+pub fn unhush() {
+    let saved = REAL_STDERR.load(Ordering::SeqCst);
+    if saved >= 0 {
+        // SAFETY: `saved` is open while the run lasts.
+        unsafe { libc::dup2(saved, 2) };
+    }
+}
+
+/// `/dev/null` on 2 again, while the run lasts.
+pub fn rehush() {
+    use std::os::fd::AsRawFd;
+    if REAL_STDERR.load(Ordering::SeqCst) < 0 {
+        return;
+    }
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        // SAFETY: `null` outlives the call; dup2 makes 2 a copy of it.
+        unsafe { libc::dup2(null.as_raw_fd(), 2) };
+    }
+}
+
+/// The real stderr on 2 until dropped, for `$EDITOR` and sudo. Taken under
+/// [`stderr_lock`], so nothing hushed prints into it meanwhile.
+#[must_use]
+pub struct Speaking(());
+
+impl Drop for Speaking {
+    fn drop(&mut self) {
+        rehush();
+    }
+}
+
+pub fn speaking() -> Speaking {
+    unhush();
+    Speaking(())
 }
 
 /// Ask the daemon once: `info`, or `status` for a daemon known to be older
@@ -485,6 +976,10 @@ mod list_tests {
                 home: None,
             },
             older: Arc::new(AtomicBool::new(false)),
+            env: Env::default(),
+            tools: Tools::real(),
+            downloads: Arc::default(),
+            mic: Mutex::new(None),
         };
         workers.list(ListKind::Devices);
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -501,10 +996,55 @@ mod list_tests {
         (stat.st_dev, stat.st_ino)
     }
 
+    /// Held by every test that looks at or moves file descriptor 2.
+    static FD2: Mutex<()> = Mutex::new(());
+
+    /// The device and inode of `/dev/null`.
+    fn null_file() -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata("/dev/null").unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    /// For the run, stderr is `/dev/null`; a suspend has the real one, as
+    /// does a panic hook until the terminal is reclaimed; dropping the
+    /// guard, or unwinding through it in a panic, gives it back for good.
+    #[test]
+    fn stderr_is_hushed_for_the_run_and_given_back() {
+        let _fd2 = lock(&FD2);
+        let before = stderr_file();
+        let hushed = hush();
+        assert_eq!(stderr_file(), null_file());
+        {
+            let _real = speaking();
+            assert_eq!(stderr_file(), before, "a suspend has the real stderr");
+        }
+        assert_eq!(stderr_file(), null_file());
+        unhush();
+        assert_eq!(stderr_file(), before, "the panic hook gives it back");
+        rehush();
+        assert_eq!(stderr_file(), null_file());
+        drop(hushed);
+        assert_eq!(stderr_file(), before, "back after the run");
+        assert_eq!(REAL_STDERR.load(Ordering::SeqCst), -1);
+        // Out of a run, they change nothing.
+        rehush();
+        assert_eq!(stderr_file(), before);
+
+        let caught = std::panic::catch_unwind(|| {
+            let _hushed = hush();
+            panic!("in the run");
+        });
+        assert!(caught.is_err());
+        assert_eq!(stderr_file(), before, "back after a panic in the run");
+        assert_eq!(REAL_STDERR.load(Ordering::SeqCst), -1);
+    }
+
     /// Stderr is back after a quiet listing, a panicking one too, and the
     /// saved copy is not left open.
     #[test]
     fn stderr_comes_back_after_a_quiet_listing() {
+        let _fd2 = lock(&FD2);
         let before = stderr_file();
         assert_eq!(quiet_stderr(|| 7), 7);
         assert_eq!(stderr_file(), before);
@@ -517,6 +1057,287 @@ mod list_tests {
 
     fn boom() -> Vec<InputDeviceInfo> {
         panic!("the sound server library panicked")
+    }
+
+    /// A microphone that gives what a test says.
+    struct Scripted(std::collections::VecDeque<Polled>);
+
+    impl Chunks for Scripted {
+        fn poll(&mut self) -> Polled {
+            self.0.pop_front().unwrap_or(Polled::Waiting)
+        }
+    }
+
+    /// A reading comes for each window of audio, the latest at once, and
+    /// a capture that stops says so.
+    #[test]
+    fn the_meter_reads_windows_until_stopped() {
+        let stop = AtomicBool::new(false);
+        let mut mic = Scripted(
+            [
+                Polled::Chunk(vec![3277; 300]),
+                Polled::Waiting,
+                Polled::Chunk(vec![3277; 300]),
+                Polled::Chunk(vec![0; 2000]),
+                Polled::Waiting,
+                Polled::Ended,
+            ]
+            .into(),
+        );
+        let mut events = Vec::new();
+        meter_loop(
+            &mut mic,
+            &stop,
+            |event| {
+                events.push(event);
+                true
+            },
+            |_| {},
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        match &events[0] {
+            MicEvent::Reading(reading, _) => {
+                assert!(reading.rms_dbfs < -20.0 && reading.rms_dbfs > -40.0)
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(events[1], MicEvent::Failed("the microphone stopped".into()));
+
+        // Stopped, it reads nothing more.
+        stop.store(true, Ordering::Relaxed);
+        let mut mic = Scripted([Polled::Chunk(vec![1; 5000])].into());
+        let mut any = false;
+        meter_loop(
+            &mut mic,
+            &stop,
+            |_| {
+                any = true;
+                true
+            },
+            |_| {},
+        );
+        assert!(!any);
+    }
+
+    /// A capture whose device does not open says why, after the probe.
+    #[test]
+    fn a_mic_that_does_not_open_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers = Workers {
+            tx,
+            socket: dir.path().join("whisrs.sock"),
+            service: ServiceManager::None,
+            lister: Lister {
+                devices: two,
+                models: dir.path().to_path_buf(),
+                home: None,
+            },
+            older: Arc::new(AtomicBool::new(false)),
+            env: Env::default(),
+            tools: Tools {
+                open_mic: |_| Err("no such device".to_string()),
+                probe: |_| {
+                    Err(mic::ProbeError {
+                        error: "no such device".into(),
+                        devices: Vec::new(),
+                    })
+                },
+                ..Tools::real()
+            },
+            downloads: Arc::default(),
+            mic: Mutex::new(None),
+        };
+        workers.mic_start(7, "nope".into());
+        let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Mic { session, event } => (session, event),
+            _ => panic!("not a mic event"),
+        };
+        assert!(matches!(next(), (7, MicEvent::Probed(Err(_)))));
+        assert_eq!(next(), (7, MicEvent::Failed("no such device".into())));
+    }
+
+    /// What the probes below were asked to look at.
+    static PROBED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn counting_probe(device: &str) -> Result<mic::Probe, mic::ProbeError> {
+        lock(&PROBED).push(device.to_string());
+        Err(mic::ProbeError {
+            error: "not here".into(),
+            devices: Vec::new(),
+        })
+    }
+
+    /// A capture superseded before its probe got the stderr lock never
+    /// probes: quick h/l presses do not queue a probe each.
+    #[test]
+    fn a_superseded_probe_does_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers = Workers {
+            tx,
+            socket: dir.path().join("whisrs.sock"),
+            service: ServiceManager::None,
+            lister: Lister {
+                devices: two,
+                models: dir.path().to_path_buf(),
+                home: None,
+            },
+            older: Arc::new(AtomicBool::new(false)),
+            env: Env::default(),
+            tools: Tools {
+                open_mic: |_| Err("no such device".to_string()),
+                probe: counting_probe,
+                ..Tools::real()
+            },
+            downloads: Arc::default(),
+            mic: Mutex::new(None),
+        };
+        {
+            // Another probe, or a listing, holds the lock meanwhile.
+            let _held = stderr_lock();
+            workers.mic_start(1, "first".into());
+            workers.mic_start(2, "second".into());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Msg::Mic {
+                    session: 2,
+                    event: MicEvent::Probed(_),
+                } => break,
+                Msg::Mic { session: 1, .. } => panic!("the superseded capture answered"),
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rx
+            .try_iter()
+            .all(|msg| !matches!(msg, Msg::Mic { session: 1, .. })));
+        assert_eq!(*lock(&PROBED), ["second"]);
+    }
+
+    fn fake_machine() -> Machine {
+        Machine {
+            manager: || ServiceManager::Systemd,
+            uinput: || Uinput::Denied,
+            unit: |_| UnitFile::Missing,
+            unit_path: |_| Some(PathBuf::from("/nowhere/whisrs.service")),
+            enabled: |_| false,
+            active: |_| true,
+            whisrsd: || "/opt/bin/whisrsd".into(),
+            whisrs: || "/opt/bin/whisrs".into(),
+            run: |_, _| Err("no programs in tests".to_string()),
+        }
+    }
+
+    /// The checks come from the machine given: the service, uinput, the
+    /// binaries, the keybinding in the config folder, the GNOME extension
+    /// only on GNOME with the overlay on.
+    #[test]
+    fn look_asks_the_machine_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = SetupDirs {
+            config: dir.path().join("cfg"),
+            data: dir.path().join("data"),
+        };
+        let conf = dirs.config.join("hypr/hyprland.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "$mainMod = SUPER\n").unwrap();
+        let hypr = Env::from_pairs(&[("HYPRLAND_INSTANCE_SIGNATURE", "x")]);
+        let checks = look(&dirs, true, &hypr, &fake_machine());
+        assert_eq!(checks.uinput, Uinput::Denied);
+        assert_eq!(checks.manager, ServiceManager::Systemd);
+        assert_eq!(checks.unit, UnitFile::Missing);
+        assert_eq!(
+            checks.unit_path.as_deref(),
+            Some(Path::new("/nowhere/whisrs.service"))
+        );
+        assert!(!checks.enabled && checks.active);
+        assert_eq!(checks.whisrsd, "/opt/bin/whisrsd");
+        assert_eq!(checks.compositor, Some(keybind::Compositor::Hyprland));
+        assert_eq!(checks.binding, Some(keybind::Binding::Unbound(conf)));
+        assert_eq!(checks.gnome, None);
+
+        let gnome = Env::from_pairs(&[("XDG_CURRENT_DESKTOP", "GNOME")]);
+        assert_eq!(
+            look(&dirs, true, &gnome, &fake_machine()).gnome,
+            Some(false)
+        );
+        assert_eq!(look(&dirs, false, &gnome, &fake_machine()).gnome, None);
+    }
+
+    /// Each system step runs with the runner given: the service written
+    /// and enabled, repointed, a keybinding appended once, the GNOME
+    /// extension copied and enabled; a failure says how to do it by hand.
+    #[test]
+    fn act_runs_each_step_with_the_runner_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = SetupDirs {
+            config: dir.path().join("cfg"),
+            data: dir.path().join("data"),
+        };
+        let unit = dir.path().join("systemd/user/whisrs.service");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let run = |program: &str, args: &[&str]| -> Result<(), String> {
+            seen.borrow_mut()
+                .push(format!("{program} {}", args.join(" ")));
+            Ok(())
+        };
+        let mut checks = look(&dirs, true, &Env::default(), &fake_machine());
+        checks.unit_path = Some(unit.clone());
+        checks.compositor = Some(keybind::Compositor::Hyprland);
+
+        let notes = act(SystemAction::InstallService, &dirs, &checks, &run).unwrap();
+        assert!(
+            notes[0].starts_with("installed the service at"),
+            "{notes:?}"
+        );
+        assert!(std::fs::read_to_string(&unit)
+            .unwrap()
+            .contains("ExecStart=/opt/bin/whisrsd"));
+        assert_eq!(
+            seen.take(),
+            [
+                "systemctl --user daemon-reload",
+                "systemctl --user enable --now whisrs.service"
+            ]
+        );
+
+        std::fs::write(&unit, "[Service]\nExecStart=/usr/bin/whisrsd\n").unwrap();
+        act(SystemAction::Repoint, &dirs, &checks, &run).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&unit).unwrap(),
+            "[Service]\nExecStart=/opt/bin/whisrsd\n"
+        );
+        assert_eq!(seen.take(), ["systemctl --user daemon-reload"]);
+
+        let failing = |_: &str, _: &[&str]| -> Result<(), String> { Err("no".into()) };
+        let why = act(SystemAction::EnableService, &dirs, &checks, &failing).unwrap_err();
+        assert!(
+            why.contains("systemctl --user enable --now whisrs.service"),
+            "{why}"
+        );
+
+        let conf = dirs.config.join("hypr/hyprland.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "").unwrap();
+        let notes = act(SystemAction::Bind, &dirs, &checks, &run).unwrap();
+        assert!(notes[0].contains("run hyprctl reload"), "{notes:?}");
+        act(SystemAction::Bind, &dirs, &checks, &run).unwrap();
+        let bound = std::fs::read_to_string(&conf).unwrap();
+        assert_eq!(bound.matches("whisrs toggle").count(), 1, "appended once");
+
+        let notes = act(SystemAction::InstallGnome, &dirs, &checks, &run).unwrap();
+        assert!(notes[0].starts_with("installed and enabled"), "{notes:?}");
+        assert!(gnome::installed(&dirs.data));
+        assert_eq!(
+            seen.take(),
+            [format!("gnome-extensions enable {}", gnome::UUID)]
+        );
+
+        checks.unit_path = None;
+        assert!(act(SystemAction::Repoint, &dirs, &checks, &run).is_err());
     }
 
     /// A panic while listing is the list's failure, not a picker looking

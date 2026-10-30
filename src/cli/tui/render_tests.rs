@@ -41,6 +41,45 @@ fn hotkey() -> Fixture {
     fixture
 }
 
+/// Mic with the yeti picked and a reading in, as the mockup has it.
+fn mic() -> Fixture {
+    use std::time::Instant;
+
+    use whisrs::config::setup::mic::Probe;
+
+    use super::app::{MicEvent, Msg};
+    use super::screens::mic::analysis::MicReading;
+
+    let mut fixture = mockup();
+    press(&mut fixture.app, "\x1bj\n");
+    for event in [
+        MicEvent::Probed(Ok(Probe {
+            name: "default".into(),
+            rate: 48_000,
+            channels: 2,
+        })),
+        MicEvent::Reading(
+            MicReading {
+                rms_dbfs: -18.0,
+                peak_dbfs: -12.0,
+                quality: None,
+            },
+            Instant::now(),
+        ),
+    ] {
+        fixture.app.update(Msg::Mic { session: 1, event });
+    }
+    fixture
+}
+
+#[test]
+fn mic_snapshots() {
+    let fixture = mic();
+    for (w, h) in SIZES {
+        assert_snapshot(&format!("mic-{w}x{h}"), &rows(&draw(&fixture.app, w, h)));
+    }
+}
+
 #[test]
 fn picker_and_hotkey_snapshots() {
     for (w, h) in [(60, 18), (90, 30)] {
@@ -209,6 +248,7 @@ fn no_size_panics() {
     states.push(picker());
     states.push(hotkey());
     states.push(hotkeys_with_an_agent());
+    states.push(mic());
     for fixture in &states {
         for w in [1, 2, 10, 40, 59, 60, 61, 70, 89, 90, 91, 120, 199, 200, 250] {
             for h in [1, 2, 5, 17, 18, 19, 25, 30, 60, 90] {

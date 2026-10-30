@@ -339,6 +339,85 @@ pub const OPENAI_MODELS: &[Entry] = &[
     ("whisper-1", "openai, timestamps, removed 2027-02-26"),
 ];
 
+/// A whisper.cpp model whisrs setup can download: its name (the file is
+/// `ggml-<name>.bin`), its size in bytes, and what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WhisperModel {
+    pub name: &'static str,
+    pub bytes: u64,
+    pub about: &'static str,
+}
+
+/// The whisper.cpp models setup offers to download for `local-whisper`,
+/// smallest first: each size English only (`.en`, better at English) and
+/// multilingual, then the large ones. The quantized files are left out but
+/// for large-v3-turbo's q5_0, a third of its size.
+///
+/// Source: https://huggingface.co/ggerganov/whisper.cpp (file names and
+/// sizes from https://huggingface.co/api/models/ggerganov/whisper.cpp/tree/main),
+/// checked 2026-10-29.
+pub const WHISPER_MODELS: &[WhisperModel] = &[
+    WhisperModel {
+        name: "tiny.en",
+        bytes: 77_704_715,
+        about: "English, fastest, rough",
+    },
+    WhisperModel {
+        name: "tiny",
+        bytes: 77_691_713,
+        about: "multilingual, fastest, rough",
+    },
+    WhisperModel {
+        name: "base.en",
+        bytes: 147_964_211,
+        about: "English, good, real-time on most CPUs",
+    },
+    WhisperModel {
+        name: "base",
+        bytes: 147_951_465,
+        about: "multilingual, good",
+    },
+    WhisperModel {
+        name: "small.en",
+        bytes: 487_614_201,
+        about: "English, very good, slower",
+    },
+    WhisperModel {
+        name: "small",
+        bytes: 487_601_967,
+        about: "multilingual, very good, slower",
+    },
+    WhisperModel {
+        name: "medium.en",
+        bytes: 1_533_774_781,
+        about: "English, better still, slow on a CPU",
+    },
+    WhisperModel {
+        name: "medium",
+        bytes: 1_533_763_059,
+        about: "multilingual, slow on a CPU",
+    },
+    WhisperModel {
+        name: "large-v3-turbo-q5_0",
+        bytes: 574_041_195,
+        about: "multilingual, large-v3-turbo quantized",
+    },
+    WhisperModel {
+        name: "large-v3-turbo",
+        bytes: 1_624_555_275,
+        about: "multilingual, near large-v3, much faster",
+    },
+    WhisperModel {
+        name: "large-v3",
+        bytes: 3_095_033_483,
+        about: "multilingual, most accurate, wants a GPU",
+    },
+];
+
+/// The model setup offers first: the file `[local-whisper] model_path`
+/// defaults to.
+pub const DEFAULT_WHISPER_MODEL: &str = "base.en";
+
 // ---------------------------------------------------------------------------
 // Read aloud (TTS)
 // ---------------------------------------------------------------------------
@@ -634,14 +713,19 @@ pub fn tts_voices(backend: &str) -> &'static [Entry] {
 /// `[llm] api_url`: chat completions endpoints that work.
 ///
 /// Sources: https://developers.openai.com/api/reference/resources/chat,
-/// https://console.groq.com/docs/openai, https://openrouter.ai/docs/quickstart
-/// and https://docs.ollama.com/api/openai-compatibility, checked 2026-10-29.
+/// https://console.groq.com/docs/openai, https://openrouter.ai/docs/quickstart,
+/// https://ai.google.dev/gemini-api/docs/openai and
+/// https://docs.ollama.com/api/openai-compatibility, checked 2026-10-29.
 pub const LLM_URLS: &[Entry] = &[
     ("https://api.openai.com/v1/chat/completions", "OpenAI"),
     ("https://api.groq.com/openai/v1/chat/completions", "Groq"),
     (
         "https://openrouter.ai/api/v1/chat/completions",
         "OpenRouter",
+    ),
+    (
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "Google Gemini",
     ),
     (
         "http://localhost:11434/v1/chat/completions",
@@ -686,6 +770,25 @@ pub const OPENROUTER_CHAT_MODELS: &[Entry] = &[
     ("openai/gpt-oss-120b", "OpenAI open-weight 117B MoE"),
 ];
 
+/// `[llm] model` on Gemini's OpenAI-compatible endpoint. The 2.5 models are
+/// left out: Google serves them only to accounts that used them recently.
+///
+/// Source: https://ai.google.dev/gemini-api/docs/models and
+/// https://ai.google.dev/gemini-api/docs/openai, checked 2026-10-29.
+pub const GEMINI_CHAT_MODELS: &[Entry] = &[
+    ("gemini-3.8-flash", "the most capable Flash: coding, agents"),
+    (
+        "gemini-3.6-flash",
+        "the Flash before it, fast and multimodal",
+    ),
+    (
+        "gemini-3.5-flash-lite",
+        "the fastest and cheapest, high volume",
+    ),
+    ("gemini-3.1-flash-lite", "near-frontier at a lower cost"),
+    ("gemini-4-argon", "the flagship reasoning model, 1M tokens"),
+];
+
 /// `[llm] model` on Ollama: models to `ollama pull` first.
 ///
 /// Source: https://docs.ollama.com/api/openai-compatibility and
@@ -715,6 +818,7 @@ pub fn llm_models(api_url: &str) -> &'static [Entry] {
         "api.openai.com" => OPENAI_CHAT_MODELS,
         "api.groq.com" => GROQ_CHAT_MODELS,
         "openrouter.ai" => OPENROUTER_CHAT_MODELS,
+        "generativelanguage.googleapis.com" => GEMINI_CHAT_MODELS,
         "localhost" | "127.0.0.1" | "[::1]" if port == Some("11434") => OLLAMA_CHAT_MODELS,
         _ => &[],
     }
@@ -768,6 +872,7 @@ mod tests {
             OPENAI_CHAT_MODELS,
             GROQ_CHAT_MODELS,
             OPENROUTER_CHAT_MODELS,
+            GEMINI_CHAT_MODELS,
             OLLAMA_CHAT_MODELS,
         ] {
             let values: BTreeSet<&str> = list.iter().map(|(v, _)| *v).collect();
@@ -873,6 +978,21 @@ mod tests {
             "{}",
             llm.model
         );
+    }
+
+    /// The default model is offered, and is the file the default
+    /// `model_path` names; names are distinct and plain.
+    #[test]
+    fn whisper_models_hold_the_default() {
+        let names: BTreeSet<&str> = WHISPER_MODELS.iter().map(|m| m.name).collect();
+        assert_eq!(names.len(), WHISPER_MODELS.len());
+        assert!(names.contains(DEFAULT_WHISPER_MODEL));
+        assert!(crate::config::types::default_whisper_model_path()
+            .ends_with(&format!("ggml-{DEFAULT_WHISPER_MODEL}.bin")));
+        for model in WHISPER_MODELS {
+            assert!(!model.about.contains(['\u{2013}', '\u{2014}']), "{model:?}");
+            assert!(model.bytes > 1_000_000, "{model:?}");
+        }
     }
 
     /// Every URL offered has its model list.

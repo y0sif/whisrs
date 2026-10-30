@@ -47,6 +47,16 @@ pub struct Glyphs {
     /// The arrow keys, in key hints.
     pub key_up: &'static str,
     pub key_down: &'static str,
+    /// A level meter's filled cell.
+    pub level: &'static str,
+    /// The silence gate's mark on a level meter.
+    pub gate: &'static str,
+    /// The held peak's mark on a level meter.
+    pub peak: &'static str,
+    /// A spinner's frames, while a test runs.
+    pub spinner: [&'static str; 4],
+    /// Between a value and what it becomes.
+    pub to: &'static str,
     /// The ASCII set: text with no one-character ASCII stand-in (`±`) is
     /// spelled out instead.
     pub ascii: bool,
@@ -73,6 +83,12 @@ impl Glyphs {
         swatch: "\u{2588}",   // █ FULL BLOCK
         key_up: "\u{2191}",   // ↑ UPWARDS ARROW
         key_down: "\u{2193}", // ↓ DOWNWARDS ARROW
+        level: "\u{2588}",    // █ FULL BLOCK
+        gate: "\u{250A}",     // ┊ BOX DRAWINGS LIGHT QUADRUPLE DASH VERTICAL
+        peak: "\u{2503}",     // ┃ BOX DRAWINGS HEAVY VERTICAL
+        // ⠋ ⠙ ⠹ ⠸ BRAILLE PATTERNS
+        spinner: ["\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}"],
+        to: "\u{2192}", // → RIGHTWARDS ARROW
         ascii: false,
     };
 
@@ -114,6 +130,11 @@ impl Glyphs {
         swatch: "#",
         key_up: "^",
         key_down: "v",
+        level: "#",
+        gate: ":",
+        peak: "|",
+        spinner: ["|", "/", "-", "\\"],
+        to: ">",
         ascii: true,
     };
 
@@ -177,13 +198,19 @@ mod tests {
             swatch,
             key_up,
             key_down,
+            level,
+            gate,
+            peak,
+            spinner,
+            to,
             ascii: _,
         } = *set;
         let mut glyphs = vec![
             gutter, up, down, left, right, separator, ellipsis, bullet, warn, prompt, current,
-            bar_on, bar_off, swatch, key_up, key_down,
+            bar_on, bar_off, swatch, key_up, key_down, level, gate, peak, to,
         ];
         glyphs.extend(wave);
+        glyphs.extend(spinner);
         for border in [frame, dialog] {
             glyphs.extend([
                 border.top_left,

@@ -139,7 +139,7 @@ cargo install --path .
 whisrs setup
 ```
 
-The interactive setup will walk you through backend selection, API keys / model download, microphone test, uinput permissions, the user service, and keybindings.
+Setup is a full-screen wizard, one step at a time: the backend, its API key (`t` tests it, sending no audio) or a whisper.cpp model to download, the language, a live microphone meter, extras, the typing backend and an optional LLM. It then writes the answers into `config.toml`, changing only the keys it asked about and keeping the old file as `config.toml.bak`, and checks uinput permissions, the user service and a compositor keybinding, fixing each with a keypress (sudo asks in the plain terminal). Answers are picked from a list wherever whisrs can list the values (keys, URLs and tokens are typed): `Space` opens one, `Enter` goes on, `Backspace` goes back. It needs an interactive terminal.
 
 Setup detects your init system and installs the matching service: a systemd user unit from `contrib/whisrs.service`, or an OpenRC user service from `contrib/openrc/`. To install by hand instead:
 
@@ -197,7 +197,7 @@ bindsym $mod+w exec whisrs toggle
 | **Local whisper.cpp** | Local (CPU/GPU) | Silence-split phrases | Free | Privacy, offline use |
 | **ASR sidecar** | Local sidecar or any OpenAI-compatible endpoint | Batch | Free | Bring-your-own ASR (Moonshine, Parakeet, VibeVoice-ASR, LiteLLM, Speaches, …) |
 
-Groq is the default. For fully offline use, run `whisrs setup` and select **Local > whisper.cpp**: `base.en` (142 MB, ~388 MB RAM) is recommended; `tiny.en` (75 MB) for low-end hardware, `small.en` (466 MB) for higher accuracy.
+Groq is the default. For fully offline use, run `whisrs setup`, pick **local-whisper**, and pick a model to download: `base.en` (148 MB, ~388 MB RAM) is recommended; `tiny.en` (78 MB) for low-end hardware, `small.en` (488 MB) for higher accuracy.
 
 Local whisper.cpp streams by splitting dictation into phrases at natural pauses and decoding each phrase exactly once; for local models without a Rust runtime (Moonshine, NVIDIA Parakeet, VibeVoice-ASR) the ASR sidecar backend talks to a small local HTTP service (ready-to-run recipes in [`contrib/asr-sidecars/`](contrib/asr-sidecars/)), and its OpenAI `/v1/audio/transcriptions` wire format also drives any OpenAI-compatible endpoint (LiteLLM, Speaches, your own server). External realtime servers that speak the OpenAI Realtime event model over WebSocket (Lemonade is the first supported profile) use `backend = "openai-compatible-realtime"`. Details for all three: [docs/configuration.md](docs/configuration.md).
 
@@ -226,8 +226,8 @@ For the full reference (overlay, `[input]`, `[tts]`, `[llm]`, `[hotkeys]`, `[hoo
 ## CLI Commands
 
 ```
-whisrs setup     # Interactive onboarding
-whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle
+whisrs setup     # Onboarding wizard (TUI): backend, key or model download, mic, service, keybinding
+whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle. Esc goes to Home, which opens Setup, Config and a Mic test (a live level meter; its w saves only [audio] device)
 whisrs toggle    # Start/stop dictation (uses general.language)
 whisrs toggle -l en  # Start/stop dictation, overriding the language for this session
 whisrs cancel    # Cancel dictation, discard audio

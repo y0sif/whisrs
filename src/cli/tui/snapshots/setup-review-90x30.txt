@@ -1,0 +1,30 @@
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                      setup 8/9 · ○  │
+   │                                                                                  │
+   │   Review                                                                         │
+   │   Enter writes ~/config.toml (0600). Backspace goes back to change an answer.    │
+   │                                                                                  │
+   │   backend     groq                                                               │
+   │   key         set ****6789                                                       │
+   │   model       whisper-large-v3-turbo                                             │
+   │   language    en                                                                 │
+   │   mic         default                                                            │
+   │   extras      fillers on · tones on · overlay off · theme carbon                 │
+   │   typing      auto                                                               │
+   │   LLM         skipped                                                            │
+   │                                                                                  │
+   │   skipped: [llm] stays as it is; whisrs config sets it later                     │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     enter write · backspace back · esc leave
+
+
+
+
+
+

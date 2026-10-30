@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                          setup · ○  │
+   │                                                                                  │
+   │   A config is there                                                              │
+   │   ~/config.toml has backend groq. Start fresh asks every question again and      │
+   │   writes the answers over it; System checks only looks at the machine.           │
+   │                                                                                  │
+   │ ▌ Start fresh         answer every question again                                │
+   │   System checks only  keep the config, check the machine                         │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k move · enter choose · esc leave
+
+
+
+
+
+
+
+
+
+

@@ -51,7 +51,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum SubCmd {
-    /// Interactive onboarding — pick a backend, set API key, test microphone
+    /// Interactive onboarding: backend, key, language, microphone, service
     Setup,
     /// Edit any part of ~/.config/whisrs/config.toml; restarts the daemon on save
     Config,
@@ -378,7 +378,13 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         SubCmd::Setup => {
-            if let Err(e) = whisrs::config::setup::run_setup() {
+            let result = tokio::task::spawn_blocking(|| tui::run(tui::Entry::Setup)).await?;
+            if let Err(e) = result {
+                // Its own whole message, not a failure of the setup.
+                if let Some(refusal) = e.downcast_ref::<tui::NotATerminal>() {
+                    eprintln!("{refusal}");
+                    process::exit(1);
+                }
                 if is_tty() {
                     eprintln!("{RED}setup failed:{RESET} {e:#}");
                 } else {

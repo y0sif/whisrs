@@ -21,7 +21,7 @@ cargo fmt -- --check                           # check formatting (CI)
 ## Running
 
 ```fish
-# First-time setup (interactive, no daemon needed)
+# First-time setup (the TUI wizard, no daemon needed; needs a terminal)
 whisrs setup
 
 # Start the daemon
@@ -42,7 +42,9 @@ whisrs status    # query daemon state
 whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
-whisrs config    # full-screen config editor (TUI): every key by section, w saves (comments kept)
+whisrs config    # full-screen config editor (TUI): every key by section, w saves (comments kept),
+                 # t tests a key row; Esc goes to Home, which opens Setup, Config and the Mic
+                 # test (a live level meter; its w writes only [audio] device)
                  # and restarts the daemon only while it is idle (r later), e opens config.toml
                  # in $EDITOR. Refuses off a terminal
 whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
@@ -91,9 +93,11 @@ src/
 ├── mcp.rs                  # whisrs mcp (feature mcp): read-only rmcp server, 4 tools over the recordings folder
 ├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
-├── cli/tui/                # whisrs config TUI (ratatui; in the CLI binary only, whisrsd never links it)
+├── cli/tui/                # whisrs config + whisrs setup TUI (ratatui; in the CLI binary only, whisrsd
+│   │                       #   never links it)
 │   ├── mod.rs              #   run(): tty refusal, load (#134 refusals), colour probe, init/restore,
-│   │                       #   the event loop, effects (save, restart, $EDITOR suspend)
+│   │                       #   the event loop, effects (save, restart, $EDITOR and sudo suspend,
+│   │                       #   a download's .part removed on the way out)
 │   ├── app.rs              #   App: screen stack, dialogs, pure update(Msg) -> Effect
 │   ├── keys.rs             #   key -> Action (pure)
 │   ├── theme.rs            #   colour roles from the overlay theme; 16-colour map, light remap, NO_COLOR
@@ -106,11 +110,18 @@ src/
 │   ├── form.rs             #   the edit buffer: dotted-path get/set over a toml::Table, checked by serde
 │   ├── worker.rs           #   threads: the 2 s info poll (status for an older daemon), the restart
 │   │                       #   gate (only an idle daemon; silence, a recording, an agent turn or
-│   │                       #   busy skip it; an older one is asked `recording status` too), and the
-│   │                       #   lists a picker needs (input devices, ggml-*.bin), the lister injected
+│   │                       #   busy skip it; an older one is asked `recording status` too), the
+│   │                       #   lists a picker needs (input devices, ggml-*.bin), the lister injected;
+│   │                       #   the key test, the model download, the mic capture (about 30 readings
+│   │                       #   a second), setup's checks and system steps
 │   ├── widgets/            #   frame + footer, row, text input, dialog, picker (filter by word
-│   │                       #   prefix), hotkey dialog (checked by hotkey::parse_hotkey)
-│   ├── screens/            #   home.rs (the hub), config.rs (sections, rows, list/map/entry editors, save)
+│   │                       #   prefix), hotkey dialog (checked by hotkey::parse_hotkey), level meter,
+│   │                       #   download progress
+│   ├── screens/            #   home.rs (the hub), config.rs (sections, rows, list/map/entry editors, save,
+│   │                       #   `t` key tests; pinned rows for the wizard and Mic), setup.rs (the wizard:
+│   │                       #   steps over its own pinned ConfigScreen, review + write, system checks;
+│   │                       #   tests in setup/tests.rs), mic/ (meter; analysis.rs::analyze is the seam
+│   │                       #   the audio-quality report fills)
 │   ├── testing.rs, render_tests.rs  #   fixtures; snapshots, styles, layouts (tests only)
 │   └── snapshots/          #   TestBackend row-string snapshots (WHISRS_UPDATE_SNAPSHOTS=1 rewrites)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
@@ -189,12 +200,18 @@ src/
 │   └── gnome.rs            #   GNOME overlay D-Bus broadcaster (pill state + AgentsChanged JSON)
 └── config/
     ├── types.rs            # Config structs, defaults, validation (config.toml)
-    ├── write.rs            # Load (ExistingConfig, refusals) and the format-preserving write
+    ├── write.rs            # Load (ExistingConfig, refusals) and the format-preserving write: only the
+    │                       #   leaves that changed against the file (a default is never written)
     ├── vocabulary.rs       # vocabulary.txt, and the save that splits terms between the two stores
     ├── keys.rs             # mask_api_key, the key summary (env var wins), the masked TOML
     ├── catalog.rs          # (value, description) lists the pickers offer: languages, models, voices,
-    │                       #   closed choices; each provider list names its source URL and check date
-    └── setup.rs            # Interactive onboarding (whisrs setup)
+    │                       #   closed choices, downloadable whisper models; each provider list names
+    │                       #   its source URL and check date
+    └── setup/              # whisrs setup's side effects as plain functions (no printing, no asking;
+                            #   programs, network and audio injected in tests): uinput (check, the sudo
+                            #   fix's commands), unit (status, write, #146 repoint, enable), keybind,
+                            #   gnome, model (download to .part, renamed when whole), mic (probe),
+                            #   key_test (one authenticated GET per provider, #[ignore] live tests)
 ```
 
 Injection **policy** lives in the daemon: `type_text_at_cursor`, `paste_via_keyboard`
@@ -355,10 +372,12 @@ list/show/path` read the recordings folder directly, which keeps transcript bodi
 (as does the speaker list `whisrs recording name` prints after the daemon renamed one).
 `whisrs mcp` reads it too, but its logic is in the library (`src/mcp.rs`); the CLI only
 starts it with `store::configured_recordings_dir()`.
-The `whisrs config` TUI (`src/cli/tui/`) lives in the CLI so whisrsd never links ratatui; it
-reads and writes config.toml through the library (`config::write`, `config::vocabulary`,
-`config::keys`), asks the daemon only `info` (or `status`), and restarts it after a save through
-`ServiceManager::restart`, as the old editor did.
+The `whisrs config` and `whisrs setup` TUI (`src/cli/tui/`) lives in the CLI so whisrsd never
+links ratatui; it reads and writes config.toml through the library (`config::write`,
+`config::vocabulary`, `config::keys`, `config::setup`), asks the daemon only `info` (or
+`status`), and restarts it after a save through `ServiceManager::restart`, as the old editor
+did. The dialoguer wizard and its deps (`dialoguer`, `indicatif`) are gone; the daemon saves an
+`[[llm_commands]]` instruction through `config::write::write_config`.
 `whisrs agent-hook` (hidden, run by the hooks whisrs puts in the Claude sessions it starts)
 only forwards its stdin to the daemon as `agent-event`, and always exits 0 within two seconds.
 

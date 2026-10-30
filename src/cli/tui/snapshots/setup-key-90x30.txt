@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                      setup 2/9 · ○  │
+   │                                                                                  │
+   │   Groq API key                                                                   │
+   │   Get one free at console.groq.com/keys. It is saved in config.toml (0600).      │
+   │   Leave it blank to use WHISRS_GROQ_API_KEY.                                     │
+   │                                                                                  │
+   │ ▌ groq api_key  set ****6789                                                     │
+   │   groq model    whisper-large-v3-turbo                                           │
+   │   test          valid, 214 ms                                                    │
+   │                                                                                  │
+   │   API key for groq. WHISRS_GROQ_API_KEY wins over it.                            │
+   │                                                                                  │
+   │   groq test: valid, 214 ms                                                       │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     space type · enter next · t test · backspace back · esc leave
+
+
+
+
+
+
+

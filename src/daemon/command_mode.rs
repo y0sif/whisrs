@@ -725,8 +725,18 @@ pub(crate) async fn handle_set_llm_instruction(
 /// config, update the matching entry, write it back. Best-effort — the
 /// in-memory override already applies to the running daemon.
 fn persist_llm_instruction(name: &str, instruction: &str) -> anyhow::Result<()> {
-    let path = whisrs::config_path();
-    let contents = std::fs::read_to_string(&path)
+    persist_llm_instruction_at(&whisrs::config_path(), name, instruction)
+}
+
+/// [`persist_llm_instruction`] on the config at `path`. Only the entry's
+/// `instruction` changes in the file: the write leaves every other key, and
+/// every default the file leaves out, as it is.
+fn persist_llm_instruction_at(
+    path: &std::path::Path,
+    name: &str,
+    instruction: &str,
+) -> anyhow::Result<()> {
+    let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
     let mut config: Config =
         toml::from_str(&contents).context("failed to parse config for instruction update")?;
@@ -736,7 +746,7 @@ fn persist_llm_instruction(name: &str, instruction: &str) -> anyhow::Result<()> 
         .find(|e| e.name == name)
         .ok_or_else(|| anyhow::anyhow!("entry '{name}' not present in config file"))?;
     entry.instruction = instruction.to_string();
-    whisrs::config::setup::write_config(&config)?;
+    whisrs::config::write::write_config_to(&config, path)?;
     Ok(())
 }
 
@@ -1078,6 +1088,24 @@ async fn llm_command_background_inner(
 
 #[cfg(test)]
 mod tests {
+
+    /// Reprogramming an instruction rewrites that one line: no default of
+    /// any section the file leaves out is written, no comment is lost, no
+    /// template is appended.
+    #[test]
+    fn a_set_instruction_changes_only_its_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# mine\n[general]\nlanguage = \"de\"\n\n# my commands\n[[llm_commands]]\nname = \"translate\"\nhotkey = \"Super+T\"\ninstruction = \"Translate to German.\"\n";
+        std::fs::write(&path, original).unwrap();
+        persist_llm_instruction_at(&path, "translate", "Translate to French.").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written,
+            original.replace("Translate to German.", "Translate to French."),
+            "only the instruction line changes"
+        );
+    }
     use super::*;
     use crate::selection::CaptureError;
 

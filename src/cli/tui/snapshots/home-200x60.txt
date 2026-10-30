@@ -25,9 +25,9 @@
                                                   ╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
                                                   │ whisrs ▁▃▅▃▁                                                                           home · ●  │
                                                   │                                                                                                  │
-                                                  │ ▌ Config                  daemon      running · idle · v0.2.0                                    │
-                                                  │                           backend     deepgram-streaming                                         │
-                                                  │                           language    en                                                         │
+                                                  │   Setup                   daemon      running · idle · v0.2.0                                    │
+                                                  │ ▌ Config                  backend     deepgram-streaming                                         │
+                                                  │   Mic test                language    en                                                         │
                                                   │                           hotkeys     toggle Alt+D · recording Alt+Shift+M                       │
                                                   │                           built with  local-whisper tray overlay hooks rec mcp                   │
                                                   │                                                                                                  │

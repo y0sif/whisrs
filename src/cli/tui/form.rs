@@ -12,31 +12,7 @@ use whisrs::Config;
 
 /// Every section, empty: what each key is when the file does not set it.
 /// An entry of each array gives the defaults of an entry's fields.
-const DEFAULTS: &str = "\
-[general]
-[audio]
-[input]
-[deepgram]
-[groq]
-[openai]
-[local-whisper]
-[local-vosk]
-[local-parakeet]
-[asr-sidecar]
-[openai-compatible-realtime]
-[llm]
-[tts]
-[hotkeys]
-[hooks]
-[overlay]
-[agent_overlay]
-[recording]
-[[llm_commands]]
-name = \"\"
-hotkey = \"\"
-instruction = \"\"
-[[agents]]
-";
+const DEFAULTS: &str = whisrs::config::write::SECTION_DEFAULTS;
 
 pub struct Form {
     /// The config being edited.
@@ -137,6 +113,18 @@ impl Form {
             return Ok(false);
         }
         self.set(path, default)
+    }
+
+    /// What is edited at `path` is what is on disk now: that key alone was
+    /// written. The other edits stay unsaved.
+    pub fn settle(&mut self, path: &str) {
+        let value = lookup(&self.table, path).cloned();
+        let _ = put(&mut self.baseline, path, value);
+    }
+
+    /// Whether `path` changed since the load.
+    pub fn is_dirty_at(&self, path: &str) -> bool {
+        lookup(&self.table, path) != lookup(&self.baseline, path)
     }
 
     /// The entries of the array of tables at `path`.

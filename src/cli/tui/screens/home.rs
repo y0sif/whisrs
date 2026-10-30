@@ -7,15 +7,19 @@ use ratatui::Frame;
 use whisrs::recording::RecordingPhase;
 use whisrs::InfoAnswer;
 
-use crate::tui::app::App;
+use crate::tui::app::{App, Screen};
 use crate::tui::keys::Action;
 use crate::tui::widgets::frame::{self, Header};
 use crate::tui::widgets::row::{Row, Value};
 use crate::tui::widgets::{Tone, Ui};
 use crate::tui::worker::DaemonView;
 
-/// The screens Home opens.
-const SCREENS: &[&str] = &["Config"];
+/// The screens Home opens, and their names.
+const SCREENS: &[(Screen, &str)] = &[
+    (Screen::Setup, "Setup"),
+    (Screen::Config, "Config"),
+    (Screen::Mic, "Mic test"),
+];
 
 /// The list's width in the two-pane layout: the gutter, a space and a
 /// 22-column label.
@@ -30,18 +34,25 @@ pub struct Home {
 }
 
 impl Home {
-    /// Handle `action`; `true` opens the screen under the cursor.
-    pub fn key(&mut self, action: Action) -> bool {
+    /// Handle `action`; the screen to open, if it asks for one.
+    pub fn key(&mut self, action: Action) -> Option<Screen> {
         let last = SCREENS.len() - 1;
         match action {
             Action::Up => self.cursor = self.cursor.saturating_sub(1),
             Action::Down => self.cursor = (self.cursor + 1).min(last),
             Action::First => self.cursor = 0,
             Action::Last => self.cursor = last,
-            Action::Enter | Action::Right | Action::Pane => return true,
+            Action::Enter | Action::Right | Action::Pane => return Some(SCREENS[self.cursor].0),
             _ => {}
         }
-        false
+        None
+    }
+
+    /// Put the cursor on `screen`'s row: the one just left.
+    pub fn point(&mut self, screen: Screen) {
+        if let Some(at) = SCREENS.iter().position(|(s, _)| *s == screen) {
+            self.cursor = at;
+        }
     }
 }
 
@@ -71,11 +82,12 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         Header {
             screen: "home",
             daemon: app.daemon_up(),
+            live: None,
         },
     );
 
     let line = |y: u16, x: u16, width: u16| Rect::new(x, y, width, 1);
-    for (i, name) in SCREENS.iter().enumerate() {
+    for (i, (_, name)) in SCREENS.iter().enumerate() {
         let y = body.y + i as u16;
         if y >= body.bottom() {
             break;

@@ -30,6 +30,8 @@ pub fn paths(dir: &std::path::Path) -> Paths {
         vocabulary: dir.join("vocabulary.txt"),
         socket: dir.join("whisrs.sock"),
         models: dir.join("models"),
+        xdg_config: dir.join("xdg-config"),
+        xdg_data: dir.join("xdg-data"),
     }
 }
 
@@ -52,6 +54,34 @@ pub fn app_on(toml: Option<&str>, env: &[(&str, &str)]) -> Fixture {
 
 pub fn app(toml: &str) -> Fixture {
     app_on(Some(toml), &[])
+}
+
+/// `whisrs setup` on `toml` (no file for `None`), with `env`; `HOME` is
+/// the temp dir unless `env` names one, so paths show as `~/...`.
+pub fn setup_on(toml: Option<&str>, env: &[(&str, &str)]) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths(dir.path());
+    if let Some(toml) = toml {
+        std::fs::write(&paths.config, toml).unwrap();
+    }
+    let home = dir.path().to_str().unwrap().to_string();
+    let mut env: Vec<(&str, &str)> = env.to_vec();
+    if !env.iter().any(|(key, _)| *key == "HOME") {
+        env.push(("HOME", &home));
+    }
+    let app = App::prepare(
+        Entry::Setup,
+        paths,
+        Env::from_pairs(&env),
+        ServiceManager::Systemd,
+    )
+    .expect("the fixture loads");
+    Fixture { dir, app }
+}
+
+/// Press a key that has no character: Backspace, the arrows.
+pub fn key(app: &mut App, code: KeyCode) -> Option<Effect> {
+    app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }
 
 /// The config the mockups show: deepgram-streaming with a key in the file,

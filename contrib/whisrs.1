@@ -13,14 +13,80 @@ It sends commands (toggle, cancel, status) and prints the daemon's response.
 .PP
 The
 .B setup
-subcommand runs an interactive onboarding flow and does not require the daemon.
+subcommand runs an onboarding wizard and does not require the daemon.
 .SH SUBCOMMANDS
 .TP
 .B setup
-Interactive onboarding \(em select a transcription backend, enter an API key,
-test the microphone, and write
-.IR config.toml .
-Does not require the daemon to be running.
+Open the onboarding wizard, a full\-screen TUI, one step at a time: the
+transcription backend; its API key (with a test, below), its server, or a
+whisper.cpp model to download with a progress bar
+.RB ( Esc
+cancels it and leaves no partial file); the language; the microphone, with
+a live level meter; filler removal, tones, the overlay and its theme; the
+typing backend; and, optionally, an LLM for command mode. A review then
+writes
+.I config.toml
+through the same save as
+.BR config ,
+and the last step checks the machine: write access to
+.I /dev/uinput
+(fixed with sudo in the plain terminal, where it may ask for a password),
+the user service (installed and started, or repointed at the
+.B whisrsd
+on
+.B PATH
+when it runs another one), a compositor keybinding for
+.B whisrs toggle
+(appended to Hyprland's or Sway's config only after a yes; Hyprland then
+needs
+.BR "hyprctl reload" ),
+and the GNOME Shell extension on GNOME. Answers are picked from a list or
+stepped, as in
+.BR config ,
+wherever whisrs can list the values; keys, URLs and tokens are typed.
+Keys:
+.B Enter
+the next step,
+.B Backspace
+the step before,
+.B Space
+opens the row's list or input (or flips a toggle),
+.B h
+and
+.B l
+change it in place,
+.B t
+tests the key with one request that sends no audio (valid, rejected,
+limited or unreachable, within 5 seconds), using the key the daemon would:
+a
+.B WHISRS_*_API_KEY
+variable wins over a backend's key in the file, and fills in for an empty
+.B [llm] api_key
+(an ASR sidecar is sent half a second of silence; a whisper model file is
+checked to be one),
+.B s
+skips an optional step (a skipped LLM step leaves
+.B [llm]
+as it is), and
+.B Esc
+or
+.B q
+leave, asking first about answers not written yet. With a config already
+there, it offers to start fresh (the answers start from the defaults) or
+only check the machine. The write changes only the keys setup asked about,
+leaving the rest of the file, comments included, as it is; the review lists
+each key that changes, a key masked, and the old file is first kept as
+.I config.toml.bak
+(0600). A missing API key is a warning, not a refusal: the daemon then needs
+the
+.B WHISRS_*_API_KEY
+variable in its own environment. A config that cannot be read is refused
+before the TUI opens; one that does not load is written anew from the
+answers and kept as
+.IR config.toml.bak .
+Off an interactive terminal it exits 1, as
+.B config
+does. Does not require the daemon to be running.
 .TP
 .B config
 Open a full\-screen editor (a TUI) for every key of
@@ -43,7 +109,9 @@ a key. A value no list has can still be typed, and
 .B Tab
 completes a path.
 .B w
-saves, keeping comments, key order and unknown keys, then restarts the
+saves only what changed (a value set back to its default leaves the file,
+and no default is ever written), keeping comments, key order and unknown
+keys, then restarts the
 daemon through its service manager, but only while it is idle: while it
 dictates, records or runs an agent turn the restart is skipped, and
 .B r
@@ -72,6 +140,21 @@ turns them off. Off an interactive terminal (stdin or stdout not a TTY, or
 it prints where to edit the file and exits 1, changing nothing. Unlike
 .B setup
 this does not touch udev rules, the systemd unit, or compositor keybindings.
+.B Esc
+goes up to Home, which also opens Setup and the Mic test: a live level
+meter of the
+.B [audio] device
+(from \-60 to 0 dBFS, with the silence gate and the peak held), where
+.B h
+and
+.B l
+or
+.B Enter
+pick the device and
+.B w
+writes only
+.B [audio] device
+(other unsaved edits stay unsaved), then restarts the daemon if it is idle.
 .TP
 .B toggle
 Start or stop dictation. If idle, begins audio capture. If recording,

@@ -1,11 +1,13 @@
-//! The TUI behind `whisrs config`: a full-screen editor for config.toml,
-//! with Home as the hub, built on ratatui.
+//! The TUI behind `whisrs config` and `whisrs setup`: a full-screen editor
+//! for config.toml, the onboarding wizard and a microphone test, with Home
+//! as the hub, built on ratatui.
 //!
 //! It lives in the CLI binary, so the daemon never links ratatui. Everything
 //! it decides is in [`app::App::update`], which is pure: keys and worker
 //! answers in, an [`app::Effect`] out. This module runs the effects (save,
-//! restart, `$EDITOR`) and owns the terminal. The daemon is only ever asked
-//! from [`worker`] threads, so a daemon that hangs cannot freeze the screen.
+//! restart, `$EDITOR`, setup's sudo step) and owns the terminal. The daemon,
+//! the network and the sound server are only ever asked from [`worker`]
+//! threads, so none of them can freeze the screen.
 
 mod app;
 mod complete;
@@ -35,7 +37,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use whisrs::service::ServiceManager;
 
-use app::{App, Effect, Msg};
+use app::{App, Effect, Msg, Origin};
 use glyphs::Glyphs;
 use theme::{Depth, Ground, Theme};
 use widgets::Ui;
@@ -44,17 +46,20 @@ use widgets::Ui;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
     Config,
+    Setup,
 }
 
 impl Entry {
     fn command(self) -> &'static str {
         match self {
             Entry::Config => "whisrs config",
+            Entry::Setup => "whisrs setup",
         }
     }
 }
 
-/// `whisrs config` refused because it is not on an interactive terminal.
+/// `whisrs config` or `whisrs setup` refused because it is not on an
+/// interactive terminal.
 /// Its text is the whole message, printed without a prefix.
 #[derive(Debug)]
 pub struct NotATerminal(String);
@@ -101,17 +106,30 @@ pub struct Paths {
     pub socket: PathBuf,
     /// Where `whisrs setup` puts whisper models.
     pub models: PathBuf,
+    /// The user's config folder (`~/.config`): compositor configs, OpenRC
+    /// tunables.
+    pub xdg_config: PathBuf,
+    /// The user's data folder (`~/.local/share`): GNOME extensions.
+    pub xdg_data: PathBuf,
 }
 
 impl Paths {
     fn detect() -> Paths {
+        let data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("~/.local/share"));
         Paths {
             config: whisrs::config_path(),
             vocabulary: whisrs::config::vocabulary::vocabulary_path(),
             socket: whisrs::socket_path(),
-            models: dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-                .join("whisrs/models"),
+            models: whisrs::config::setup::default_model_dir(),
+            xdg_config: dirs::config_dir().unwrap_or_else(|| PathBuf::from("~/.config")),
+            xdg_data: data,
+        }
+    }
+
+    fn setup_dirs(&self) -> worker::SetupDirs {
+        worker::SetupDirs {
+            config: self.xdg_config.clone(),
+            data: self.xdg_data.clone(),
         }
     }
 }
@@ -151,6 +169,12 @@ pub fn run(entry: Entry) -> anyhow::Result<()> {
             return Err(e).context("cannot open the terminal");
         }
     };
+    // From here until the TUI is gone, stderr is /dev/null: ALSA and
+    // PipeWire print to it, over the screen. The real one comes back for
+    // `$EDITOR` and sudo, in a panic (before ratatui's hook and the default
+    // one print), and when `hushed` drops, on every way out of here.
+    let hushed = worker::hush();
+    unhush_on_panic();
     let (tx, rx) = mpsc::channel();
     let workers = worker::Workers::start(
         tx,
@@ -161,6 +185,8 @@ pub fn run(entry: Entry) -> anyhow::Result<()> {
             models: app.paths.models.clone(),
             home: app.env.get("HOME").map(str::to_string),
         },
+        app.env.clone(),
+        worker::Tools::real(),
     );
     let result = restoring(ratatui::restore, || {
         drain_early_input()?;
@@ -174,10 +200,58 @@ pub fn run(entry: Entry) -> anyhow::Result<()> {
             ground,
         )
     });
+    let stopped = wind_down(&app, &workers, &rx);
+    drop(hushed);
     for line in &app.farewell {
         println!("{line}");
     }
+    if stopped {
+        println!("Stopped the model download; nothing of it is left behind.");
+    }
     result
+}
+
+/// Put the real stderr back first thing in a panic, then run the hooks
+/// that were there (ratatui's, which restores the terminal, then the
+/// default one, which prints the panic).
+fn unhush_on_panic() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        worker::unhush();
+        previous(info);
+    }));
+}
+
+/// Stop what still runs once the TUI is gone: the capture, and the
+/// downloads, whose `.part` is removed here if their worker did not get to
+/// it in time. Whether there was a download to stop.
+fn wind_down(app: &App, workers: &worker::Workers, rx: &mpsc::Receiver<Msg>) -> bool {
+    workers.mic_stop();
+    let mut left: Vec<(u64, PathBuf)> = app.orphans.clone();
+    left.extend(app.setup.as_ref().and_then(|setup| setup.partial()));
+    if left.is_empty() {
+        return false;
+    }
+    workers.cancel_downloads();
+    let until = Instant::now() + Duration::from_secs(3);
+    while !left.is_empty() {
+        let Some(wait) = until.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match rx.recv_timeout(wait) {
+            Ok(Msg::Download(worker::Download::Done { id, .. })) => {
+                left.retain(|(other, _)| *other != id);
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    // The workers remove them on their way out; this is for those that did
+    // not in time.
+    for (_, part) in &left {
+        let _ = std::fs::remove_file(part);
+    }
+    true
 }
 
 /// Run `body` in the TUI, then `restore` the terminal, whatever `body`
@@ -255,10 +329,18 @@ fn event_loop(
             return Ok(());
         }
 
+        // Faster while something moves: worker answers are taken after the
+        // wait, so the meter would otherwise run at the tick's pace.
+        let tick = app.frame().unwrap_or(TICK);
         let wait = flash_until
             .map(|until| until.saturating_duration_since(Instant::now()))
-            .map_or(TICK, |left| left.min(TICK));
-        if event::poll(wait)? {
+            .map_or(tick, |left| left.min(tick));
+        if !event::poll(wait)? {
+            if app.spinning() {
+                app.update(Msg::Tick);
+                redraw = true;
+            }
+        } else {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let effect = app.update(Msg::Key(key));
@@ -291,15 +373,95 @@ fn event_loop(
     }
 }
 
-/// Run `effect`, and whatever the answer to it asks for next.
+/// Run `effect`, and whatever the answers to it ask for next.
 fn perform(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     workers: &worker::Workers,
-    mut effect: Option<Effect>,
+    effect: Option<Effect>,
 ) -> anyhow::Result<()> {
-    while let Some(next) = effect.take() {
-        effect = match next {
+    let mut queue: std::collections::VecDeque<Effect> = effect.into_iter().collect();
+    while let Some(next) = queue.pop_front() {
+        let effect = match next {
+            Effect::All(effects) => {
+                queue.extend(effects);
+                None
+            }
+            Effect::TestKey {
+                origin,
+                path,
+                target,
+            } => {
+                let config = match (origin, &app.setup) {
+                    (Origin::Setup, Some(setup)) => setup.editor.form.config().clone(),
+                    _ => app.config.form.config().clone(),
+                };
+                workers.test_key(origin, path, config, target);
+                None
+            }
+            Effect::Download { name, id } => {
+                workers.download(name, app.paths.models.clone(), id);
+                None
+            }
+            Effect::CancelDownload(id) => {
+                workers.cancel_download(id);
+                None
+            }
+            Effect::SaveDevice { overwrite } => {
+                let keys = ["audio.device".to_string()];
+                let saved =
+                    screens::config::save_keys(&app.config, &keys, false, &app.paths, overwrite);
+                app.update(Msg::DeviceSaved(saved))
+            }
+            Effect::MicStart { session, device } => {
+                workers.mic_start(session, device);
+                None
+            }
+            Effect::MicStop => {
+                workers.mic_stop();
+                None
+            }
+            Effect::OpenSetup => {
+                let load = app::setup_load(&app.paths);
+                app.update(Msg::SetupReady(load))
+            }
+            Effect::WriteSetup { overwrite } => match &app.setup {
+                Some(setup) => {
+                    // Only what setup asked, onto the file as it is now,
+                    // kept as config.toml.bak first.
+                    let written = screens::config::save_keys(
+                        &setup.editor,
+                        &setup.asked(),
+                        true,
+                        &app.paths,
+                        overwrite,
+                    );
+                    let again = match written {
+                        Ok(_) => screens::config::reload(&app.paths).ok(),
+                        Err(_) => None,
+                    };
+                    app.update(Msg::SetupWritten(written, again))
+                }
+                None => None,
+            },
+            Effect::Checks => {
+                let overlay = match &app.setup {
+                    Some(setup) if setup.fresh => setup.editor.form.config().general.overlay,
+                    _ => app.config.form.config().general.overlay,
+                };
+                workers.checks(app.paths.setup_dirs(), overlay);
+                None
+            }
+            Effect::System(action) => {
+                if let Some(checks) = app.setup.as_ref().and_then(|s| s.checks.as_deref()) {
+                    workers.system(action, app.paths.setup_dirs(), checks.clone());
+                }
+                None
+            }
+            Effect::FixUinput => {
+                let failed = suspend_for_sudo(terminal, &app.env)?;
+                app.update(Msg::Fixed(failed))
+            }
             Effect::Save | Effect::SaveOver => {
                 let overwrite = next == Effect::SaveOver;
                 let saved = screens::config::save(&app.config, &app.paths, overwrite);
@@ -314,7 +476,10 @@ fn perform(
                 None
             }
             Effect::Reclaim => {
+                // A worker's panic: the hooks gave the terminal and stderr
+                // back.
                 reclaim(terminal)?;
+                worker::rehush();
                 None
             }
             Effect::Reload => {
@@ -335,8 +500,49 @@ fn perform(
                 None
             }
         };
+        queue.extend(effect);
     }
     Ok(())
+}
+
+/// Leave the TUI to run setup's uinput fix with sudo, where it can ask for
+/// a password, and come back; the commands that failed. Nothing here
+/// restarts systemd-udevd.
+fn suspend_for_sudo(
+    terminal: &mut ratatui::DefaultTerminal,
+    env: &Env,
+) -> anyhow::Result<Vec<String>> {
+    use whisrs::config::setup::{find_contrib_file, uinput};
+    let rule = find_contrib_file("99-whisrs.rules");
+    let user = env.get("USER").unwrap_or("unknown");
+    let commands = uinput::fix_commands(rule.as_deref(), user);
+    let mut failed = Vec::new();
+    {
+        let _stderr = worker::stderr_lock();
+        let _real = worker::speaking();
+        ratatui::restore();
+        println!();
+        println!(
+            "whisrs setup: giving {user} access to /dev/uinput. sudo may ask for your password."
+        );
+        for command in &commands {
+            println!("$ {}", command.join(" "));
+            let status = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .status();
+            match status {
+                Ok(status) if status.success() => {}
+                Ok(status) => failed.push(format!(
+                    "{} {} ({status})",
+                    command[0],
+                    command.get(1).map_or("", String::as_str)
+                )),
+                Err(e) => failed.push(format!("cannot run {}: {e}", command[0])),
+            }
+        }
+    }
+    reclaim(terminal)?;
+    Ok(failed)
 }
 
 /// The editors tried, in order, when neither `$VISUAL` nor `$EDITOR` is
@@ -406,6 +612,7 @@ fn suspend_for_editor(
     // until it is back, so it never gets /dev/null as its stderr.
     let status = {
         let _stderr = worker::stderr_lock();
+        let _real = worker::speaking();
         ratatui::restore();
         std::process::Command::new("sh")
             .arg("-c")
@@ -514,6 +721,9 @@ mod tests {
                  whisrs restart."
             )
         );
+        assert!(terminal_refusal(Entry::Setup, &env, false, config)
+            .unwrap()
+            .starts_with("whisrs setup needs an interactive terminal."));
         let dumb = Env::from_pairs(&[("TERM", "dumb")]);
         let refusal = terminal_refusal(Entry::Config, &dumb, true, config).unwrap();
         assert!(

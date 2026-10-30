@@ -22,6 +22,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use toml::Value;
 use whisrs::config::keys::{self, KeySummary};
+use whisrs::config::setup::key_test::{
+    Outcome as Checked, Source as KeySource, Target as TestTarget, Tested,
+};
 use whisrs::config::vocabulary::{self, VocabularyBaseline};
 use whisrs::config::write::{self, ExistingConfig};
 
@@ -103,6 +106,8 @@ pub struct Saved {
     pub warnings: Vec<String>,
     /// config.toml could not be merged into and was written from scratch.
     pub regenerated: Option<write::Regenerated>,
+    /// The file as it was, kept here before the write.
+    pub backup: Option<PathBuf>,
     /// Both stores as they are now on disk, to edit on from.
     pub loaded: Loaded,
 }
@@ -122,8 +127,16 @@ pub enum SaveError {
 /// used is refused with the text `whisrs config` exits with (#134): nothing
 /// opens on defaults over a file the user has.
 pub fn load(paths: &Paths) -> Result<Loaded, String> {
-    read(paths)
-        .map_err(|(kind, message)| write::unusable_config_refusal(kind, &message, &paths.config))
+    let mut loaded = read(paths)
+        .map_err(|(kind, message)| write::unusable_config_refusal(kind, &message, &paths.config))?;
+    if loaded.fresh {
+        loaded.notices.push(Notice::new(
+            Tone::Muted,
+            "No config.toml yet: these are the defaults, and w writes them. whisrs setup does \
+             the whole onboarding.",
+        ));
+    }
+    Ok(loaded)
 }
 
 /// [`load`] again after `$EDITOR`, with what validation says about the
@@ -131,7 +144,7 @@ pub fn load(paths: &Paths) -> Result<Loaded, String> {
 pub fn reload(paths: &Paths) -> Result<Loaded, String> {
     let mut loaded = read(paths)
         .map_err(|(_, message)| message.lines().next().unwrap_or_default().to_string())?;
-    match loaded.form.config().validate() {
+    match loaded.form.config().validate_to_write() {
         Ok(warnings) => loaded.notices.extend(
             warnings
                 .into_iter()
@@ -142,6 +155,59 @@ pub fn reload(paths: &Paths) -> Result<Loaded, String> {
             .push(Notice::new(Tone::Error, one_line(&e.to_string()))),
     }
     Ok(loaded)
+}
+
+/// What `whisrs setup` found at the config path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    Missing,
+    /// A config that loads.
+    Usable,
+    /// A file that does not deserialize, and why: setup starts fresh and
+    /// writes over it, keeping it as `.bak` (#134).
+    Broken(String),
+}
+
+/// [`load`] for `whisrs setup`: an unreadable file is refused as by
+/// `config`, but one that does not deserialize opens on the defaults, with
+/// what is wrong, for setup to write over (#134).
+pub fn load_for_setup(paths: &Paths) -> Result<(Loaded, Found), String> {
+    match read(paths) {
+        Ok(loaded) => {
+            let found = if loaded.fresh {
+                Found::Missing
+            } else {
+                Found::Usable
+            };
+            Ok((loaded, found))
+        }
+        Err((write::UnusableKind::Unreadable, message)) => Err(write::unusable_config_refusal(
+            write::UnusableKind::Unreadable,
+            &message,
+            &paths.config,
+        )),
+        Err((write::UnusableKind::Undeserializable, message)) => {
+            let defaults = toml::from_str("").expect("an empty config parses");
+            let mut loaded = loaded_from(paths, defaults)?;
+            loaded.fresh = false;
+            Ok((loaded, Found::Broken(message)))
+        }
+    }
+}
+
+/// `config` ready to edit as if read from `paths` now: `vocabulary.txt`
+/// merged in as a load does, and both files' bytes kept to tell a change at
+/// save. Setup's answers start here.
+pub fn loaded_from(paths: &Paths, mut config: whisrs::Config) -> Result<Loaded, String> {
+    let disk = OnDisk::read(paths);
+    let (vocabulary, _) = VocabularyBaseline::load(&mut config, &paths.vocabulary);
+    Ok(Loaded {
+        form: Form::new(config)?,
+        vocabulary,
+        fresh: true,
+        notices: Vec::new(),
+        disk,
+    })
 }
 
 fn read(paths: &Paths) -> Result<Loaded, (write::UnusableKind, String)> {
@@ -178,13 +244,6 @@ fn read(paths: &Paths) -> Result<Loaded, (write::UnusableKind, String)> {
             ),
         ));
     }
-    if fresh {
-        notices.push(Notice::new(
-            Tone::Muted,
-            "No config.toml yet: these are the defaults, and w writes them. whisrs setup does \
-             the whole onboarding.",
-        ));
-    }
     let form = Form::new(config).map_err(|e| (write::UnusableKind::Undeserializable, e))?;
     Ok(Loaded {
         form,
@@ -213,13 +272,78 @@ pub fn save(screen: &ConfigScreen, paths: &Paths, overwrite: bool) -> Result<Sav
             return Err(SaveError::Changed(file));
         }
     }
-    let config = screen.form.config();
+    write_out(screen.form.config(), &screen.vocabulary, paths, None)
+}
+
+/// Write `keys` (dotted) of `answers` onto config.toml as it is on disk now,
+/// and nothing else: every other key, section and comment of the file stays
+/// as it is. With `backup`, the file is first kept as `config.toml.bak`
+/// (0600). Unless `overwrite`, a file that changed since `answers` read it
+/// is left alone, as [`save`] does. A file that does not deserialize is
+/// written over from the defaults, and kept as `.bak` (#134).
+pub fn save_keys(
+    answers: &ConfigScreen,
+    keys: &[String],
+    backup: bool,
+    paths: &Paths,
+    overwrite: bool,
+) -> Result<Saved, SaveError> {
+    if !overwrite {
+        if let Some(file) = answers.disk.changed(&OnDisk::read(paths)) {
+            return Err(SaveError::Changed(file));
+        }
+    }
+    let mut base = match read(paths) {
+        Ok(loaded) => loaded,
+        Err((write::UnusableKind::Undeserializable, _)) => {
+            let defaults = toml::from_str("").expect("an empty config parses");
+            loaded_from(paths, defaults).map_err(SaveError::Failed)?
+        }
+        Err((write::UnusableKind::Unreadable, message)) => {
+            return Err(SaveError::Failed(
+                message.lines().next().unwrap_or_default().to_string(),
+            ))
+        }
+    };
+    for key in keys {
+        let value = answers.form.effective(key).cloned();
+        base.form
+            .set(key, value)
+            .map_err(|why| SaveError::Failed(format!("{key}: {why}")))?;
+    }
+    // Checked before the backup: a refusal writes nothing at all.
+    base.form
+        .config()
+        .validate_to_write()
+        .map_err(|e| SaveError::Failed(one_line(&e.to_string())))?;
+    let kept = match (backup, std::fs::read_to_string(&paths.config)) {
+        (true, Ok(text)) => {
+            let bak = write::config_backup_path(&paths.config);
+            write::write_private_file(&bak, &text).map_err(|e| {
+                SaveError::Failed(format!("cannot keep a copy at {}: {e}", bak.display()))
+            })?;
+            Some(bak)
+        }
+        _ => None,
+    };
+    write_out(base.form.config(), &base.vocabulary, paths, kept)
+}
+
+/// Validate `config` for a write, write it and `vocabulary.txt` by the
+/// plan `write_config_and_vocabulary` makes, and read both back. A missing
+/// API key is a warning here: the daemon can take it from its env.
+fn write_out(
+    config: &whisrs::Config,
+    vocabulary: &VocabularyBaseline,
+    paths: &Paths,
+    backup: Option<PathBuf>,
+) -> Result<Saved, SaveError> {
     let warnings = config
-        .validate()
+        .validate_to_write()
         .map_err(|e| SaveError::Failed(one_line(&e.to_string())))?;
     let wrote = vocabulary::write_config_and_vocabulary(
         config,
-        &screen.vocabulary,
+        vocabulary,
         &paths.config,
         &paths.vocabulary,
     )
@@ -231,6 +355,7 @@ pub fn save(screen: &ConfigScreen, paths: &Paths, overwrite: bool) -> Result<Sav
         path: paths.config.clone(),
         warnings: warnings.into_iter().map(|w| w.message).collect(),
         regenerated: wrote.regenerated,
+        backup,
         loaded,
     })
 }
@@ -374,6 +499,15 @@ pub struct Outcome {
     pub dialog: Option<Dialog>,
     /// A list to fetch on a worker.
     pub load: Option<ListKind>,
+    /// `t` on a key row: test what the row at this path holds.
+    pub test: Option<(String, TestTarget)>,
+}
+
+/// A row's key test: running, or what it found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Test {
+    Running,
+    Done(Tested),
 }
 
 impl Outcome {
@@ -406,6 +540,15 @@ pub struct ConfigScreen {
     env: Env,
     /// Rows whose label or path holds this, in any case.
     filter: String,
+    /// Only these rows, in this order, and no section list: the wizard's
+    /// step, or the Mic screen's device.
+    pinned: Option<Vec<&'static Field>>,
+    /// Where the section list was before [`ConfigScreen::pin`].
+    unpinned: Option<(usize, Focus, Vec<View>)>,
+    /// The key tests of the rows, by path. A changed value drops its own.
+    pub tests: BTreeMap<String, Test>,
+    /// The spinner's frame, while a test runs.
+    pub spin: usize,
 }
 
 impl ConfigScreen {
@@ -425,7 +568,58 @@ impl ConfigScreen {
             lists: Lists::default(),
             env,
             filter: String::new(),
+            pinned: None,
+            unpinned: None,
+            tests: BTreeMap::new(),
+            spin: 0,
         }
+    }
+
+    /// Show only `fields`, the cursor on the first, for a screen that
+    /// edits a few rows of the config (setup's steps, the Mic screen);
+    /// [`ConfigScreen::unpin`] puts the section list back as it was.
+    pub fn pin(&mut self, fields: Vec<&'static Field>) {
+        if self.pinned.is_none() {
+            self.unpinned = Some((self.section, self.focus, self.views.clone()));
+        }
+        self.close();
+        self.pinned = Some(fields);
+        self.section = 0;
+        self.focus = Focus::Detail;
+        self.views = vec![View::Section { cursor: 0 }];
+    }
+
+    pub fn unpin(&mut self) {
+        self.close();
+        self.pinned = None;
+        if let Some((section, focus, views)) = self.unpinned.take() {
+            self.section = section;
+            self.focus = focus;
+            self.views = views;
+        }
+        self.clamp();
+    }
+
+    /// The row with the cursor, when it is a key's.
+    pub fn focused(&self) -> Option<(&'static Field, String)> {
+        match self.items().get(self.view().cursor()) {
+            Some(Item::Field { field, path }) => Some((field, path.clone())),
+            _ => None,
+        }
+    }
+
+    /// Open the editor of the row at `path` (its picker, input or hotkey
+    /// dialog), as `Enter` does on Config.
+    pub fn edit(&mut self, path: &str) -> Outcome {
+        let Some(at) = self
+            .items()
+            .iter()
+            .position(|item| matches!(item, Item::Field { path: p, .. } if p == path))
+        else {
+            return Outcome::default();
+        };
+        self.view_mut().set_cursor(at);
+        self.key(Action::Enter)
     }
 
     /// Whether a text input has the keys.
@@ -490,6 +684,13 @@ impl ConfigScreen {
     /// Edit on from what a save wrote.
     pub fn saved(&mut self, loaded: Loaded) {
         self.reloaded(loaded);
+    }
+
+    /// `path` alone was written ([`save_keys`]): it is no edit any more,
+    /// and `loaded` is the file as it is now. The other edits stay.
+    pub fn settled(&mut self, path: &str, loaded: Loaded) {
+        self.form.settle(path);
+        self.disk = loaded.disk;
     }
 
     /// Edit on from config.toml as read again.
@@ -572,6 +773,15 @@ impl ConfigScreen {
 
     /// The rows of the detail pane's current level.
     fn items(&self) -> Vec<Item> {
+        if let Some(fields) = &self.pinned {
+            return fields
+                .iter()
+                .map(|field| Item::Field {
+                    field,
+                    path: field.path.to_string(),
+                })
+                .collect();
+        }
         let section = self.current();
         match self.view() {
             _ if !self.built() => Vec::new(),
@@ -738,7 +948,7 @@ impl ConfigScreen {
         if self.editing.is_some() {
             return self.edit_key(action);
         }
-        if action == Action::Filter {
+        if action == Action::Filter && self.pinned.is_none() {
             self.editing = Some(Editing {
                 target: Target::Filter,
                 input: Input::new(&self.filter, false),
@@ -798,6 +1008,9 @@ impl ConfigScreen {
             Action::PageDown => (cursor + PAGE).min(last),
             Action::First => 0,
             Action::Last => last,
+            Action::Pane | Action::Back if self.pinned.is_some() => {
+                return Outcome::default();
+            }
             Action::Pane => {
                 self.focus = Focus::Sections;
                 return Outcome::default();
@@ -926,7 +1139,7 @@ impl ConfigScreen {
                     return outcome;
                 }
             }
-            (_, _, Action::Left) => self.focus = Focus::Sections,
+            (_, _, Action::Left) if self.pinned.is_none() => self.focus = Focus::Sections,
             _ => {}
         }
         Outcome::default()
@@ -936,6 +1149,18 @@ impl ConfigScreen {
         let current = self.form.effective(path).cloned();
         let picked = picked(&field.kind);
         match (&field.kind, action) {
+            (_, Action::Test) => {
+                return match key_target(path) {
+                    Some(target) => Outcome {
+                        test: Some((path.to_string(), target)),
+                        ..Outcome::default()
+                    },
+                    None => Outcome::say(
+                        Tone::Muted,
+                        "t tests a key: it works on the api_key rows and the whisper model",
+                    ),
+                }
+            }
             (_, Action::Reset) => {
                 let result = self.form.reset(path);
                 return self.apply(path, field, result);
@@ -1039,7 +1264,7 @@ impl ConfigScreen {
                     cursor: 0,
                 });
             }
-            (_, Action::Left) => self.focus = Focus::Sections,
+            (_, Action::Left) if self.pinned.is_none() => self.focus = Focus::Sections,
             _ => {}
         }
         Outcome::default()
@@ -1375,6 +1600,9 @@ impl ConfigScreen {
     }
 
     fn apply(&mut self, path: &str, field: &Field, result: Result<bool, String>) -> Outcome {
+        if result == Ok(true) {
+            self.tests.remove(path);
+        }
         match result {
             Ok(true) => Outcome {
                 flash: Some(path.to_string()),
@@ -1612,6 +1840,61 @@ fn entry_index(path: &str) -> Option<(&str, usize)> {
         [list, index, _] => Some((list, index.parse().ok()?)),
         _ => None,
     }
+}
+
+/// What `t` tests on the row at `path`, if it tests anything.
+pub fn key_target(path: &str) -> Option<TestTarget> {
+    let backend = |name: &str| Some(TestTarget::Backend(name.to_string()));
+    match path {
+        "groq.api_key" => backend("groq"),
+        "deepgram.api_key" => backend("deepgram"),
+        "openai.api_key" => backend("openai"),
+        "asr-sidecar.api_key" => backend("asr-sidecar"),
+        "openai-compatible-realtime.api_key" => backend("openai-compatible-realtime"),
+        "local-whisper.model_path" => backend("local-whisper"),
+        "tts.api_key" => Some(TestTarget::Tts),
+        "llm.api_key" => Some(TestTarget::Llm),
+        _ => None,
+    }
+}
+
+/// A key test's outcome as a row shows it: one word, and its tone.
+pub fn test_word(test: &Test, spin: usize, ui: &Ui) -> (String, Tone) {
+    let Test::Done(tested) = test else {
+        return (
+            ui.glyphs.spinner[spin % ui.glyphs.spinner.len()].to_string(),
+            Tone::Muted,
+        );
+    };
+    let (word, tone) = match &tested.outcome {
+        Checked::Valid { .. } => ("valid", Tone::Ok),
+        Checked::Model(whisrs::config::setup::key_test::Model::Ggml(_)) => ("a model", Tone::Ok),
+        Checked::Model(_) => ("not a model", Tone::Error),
+        Checked::Rejected => ("rejected", Tone::Error),
+        Checked::Malformed => ("not a key", Tone::Error),
+        Checked::Limited => ("limited", Tone::Warn),
+        Checked::Unreachable(_) => ("unreachable", Tone::Warn),
+        Checked::Unexpected(_) => ("unexpected", Tone::Warn),
+        Checked::NoKey => ("no key", Tone::Muted),
+        Checked::NotTestable(_) => ("not testable", Tone::Muted),
+    };
+    (word.to_string(), tone)
+}
+
+/// A key test's outcome in full, for the status line: what it found, and
+/// whose key it was when that was the env var.
+pub fn test_notice(label: &str, tested: &Tested) -> Notice {
+    let tone = match &tested.outcome {
+        outcome if outcome.passed() => Tone::Ok,
+        Checked::Rejected | Checked::Malformed | Checked::Model(_) => Tone::Error,
+        Checked::NoKey | Checked::NotTestable(_) => Tone::Muted,
+        _ => Tone::Warn,
+    };
+    let whose = match tested.source {
+        KeySource::Env(var) => format!(" ({var} from this shell, which wins over config.toml)"),
+        KeySource::Config | KeySource::None => String::new(),
+    };
+    Notice::new(tone, format!("{label}: {}{whose}", tested.outcome))
 }
 
 /// `text` with its first letter lower case, to follow a colon.
@@ -2010,7 +2293,12 @@ fn describe(screen: &ConfigScreen, item: &Item, env: &Env, ui: &Ui) -> (String, 
             } else {
                 field.label.to_string()
             };
-            (label, shown(screen, field, path, env, ui), look)
+            let mut value = shown(screen, field, path, env, ui);
+            if let Some(test) = screen.tests.get(path) {
+                let (word, tone) = test_word(test, screen.spin, ui);
+                value = value.then(format!("{} {word}", ui.glyphs.separator), tone);
+            }
+            (label, value, look)
         }
         Item::Heading(title) => (title.to_string(), Shown::default(), Look::default()),
         Item::Entry(index) => {
@@ -2056,6 +2344,11 @@ fn flash_key(item: &Item) -> Option<&str> {
         Item::Field { path, .. } => Some(path),
         _ => None,
     }
+}
+
+/// The help of the row with the cursor, for a screen that draws it itself.
+pub fn row_help(screen: &ConfigScreen) -> String {
+    help(screen, screen.items().get(screen.view().cursor()))
 }
 
 /// The help under the rows, for the row with the cursor.
@@ -2169,6 +2462,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         Header {
             screen: &name,
             daemon: app.daemon_up(),
+            live: None,
         },
     );
 
@@ -2194,11 +2488,27 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
             ..panes
         };
         sections(screen, f, list, ui);
-        self::detail(app, f, detail_rect, ui, false);
+        let pane = Pane {
+            crumb: false,
+            help: true,
+        };
+        draw_rows(
+            screen,
+            &app.env,
+            app.flash.as_deref(),
+            f,
+            detail_rect,
+            ui,
+            pane,
+        );
     } else if screen.focus == Focus::Sections {
         sections(screen, f, panes, ui);
     } else {
-        self::detail(app, f, panes, ui, true);
+        let pane = Pane {
+            crumb: true,
+            help: true,
+        };
+        draw_rows(screen, &app.env, app.flash.as_deref(), f, panes, ui, pane);
     }
     for (i, line) in messages.into_iter().enumerate() {
         let y = panes.bottom() + 1 + i as u16;
@@ -2211,15 +2521,18 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
     }
 
     footer(screen, f, placed.footer, ui);
+    draw_open(screen, f, placed.frame, detail_rect, ui);
+}
 
-    // The hotkey dialog, and a picker over the detail pane (the key picker
-    // over the dialog), the screen behind dimmed.
+/// The hotkey dialog, and a picker over `detail` (the key picker over the
+/// dialog), the screen behind dimmed.
+pub fn draw_open(screen: &ConfigScreen, f: &mut Frame, frame: Rect, detail: Rect, ui: &Ui) {
     if let Some(open) = &screen.hotkey {
-        open.dialog.draw(f, placed.frame, ui);
+        open.dialog.draw(f, frame, ui);
     }
     if let Some(picking) = &screen.picker {
-        dialog::dim(f.buffer_mut(), placed.frame, ui);
-        picking.picker.draw(f, detail_rect, ui);
+        dialog::dim(f.buffer_mut(), frame, ui);
+        picking.picker.draw(f, detail, ui);
     }
 }
 
@@ -2288,12 +2601,31 @@ fn sections(screen: &ConfigScreen, f: &mut Frame, area: Rect, ui: &Ui) {
     }
 }
 
-/// The detail pane. `crumb` heads it with where it is, for the one-pane
-/// layout, where the section list is not on screen; a nested level always
-/// has one.
-fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
-    let screen = &app.config;
+/// How [`draw_rows`] heads and ends the rows.
+#[derive(Debug, Clone, Copy)]
+pub struct Pane {
+    /// Where the rows are, over them.
+    pub crumb: bool,
+    /// The row's help, under them.
+    pub help: bool,
+}
+
+/// The detail pane: the rows, with the one being typed into, and the help
+/// of the row with the cursor. `crumb` heads it with where it is, for the
+/// one-pane layout, where the section list is not on screen; a nested level
+/// always has one. `flash` is the row that just changed.
+pub fn draw_rows(
+    screen: &ConfigScreen,
+    env: &Env,
+    flash: Option<&str>,
+    f: &mut Frame,
+    area: Rect,
+    ui: &Ui,
+    pane: Pane,
+) {
     let section = screen.current();
+    let Pane { crumb, help } = pane;
+    let crumb = crumb && screen.pinned.is_none();
     let focused = screen.focus == Focus::Detail;
     let mut top = area.y;
     let crumbs = match screen.view() {
@@ -2346,7 +2678,7 @@ fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
     let cursor = screen.view().cursor();
     let rows: Vec<(String, Shown, Look)> = items
         .iter()
-        .map(|item| describe(screen, item, &app.env, ui))
+        .map(|item| describe(screen, item, env, ui))
         .collect();
     // A new item is typed on a row of its own, after the others.
     let new_row = screen.editing.as_ref().and_then(|e| match &e.target {
@@ -2370,8 +2702,8 @@ fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
         .max()
         .map_or(0, |w| if w == 0 { 0 } else { (w + 2).min(MAX_LABEL) });
 
-    let help_text = if focused {
-        help(screen, items.get(cursor))
+    let help_text = if focused && help {
+        self::help(screen, items.get(cursor))
     } else {
         String::new()
     };
@@ -2434,10 +2766,7 @@ fn detail(app: &App, f: &mut Frame, area: Rect, ui: &Ui, crumb: bool) {
             choice: look.arrows,
             at_min: look.at_min,
             at_max: look.at_max,
-            flash: app
-                .flash
-                .as_deref()
-                .is_some_and(|key| Some(key) == flash_key(item)),
+            flash: flash.is_some_and(|key| Some(key) == flash_key(item)),
             input: input_on(item),
             ..Row::new(&label, value)
         };
@@ -2475,6 +2804,16 @@ fn screen_map_label(section: &Section) -> &'static str {
         Body::Map(map) => map.key_label,
         _ => "",
     }
+}
+
+/// The footer while a picker, the hotkey dialog or an input has the keys;
+/// `false` when none has, and nothing was drawn.
+pub fn draw_open_footer(screen: &ConfigScreen, f: &mut Frame, rect: Rect, ui: &Ui) -> bool {
+    if screen.mode() == Mode::Browse {
+        return false;
+    }
+    footer(screen, f, rect, ui);
+    true
 }
 
 fn footer(screen: &ConfigScreen, f: &mut Frame, rect: Rect, ui: &Ui) {
@@ -2542,6 +2881,8 @@ fn footer(screen: &ConfigScreen, f: &mut Frame, rect: Rect, ui: &Ui) {
             Focus::Detail => {
                 let items = screen.items();
                 let item = items.get(screen.view().cursor());
+                let testable =
+                    matches!(item, Some(Item::Field { path, .. }) if key_target(path).is_some());
                 let change = match item {
                     Some(Item::Field { field, .. }) => verbs(field, ui),
                     Some(Item::Entry(_)) => vec![pair("enter", "open")],
@@ -2561,12 +2902,12 @@ fn footer(screen: &ConfigScreen, f: &mut Frame, rect: Rect, ui: &Ui) {
                 } else {
                     keys.push(pair("tab", "pane"));
                     keys.extend(change);
-                    keys.extend([
-                        pair("w", "save"),
-                        pair("e", "$EDITOR"),
-                        pair("/", "filter"),
-                        pair("?", "help"),
-                    ]);
+                    keys.extend([pair("w", "save"), pair("e", "$EDITOR"), pair("/", "filter")]);
+                    // Last but help: the first to go when narrow.
+                    if testable {
+                        keys.push(pair("t", "test"));
+                    }
+                    keys.push(pair("?", "help"));
                 }
                 keys
             }
@@ -2581,7 +2922,7 @@ fn footer(screen: &ConfigScreen, f: &mut Frame, rect: Rect, ui: &Ui) {
 
 /// What the keys do on a row of `field`: `h/l change · enter pick`,
 /// `h/l +/-250 · H/L +/-1000 · enter type`.
-fn verbs(field: &Field, ui: &Ui) -> Vec<(String, String)> {
+pub fn verbs(field: &Field, ui: &Ui) -> Vec<(String, String)> {
     let pm = ui.glyphs.plus_minus();
     let pair = |key: &str, what: String| (key.to_string(), what);
     let number = |n: f64| {
@@ -2994,11 +3335,13 @@ mod tests {
     /// stays.
     #[test]
     fn an_invalid_config_is_refused_with_its_edits_kept() {
-        let toml = "[general]\nbackend = \"deepgram\"\n[deepgram]\napi_key = \"dg_1\"\n";
+        let toml = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"http://127.0.0.1:8765/transcribe\"\n";
         let mut fixture = app(toml);
         open(&mut fixture, "Backend & keys");
-        to_row(&mut fixture, "deepgram api_key");
-        press(&mut fixture.app, "x");
+        to_row(&mut fixture, "sidecar url");
+        press(&mut fixture.app, "\n");
+        chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut fixture.app, "\n");
         open(&mut fixture, "General");
         to_row(&mut fixture, "notifications");
         press(&mut fixture.app, " ");
@@ -3009,7 +3352,7 @@ mod tests {
             Err(other) => panic!("refused for another reason: {other:?}"),
             Ok(_) => panic!("saved an invalid config"),
         };
-        assert!(why.contains("Deepgram backend selected"), "{why}");
+        assert!(why.contains("no sidecar URL configured"), "{why}");
         assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), toml);
         fixture
             .app
@@ -3019,7 +3362,133 @@ mod tests {
         assert!(status.text.starts_with("not saved: "), "{}", status.text);
         assert!(fixture.app.config.form.is_dirty());
         assert!(!config(&fixture).general.notify);
-        assert_eq!(config(&fixture).deepgram.as_ref().unwrap().api_key, "");
+        assert_eq!(config(&fixture).asr_sidecar.as_ref().unwrap().url, "");
+    }
+
+    /// A sparse config, hand-commented: what the save tests below edit.
+    const SPARSE: &str = "# my whisrs\n[general]\nbackend = \"groq\"\n# my language\nlanguage = \"de\"\nsilence_timeout_ms = 4500\n\n[groq]\napi_key = \"gsk_1\"\n\n[[agents]]\nname = \"jarvis\"\ndir = \"/tmp\"\n";
+
+    /// The inode config.toml is at: a write replaces the file, a no-op does
+    /// not.
+    fn inode(path: &std::path::Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().ino()
+    }
+
+    /// One key changed, one line changed: nothing else of the file moves,
+    /// and no default of anything else is written.
+    #[test]
+    fn a_save_writes_only_the_changed_line() {
+        let mut fixture = app(SPARSE);
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "silence timeout");
+        press(&mut fixture.app, "l");
+        let paths = paths(fixture.dir.path());
+        save(&fixture.app.config, &paths, false).expect("saved");
+        assert_eq!(
+            std::fs::read_to_string(&paths.config).unwrap(),
+            SPARSE.replace("silence_timeout_ms = 4500", "silence_timeout_ms = 4750"),
+            "the file differs by that one line"
+        );
+    }
+
+    /// `x` on a set key removes it from the file, so its default applies
+    /// again. The comment above it moves onto the key after it.
+    #[test]
+    fn a_reset_key_is_removed_and_its_comment_kept() {
+        let mut fixture = app(SPARSE);
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "silence timeout");
+        press(&mut fixture.app, "x");
+        let paths = paths(fixture.dir.path());
+        save(&fixture.app.config, &paths, false).expect("saved");
+        assert_eq!(
+            std::fs::read_to_string(&paths.config).unwrap(),
+            SPARSE.replace("silence_timeout_ms = 4500\n", ""),
+        );
+
+        let mut fixture = app(SPARSE);
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "language");
+        press(&mut fixture.app, "x");
+        let paths = crate::tui::testing::paths(fixture.dir.path());
+        save(&fixture.app.config, &paths, false).expect("saved");
+        assert_eq!(
+            std::fs::read_to_string(&paths.config).unwrap(),
+            SPARSE.replace("language = \"de\"\n", ""),
+            "the key goes; its comment stays, above the key after it"
+        );
+    }
+
+    /// A value toggled and toggled back is no change: nothing is written.
+    /// A save with no edits at all writes nothing either.
+    #[test]
+    fn a_change_and_back_writes_nothing() {
+        let mut fixture = app(SPARSE);
+        let paths = paths(fixture.dir.path());
+        let before = inode(&paths.config);
+        open(&mut fixture, "General");
+        to_row(&mut fixture, "notifications");
+        press(&mut fixture.app, "  ");
+        assert!(!fixture.app.config.form.is_dirty());
+        save(&fixture.app.config, &paths, false).expect("a no-op");
+        assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), SPARSE);
+        assert_eq!(inode(&paths.config), before, "the file was not rewritten");
+        // The app does not even ask the writer.
+        assert_eq!(press(&mut fixture.app, "w"), Vec::<Effect>::new());
+        assert_eq!(
+            fixture.app.status.as_ref().unwrap().text,
+            "no changes to save"
+        );
+    }
+
+    /// An agent added writes that entry, with what it set and nothing more;
+    /// the entry already there keeps its bytes.
+    #[test]
+    fn an_added_agent_writes_only_its_entry() {
+        let mut fixture = app(SPARSE);
+        open(&mut fixture, "Agents");
+        press(&mut fixture.app, "a");
+        type_text(&mut fixture.app, "friday");
+        press(&mut fixture.app, "\n\x1b");
+        let paths = paths(fixture.dir.path());
+        save(&fixture.app.config, &paths, false).expect("saved");
+        let written = std::fs::read_to_string(&paths.config).unwrap();
+        assert!(written.starts_with(SPARSE), "{written}");
+        assert_eq!(
+            written[SPARSE.len()..].trim(),
+            "[[agents]]\nname = \"friday\""
+        );
+    }
+
+    /// A cloud backend with no key in the file is written, with a warning
+    /// saying where the daemon must find it instead.
+    #[test]
+    fn a_missing_key_is_written_with_a_warning() {
+        // Validation reads this process's env.
+        if std::env::var_os("WHISRS_DEEPGRAM_API_KEY").is_some() {
+            return;
+        }
+        let toml = "[general]\nbackend = \"deepgram\"\n[deepgram]\napi_key = \"dg_1\"\n";
+        let mut fixture = app(toml);
+        open(&mut fixture, "Backend & keys");
+        to_row(&mut fixture, "deepgram api_key");
+        press(&mut fixture.app, "x");
+        let paths = paths(fixture.dir.path());
+        let saved = save(&fixture.app.config, &paths, false).expect("written");
+        assert!(saved.warnings.iter().any(|w| w.contains(
+            "the daemon needs WHISRS_DEEPGRAM_API_KEY in its own environment (systemd \
+             Environment=, environment.d, or the OpenRC conf.d file)"
+        )));
+        let written: whisrs::Config =
+            toml::from_str(&std::fs::read_to_string(&paths.config).unwrap()).unwrap();
+        assert_eq!(written.deepgram.unwrap().api_key, "");
+        fixture.app.update(crate::tui::app::Msg::Saved(Ok(saved)));
+        assert!(fixture
+            .app
+            .notices
+            .iter()
+            .any(|n| n.tone == Tone::Warn && n.text.contains("WHISRS_DEEPGRAM_API_KEY")));
     }
 
     /// A changed vocabulary goes whole to `vocabulary.txt` when the file is
@@ -3060,8 +3529,12 @@ mod tests {
             std::fs::read_to_string(&paths.vocabulary).unwrap(),
             "a\nb\nc\n"
         );
+        // The terms moved to vocabulary.txt: config.toml's list is empty,
+        // its default, so the key leaves the file.
         let out = std::fs::read_to_string(&paths.config).unwrap();
-        assert!(out.contains("vocabulary = []"), "{out}");
+        assert!(!out.contains("vocabulary"), "{out}");
+        let on_disk: whisrs::Config = toml::from_str(&out).unwrap();
+        assert!(on_disk.general.vocabulary.is_empty());
     }
 
     /// A save finds config.toml changed by something else (the daemon's

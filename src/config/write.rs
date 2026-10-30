@@ -1,7 +1,8 @@
 //! Reading and writing `config.toml` for the interactive flows: the load they
 //! start from, the refusals for a file they cannot use, and the
-//! format-preserving write (merged into the file on disk, atomic, 0600, with a
-//! `.bak` when it cannot merge). The daemon persists through the same write.
+//! format-preserving write (only the leaves that changed, merged into the file
+//! on disk, atomic, 0600, with a `.bak` when it cannot merge). The daemon
+//! persists through the same write.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -115,7 +116,7 @@ pub fn load_existing_config_from(path: &Path) -> ExistingConfig {
 
 /// Where [`write_config_to`] parks the previous contents of `config_path` when
 /// it has to regenerate the file from scratch.
-fn config_backup_path(config_path: &Path) -> PathBuf {
+pub fn config_backup_path(config_path: &Path) -> PathBuf {
     let file_name = config_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -223,6 +224,16 @@ pub fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
 
 /// [`write_config_to`] that prints nothing: a file it had to regenerate
 /// comes back, for a caller that owns the screen (the TUI) to say so.
+///
+/// Only what changed is written. `config` is compared with what the file on
+/// disk says now, leaf by leaf ([`changes_only`]): a changed value is set, a
+/// value set back to its default is removed (so the default applies again,
+/// and a later change to it reaches the user), and an unchanged one is never
+/// written, whether the file has it or not. Writing every default pinned it:
+/// `history = true`, a login-derived `user_name`, `llm_commands = []`, every
+/// `[recording]` key. Lists and arrays of tables change whole, matched entry
+/// by entry. Nothing else is appended. A write that changes nothing writes
+/// nothing, and the file keeps its bytes and its mtime.
 pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option<Regenerated>> {
     let config_dir = config_path
         .parent()
@@ -233,13 +244,29 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
         .with_context(|| format!("failed to create config directory {}", config_dir.display()))?;
 
     // Serialize the struct, then parse that back into a TOML document. This
-    // "fresh" document is the source of truth for *which* keys exist and what
-    // their values are; the on-disk document is the source of truth for
-    // comments, ordering, and formatting.
+    // "fresh" document is the source of truth for the values; the on-disk
+    // document is the source of truth for comments, ordering, and formatting.
+    // [`changes_only`] cuts it down to the leaves this write changes.
     let fresh_str = toml::to_string_pretty(config).context("failed to serialize config to TOML")?;
+    let fresh_full: DocumentMut = fresh_str
+        .parse()
+        .context("failed to reparse serialized config")?;
+    let after = config_table(config)?;
+    // What a file with nothing in it says: the "before" of a first write, or
+    // of a file regenerated from scratch.
+    let nothing = config_table(&toml::from_str::<Config>("").expect("an empty config parses"))?;
     let mut regenerated = None;
-    let mut output = match fs::read_to_string(config_path) {
-        Ok(existing_str) => match existing_str.parse::<DocumentMut>() {
+    let existing_str = match fs::read_to_string(config_path) {
+        Ok(existing_str) => Some(existing_str),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("failed to read existing config {}", config_path.display())
+            });
+        }
+    };
+    let output = match &existing_str {
+        Some(existing_str) => match existing_str.parse::<DocumentMut>() {
             // Derived from the bytes on disk, on every write: a set built from
             // `fresh_str`, or cached across writes, would describe keys that are
             // not there and break byte-stability.
@@ -260,13 +287,21 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
             // `toml::from_str::<Config>` agreed only by coincidence: it missed
             // the reserialization failure, which would have merged against an
             // empty set and deleted the unknown sections all over again (#134).
-            Ok(mut existing) => match PreservedKeys::from_config_str(&existing_str) {
+            Ok(existing) => match PreservedKeys::from_config_str(existing_str) {
                 Ok(preserved) => {
-                    let fresh: DocumentMut = fresh_str
-                        .parse()
-                        .context("failed to reparse serialized config")?;
-                    merge_table(existing.as_table_mut(), fresh.as_table(), &preserved);
-                    existing.to_string()
+                    // Described, so it deserializes: what it says now is the
+                    // "before" the changes are taken against.
+                    let before = toml::from_str::<Config>(existing_str)
+                        .context("failed to read the existing config")
+                        .and_then(|before| config_table(&before))?;
+                    let merged = |fresh: &DocumentMut| {
+                        let mut doc = existing.clone();
+                        merge_table(doc.as_table_mut(), fresh.as_table(), &preserved);
+                        doc.to_string()
+                    };
+                    let fresh =
+                        changes_only(&fresh_full, &after, &before, Some(existing.as_table()));
+                    checked(merged(&fresh), &after, || merged(&fresh_full))
                 }
                 // A file with no preserve set cannot be merged into: the
                 // stale-key pass would delete every section the struct does not
@@ -281,9 +316,10 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
                 // with `duplicate field`, which is total config loss (see
                 // [`is_preserved`]).
                 Err(reason) => {
-                    let reason = reason.summary(&existing_str);
-                    regenerated = Some(backup_and_regenerate(config_path, &existing_str, reason)?);
-                    fresh_str
+                    let reason = reason.summary(existing_str);
+                    regenerated = Some(backup_and_regenerate(config_path, existing_str, reason)?);
+                    let fresh = changes_only(&fresh_full, &after, &nothing, None);
+                    checked(from_nothing(&fresh), &after, || fresh_str.clone())
                 }
             },
             // Unparseable on-disk file: there is no layout to preserve, so
@@ -294,37 +330,335 @@ pub fn write_config_noting(config: &Config, config_path: &Path) -> Result<Option
             Err(e) => {
                 let reason = crate::config::types::with_position(
                     "is not valid TOML",
-                    &existing_str,
+                    existing_str,
                     e.span(),
                 );
-                regenerated = Some(backup_and_regenerate(config_path, &existing_str, reason)?);
-                fresh_str
+                regenerated = Some(backup_and_regenerate(config_path, existing_str, reason)?);
+                let fresh = changes_only(&fresh_full, &after, &nothing, None);
+                checked(from_nothing(&fresh), &after, || fresh_str.clone())
             }
         },
-        // First-time setup: nothing on disk yet, plain serialization is fine.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fresh_str,
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!("failed to read existing config {}", config_path.display())
-            });
+        // First-time setup: nothing on disk yet, so what differs from an empty
+        // file is what is written.
+        None => {
+            let fresh = changes_only(&fresh_full, &after, &nothing, None);
+            checked(from_nothing(&fresh), &after, || fresh_str.clone())
         }
     };
 
-    // Appended as a trailing comment: `merge_table` only touches keys, so
-    // unrecognized trailing text survives the round-trip.  Only shown when the
-    // user hasn't configured hooks yet, and only if the hint isn't already
-    // present (idempotent: writing twice must produce the same bytes).
-    const HOOKS_HINT: &str = "\n# [hooks]\n\
-             # media_auto_pause = true   # pause playing MPRIS media while dictating, resume it after\n\
-             # on_record_start = \"\"     # shell command on recording start\n\
-             # on_record_stop = \"\"      # shell command on recording stop\n";
-    if config.hooks.is_none() && !output.contains(HOOKS_HINT) {
-        output.push_str(HOOKS_HINT);
+    if existing_str.as_deref() == Some(output.as_str()) {
+        // Nothing to write; a file that drifted to laxer permissions still
+        // goes back to 0600, as a write would make it: it holds API keys.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(config_path) {
+                if meta.permissions().mode() & 0o077 != 0 {
+                    fs::set_permissions(config_path, fs::Permissions::from_mode(0o600))
+                        .with_context(|| {
+                            format!("failed to make {} private", config_path.display())
+                        })?;
+                }
+            }
+        }
+        return Ok(regenerated);
     }
-
     atomic_write(config_path, &output)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
     Ok(regenerated)
+}
+
+/// The sections of a config, each set and empty, for what every key is when
+/// a file leaves it out. One entry of each array of tables gives the
+/// defaults of an entry's keys; the keys it names are the ones an entry
+/// needs (`name`, `hotkey` and `instruction` of an LLM command).
+pub const SECTION_DEFAULTS: &str = "\
+[general]
+[audio]
+[input]
+[deepgram]
+[groq]
+[openai]
+[local-whisper]
+[local-vosk]
+[local-parakeet]
+[asr-sidecar]
+[openai-compatible-realtime]
+[llm]
+[tts]
+[hotkeys]
+[hooks]
+[overlay]
+[agent_overlay]
+[recording]
+[[llm_commands]]
+name = \"\"
+hotkey = \"\"
+instruction = \"\"
+[[agents]]
+";
+
+/// A file written from nothing: `fresh`, without the blank line its first
+/// section kept from the whole serialization.
+fn from_nothing(fresh: &DocumentMut) -> String {
+    fresh.to_string().trim_start_matches('\n').to_string()
+}
+
+/// `config` as a TOML table.
+fn config_table(config: &Config) -> Result<toml::Table> {
+    match toml::Value::try_from(config).context("failed to serialize config")? {
+        toml::Value::Table(table) => Ok(table),
+        _ => anyhow::bail!("the config did not serialize to a table"),
+    }
+}
+
+/// `output` when it reads back as exactly `after`, else what `full` makes:
+/// the whole config, every default with it. Pruning that loses a value is a
+/// bug, and a config full of defaults is the lesser harm; tests make it
+/// fail loudly instead.
+fn checked(output: String, after: &toml::Table, full: impl FnOnce() -> String) -> String {
+    let reads_back = toml::from_str::<Config>(&output)
+        .ok()
+        .and_then(|config| config_table(&config).ok())
+        .is_some_and(|table| table == *after);
+    if reads_back {
+        return output;
+    }
+    #[cfg(test)]
+    {
+        let _ = full;
+        panic!("the changed-only write does not read back as the config:\n{output}");
+    }
+    #[cfg(not(test))]
+    {
+        tracing::warn!("config write: the changed-only file does not read back; writing it whole");
+        full()
+    }
+}
+
+/// What a write changes: `fresh` (the whole config, as serialized) cut down
+/// to the leaves where `after` (the config written) differs from `before`
+/// (what the file says now), plus the unchanged leaves `disk` (the file's
+/// document) already has, which the merge then leaves alone. A changed leaf
+/// equal to its default is cut too: the merge removes it from the file. An
+/// absent section with nothing changed in it stays absent.
+fn changes_only(
+    fresh: &DocumentMut,
+    after: &toml::Table,
+    before: &toml::Table,
+    disk: Option<&Table>,
+) -> DocumentMut {
+    let raw: toml::Table = toml::from_str(SECTION_DEFAULTS).expect("the section defaults parse");
+    let defaults = toml::from_str::<Config>(SECTION_DEFAULTS)
+        .ok()
+        .and_then(|config| config_table(&config).ok())
+        .expect("the section defaults deserialize");
+    let sides = Sides {
+        before: Some(before),
+        defaults: Some(&defaults),
+        disk: disk.map(|t| t as &dyn TableLike),
+    };
+    let keep = keep_changes(after, sides, "", &raw);
+    let mut fresh = fresh.clone();
+    retain(fresh.as_table_mut(), &keep);
+    fresh
+}
+
+use toml_edit::TableLike;
+
+/// What [`keep_changes`] compares a table of `after` with.
+#[derive(Clone, Copy)]
+struct Sides<'a> {
+    /// The same table as the file says it now.
+    before: Option<&'a toml::Table>,
+    /// The same table with every key at its default.
+    defaults: Option<&'a toml::Table>,
+    /// The file's own spelling of it, for which keys it has.
+    disk: Option<&'a dyn TableLike>,
+}
+
+/// The leaves of `after` to write, at `path` (dotted, `""` for the root):
+/// see [`changes_only`]. `raw` is [`SECTION_DEFAULTS`] as written, which
+/// names the keys an entry needs.
+fn keep_changes(after: &toml::Table, sides: Sides, path: &str, raw: &toml::Table) -> toml::Table {
+    keep_with(after, sides, path, raw, &[])
+}
+
+fn keep_with(
+    after: &toml::Table,
+    sides: Sides,
+    path: &str,
+    raw: &toml::Table,
+    required: &[String],
+) -> toml::Table {
+    let mut keep = toml::Table::new();
+    for (key, value) in after {
+        let was = sides.before.and_then(|b| b.get(key));
+        let default = sides.defaults.and_then(|d| d.get(key));
+        let disk = on_disk(sides.disk, path, key);
+        let child = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        match value {
+            toml::Value::Table(table) => {
+                let inner = Sides {
+                    before: was.and_then(toml::Value::as_table),
+                    defaults: default.and_then(toml::Value::as_table),
+                    disk: disk.and_then(Item::as_table_like),
+                };
+                let kept = keep_with(table, inner, &child, raw, &[]);
+                // A table the file does not have stays out unless something
+                // in it changed, or it is new as a whole (an optional section
+                // set, with every key at its default: the header says so).
+                if !kept.is_empty() || disk.is_some() || was.is_none() {
+                    keep.insert(key.clone(), toml::Value::Table(kept));
+                }
+            }
+            toml::Value::Array(entries) if is_array_of_tables(entries) => {
+                // Unchanged and not in the file: stays out. Else entry by
+                // entry, so an entry's defaults stay out of it too.
+                if was == Some(value) && disk.is_none() {
+                    continue;
+                }
+                let entry_default = default
+                    .and_then(toml::Value::as_array)
+                    .and_then(|d| d.first())
+                    .and_then(toml::Value::as_table);
+                let needed: Vec<String> = raw
+                    .get(key)
+                    .and_then(toml::Value::as_array)
+                    .and_then(|d| d.first())
+                    .and_then(toml::Value::as_table)
+                    .map(|t| t.keys().cloned().collect())
+                    .unwrap_or_default();
+                let olds: Vec<&toml::Table> = was
+                    .and_then(toml::Value::as_array)
+                    .map(|a| a.iter().filter_map(toml::Value::as_table).collect())
+                    .unwrap_or_default();
+                let matched = match_entries(entries, &olds);
+                let kept = entries
+                    .iter()
+                    .zip(matched)
+                    .map(|(entry, old)| {
+                        let entry = entry.as_table().expect("checked above");
+                        let inner = Sides {
+                            before: old.map(|i| olds[i]),
+                            defaults: entry_default,
+                            disk: old.and_then(|i| disk_entry(disk, i)),
+                        };
+                        toml::Value::Table(keep_with(entry, inner, &child, raw, &needed))
+                    })
+                    .collect();
+                keep.insert(key.clone(), toml::Value::Array(kept));
+            }
+            _ => {
+                let unchanged = was == Some(value);
+                if unchanged {
+                    // The merge leaves it as it is; one the file lacks stays
+                    // out of it.
+                    if disk.is_some() {
+                        keep.insert(key.clone(), value.clone());
+                    }
+                } else if default == Some(value) && !required.contains(key) {
+                    // Back to its default: left out, so the merge removes it
+                    // and the default applies again.
+                } else {
+                    keep.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    keep
+}
+
+/// Whether `values` is an array of tables (`[[agents]]`), not a list.
+fn is_array_of_tables(values: &[toml::Value]) -> bool {
+    !values.is_empty() && values.iter().all(toml::Value::is_table)
+}
+
+/// For each entry of `fresh`, the entry of `olds` it is: by `name` first,
+/// then by position, each old entry once. The same matching as
+/// [`merge_array_of_tables`], so a kept key lands in the entry it came from.
+fn match_entries(fresh: &[toml::Value], olds: &[&toml::Table]) -> Vec<Option<usize>> {
+    let mut consumed = vec![false; olds.len()];
+    let name = |t: &toml::Table| {
+        t.get("name")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+    };
+    fresh
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let by_name = entry.as_table().and_then(name).and_then(|n| {
+                (0..olds.len()).find(|&j| !consumed[j] && name(olds[j]) == Some(n.clone()))
+            });
+            let found = by_name.or_else(|| (i < olds.len() && !consumed[i]).then_some(i));
+            if let Some(j) = found {
+                consumed[j] = true;
+            }
+            found
+        })
+        .collect()
+}
+
+/// The item the file has for `key` of the table at `path`, under its serde
+/// alias too (`[local]` for `[local-whisper]`, `read` for `[hotkeys]
+/// speak`): the merge then rewrites it under the canonical name.
+fn on_disk<'a>(disk: Option<&'a dyn TableLike>, path: &str, key: &str) -> Option<&'a Item> {
+    let disk = disk?;
+    if let Some(item) = disk.get(key) {
+        return Some(item);
+    }
+    let aliases: &[&str] = match (path, key) {
+        ("", "local-whisper") => &["local"],
+        ("", "asr-sidecar") => &["asr", "vibevoice"],
+        ("hotkeys", "speak") => &["read"],
+        _ => &[],
+    };
+    aliases.iter().find_map(|alias| disk.get(alias))
+}
+
+/// Entry `i` of an array of tables in the file, either spelling.
+fn disk_entry(item: Option<&Item>, i: usize) -> Option<&dyn TableLike> {
+    match item? {
+        Item::ArrayOfTables(entries) => entries.get(i).map(|t| t as &dyn TableLike),
+        Item::Value(Value::Array(entries)) => entries
+            .get(i)?
+            .as_inline_table()
+            .map(|t| t as &dyn TableLike),
+        _ => None,
+    }
+}
+
+/// Cut `table` (the serialized config) down to the keys of `keep`, keeping
+/// its order and spelling. A table left with sub-tables only loses its own
+/// header (`[overlay.colors]` without an `[overlay]` line).
+fn retain(table: &mut Table, keep: &toml::Table) {
+    table.retain(|key, _| keep.contains_key(key));
+    for (key, item) in table.iter_mut() {
+        match (item, keep.get(key.get())) {
+            (Item::Table(inner), Some(toml::Value::Table(kept))) => {
+                retain(inner, kept);
+                if !inner.is_empty() && inner.iter().all(|(_, item)| !item.is_value()) {
+                    inner.set_implicit(true);
+                }
+            }
+            (Item::ArrayOfTables(entries), Some(toml::Value::Array(kept))) => {
+                for (entry, kept) in entries.iter_mut().zip(kept) {
+                    if let toml::Value::Table(kept) = kept {
+                        retain(entry, kept);
+                    }
+                }
+            }
+            (Item::Value(Value::InlineTable(inline)), Some(toml::Value::Table(kept))) => {
+                inline.retain(|key, _| kept.contains_key(key));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Park the current contents of `config_path` in a private `.bak` beside it,
@@ -398,6 +732,7 @@ fn merge_table(existing: &mut Table, fresh: &Table, preserved: &PreservedKeys) {
         .map(|(key, _)| key.to_string())
         .collect();
     for key in stale {
+        keep_comment(existing, &key);
         existing.remove(&key);
     }
 
@@ -414,6 +749,44 @@ fn merge_table(existing: &mut Table, fresh: &Table, preserved: &PreservedKeys) {
                 existing.insert(key, fresh_item.clone());
             }
         }
+    }
+}
+
+/// The comment above value `key`, which is about to be removed (set back
+/// to its default), moved onto the value after it: the user's own text
+/// stays. A last value's comment goes with it; there is no line left to
+/// hold it.
+fn keep_comment(table: &mut Table, key: &str) {
+    if !matches!(table.get(key), Some(Item::Value(_))) {
+        return;
+    }
+    let Some(prefix) = table
+        .key(key)
+        .and_then(|k| k.leaf_decor().prefix())
+        .and_then(|p| p.as_str())
+        .filter(|p| p.contains('#'))
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
+    let Some(at) = keys.iter().position(|k| k == key) else {
+        return;
+    };
+    let Some(next) = keys[at + 1..]
+        .iter()
+        .find(|k| matches!(table.get(k), Some(Item::Value(_))))
+    else {
+        return;
+    };
+    if let Some(mut next) = table.key_mut(next) {
+        let decor = next.leaf_decor_mut();
+        let own = decor
+            .prefix()
+            .and_then(|p| p.as_str())
+            .unwrap_or_default()
+            .to_string();
+        decor.set_prefix(format!("{prefix}{own}"));
     }
 }
 
@@ -893,6 +1266,58 @@ args = ["--model", "haiku"]
         assert_eq!(reparsed.agents[0].args, ["--model", "haiku"]);
     }
 
+    /// No default is ever written: a first write of a config with one key
+    /// changed holds that key alone. Any field, a field that has no row in
+    /// the TUI or one added later included, stays out while it is at its
+    /// default.
+    #[test]
+    fn only_a_changed_leaf_is_written_never_a_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config: Config = toml::from_str("").unwrap();
+        config.general.language = "de".to_string();
+        write_config_to(&config, &path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[general]\nlanguage = \"de\"\n"
+        );
+        // Over a sparse file, the defaults of the sections it has, and of
+        // those it lacks, stay out too; no template is appended.
+        let sparse = "# mine\n[audio]\ndevice = \"mic\"\n";
+        fs::write(&path, sparse).unwrap();
+        let mut config: Config = toml::from_str(sparse).unwrap();
+        config.audio.device = "yeti".to_string();
+        write_config_to(&config, &path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# mine\n[audio]\ndevice = \"yeti\"\n"
+        );
+        // The value back as the file has it: nothing to write.
+        fs::write(&path, sparse).unwrap();
+        let mut over: Config = toml::from_str(sparse).unwrap();
+        over.audio.device = "mic".to_string();
+        write_config_to(&over, &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), sparse);
+    }
+
+    /// A key set back to its default leaves the file; a comment above it
+    /// moves onto the key after it, and a last key's comment goes with it.
+    #[test]
+    fn a_key_back_at_its_default_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[general]\n# mine\nsilence_timeout_ms = 4500\nlanguage = \"de\"\n# last\nnotify = false\n";
+        fs::write(&path, original).unwrap();
+        let mut config: Config = toml::from_str(original).unwrap();
+        config.general.silence_timeout_ms = 2000;
+        config.general.notify = true;
+        write_config_to(&config, &path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[general]\n# mine\nlanguage = \"de\"\n"
+        );
+    }
+
     #[test]
     fn added_keys_appear() {
         let dir = tempfile::tempdir().unwrap();
@@ -907,8 +1332,9 @@ args = ["--model", "haiku"]
         // New key in an existing section.
         assert!(out.contains(r#"prompt = "Vocabulary: whisrs, Hyprland""#));
         assert!(out.contains(r#"speak = "Super+R""#));
-        // A whole section the file never had (serialized from defaults).
-        assert!(out.contains("[input]"));
+        // A section the file never had, with nothing changed in it, stays
+        // out: no defaults are written.
+        assert!(!out.contains("[input]"));
         // Comments still intact.
         assert!(out.contains("# whisrs config - hand-tuned, do not regenerate"));
         let reparsed: Config = toml::from_str(&out).unwrap();
@@ -976,7 +1402,18 @@ args = ["--model", "haiku"]
 
         // Rewrite over a file that drifted to laxer permissions.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        write_config_to(&config, &path).unwrap();
+        let mut changed = config.clone();
+        changed.general.language = "fr".to_string();
+        write_config_to(&changed, &path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // A write with nothing to change writes nothing, and still makes the
+        // file private.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = fs::read(&path).unwrap();
+        write_config_to(&changed, &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
@@ -1686,8 +2123,9 @@ stray = "keep me"
                 what: "a typo beside real keys",
                 contents: "[input]\npast = true\n",
                 kept: &["past = true"],
-                gone: &[],
-                once: &["paste = "],
+                // Its real neighbour is at its default: not written at all.
+                gone: &["paste = "],
+                once: &[],
             },
             Row {
                 what: "a hotkey alias",

@@ -933,7 +933,7 @@ const LLM: &[Field] = &[
             check: None,
             from: Source::LlmModels,
         },
-        "The chat model. Suggested for the OpenAI, Groq, OpenRouter and Ollama URLs; any \
+        "The chat model. Suggested for the OpenAI, Groq, OpenRouter, Gemini and Ollama URLs; any \
          other name can be typed.",
     ),
     field(
@@ -1332,6 +1332,23 @@ pub const SECTIONS: &[Section] = &[
         entry_hotkeys: false,
     },
 ];
+
+/// The row of a section's key at `path` (`general.language`).
+pub fn find(path: &str) -> Option<&'static Field> {
+    SECTIONS
+        .iter()
+        .filter_map(|section| match section.body {
+            Body::Rows(fields) => Some(fields),
+            _ => None,
+        })
+        .flatten()
+        .find(|field| field.path == path)
+}
+
+/// [`find`], for a screen that edits a few known rows.
+pub fn row(path: &str) -> &'static Field {
+    find(path).unwrap_or_else(|| panic!("no row {path}"))
+}
 
 #[cfg(test)]
 mod tests {

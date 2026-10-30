@@ -37,6 +37,12 @@ pub enum Action {
     Add,
     Delete,
     Restart,
+    /// `t`: test the key (or model) of the row.
+    Test,
+    /// `s`: skip an optional wizard step.
+    Skip,
+    /// `Backspace` on the rows: the wizard's previous step.
+    Previous,
     // Text input.
     Type(char),
     Erase,
@@ -149,6 +155,9 @@ pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
             KeyCode::Char('a') => Some(Action::Add),
             KeyCode::Char('d') => Some(Action::Delete),
             KeyCode::Char('r') => Some(Action::Restart),
+            KeyCode::Char('t') => Some(Action::Test),
+            KeyCode::Char('s') => Some(Action::Skip),
+            KeyCode::Backspace => Some(Action::Previous),
             _ => None,
         },
     }
@@ -310,6 +319,32 @@ mod tests {
         assert_eq!(
             action(press(KeyCode::Tab), Mode::Text),
             Some(Action::Complete)
+        );
+    }
+
+    /// `t`, `s` and `Backspace` are the wizard's on the rows, and text in an
+    /// input.
+    #[test]
+    fn test_skip_and_previous() {
+        assert_eq!(
+            action(press(KeyCode::Char('t')), Mode::Browse),
+            Some(Action::Test)
+        );
+        assert_eq!(
+            action(press(KeyCode::Char('s')), Mode::Browse),
+            Some(Action::Skip)
+        );
+        assert_eq!(
+            action(press(KeyCode::Backspace), Mode::Browse),
+            Some(Action::Previous)
+        );
+        assert_eq!(
+            action(press(KeyCode::Char('t')), Mode::Text),
+            Some(Action::Type('t'))
+        );
+        assert_eq!(
+            action(press(KeyCode::Backspace), Mode::Text),
+            Some(Action::Erase)
         );
     }
 

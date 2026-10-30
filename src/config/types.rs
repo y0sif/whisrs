@@ -1079,6 +1079,75 @@ pub struct OpenAiCompatibleRealtimeConfig {
     pub api_key: Option<String>,
 }
 
+/// What [`Config::validate`] does about a cloud backend with no API key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingKey {
+    /// An error: the daemon cannot transcribe with this config as it is.
+    Refuse,
+    /// A warning naming where the daemon has to find `var` instead.
+    Warn,
+}
+
+impl MissingKey {
+    /// The key in `var` is missing: `refusal` as the error, or a warning.
+    fn missing(
+        self,
+        warnings: &mut Vec<ConfigWarning>,
+        var: &str,
+        refusal: &str,
+    ) -> Result<(), WhisrsError> {
+        match self {
+            MissingKey::Refuse => Err(WhisrsError::Config(refusal.to_string())),
+            MissingKey::Warn => {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "no API key in config.toml: the daemon needs {var} in its own \
+                         environment (systemd Environment=, environment.d, or the OpenRC \
+                         conf.d file)"
+                    ),
+                });
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod missing_key_tests {
+    use super::*;
+
+    /// A cloud backend with no key refuses to validate, as the daemon's
+    /// startup check says, but only warns for a write, naming where the
+    /// daemon looks; any other error still refuses.
+    #[test]
+    fn a_missing_key_only_warns_for_a_write() {
+        for (backend, var) in [
+            ("groq", "WHISRS_GROQ_API_KEY"),
+            ("deepgram-streaming", "WHISRS_DEEPGRAM_API_KEY"),
+            ("openai-realtime", "WHISRS_OPENAI_API_KEY"),
+        ] {
+            // Validation reads this process's env.
+            if std::env::var_os(var).is_some() {
+                continue;
+            }
+            let config: Config =
+                toml::from_str(&format!("[general]\nbackend = \"{backend}\"\n")).unwrap();
+            assert!(config.validate().is_err(), "{backend}");
+            let warnings = config.validate_to_write().expect("written with a warning");
+            assert!(
+                warnings.iter().any(|w| w
+                    .message
+                    .contains(&format!("needs {var} in its own environment"))),
+                "{backend}"
+            );
+        }
+        let no_url: Config =
+            toml::from_str("[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"\"\n")
+                .unwrap();
+        assert!(no_url.validate_to_write().is_err());
+    }
+}
+
 fn default_backend() -> String {
     "groq".to_string()
 }
@@ -1940,6 +2009,19 @@ impl Config {
     /// Returns `Err` for fatal issues (e.g., no backend configured).
     /// Returns `Ok(warnings)` with non-fatal warnings.
     pub fn validate(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
+        self.validate_with(MissingKey::Refuse)
+    }
+
+    /// [`Config::validate`] for a config about to be written: a cloud
+    /// backend with no key in the file and none in this process's env is a
+    /// warning, not a refusal. The daemon does not refuse it either: it
+    /// logs it and reads `WHISRS_*_API_KEY` at transcription time, from its
+    /// own environment, which a service gets from its unit or conf.d.
+    pub fn validate_to_write(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
+        self.validate_with(MissingKey::Warn)
+    }
+
+    fn validate_with(&self, keys: MissingKey) -> Result<Vec<ConfigWarning>, WhisrsError> {
         let mut warnings = Vec::new();
         let backend = self.general.backend.as_str();
 
@@ -1971,12 +2053,13 @@ impl Config {
                     .map(|k| !k.is_empty())
                     .unwrap_or(false);
                 if !has_config_key && !has_env_key {
-                    return Err(WhisrsError::Config(
+                    keys.missing(
+                        &mut warnings,
+                        "WHISRS_DEEPGRAM_API_KEY",
                         "Deepgram backend selected but no API key configured.\n\
                          Set WHISRS_DEEPGRAM_API_KEY or add [deepgram] api_key to config.toml.\n\
-                         Run 'whisrs setup' to get started."
-                            .to_string(),
-                    ));
+                         Run 'whisrs setup' to get started.",
+                    )?;
                 }
             }
             "groq" => {
@@ -1989,12 +2072,13 @@ impl Config {
                     .map(|k| !k.is_empty())
                     .unwrap_or(false);
                 if !has_config_key && !has_env_key {
-                    return Err(WhisrsError::Config(
+                    keys.missing(
+                        &mut warnings,
+                        "WHISRS_GROQ_API_KEY",
                         "Groq backend selected but no API key configured.\n\
                          Set WHISRS_GROQ_API_KEY or add [groq] api_key to config.toml.\n\
-                         Run 'whisrs setup' to get started."
-                            .to_string(),
-                    ));
+                         Run 'whisrs setup' to get started.",
+                    )?;
                 }
             }
             "openai" | "openai-realtime" => {
@@ -2007,12 +2091,13 @@ impl Config {
                     .map(|k| !k.is_empty())
                     .unwrap_or(false);
                 if !has_config_key && !has_env_key {
-                    return Err(WhisrsError::Config(
+                    keys.missing(
+                        &mut warnings,
+                        "WHISRS_OPENAI_API_KEY",
                         "OpenAI backend selected but no API key configured.\n\
                          Set WHISRS_OPENAI_API_KEY or add [openai] api_key to config.toml.\n\
-                         Run 'whisrs setup' to get started."
-                            .to_string(),
-                    ));
+                         Run 'whisrs setup' to get started.",
+                    )?;
                 }
             }
             "local-whisper" | "local" => {

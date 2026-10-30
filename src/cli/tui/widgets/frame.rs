@@ -76,6 +76,27 @@ pub fn too_small(f: &mut Frame, ui: &Ui) {
 pub struct Header<'a> {
     pub screen: &'a str,
     pub daemon: Option<bool>,
+    /// The microphone's level, 0 to 1, while it is live: the waveform
+    /// follows it.
+    pub live: Option<f32>,
+}
+
+/// The header's five waveform cells: still, or after a live `level`.
+fn wave(ui: &Ui, live: Option<f32>) -> Vec<Span<'static>> {
+    let [low, mid, high] = ui.glyphs.wave;
+    let Some(level) = live else {
+        return vec![Span::styled(
+            [low, mid, high, mid, low].concat(),
+            ui.theme.muted,
+        )];
+    };
+    [0.35, 0.7, 1.0, 0.7, 0.35]
+        .into_iter()
+        .map(|weight: f32| {
+            let height = (level.clamp(0.0, 1.0) * weight * 3.0) as usize;
+            Span::styled([low, mid, high][height.min(2)], ui.theme.accent)
+        })
+        .collect()
 }
 
 /// Draw the frame and header; the area for the body under them.
@@ -93,11 +114,9 @@ pub fn draw(f: &mut Frame, rect: Rect, ui: &Ui, header: Header) -> Rect {
         inner.height,
     );
 
-    let [low, mid, high] = ui.glyphs.wave;
-    let title = Line::from(vec![
-        Span::raw("whisrs "),
-        Span::styled([low, mid, high, mid, low].concat(), ui.theme.muted),
-    ]);
+    let mut title = vec![Span::raw("whisrs ")];
+    title.extend(wave(ui, header.live));
+    let title = Line::from(title);
     let (dot, dot_tone) = match header.daemon {
         Some(true) => (ui.glyphs.up, Tone::Ok),
         Some(false) => (ui.glyphs.down, Tone::Muted),

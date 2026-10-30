@@ -108,10 +108,13 @@ src/
   tray/, overlay/      — tray icon and recording overlay (feature-gated)
 ```
 
-`src/config/` holds the config types and their validation, `whisrs setup`, and the load
-and format-preserving write. The `whisrs config` TUI is in `src/cli/tui/`, in the CLI binary
-so whisrsd never links ratatui: screens, widgets, and the schema of every config key. It
-reads and writes config.toml through `src/config/`.
+`src/config/` holds the config types and their validation, the load and format-preserving
+write, and `src/config/setup/`: the side effects of `whisrs setup` (uinput, the service,
+the keybinding, the GNOME extension, the model download, the microphone probe, the API key
+test) as plain functions that neither print nor ask, their programs and network injected
+in tests. The `whisrs config` and `whisrs setup` TUI is in `src/cli/tui/`, in the CLI binary
+so whisrsd never links ratatui: screens (Home, Config, the setup wizard, Mic), widgets, and
+the schema of every config key. It reads and writes config.toml through `src/config/`.
 
 Injection policy stays in the daemon (`inject_text` and friends in `src/daemon/main.rs`),
 but the primitives it calls live in the `xkb-type` workspace crate, alongside four other

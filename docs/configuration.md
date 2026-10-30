@@ -106,7 +106,7 @@ position = "bottom-center"
 # glow         = "#F0EDF5"
 
 [audio]
-device = "default"         # input device; see "Choosing the microphone" below
+device = "default"         # input device; see "Choosing the microphone" below, or pick it on the Mic test screen (whisrs config, Esc to Home, Mic test)
 
 [input]
 # Inter-key delay for the virtual keyboard. Raise this if a TUI
@@ -1287,7 +1287,7 @@ without a whisrs release: whisrs reads the output of 1.0.103.
 
 ## Choosing the microphone
 
-`[audio] device` picks the input whisrs records from:
+`[audio] device` picks the input whisrs records from. The easiest way to choose it is the Mic test screen: run `whisrs config`, press Esc to go to Home and open Mic test. It lists the inputs (`h`/`l` step through them, `Enter` opens the list), shows each one's level live against the silence gate, and `w` writes only `[audio] device` (other unsaved Config edits stay unsaved), then restarts the daemon when it is idle. `whisrs setup` has the same meter on its microphone step. By hand, the value is one of:
 
 - `"default"` (or empty): the system default input, through ALSA. With the PipeWire or PulseAudio ALSA plugin installed (the usual setup) this follows the default source set in your sound settings.
 - A PulseAudio or PipeWire source name, such as `alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo`. List them with `pactl list short sources` (second column). The source description shown in your sound settings also works; on PipeWire, `wpctl status` lists the sources by description. Monitor sources (names ending in `.monitor`) record what your speakers play.

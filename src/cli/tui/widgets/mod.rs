@@ -1,11 +1,14 @@
 //! The pieces every screen draws with: the frame and footer, rows, the text
-//! input, the picker and the hotkey dialog, scrolling, and dialogs.
+//! input, the picker and the hotkey dialog, the level meter and the
+//! download bar, scrolling, and dialogs.
 
 pub mod dialog;
 pub mod frame;
 pub mod hotkey;
 pub mod input;
+pub mod meter;
 pub mod picker;
+pub mod progress;
 pub mod row;
 
 use ratatui::style::Style;
