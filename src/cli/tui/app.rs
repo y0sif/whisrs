@@ -1332,6 +1332,17 @@ impl App {
     }
 
     /// A new capture of `device`, for the meter.
+    /// The speech detector the Mic test's quality line uses: `[audio] vad`
+    /// as edited, earshot when unset or unknown, as the daemon reads it.
+    pub fn mic_vad(&self) -> audio_silence_gate::Vad {
+        self.config
+            .form
+            .effective("audio.vad")
+            .and_then(toml::Value::as_str)
+            .and_then(whisrs::parse_vad)
+            .unwrap_or_default()
+    }
+
     fn start_mic(&mut self, device: String) -> Effect {
         self.mic_session += 1;
         self.mic.start(self.mic_session);

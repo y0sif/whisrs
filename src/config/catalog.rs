@@ -189,6 +189,15 @@ pub const REALTIME_PROFILES: &[Entry] = &[
     ("openai", "OpenAI's wire: 24 kHz, text appended"),
 ];
 
+/// `[audio] vad`: what decides a sound is speech.
+pub const VADS: &[Entry] = &[
+    (
+        "earshot",
+        "a small learned model, steady in background noise",
+    ),
+    ("rms", "the 0.1.31 loudness test"),
+];
+
 /// `[openai-compatible-realtime] turn_detection`.
 pub const TURN_DETECTIONS: &[Entry] = &[
     ("server-vad", "the server ends a turn at a pause"),

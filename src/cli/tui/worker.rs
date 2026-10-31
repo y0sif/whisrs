@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use audio_silence_gate::Vad;
 use whisrs::audio::playback::{play_wav_stream, StreamChunk};
 use whisrs::config::setup::key_test::{self, Endpoints, Provider, Target};
 use whisrs::config::setup::uinput::Uinput;
@@ -364,7 +365,7 @@ impl Workers {
     /// Probe `device`, then capture from it and send about 30 readings a
     /// second, tagged `session`, until [`Workers::mic_stop`] or the next
     /// start. Stops on its own once the TUI is gone.
-    pub fn mic_start(&self, session: u64, device: String) {
+    pub fn mic_start(&self, session: u64, device: String, vad: Vad) {
         let stop = Arc::new(AtomicBool::new(false));
         if let Some(old) = lock(&self.mic).replace(Arc::clone(&stop)) {
             old.store(true, Ordering::Relaxed);
@@ -390,7 +391,7 @@ impl Workers {
                 return;
             }
             match (tools.open_mic)(&device) {
-                Ok(mut chunks) => meter_loop(chunks.as_mut(), &stop, send, std::thread::sleep),
+                Ok(mut chunks) => meter_loop(chunks.as_mut(), &stop, vad, send, std::thread::sleep),
                 Err(why) => {
                     send(MicEvent::Failed(why));
                 }
@@ -884,9 +885,11 @@ const NAP: Duration = Duration::from_millis(5);
 pub fn meter_loop(
     chunks: &mut dyn Chunks,
     stop: &AtomicBool,
+    vad: Vad,
     mut send: impl FnMut(MicEvent) -> bool,
     sleep: impl Fn(Duration),
 ) {
+    let mut analyzer = analysis::Analyzer::new(vad);
     let mut pending: Vec<i16> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         match chunks.poll() {
@@ -901,7 +904,7 @@ pub fn meter_loop(
             Polled::Waiting => {}
         }
         if pending.len() >= WINDOW {
-            let reading = analysis::analyze(&pending, whisrs::audio::capture::SAMPLE_RATE);
+            let reading = analyzer.analyze(&pending, whisrs::audio::capture::SAMPLE_RATE);
             pending.clear();
             if !send(MicEvent::Reading(reading, Instant::now())) {
                 return;
@@ -1503,6 +1506,7 @@ mod list_tests {
         meter_loop(
             &mut mic,
             &stop,
+            Vad::Earshot,
             |event| {
                 events.push(event);
                 true
@@ -1525,6 +1529,7 @@ mod list_tests {
         meter_loop(
             &mut mic,
             &stop,
+            Vad::Earshot,
             |_| {
                 any = true;
                 true
@@ -1566,7 +1571,7 @@ mod list_tests {
             recordings: Mutex::new(None),
             nudge: Mutex::new(None),
         };
-        workers.mic_start(7, "nope".into());
+        workers.mic_start(7, "nope".into(), Vad::Earshot);
         let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Msg::Mic { session, event } => (session, event),
             _ => panic!("not a mic event"),
@@ -1617,8 +1622,8 @@ mod list_tests {
         {
             // Another probe, or a listing, holds the lock meanwhile.
             let _held = stderr_lock();
-            workers.mic_start(1, "first".into());
-            workers.mic_start(2, "second".into());
+            workers.mic_start(1, "first".into(), Vad::Earshot);
+            workers.mic_start(2, "second".into(), Vad::Earshot);
             std::thread::sleep(Duration::from_millis(100));
         }
         loop {

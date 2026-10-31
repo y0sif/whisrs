@@ -642,17 +642,27 @@ const BACKEND: &[Field] = &[
     ),
 ];
 
-const AUDIO: &[Field] = &[field(
-    "audio.device",
-    "device",
-    Kind::Suggest {
-        unset: None,
-        check: None,
-        from: Source::Inputs,
-    },
-    "The microphone: default, or a source the sound server lists. Monitors, last, record \
-     what the speakers play.",
-)];
+const AUDIO: &[Field] = &[
+    field(
+        "audio.device",
+        "device",
+        Kind::Suggest {
+            unset: None,
+            check: None,
+            from: Source::Inputs,
+        },
+        "The microphone: default, or a source the sound server lists. Monitors, last, record \
+         what the speakers play.",
+    ),
+    field(
+        "audio.vad",
+        "speech detector",
+        Kind::Choice(catalog::VADS),
+        "What decides a sound is speech, for auto-stop, the skips and recordings: earshot, a \
+         small learned model that holds up in background noise, or rms, the loudness test of \
+         0.1.31. The Mic test's quality line uses it too.",
+    ),
+];
 
 const VOCABULARY: &[Field] = &[
     field(

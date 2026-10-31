@@ -156,14 +156,37 @@ impl Meter {
                     Span::styled(format!("gate {:.0}{peak}", gate), ui.theme.muted),
                 ]));
                 if let Some(quality) = &reading.quality {
-                    let text = format!(
-                        "speech {} {sep} noise {:.0} dBFS {sep} SNR {:.0} dB",
-                        if quality.speech { "yes" } else { "no" },
-                        quality.noise_dbfs,
-                        quality.snr_db,
-                        sep = ui.glyphs.separator
-                    );
-                    lines.push(line("quality", vec![Span::raw(text)]));
+                    let sep = format!(" {} ", ui.glyphs.separator);
+                    let mut parts = vec![match quality.speech_dbfs {
+                        Some(speech) => format!("speech {speech:.0} dBFS"),
+                        None => "no speech yet".to_string(),
+                    }];
+                    if let Some(noise) = quality.noise_dbfs {
+                        parts.push(format!("noise {noise:.0} dBFS"));
+                    }
+                    if let Some(snr) = quality.snr_db {
+                        parts.push(format!("SNR {snr:.0} dB"));
+                    }
+                    for (i, part) in wrap(&parts.join(&sep), room.max(1))
+                        .into_iter()
+                        .take(2)
+                        .enumerate()
+                    {
+                        if i == 0 {
+                            lines.push(line("quality", vec![Span::raw(part)]));
+                        } else {
+                            lines
+                                .push(Line::from(vec![Span::raw(indent.clone()), Span::raw(part)]));
+                        }
+                    }
+                    if let Some(warning) = &quality.warning {
+                        for part in wrap(&warning.message(), room.max(1)).into_iter().take(2) {
+                            lines.push(Line::from(vec![
+                                Span::raw(indent.clone()),
+                                Span::styled(part, Tone::Warn.style(ui.theme)),
+                            ]));
+                        }
+                    }
                 }
             }
         }

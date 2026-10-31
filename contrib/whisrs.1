@@ -153,7 +153,11 @@ this does not touch udev rules, the systemd unit, or compositor keybindings.
 goes up to Home, which also opens Setup, Recordings, Profiles, History and
 the Mic test: a live level meter of the
 .B [audio] device
-(from \-60 to 0 dBFS, with the silence gate and the peak held), where
+(from \-60 to 0 dBFS, with the silence gate and the peak held) and a
+quality line over the last 10 seconds (speech level, background, SNR, and
+the first warning: too quiet, noisy, clipping), measured with the
+.B [audio] vad
+detector, where
 .B h
 and
 .B l

@@ -441,7 +441,7 @@ fn perform(
                 app.update(Msg::DeviceSaved(saved))
             }
             Effect::MicStart { session, device } => {
-                workers.mic_start(session, device);
+                workers.mic_start(session, device, app.mic_vad());
                 None
             }
             Effect::MicStop => {

@@ -239,7 +239,7 @@ backend = "local-whisper"
 
 ```
 whisrs setup     # Onboarding wizard (TUI): backend, key or model download, mic, service, keybinding
-whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle. Esc goes to Home, which opens Setup, Config, a Mic test (a live level meter; its w saves only [audio] device), Recordings (list, preview and transcript; retry, copy, name a speaker, summarize, delete), Profiles (switch, new, delete; l edits a profile in Config, w writing only its file) and History (what dictation typed; C clears it, asking first)
+whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle. Esc goes to Home, which opens Setup, Config, a Mic test (a live level meter and a quality line: speech level, background, SNR; its w saves only [audio] device), Recordings (list, preview and transcript; retry, copy, name a speaker, summarize, delete), Profiles (switch, new, delete; l edits a profile in Config, w writing only its file) and History (what dictation typed; C clears it, asking first)
 whisrs toggle    # Start/stop dictation (uses general.language)
 whisrs toggle -l en  # Start/stop dictation, overriding the language for this session
 whisrs cancel    # Cancel dictation, discard audio

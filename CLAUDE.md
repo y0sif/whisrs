@@ -49,7 +49,8 @@ whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs config    # full-screen config editor (TUI): every key by section, w saves (comments kept),
                  # t tests a key row; Esc goes to Home, which opens Setup, Config, the Mic
-                 # test (a live level meter; its w writes only [audio] device), Recordings
+                 # test (a live level meter and a quality line over the last 10 s, by [audio] vad;
+                 # its w writes only [audio] device), Recordings
                  # (list, preview, transcript; r c n S d are the daemon's actions), Profiles
                  # (Enter switches through the daemon, n new, d delete, e the file; l opens
                  # profile mode: rows tagged profile/base/base only, edits go into the profile,

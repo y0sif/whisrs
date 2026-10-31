@@ -83,6 +83,77 @@ fn mic_snapshots() {
     }
 }
 
+/// The quality line: the speech level, the background and the SNR, and the
+/// first warning under them; before any speech, the background alone.
+#[test]
+fn mic_quality_snapshots() {
+    use std::time::Instant;
+
+    use whisrs::audio::quality::{Check, Verdict};
+
+    use super::app::{MicEvent, Msg};
+    use super::screens::mic::analysis::{MicReading, Quality};
+
+    let reading = |quality| {
+        MicEvent::Reading(
+            MicReading {
+                rms_dbfs: -48.0,
+                peak_dbfs: -40.0,
+                quality: Some(quality),
+            },
+            Instant::now(),
+        )
+    };
+    let mut fixture = mic();
+    fixture.app.update(Msg::Mic {
+        session: 1,
+        event: reading(Quality {
+            speech_dbfs: Some(-58.0),
+            noise_dbfs: Some(-70.0),
+            snr_db: Some(12.0),
+            warning: Some(Verdict::of(Check::TooQuiet, -58.0)),
+        }),
+    });
+    for (w, h) in [(60, 18), (90, 30)] {
+        assert_snapshot(
+            &format!("mic-quality-{w}x{h}"),
+            &rows(&draw(&fixture.app, w, h)),
+        );
+    }
+    fixture.app.update(Msg::Mic {
+        session: 1,
+        event: reading(Quality {
+            speech_dbfs: None,
+            noise_dbfs: Some(-66.0),
+            snr_db: None,
+            warning: None,
+        }),
+    });
+    let drawn = rows(&draw(&fixture.app, 90, 30));
+    assert!(
+        drawn
+            .iter()
+            .any(|row| row.contains("no speech yet \u{00B7} noise -66 dBFS")),
+        "{drawn:#?}"
+    );
+}
+
+/// The quality line's detector is `[audio] vad` as edited: earshot unset.
+#[test]
+fn the_mic_test_uses_the_configured_detector() {
+    use audio_silence_gate::Vad;
+
+    assert_eq!(mockup().app.mic_vad(), Vad::Earshot);
+    assert_eq!(
+        mockup_with("\n[audio]\nvad = \"rms\"\n").app.mic_vad(),
+        Vad::Rms
+    );
+    assert_eq!(
+        mockup_with("\n[audio]\nvad = \"nope\"\n").app.mic_vad(),
+        Vad::Earshot
+    );
+}
+
 #[test]
 fn picker_and_hotkey_snapshots() {
     for (w, h) in [(60, 18), (90, 30)] {
