@@ -4,10 +4,10 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
-use tracing::warn;
 
-use crate::{OverlayConfig, State};
+use crate::State;
 
+use super::palette::Palette;
 use super::service::OverlayError;
 
 /// Gap in px between the pill and the screen edges it is placed against.
@@ -52,108 +52,6 @@ const BAR_BLOCK_W: f32 = BAR_COUNT as f32 * BAR_W + (BAR_COUNT - 1) as f32 * BAR
 const BAR_BASELINE: f32 = 6.0;
 const BAR_VPAD: f32 = 6.0;
 
-/// Color palette for one overlay theme. Bytes are stored as `[A, R, G, B]`,
-/// matching the canvas pixel layout used by [`blend_pixel`].
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Theme {
-    bg: [u8; 4],
-    ring: [u8; 4],
-    rec_bar: [u8; 4],
-    trans_bar: [u8; 4],
-    /// Read-aloud "speaking" bar color — a distinct hue from `rec_bar` so the
-    /// user can tell dictation from read-aloud at a glance.
-    speak_bar: [u8; 4],
-    glow: [u8; 4],
-}
-
-impl Theme {
-    /// Default palette — warm "tally light" amber on near-black slate.
-    const fn ember() -> Self {
-        Self {
-            bg: [235, 14, 14, 16],           // #0E0E10 @ 92%
-            ring: [64, 249, 115, 22],        // #F97316 @ 25%
-            rec_bar: [255, 249, 115, 22],    // #F97316
-            trans_bar: [255, 240, 237, 245], // #F0EDF5
-            speak_bar: [255, 52, 211, 153],  // #34D399 emerald — distinct from amber
-            glow: [60, 249, 115, 22],
-        }
-    }
-
-    /// Monochrome terminal palette — subdued, never distracting.
-    const fn carbon() -> Self {
-        Self {
-            bg: [235, 14, 14, 16],
-            ring: [80, 58, 58, 64],          // hairline gray
-            rec_bar: [255, 240, 237, 245],   // soft white
-            trans_bar: [255, 156, 163, 175], // warm gray
-            speak_bar: [255, 45, 212, 191],  // #2DD4BF teal — pops against the grays
-            glow: [40, 240, 237, 245],
-        }
-    }
-
-    /// Cool electric-blue palette — audio-equipment vibe.
-    const fn cyan() -> Self {
-        Self {
-            bg: [235, 10, 15, 20],
-            ring: [64, 34, 211, 238], // #22D3EE @ 25%
-            rec_bar: [255, 34, 211, 238],
-            trans_bar: [255, 56, 189, 248], // #38BDF8
-            speak_bar: [255, 74, 222, 128], // #4ADE80 green — distinct from cyan
-            glow: [50, 34, 211, 238],
-        }
-    }
-
-    pub(super) fn from_config(cfg: &OverlayConfig) -> Self {
-        let base = match cfg.theme.as_str() {
-            "carbon" => Self::carbon(),
-            "cyan" => Self::cyan(),
-            "ember" | "custom" => Self::ember(),
-            other => {
-                warn!("unknown overlay theme {other:?}, falling back to ember");
-                Self::ember()
-            }
-        };
-        if cfg.theme != "custom" {
-            return base;
-        }
-        let Some(c) = cfg.colors.as_ref() else {
-            return base;
-        };
-        Self {
-            bg: c
-                .background
-                .as_deref()
-                .and_then(crate::parse_hex_color)
-                .unwrap_or(base.bg),
-            ring: c
-                .ring
-                .as_deref()
-                .and_then(crate::parse_hex_color)
-                .unwrap_or(base.ring),
-            rec_bar: c
-                .recording
-                .as_deref()
-                .and_then(crate::parse_hex_color)
-                .unwrap_or(base.rec_bar),
-            trans_bar: c
-                .transcribing
-                .as_deref()
-                .and_then(crate::parse_hex_color)
-                .unwrap_or(base.trans_bar),
-            speak_bar: c
-                .speaking
-                .as_deref()
-                .and_then(crate::parse_hex_color)
-                .unwrap_or(base.speak_bar),
-            glow: c
-                .glow
-                .as_deref()
-                .and_then(crate::parse_hex_color)
-                .unwrap_or(base.glow),
-        }
-    }
-}
-
 pub(super) struct OverlayRenderer {
     state_rx: mpsc::Receiver<State>,
     level_rx: mpsc::Receiver<f32>,
@@ -185,7 +83,7 @@ pub(super) struct OverlayRenderer {
     level_velocity: f32,
     /// Wall-clock instant of the previous spring step.
     last_update: Instant,
-    theme: Theme,
+    theme: Palette,
     /// Pill sits at the top of the screen: anchor the grow to the surface's
     /// top edge instead of its bottom.
     from_top: bool,
@@ -223,7 +121,7 @@ impl OverlayRenderer {
         level_rx: mpsc::Receiver<f32>,
         width: u32,
         height: u32,
-        theme: Theme,
+        theme: Palette,
         from_top: bool,
     ) -> Result<Self, OverlayError> {
         let pixmap = Pixmap::new(width, height).ok_or(OverlayError::Pixmap(width, height))?;
@@ -436,7 +334,7 @@ fn draw_overlay(
     frame: u32,
     level: f32,
     anim: AnimState,
-    theme: &Theme,
+    theme: &Palette,
     from_top: bool,
 ) {
     pixmap.fill(Color::TRANSPARENT);
@@ -594,7 +492,7 @@ fn taper_factor(i: u32, count: u32) -> f32 {
 /// speech reaches near the pill edge.
 fn draw_bars(
     pixmap: &mut Pixmap,
-    theme: &Theme,
+    theme: &Palette,
     bar_color: [u8; 4],
     level: f32,
     anim: AnimState,
@@ -667,7 +565,7 @@ fn draw_bars(
 /// Transcribing state: no audio level, just a center-out shimmer that
 /// travels across the bar row to communicate "working on it" without
 /// flat staticness.
-fn draw_sweep(pixmap: &mut Pixmap, theme: &Theme, frame: u32, anim: AnimState, pill_cy: f32) {
+fn draw_sweep(pixmap: &mut Pixmap, theme: &Palette, frame: u32, anim: AnimState, pill_cy: f32) {
     let surface_w = pixmap.width() as f32;
     let max_h = (anim.pill_height - BAR_VPAD * 2.0).max(BAR_BASELINE + 2.0);
     let bar_x_start = (surface_w - BAR_BLOCK_W) / 2.0;
@@ -748,7 +646,7 @@ mod tests {
     #[test]
     fn idle_draw_is_transparent() {
         let mut pm = fresh_pixmap();
-        let t = Theme::ember();
+        let t = Palette::ember();
         draw_overlay(&mut pm, State::Idle, 0, 0.0, hidden(), &t, false);
         assert!(pm.data().iter().all(|b| *b == 0));
     }
@@ -756,7 +654,7 @@ mod tests {
     #[test]
     fn faded_out_draw_is_transparent() {
         let mut pm = fresh_pixmap();
-        let t = Theme::ember();
+        let t = Palette::ember();
         draw_overlay(&mut pm, State::Recording, 0, 1.0, hidden(), &t, false);
         assert!(pm.data().iter().all(|b| *b == 0));
     }
@@ -764,7 +662,7 @@ mod tests {
     #[test]
     fn active_draw_has_visible_pixels() {
         let mut pm = fresh_pixmap();
-        let t = Theme::ember();
+        let t = Palette::ember();
         draw_overlay(&mut pm, State::Recording, 0, 1.0, shown(), &t, false);
         // tiny-skia stores premultiplied RGBA; alpha lives in the 4th byte.
         assert!(pm.data().as_chunks::<4>().0.iter().any(|px| px[3] != 0));
@@ -787,7 +685,7 @@ mod tests {
                 .iter()
                 .any(|px| px[3] != 0)
         };
-        let t = Theme::ember();
+        let t = Palette::ember();
 
         let mut bottom = fresh_pixmap();
         draw_overlay(&mut bottom, State::Recording, 0, 0.0, growing, &t, false);
@@ -812,7 +710,7 @@ mod tests {
                 .count()
         }
 
-        let t = Theme::ember();
+        let t = Palette::ember();
         let mut rec = fresh_pixmap();
         let mut spk = fresh_pixmap();
         draw_overlay(&mut rec, State::Recording, 0, 1.0, shown(), &t, false);
@@ -829,7 +727,7 @@ mod tests {
     #[test]
     fn synthesizing_draws_visible_pixels() {
         let mut pm = fresh_pixmap();
-        let t = Theme::ember();
+        let t = Palette::ember();
         draw_overlay(&mut pm, State::Synthesizing, 0, 0.0, shown(), &t, false);
         assert!(pm.data().as_chunks::<4>().0.iter().any(|px| px[3] != 0));
     }
@@ -839,7 +737,7 @@ mod tests {
     fn renderer() -> (mpsc::Sender<State>, mpsc::Sender<f32>, OverlayRenderer) {
         let (state_tx, state_rx) = mpsc::channel();
         let (level_tx, level_rx) = mpsc::channel();
-        let r = OverlayRenderer::new(state_rx, level_rx, W, H, Theme::ember(), false).unwrap();
+        let r = OverlayRenderer::new(state_rx, level_rx, W, H, Palette::ember(), false).unwrap();
         (state_tx, level_tx, r)
     }
 
@@ -926,7 +824,7 @@ mod tests {
                 .count()
         }
 
-        let t = Theme::ember();
+        let t = Palette::ember();
         let mut quiet = fresh_pixmap();
         let mut loud = fresh_pixmap();
         draw_overlay(&mut quiet, State::Recording, 0, 0.0, shown(), &t, false);

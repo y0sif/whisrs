@@ -201,7 +201,14 @@ fi
 step 5 "Running whisrs setup..."
 
 echo ""
-/usr/local/bin/whisrs setup
+# Setup is a full-screen TUI and needs the terminal on stdin; under
+# `curl | bash` stdin is the pipe, so it reads the terminal instead.
+if [ -t 1 ] && (exec </dev/tty) 2>/dev/null; then
+    /usr/local/bin/whisrs setup </dev/tty
+else
+    warn "No terminal to run setup in."
+    echo "  Run it yourself: whisrs setup"
+fi
 
 if service_is_active; then
     /usr/local/bin/whisrs restart || true

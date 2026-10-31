@@ -76,6 +76,10 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+The `whisrs config` TUI's render tests compare each screen with a snapshot of its
+rows in `src/cli/tui/snapshots/`. After a change to a screen that is meant, rewrite them
+with `WHISRS_UPDATE_SNAPSHOTS=1 cargo test --bin whisrs` and read the diff.
+
 ### Running locally
 
 ```bash
@@ -102,8 +106,15 @@ src/
   window/              — compositor-specific window tracking
   hotkey/              — evdev hotkey listener + spec parsing
   tray/, overlay/      — tray icon and recording overlay (feature-gated)
-  config/              — interactive setup and config editor
 ```
+
+`src/config/` holds the config types and their validation, the load and format-preserving
+write, and `src/config/setup/`: the side effects of `whisrs setup` (uinput, the service,
+the keybinding, the GNOME extension, the model download, the microphone probe, the API key
+test) as plain functions that neither print nor ask, their programs and network injected
+in tests. The `whisrs config` and `whisrs setup` TUI is in `src/cli/tui/`, in the CLI binary
+so whisrsd never links ratatui: screens (Home, Config, the setup wizard, Mic), widgets, and
+the schema of every config key. It reads and writes config.toml through `src/config/`.
 
 Injection policy stays in the daemon (`inject_text` and friends in `src/daemon/main.rs`),
 but the primitives it calls live in the `xkb-type` workspace crate, alongside four other

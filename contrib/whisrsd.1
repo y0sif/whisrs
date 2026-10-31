@@ -18,7 +18,8 @@ systemd user service.
 On startup, the daemon:
 .IP \(bu 2
 Loads configuration from
-.IR ~/.config/whisrs/config.toml
+.IR ~/.config/whisrs/config.toml ,
+with the active config profile merged over it (see PROFILES)
 .IP \(bu 2
 Checks /dev/uinput access for virtual keyboard
 .IP \(bu 2
@@ -55,6 +56,54 @@ Read-aloud: generating speech from the selected text.
 .TP
 .B speaking
 Read-aloud: playing synthesized speech; a second speak or a cancel stops it.
+.SH PROFILES
+A config profile is a partial
+.I config.toml
+in
+.IR ~/.config/whisrs/profiles/NAME.toml .
+The active one is named on one line of
+.I $XDG_STATE_HOME/whisrs/active\-profile
+(no file, or
+.BR base :
+the base config alone). At startup its tables merge over
+.I config.toml
+key by key, and any other value replaces the base one, before the
+unknown\-key check and validation;
+.I vocabulary.txt
+merges after. API keys,
+.BR [hotkeys] ,
+.BR [[llm_commands]] ,
+.B [[agents]]
+and
+.B [recording] dir
+stay in the base: a profile's are ignored, with a warning. A profile that is
+missing, not valid TOML, or does not load or validate over the base is
+warned about and notified, and the daemon runs on the base.
+.PP
+.B whisrs profile
+(or
+.BR "[hotkeys] next_profile" ,
+or the tray's Profile menu) switches: refused unless dictation, read\-aloud,
+recordings and agent turns are idle, and when the profile would not load.
+A switch to base is refused too while
+.I config.toml
+does not load. Otherwise the daemon writes the active name, notifies,
+answers, and restarts on it: through its service when it runs as one
+(systemd:
+.BR whisrs.service ,
+the restart queued with
+.BR \-\-no\-block ;
+OpenRC:
+.BR RC_SVCNAME=whisrs ),
+else by starting itself again in place, with the same arguments, after the
+shutdown SIGTERM runs (a recording in progress is finalized), from the
+binary its path names now, so an upgrade takes effect. Until the restart,
+anything that would start a dictation, command mode, a read\-aloud, a
+recording or a job on one, or an agent turn is refused with
+.BR "switching profile: try again in a moment" ,
+and agent replies wait. When something started anyway, or the restart
+fails, the previous name comes back and a notification says why. The tray's
+Restart Daemon restarts the same way.
 .SH TRANSCRIPTION BACKENDS
 .TP
 .B groq
@@ -144,6 +193,13 @@ Used to detect X11 session for window tracking.
 .TP
 .I ~/.config/whisrs/config.toml
 Configuration file.
+.TP
+.I ~/.config/whisrs/profiles/NAME.toml
+Config profiles (see PROFILES).
+.TP
+.I $XDG_STATE_HOME/whisrs/active\-profile
+The active profile's name (defaults to
+.IR ~/.local/state/whisrs/active\-profile ).
 .TP
 .I $XDG_RUNTIME_DIR/whisrs.sock
 IPC socket.

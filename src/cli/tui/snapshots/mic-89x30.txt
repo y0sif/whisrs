@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+   ╭─────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                           mic · ●  │
+   │                                                                                 │
+   │ ▌ device  ◂ default ▸                                                           │
+   │                                                                                 │
+   │   format  48000 Hz, 2 channels, captured as 16000 Hz mono                       │
+   │                                                                                 │
+   │   level   ████████┊██████████████████████████████─────┃──────────   -18 dBFS    │
+   │           gate -50 · peak -12 dBFS                                              │
+   │                                                                                 │
+   │   Say a sentence. The bar passes the gate while you talk and drops under it     │
+   │   when you stop.                                                                │
+   │                                                                                 │
+   │   ! unknown key [general] silense_timeout_ms is ignored                         │
+   ╰─────────────────────────────────────────────────────────────────────────────────╯
+     h/l device · enter pick · w save device · esc back · ? help
+
+
+
+
+
+
+

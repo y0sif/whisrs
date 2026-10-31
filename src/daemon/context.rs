@@ -243,6 +243,14 @@ impl StateBus {
         });
     }
 
+    /// The raw state as last published. It can lag the state machine: not
+    /// every transition is published as it happens (the command-mode and
+    /// LLM-command claims move Recording to Transcribing unpublished), so
+    /// `info` reads it only while the dictation lock is held, and says so.
+    pub(crate) fn raw(&self) -> State {
+        *self.raw.borrow()
+    }
+
     pub(crate) fn subscribe_raw(&self) -> watch::Receiver<State> {
         self.raw.subscribe()
     }
@@ -290,6 +298,10 @@ pub(crate) struct DaemonContext {
     /// An agent overlay is on screen (set by its host once it shows): the
     /// agent's progress toasts are then left out ([`Self::notify_agent_state`]).
     pub(crate) agent_overlay_shown: AtomicBool,
+    /// When this whisrsd started, in Unix milliseconds, for `info`.
+    pub(crate) started_at: u64,
+    /// The config profile it runs on, and `switch-profile`'s state.
+    pub(crate) profile: crate::profile::ProfileRuntime,
 }
 
 impl DaemonContext {

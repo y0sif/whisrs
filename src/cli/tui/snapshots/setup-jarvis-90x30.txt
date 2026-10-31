@@ -1,0 +1,30 @@
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                    setup 10/12 · ○  │
+   │                                                                                  │
+   │   Jarvis (optional)                                                              │
+   │   Press a hotkey and talk to a coding agent (Claude Code, OpenCode, Codex or     │
+   │   Copilot) working in a folder of yours. Read aloud is not on, so you would not  │
+   │   hear its replies.                                                              │
+   │                                                                                  │
+   │ ▌ name             jarvis                                                        │
+   │   harness          claude not on PATH                                            │
+   │   dir              not set                                                       │
+   │   permissions      auto                                                          │
+   │   feedback         brief                                                         │
+   │   hotkey           not set                                                       │
+   │   new session key  not set                                                       │
+   │                                                                                  │
+   │   Used by whisrs agent <name>: a-z, 0-9, _ and -.                                │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     space type · enter next · s skip · backspace back · esc leave
+
+
+
+
+
+

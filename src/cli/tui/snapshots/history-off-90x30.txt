@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                        history · ●  │
+   │                                                                                  │
+   │   History is off: new dictations are not kept. C clears these.                   │
+   │                                                                                  │
+   │ ▌ Oct 30 14:02    1.9s  local-whisper       Ship the TUI this week.              │
+   │   Oct 30 11:40   14.8s  deepgram-streaming  The parser keeps the comments and …  │
+   │   Oct 29 09:15    2.4s  groq                Remind me to book the van for Frid…  │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k move · enter open · / filter · C clear · esc back · ? help
+
+
+
+
+
+
+
+
+

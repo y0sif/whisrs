@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                       profiles · ●  │
+   │                                                                                  │
+   │   whisrsd runs on base; offline applies when it restarts                         │
+   │                                                                                  │
+   │     base   ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓            │
+   │     broken ┃ Delete profile work? profiles/work.toml goes for good. ┃            │
+   │   ● offline┃                                                        ┃            │
+   │ ▌   work   ┃ y delete · n keep                                      ┃            │
+   │            ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛            │
+   │                           hotkeys (base only, ignored)                           │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     enter switch · l edit · n new · d delete · e $EDITOR · esc back · ? help
+
+
+
+
+
+
+
+

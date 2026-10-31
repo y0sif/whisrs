@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                        history · ●  │
+   │                                                                                  │
+   │   History is off, so dictations are not kept. Config > General > history turns   │
+   │   it on.                                                                         │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     esc back · ? help
+
+
+
+
+
+
+
+
+
+
+

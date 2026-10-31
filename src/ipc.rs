@@ -1,11 +1,13 @@
 //! IPC protocol: CLI↔daemon commands, responses, socket path, and wire framing.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::agent::{AgentAction, AgentInfo};
 use crate::history;
-use crate::recording::{RecordingAction, RecordingOptions, RecordingStatus};
+use crate::recording::{RecordingAction, RecordingOptions, RecordingPhase, RecordingStatus};
 
 // ---------------------------------------------------------------------------
 // IPC protocol
@@ -26,6 +28,9 @@ pub enum Command {
     },
     Cancel,
     Status,
+    /// What the daemon is and does ([`DaemonInfo`]). Newer than `status`, so
+    /// a client falls back to `status` when an older daemon hangs up on it.
+    Info,
     /// Retrieve recent transcription history.
     Log {
         #[serde(default = "default_log_limit")]
@@ -101,6 +106,14 @@ pub enum Command {
         #[serde(flatten)]
         options: RecordingOptions,
     },
+    /// Switch the config profile (`config::profile`): a profile's name,
+    /// `base`, or `None` for the next one. The daemon checks it loads, writes
+    /// the active name and restarts on it; refused unless everything is idle.
+    #[serde(rename = "switch-profile")]
+    SwitchProfile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 fn default_log_limit() -> usize {
@@ -129,6 +142,97 @@ pub enum Response {
     Agents {
         agents: Vec<AgentInfo>,
     },
+    /// The answer to `info`.
+    Info {
+        info: DaemonInfo,
+    },
+    /// The answer to `switch-profile`: the profile switched to (`base` for
+    /// the base config). `switching` when the daemon restarts on it now,
+    /// false when it was already on it. `skipped`: the profiles `next`
+    /// passed over on the way, which do not load.
+    Profile {
+        active: String,
+        #[serde(default)]
+        switching: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped: Vec<String>,
+    },
+}
+
+/// What `info` answers. Every field has a default, so a field added later is
+/// additive: an answer without it still parses, and a client that does not
+/// know it ignores it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonInfo {
+    /// The whisrsd version.
+    pub version: String,
+    /// The dictation state, as `status` answers it. `None` when a later
+    /// daemon names a state this client does not know: the rest of the
+    /// answer still parses.
+    #[serde(deserialize_with = "known_variant")]
+    pub state: Option<State>,
+    /// The recording feature's phase: always idle in a build without it.
+    /// `None` for a phase this client does not know, as `state`.
+    #[serde(deserialize_with = "known_variant")]
+    pub recording: Option<RecordingPhase>,
+    /// The config profile this whisrsd runs on: `None` is base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Why the active profile did not load, as the line clients show
+    /// (`config::profile::not_loaded`): the daemon runs on base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_error: Option<String>,
+    /// `[general] backend` as configured.
+    pub backend: String,
+    /// The cargo features this whisrsd was built with ([`built_features`]).
+    pub features: Vec<String>,
+    /// When this whisrsd started, in Unix milliseconds: a client that sees
+    /// it change knows the daemon restarted.
+    pub started_at: u64,
+    /// Something `info` does not wait for was mid-change when asked, and
+    /// the daemon counts as busy: the dictation lock was held (a dictation
+    /// starting, a command running; `state` is then the last one published,
+    /// which can lag), or the agent runtime's lock, or a recording start or
+    /// stop was under way.
+    pub busy: bool,
+    /// An agent turn runs, or is on its way to start: a restart stops it.
+    pub agent_turn: bool,
+}
+
+/// A field of [`DaemonInfo`] that an enum fills: its variant, or `None` for
+/// one this client does not know. A later daemon's new state or phase must
+/// not fail the whole answer, which `info` exists to keep additive.
+fn known_variant<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+/// Every cargo feature of whisrs and whether this build has it, in
+/// `Cargo.toml` order.
+const FEATURES: [(&str, bool); 9] = [
+    ("local-whisper", cfg!(feature = "local-whisper")),
+    ("tray", cfg!(feature = "tray")),
+    ("overlay", cfg!(feature = "overlay")),
+    ("hooks", cfg!(feature = "hooks")),
+    ("recording", cfg!(feature = "recording")),
+    ("mcp", cfg!(feature = "mcp")),
+    ("vulkan", cfg!(feature = "vulkan")),
+    ("cuda", cfg!(feature = "cuda")),
+    ("hipblas", cfg!(feature = "hipblas")),
+];
+
+/// The cargo features this build has, for [`DaemonInfo::features`].
+pub fn built_features() -> Vec<String> {
+    FEATURES
+        .iter()
+        .filter(|(_, built)| *built)
+        .map(|(name, _)| name.to_string())
+        .collect()
 }
 
 impl Command {
@@ -163,9 +267,10 @@ impl Command {
 }
 
 /// Daemon state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
+    #[default]
     Idle,
     Recording,
     Transcribing,
@@ -264,6 +369,9 @@ pub fn validate_language_override(lang: &str) -> Result<String, String> {
 // IPC wire helpers
 // ---------------------------------------------------------------------------
 
+/// The largest frame either side reads; a longer length prefix is refused.
+const MAX_MESSAGE_LEN: usize = 1024 * 1024;
+
 /// Encode a message as a length-prefixed JSON frame (4-byte big-endian length + JSON bytes).
 pub fn encode_message<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
     let json = serde_json::to_vec(msg)?;
@@ -282,11 +390,178 @@ pub async fn read_message<T: serde::de::DeserializeOwned>(
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
-    anyhow::ensure!(len <= 1024 * 1024, "message too large: {len} bytes");
+    anyhow::ensure!(len <= MAX_MESSAGE_LEN, "message too large: {len} bytes");
 
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
     Ok(serde_json::from_slice(&body)?)
+}
+
+// ---------------------------------------------------------------------------
+// Blocking client
+// ---------------------------------------------------------------------------
+
+/// Why [`request_blocking`] has no answer.
+#[derive(Debug, thiserror::Error)]
+pub enum RequestError {
+    /// Nothing answers at the socket: whisrsd is not running.
+    #[error("whisrsd is not running ({0})")]
+    NotRunning(io::Error),
+    /// The daemon hung up without answering. A daemon older than the command
+    /// does that with one it cannot parse.
+    #[error("whisrsd closed the connection without answering")]
+    Closed,
+    /// No answer within the timeout.
+    #[error("whisrsd did not answer in time")]
+    TimedOut,
+    /// The daemon answered with an error.
+    #[error("{0}")]
+    Daemon(String),
+    /// The socket failed otherwise, or the answer was not a response.
+    #[error("IPC error: {0}")]
+    Io(io::Error),
+}
+
+impl RequestError {
+    fn from_io(e: io::Error) -> Self {
+        match e.kind() {
+            ErrorKind::WouldBlock | ErrorKind::TimedOut => Self::TimedOut,
+            _ => Self::Io(e),
+        }
+    }
+}
+
+/// Send `cmd` to the daemon and wait for its answer on a blocking socket, for
+/// a caller without a tokio runtime. Same framing as [`encode_message`] and
+/// [`read_message`]. `timeout` bounds each read and write; `None` waits as
+/// long as the daemon takes.
+///
+/// The connect is not bounded: a daemon that stopped accepting, with its
+/// listen backlog full, blocks it for good. A caller that must stay
+/// responsive (the TUI) calls this from a thread of its own, never from the
+/// loop that draws and reads keys.
+pub fn request_blocking(
+    cmd: &Command,
+    timeout: Option<Duration>,
+) -> Result<Response, RequestError> {
+    request_blocking_at(&socket_path(), cmd, timeout)
+}
+
+/// [`request_blocking`] against an explicit socket (testable).
+pub fn request_blocking_at(
+    path: &Path,
+    cmd: &Command,
+    timeout: Option<Duration>,
+) -> Result<Response, RequestError> {
+    use std::io::Write as _;
+
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(path).map_err(RequestError::NotRunning)?;
+    stream.set_read_timeout(timeout).map_err(RequestError::Io)?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(RequestError::Io)?;
+    let frame = encode_message(cmd).map_err(|e| RequestError::Io(io::Error::other(e)))?;
+    stream.write_all(&frame).map_err(RequestError::from_io)?;
+    // As the async client does: nothing more is coming.
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(RequestError::from_io)?;
+    read_response_blocking(&mut stream)
+}
+
+/// Read one response frame. A connection closed before its length prefix is
+/// [`RequestError::Closed`].
+fn read_response_blocking(reader: &mut impl io::Read) -> Result<Response, RequestError> {
+    let mut len_buf = [0u8; 4];
+    reader
+        .read_exact(&mut len_buf)
+        .map_err(|e| match e.kind() {
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset => RequestError::Closed,
+            _ => RequestError::from_io(e),
+        })?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_LEN {
+        return Err(RequestError::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("message too large: {len} bytes"),
+        )));
+    }
+    let mut body = vec![0u8; len];
+    reader
+        .read_exact(&mut body)
+        .map_err(RequestError::from_io)?;
+    serde_json::from_slice(&body).map_err(|e| RequestError::Io(e.into()))
+}
+
+/// What [`request_info_blocking`] learned about the daemon.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InfoAnswer {
+    /// A daemon that knows `info`.
+    Info(DaemonInfo),
+    /// A daemon older than `info`: it hung up on it and answered `status`,
+    /// so only its state is known.
+    Older(State),
+}
+
+impl InfoAnswer {
+    /// The dictation state, which every daemon reports: `None` only for a
+    /// state this client does not know ([`DaemonInfo::state`]).
+    pub fn state(&self) -> Option<State> {
+        match self {
+            Self::Info(info) => info.state,
+            Self::Older(state) => Some(*state),
+        }
+    }
+}
+
+/// Ask the daemon for its dictation state with `status`, which every daemon
+/// knows. `whisrs status` uses this rather than `info`: a daemon older than
+/// `info` logs an error for each `info` it cannot parse.
+pub fn request_status_blocking(timeout: Option<Duration>) -> Result<State, RequestError> {
+    request_status_blocking_at(&socket_path(), timeout)
+}
+
+/// [`request_status_blocking`] against an explicit socket (testable).
+pub fn request_status_blocking_at(
+    path: &Path,
+    timeout: Option<Duration>,
+) -> Result<State, RequestError> {
+    match request_blocking_at(path, &Command::Status, timeout)? {
+        Response::Ok { state } => Ok(state),
+        Response::Error { message } => Err(RequestError::Daemon(message)),
+        _ => Err(RequestError::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            "unexpected answer to status",
+        ))),
+    }
+}
+
+/// Ask the daemon for its [`DaemonInfo`]. A daemon older than `info` closes
+/// the connection without answering; it is then asked `status`, which every
+/// daemon knows.
+pub fn request_info_blocking(timeout: Option<Duration>) -> Result<InfoAnswer, RequestError> {
+    request_info_blocking_at(&socket_path(), timeout)
+}
+
+/// [`request_info_blocking`] against an explicit socket (testable).
+pub fn request_info_blocking_at(
+    path: &Path,
+    timeout: Option<Duration>,
+) -> Result<InfoAnswer, RequestError> {
+    let response = match request_blocking_at(path, &Command::Info, timeout) {
+        Err(RequestError::Closed) => request_blocking_at(path, &Command::Status, timeout)?,
+        answer => answer?,
+    };
+    match response {
+        Response::Info { info } => Ok(InfoAnswer::Info(info)),
+        Response::Ok { state } => Ok(InfoAnswer::Older(state)),
+        Response::Error { message } => Err(RequestError::Daemon(message)),
+        _ => Err(RequestError::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            "unexpected answer to info",
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -701,6 +976,74 @@ mod tests {
         assert_eq!(id.as_deref(), Some("last"));
     }
 
+    /// `exact` goes on the wire only when set, so a message without it (the
+    /// CLI's) is as before, and reads back as false when left out.
+    #[test]
+    fn recording_exact_is_sent_only_when_set() {
+        let plain = Command::Recording {
+            action: RecordingAction::Copy,
+            title: None,
+            id: Some("2026-10-27_1402_standup".to_string()),
+            options: RecordingOptions::default(),
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"cmd":"recording","action":"copy","id":"2026-10-27_1402_standup"}"#
+        );
+        let exact = Command::Recording {
+            action: RecordingAction::Copy,
+            title: None,
+            id: Some("2026-10-27_1402_standup".to_string()),
+            options: RecordingOptions {
+                exact: true,
+                ..RecordingOptions::default()
+            },
+        };
+        let json = serde_json::to_string(&exact).unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"recording","action":"copy","id":"2026-10-27_1402_standup","exact":true}"#
+        );
+        let Command::Recording { options, .. } = serde_json::from_str(&json).unwrap() else {
+            panic!("not a recording command");
+        };
+        assert!(options.exact);
+        // A field the options do not know is ignored, as an older daemon
+        // ignores `exact`.
+        let Command::Recording { options, .. } =
+            serde_json::from_str(r#"{"cmd":"recording","action":"copy","id":"x","later":1}"#)
+                .unwrap()
+        else {
+            panic!("not a recording command");
+        };
+        assert_eq!(options, RecordingOptions::default());
+    }
+
+    /// `delete` is an action of its own and carries the full id.
+    #[test]
+    fn recording_delete_roundtrip() {
+        let json = r#"{"cmd":"recording","action":"delete","id":"2026-10-27_1402_standup"}"#;
+        let Command::Recording {
+            action,
+            title,
+            id,
+            options,
+        } = serde_json::from_str(json).unwrap()
+        else {
+            panic!("not a recording command");
+        };
+        assert_eq!(action, RecordingAction::Delete);
+        assert_eq!(id.as_deref(), Some("2026-10-27_1402_standup"));
+        let back = serde_json::to_string(&Command::Recording {
+            action,
+            title,
+            id,
+            options,
+        })
+        .unwrap();
+        assert_eq!(back, json);
+    }
+
     #[test]
     fn recording_response_roundtrip() {
         let status = RecordingStatus {
@@ -859,5 +1202,328 @@ mod tests {
         );
         let parsed: Response = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Response::Agents { agents } if agents.len() == 1));
+    }
+
+    fn sample_info() -> DaemonInfo {
+        DaemonInfo {
+            version: "0.2.0".to_string(),
+            state: Some(State::Recording),
+            recording: Some(RecordingPhase::Processing),
+            profile: None,
+            profile_error: None,
+            backend: "deepgram-streaming".to_string(),
+            features: vec!["tray".to_string(), "recording".to_string()],
+            started_at: 1_793_000_000_000,
+            busy: true,
+            agent_turn: false,
+        }
+    }
+
+    #[test]
+    fn info_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&Command::Info).unwrap(),
+            r#"{"cmd":"info"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Command>(r#"{"cmd":"info"}"#).unwrap(),
+            Command::Info
+        ));
+
+        let resp = Response::Info {
+            info: sample_info(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"info","info":{"version":"0.2.0","state":"recording","recording":"processing","backend":"deepgram-streaming","features":["tray","recording"],"started_at":1793000000000,"busy":true,"agent_turn":false}}"#
+        );
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::Info { info } if info == sample_info()));
+    }
+
+    /// `switch-profile` names the profile, or leaves it out for the next one.
+    #[test]
+    fn switch_profile_wire_format() {
+        for (cmd, json) in [
+            (
+                Command::SwitchProfile {
+                    name: Some("offline".into()),
+                },
+                r#"{"cmd":"switch-profile","name":"offline"}"#,
+            ),
+            (
+                Command::SwitchProfile { name: None },
+                r#"{"cmd":"switch-profile"}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&cmd).unwrap(), json);
+            let parsed: Command = serde_json::from_str(json).unwrap();
+            assert_eq!(format!("{parsed:?}"), format!("{cmd:?}"));
+        }
+
+        let resp = Response::Profile {
+            active: "offline".into(),
+            switching: true,
+            skipped: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"profile","active":"offline","switching":true}"#
+        );
+        let resp = Response::Profile {
+            active: "clean".into(),
+            switching: true,
+            skipped: vec!["broken".into()],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"profile","active":"clean","switching":true,"skipped":["broken"]}"#
+        );
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::Profile { skipped, .. } if skipped == ["broken"]));
+        let parsed: Response = serde_json::from_str(r#"{"status":"profile","active":"base"}"#)
+            .expect("switching defaults");
+        assert!(matches!(
+            parsed,
+            Response::Profile { active, switching: false, skipped } if active == "base" && skipped.is_empty()
+        ));
+    }
+
+    /// `info` names the profile, and why one did not load; on base it sends
+    /// neither, so its answer reads as before.
+    #[test]
+    fn info_carries_the_profile() {
+        let info = DaemonInfo {
+            profile: Some("offline".into()),
+            ..sample_info()
+        };
+        let json = serde_json::to_string(&Response::Info { info: info.clone() }).unwrap();
+        assert!(json.contains(r#""recording":"processing","profile":"offline","backend""#));
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::Info { info: back } if back == info));
+
+        let why = "profile offline did not load, using base: profiles/offline.toml does not exist";
+        let parsed: Response = serde_json::from_str(&format!(
+            r#"{{"status":"info","info":{{"profile_error":"{why}"}}}}"#
+        ))
+        .unwrap();
+        let Response::Info { info } = parsed else {
+            panic!("not an info response: {parsed:?}");
+        };
+        assert_eq!(
+            (info.profile, info.profile_error.as_deref()),
+            (None, Some(why))
+        );
+
+        let base = serde_json::to_string(&sample_info()).unwrap();
+        assert!(!base.contains("profile"), "{base}");
+    }
+
+    /// Fields come and go additively: a missing one takes its default, and
+    /// one this client does not know (a later daemon's) is ignored.
+    #[test]
+    fn info_fields_are_additive() {
+        let empty: Response = serde_json::from_str(r#"{"status":"info","info":{}}"#).unwrap();
+        assert!(matches!(empty, Response::Info { info } if info == DaemonInfo::default()));
+
+        let later: Response =
+            serde_json::from_str(r#"{"status":"info","info":{"state":"speaking","uptime_ms":12}}"#)
+                .unwrap();
+        let Response::Info { info } = later else {
+            panic!("not an info response: {later:?}");
+        };
+        assert_eq!(info.state, Some(State::Speaking));
+        assert_eq!(info.recording, None);
+    }
+
+    /// A state or phase this client does not know (a later daemon's) is
+    /// `None`, and the rest of the answer still parses: `info` stays
+    /// additive for its enum fields too.
+    #[test]
+    fn an_unknown_state_or_phase_is_none() {
+        let later: Response = serde_json::from_str(
+            r#"{"status":"info","info":{"version":"9.0.0","state":"dancing","recording":"paused","backend":"groq"}}"#,
+        )
+        .unwrap();
+        let Response::Info { info } = later else {
+            panic!("not an info response: {later:?}");
+        };
+        assert_eq!(info.version, "9.0.0");
+        assert_eq!(info.state, None);
+        assert_eq!(info.recording, None);
+        assert_eq!(info.backend, "groq");
+        assert_eq!(InfoAnswer::Info(info).state(), None);
+
+        let null: DaemonInfo = serde_json::from_str(r#"{"state":null,"recording":7}"#).unwrap();
+        assert_eq!((null.state, null.recording), (None, None));
+    }
+
+    /// The feature list names every feature in `Cargo.toml`, so one added
+    /// there cannot go missing from `info`.
+    #[test]
+    fn built_features_cover_every_cargo_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        let section = manifest
+            .split("\n[features]\n")
+            .nth(1)
+            .expect("Cargo.toml has a [features] section")
+            .split("\n[")
+            .next()
+            .unwrap();
+        let declared: Vec<&str> = section
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_once(" = ").map(|(name, _)| name))
+            .filter(|name| *name != "default")
+            .collect();
+        let listed: Vec<&str> = FEATURES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(listed, declared);
+        assert_eq!(
+            built_features().contains(&"recording".to_string()),
+            cfg!(feature = "recording")
+        );
+    }
+
+    /// A stand-in daemon on a socket in a temp dir. Each connection reads one
+    /// frame and is answered with the next of `answers`, or closed without
+    /// an answer for `None`, as a daemon that cannot parse the command does.
+    /// The thread returns the `cmd` of every frame it read.
+    fn fake_daemon(
+        answers: Vec<Option<Response>>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whisrs.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for answer in answers {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut len = [0u8; 4];
+                stream.read_exact(&mut len).unwrap();
+                let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+                stream.read_exact(&mut body).unwrap();
+                let cmd: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                seen.push(cmd["cmd"].as_str().unwrap_or_default().to_string());
+                if let Some(answer) = answer {
+                    stream.write_all(&encode_message(&answer).unwrap()).unwrap();
+                }
+            }
+            seen
+        });
+        (dir, path, daemon)
+    }
+
+    const TIMEOUT: Option<Duration> = Some(Duration::from_secs(5));
+
+    #[test]
+    fn info_round_trips_over_the_socket() {
+        let (_dir, path, daemon) = fake_daemon(vec![Some(Response::Info {
+            info: sample_info(),
+        })]);
+        let answer = request_info_blocking_at(&path, TIMEOUT).unwrap();
+        assert_eq!(answer, InfoAnswer::Info(sample_info()));
+        assert_eq!(answer.state(), Some(State::Recording));
+        assert_eq!(daemon.join().unwrap(), vec!["info"]);
+    }
+
+    /// A daemon older than `info` hangs up on it; the client then asks
+    /// `status` and reports the state alone.
+    #[test]
+    fn an_older_daemon_is_asked_status_instead() {
+        let (_dir, path, daemon) = fake_daemon(vec![
+            None,
+            Some(Response::Ok {
+                state: State::Transcribing,
+            }),
+        ]);
+        let answer = request_info_blocking_at(&path, TIMEOUT).unwrap();
+        assert_eq!(answer, InfoAnswer::Older(State::Transcribing));
+        assert_eq!(answer.state(), Some(State::Transcribing));
+        assert_eq!(daemon.join().unwrap(), vec!["info", "status"]);
+    }
+
+    /// `whisrs status` asks `status` alone, never `info`: a daemon older
+    /// than `info` would log an error for each one.
+    #[test]
+    fn status_asks_status_only() {
+        let (_dir, path, daemon) = fake_daemon(vec![Some(Response::Ok {
+            state: State::Recording,
+        })]);
+        assert_eq!(
+            request_status_blocking_at(&path, TIMEOUT).unwrap(),
+            State::Recording
+        );
+        assert_eq!(daemon.join().unwrap(), vec!["status"]);
+
+        let (_dir, path, daemon) = fake_daemon(vec![Some(Response::Error {
+            message: "busy".to_string(),
+        })]);
+        assert!(matches!(
+            request_status_blocking_at(&path, TIMEOUT),
+            Err(RequestError::Daemon(message)) if message == "busy"
+        ));
+        daemon.join().unwrap();
+    }
+
+    /// The hang-up is told apart from the other failures, which are what the
+    /// fallback must not hide.
+    #[test]
+    fn request_errors_say_what_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("whisrs.sock");
+        assert!(matches!(
+            request_blocking_at(&absent, &Command::Status, TIMEOUT),
+            Err(RequestError::NotRunning(_))
+        ));
+        assert!(matches!(
+            request_info_blocking_at(&absent, TIMEOUT),
+            Err(RequestError::NotRunning(_))
+        ));
+
+        let (_dir, path, daemon) = fake_daemon(vec![None]);
+        assert!(matches!(
+            request_blocking_at(&path, &Command::Status, TIMEOUT),
+            Err(RequestError::Closed)
+        ));
+        daemon.join().unwrap();
+
+        let (_dir, path, daemon) = fake_daemon(vec![Some(Response::Error {
+            message: "no microphone found".to_string(),
+        })]);
+        assert!(matches!(
+            request_info_blocking_at(&path, TIMEOUT),
+            Err(RequestError::Daemon(message)) if message == "no microphone found"
+        ));
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_daemon_that_never_answers_times_out() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whisrs.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let daemon = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut frame = Vec::new();
+            stream.read_to_end(&mut frame).unwrap();
+            // Holds the connection open, unanswered, until the client gave up.
+            let _ = done_rx.recv();
+        });
+        let result = request_blocking_at(&path, &Command::Info, Some(Duration::from_millis(200)));
+        done_tx.send(()).unwrap();
+        daemon.join().unwrap();
+        assert!(matches!(result, Err(RequestError::TimedOut)), "{result:?}");
     }
 }

@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                     setup 2/12 · ○  │
+   │                                                                                  │
+   │   Whisper model                                                                  │
+   │   whisper.cpp runs on this machine, offline. h/l changes the model, space lists  │
+   │   them with their sizes; enter downloads one not on disk yet and goes on once    │
+   │   it is done. The .en ones know English only, and know it better.                │
+   │                                                                                  │
+   │ ▌ model       ◂ tiny.en 78 MB · English, fastest, rough ▸                        │
+   │   file        ~/models/ggml-tiny.en.bin · not downloaded                         │
+   │   download    ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱ 50% · 39 MB of 78 MB                          │
+   │   test        t checks the model file                                            │
+   │                                                                                  │
+   │   downloading ggml-tiny.en.bin from Hugging Face                                 │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     esc cancel the download
+
+
+
+
+
+
+

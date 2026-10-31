@@ -21,7 +21,8 @@ use x11rb::wrapper::ConnectionExt as X11WrapperConnectionExt;
 
 use crate::{OverlayConfig, OverlayHAlign, OverlayPosition, State};
 
-use super::render::{OverlayRenderer, Theme, EDGE_MARGIN, FRAME_MS};
+use super::palette::Palette;
+use super::render::{OverlayRenderer, EDGE_MARGIN, FRAME_MS};
 use super::service::OverlayError;
 
 pub(super) fn run_x11_overlay(
@@ -31,7 +32,7 @@ pub(super) fn run_x11_overlay(
 ) -> Result<(), OverlayError> {
     let width = config.clamped_width() as u16;
     let height = config.clamped_height() as u16;
-    let theme = Theme::from_config(&config);
+    let theme = Palette::from_config(&config);
     let position = config.position();
 
     let (conn, screen_num) = RustConnection::connect(None)?;

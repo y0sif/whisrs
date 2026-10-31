@@ -61,7 +61,7 @@ pub fn read_entries(limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
 }
 
 /// Read the most recent `limit` entries from a specific history file.
-fn read_entries_from(path: &Path, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
+pub fn read_entries_from(path: &Path, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }

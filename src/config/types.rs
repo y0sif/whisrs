@@ -261,6 +261,9 @@ pub struct HotkeyConfig {
     pub speak: Option<String>,
     /// Hotkey to start or stop a recording of mic + system audio (e.g. "Super+Shift+M").
     pub recording: Option<String>,
+    /// Hotkey to switch to the next config profile: base, then the
+    /// profiles by name, wrapping (e.g. "Super+Shift+P").
+    pub next_profile: Option<String>,
 }
 
 /// Recording-lifecycle hooks. `media_auto_pause` pauses the MPRIS players
@@ -290,8 +293,9 @@ pub struct HooksConfig {
 /// is set, those override the theme.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayConfig {
-    /// Theme name: `"ember"` (default), `"carbon"`, `"cyan"`, or `"custom"`.
-    /// Unknown values fall back to `"ember"` with a warning.
+    /// Theme name: `"carbon"` (default), `"ember"`, `"cyan"`, or `"custom"`.
+    /// Unknown values fall back to `"ember"` with a warning, and so do the
+    /// colors `"custom"` leaves unset.
     #[serde(default = "default_overlay_theme")]
     pub theme: String,
     /// Pill width in pixels (clamped to 90..=120).
@@ -551,8 +555,15 @@ impl AgentOverlayCorner {
 /// overlay renderer's color format. Accepts `#RGB`, `#RRGGBB`, `#RRGGBBAA`.
 /// Returns `None` for malformed input so callers can fall back to a theme
 /// default.
+///
+/// Every byte is checked to be a hex digit before the string is sliced: a
+/// multi-byte character (`#é1`) made the byte slices below panic, and a `+`
+/// passed `from_str_radix`.
 pub fn parse_hex_color(s: &str) -> Option<[u8; 4]> {
     let s = s.trim().trim_start_matches('#');
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let (r, g, b, a) = match s.len() {
         3 => {
             let r = u8::from_str_radix(&s[0..1].repeat(2), 16).ok()?;
@@ -603,7 +614,10 @@ pub struct GeneralConfig {
     #[serde(default)]
     pub audio_feedback: bool,
     /// Volume for audio feedback (0.0 to 1.0).
-    #[serde(default = "default_audio_feedback_volume")]
+    #[serde(
+        default = "default_audio_feedback_volume",
+        serialize_with = "serialize_f32_shortest"
+    )]
     pub audio_feedback_volume: f32,
     /// Custom vocabulary — domain-specific terms, names, acronyms.
     /// Passed as a prompt hint to transcription backends to improve accuracy.
@@ -1105,6 +1119,75 @@ pub struct OpenAiCompatibleRealtimeConfig {
     pub api_key: Option<String>,
 }
 
+/// What [`Config::validate`] does about a cloud backend with no API key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingKey {
+    /// An error: the daemon cannot transcribe with this config as it is.
+    Refuse,
+    /// A warning naming where the daemon has to find `var` instead.
+    Warn,
+}
+
+impl MissingKey {
+    /// The key in `var` is missing: `refusal` as the error, or a warning.
+    fn missing(
+        self,
+        warnings: &mut Vec<ConfigWarning>,
+        var: &str,
+        refusal: &str,
+    ) -> Result<(), WhisrsError> {
+        match self {
+            MissingKey::Refuse => Err(WhisrsError::Config(refusal.to_string())),
+            MissingKey::Warn => {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "no API key in config.toml: the daemon needs {var} in its own \
+                         environment (systemd Environment=, environment.d, or the OpenRC \
+                         conf.d file)"
+                    ),
+                });
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod missing_key_tests {
+    use super::*;
+
+    /// A cloud backend with no key refuses to validate, as the daemon's
+    /// startup check says, but only warns for a write, naming where the
+    /// daemon looks; any other error still refuses.
+    #[test]
+    fn a_missing_key_only_warns_for_a_write() {
+        for (backend, var) in [
+            ("groq", "WHISRS_GROQ_API_KEY"),
+            ("deepgram-streaming", "WHISRS_DEEPGRAM_API_KEY"),
+            ("openai-realtime", "WHISRS_OPENAI_API_KEY"),
+        ] {
+            // Validation reads this process's env.
+            if std::env::var_os(var).is_some() {
+                continue;
+            }
+            let config: Config =
+                toml::from_str(&format!("[general]\nbackend = \"{backend}\"\n")).unwrap();
+            assert!(config.validate().is_err(), "{backend}");
+            let warnings = config.validate_to_write().expect("written with a warning");
+            assert!(
+                warnings.iter().any(|w| w
+                    .message
+                    .contains(&format!("needs {var} in its own environment"))),
+                "{backend}"
+            );
+        }
+        let no_url: Config =
+            toml::from_str("[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"\"\n")
+                .unwrap();
+        assert!(no_url.validate_to_write().is_err());
+    }
+}
+
 fn default_backend() -> String {
     "groq".to_string()
 }
@@ -1142,6 +1225,20 @@ fn default_device() -> String {
 }
 fn default_audio_feedback_volume() -> f32 {
     0.5
+}
+
+/// An `f32` as the shortest decimal that reads back as it. TOML floats are
+/// `f64`, and widening an `f32` turns a hand-written `0.3` into
+/// `0.30000001192092896` on every save.
+fn serialize_f32_shortest<S: serde::Serializer>(
+    value: &f32,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let shortest = value
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(f64::from(*value));
+    serializer.serialize_f64(shortest)
 }
 /// Default toggle-path post-processing instruction. Conservative on purpose:
 /// dictation is content, not a request, so the out-of-the-box behavior is a
@@ -1256,6 +1353,27 @@ pub fn unknown_config_keys(contents: &str) -> Vec<String> {
     unknown
 }
 
+/// [`unknown_config_keys`], each key beside its path (its table keys, an
+/// array index in decimal), so a profile merge can tell which file set it.
+pub(crate) fn unknown_config_keys_with_paths(contents: &str) -> Vec<(Vec<String>, String)> {
+    let mut unknown: Vec<(Vec<String>, String)> = unknown_config_key_paths(contents)
+        .iter()
+        .map(|path| {
+            let keys = path
+                .iter()
+                .map(|seg| match seg {
+                    Seg::Key(key) => key.clone(),
+                    Seg::Index(index) => index.to_string(),
+                })
+                .collect();
+            (keys, render_path(path))
+        })
+        .collect();
+    unknown.sort_by(|a, b| a.1.cmp(&b.1));
+    unknown.dedup_by(|a, b| a.1 == b.1);
+    unknown
+}
+
 /// Everything the unknown-key analysis derives from one config file: the parsed
 /// document, the reserialized (schema-known) view of it, and the confirmed
 /// unknown key paths. Kept together so a caller that needs more than the
@@ -1272,9 +1390,10 @@ struct UnknownKeyScan {
 /// Every variant means the same thing to a caller about to rewrite the file:
 /// there is no preserve set for these bytes, so merging the reserialized struct
 /// into them would delete every key the schema does not carry — issue #134. The
-/// `Display` text completes the sentence "existing config at `<path>` …", which
-/// is how `write_config_to` reports the divert.
-#[derive(Debug)]
+/// [`Self::summary`] completes the sentence "existing config at `<path>` ...",
+/// which is how `write_config_to` reports the divert. There is no `Display`,
+/// and `Debug` names only the variant: the errors' own text quotes the file,
+/// which can hold an API key.
 pub(crate) enum UndescribableConfig {
     /// Not valid TOML at all.
     Unparseable(toml::de::Error),
@@ -1287,21 +1406,56 @@ pub(crate) enum UndescribableConfig {
     /// named rather than folded into the others so that if a field ever does
     /// stop reserializing, the divert is the documented outcome instead of a
     /// silent merge against an empty preserve set.
-    Unserializable(toml::ser::Error),
+    Unserializable,
 }
 
-impl fmt::Display for UndescribableConfig {
+impl UndescribableConfig {
+    /// Why, completing "existing config at `<path>` ...", with where in
+    /// `contents` (the text it was read from) it went wrong when that is
+    /// known. Nothing of the text is quoted.
+    pub(crate) fn summary(&self, contents: &str) -> String {
+        let (what, span) = match self {
+            Self::Unparseable(e) => ("is not valid TOML", e.span()),
+            Self::NotAConfig(e) => ("does not deserialize into a whisrs config", e.span()),
+            Self::Unserializable => ("does not round-trip through the config schema", None),
+        };
+        with_position(what, contents, span)
+    }
+}
+
+impl fmt::Debug for UndescribableConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // Same wording as `write_config_to`'s own `DocumentMut` parse arm,
-            // which rejects an unparseable file before this is ever consulted.
-            Self::Unparseable(e) => write!(f, "is not valid TOML ({e})"),
-            Self::NotAConfig(e) => write!(f, "does not deserialize into a whisrs config ({e})"),
-            Self::Unserializable(e) => {
-                write!(f, "does not round-trip through the config schema ({e})")
-            }
+        f.write_str(match self {
+            Self::Unparseable(_) => "Unparseable",
+            Self::NotAConfig(_) => "NotAConfig",
+            Self::Unserializable => "Unserializable",
+        })
+    }
+}
+
+/// `what`, then where the byte `span` starts in `contents`, as
+/// `(line 3, column 10)`: a position, never the line itself.
+pub(crate) fn with_position(
+    what: &str,
+    contents: &str,
+    span: Option<std::ops::Range<usize>>,
+) -> String {
+    let Some(span) = span else {
+        return what.to_string();
+    };
+    let (mut line, mut column) = (1, 1);
+    for (at, c) in contents.char_indices() {
+        if at >= span.start {
+            break;
+        }
+        if c == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
         }
     }
+    format!("{what} (line {line}, column {column})")
 }
 
 /// Run the diff prefilter and the pruning confirmation over `contents`.
@@ -1314,7 +1468,7 @@ fn scan_unknown_keys(contents: &str) -> Result<UnknownKeyScan, UndescribableConf
         .parse::<toml::Table>()
         .map_err(UndescribableConfig::Unparseable)?;
     let config = toml::from_str::<Config>(contents).map_err(UndescribableConfig::NotAConfig)?;
-    let known = toml::Value::try_from(&config).map_err(UndescribableConfig::Unserializable)?;
+    let known = toml::Value::try_from(&config).map_err(|_| UndescribableConfig::Unserializable)?;
     let mut candidates = Vec::new();
     diff_config_tables(
         &document,
@@ -1451,7 +1605,7 @@ impl PreservedKeys {
     /// keeping a whole table matters only when the table is *absent from the
     /// fresh serialization*, and this module cannot see the fresh document.
     /// So the answer is recorded here and consulted there, in
-    /// `setup::is_preserved`, which by construction runs only for keys `fresh`
+    /// `write::is_preserved`, which by construction runs only for keys `fresh`
     /// does not carry. Deciding it eagerly here instead is what made the guard
     /// eat `[hooks]`, `[hotkeys]` and `[overlay.colors]` — sections `fresh`
     /// *does* carry, where the whole-table question never comes up.
@@ -1864,6 +2018,12 @@ fn is_realtime_backend(backend: &str) -> bool {
     matches!(backend, "openai-realtime" | "openai-compatible-realtime")
 }
 
+/// The backends [`Config::validate`] routes, aliases and stubs left out, in
+/// [`BACKEND_NAMES`] order: what a backend picker offers.
+pub fn primary_backend_names() -> Vec<&'static str> {
+    backend_names_of(BackendNameKind::Primary)
+}
+
 /// The names of every [`BACKEND_NAMES`] entry of one kind, in order.
 fn backend_names_of(kind: BackendNameKind) -> Vec<&'static str> {
     BACKEND_NAMES
@@ -1910,6 +2070,19 @@ impl Config {
     /// Returns `Err` for fatal issues (e.g., no backend configured).
     /// Returns `Ok(warnings)` with non-fatal warnings.
     pub fn validate(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
+        self.validate_with(MissingKey::Refuse)
+    }
+
+    /// [`Config::validate`] for a config about to be written: a cloud
+    /// backend with no key in the file and none in this process's env is a
+    /// warning, not a refusal. The daemon does not refuse it either: it
+    /// logs it and reads `WHISRS_*_API_KEY` at transcription time, from its
+    /// own environment, which a service gets from its unit or conf.d.
+    pub fn validate_to_write(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
+        self.validate_with(MissingKey::Warn)
+    }
+
+    fn validate_with(&self, keys: MissingKey) -> Result<Vec<ConfigWarning>, WhisrsError> {
         let mut warnings = Vec::new();
         let backend = self.general.backend.as_str();
 
@@ -1941,12 +2114,13 @@ impl Config {
                     .map(|k| !k.is_empty())
                     .unwrap_or(false);
                 if !has_config_key && !has_env_key {
-                    return Err(WhisrsError::Config(
+                    keys.missing(
+                        &mut warnings,
+                        "WHISRS_DEEPGRAM_API_KEY",
                         "Deepgram backend selected but no API key configured.\n\
                          Set WHISRS_DEEPGRAM_API_KEY or add [deepgram] api_key to config.toml.\n\
-                         Run 'whisrs setup' to get started."
-                            .to_string(),
-                    ));
+                         Run 'whisrs setup' to get started.",
+                    )?;
                 }
             }
             "groq" => {
@@ -1959,12 +2133,13 @@ impl Config {
                     .map(|k| !k.is_empty())
                     .unwrap_or(false);
                 if !has_config_key && !has_env_key {
-                    return Err(WhisrsError::Config(
+                    keys.missing(
+                        &mut warnings,
+                        "WHISRS_GROQ_API_KEY",
                         "Groq backend selected but no API key configured.\n\
                          Set WHISRS_GROQ_API_KEY or add [groq] api_key to config.toml.\n\
-                         Run 'whisrs setup' to get started."
-                            .to_string(),
-                    ));
+                         Run 'whisrs setup' to get started.",
+                    )?;
                 }
             }
             "openai" | "openai-realtime" => {
@@ -1977,12 +2152,13 @@ impl Config {
                     .map(|k| !k.is_empty())
                     .unwrap_or(false);
                 if !has_config_key && !has_env_key {
-                    return Err(WhisrsError::Config(
+                    keys.missing(
+                        &mut warnings,
+                        "WHISRS_OPENAI_API_KEY",
                         "OpenAI backend selected but no API key configured.\n\
                          Set WHISRS_OPENAI_API_KEY or add [openai] api_key to config.toml.\n\
-                         Run 'whisrs setup' to get started."
-                            .to_string(),
-                    ));
+                         Run 'whisrs setup' to get started.",
+                    )?;
                 }
             }
             "local-whisper" | "local" => {
@@ -2399,6 +2575,7 @@ impl Config {
                 // with nothing there.
                 #[cfg(feature = "recording")]
                 ("[hotkeys] recording", &hotkeys.recording),
+                ("[hotkeys] next_profile", &hotkeys.next_profile),
             ] {
                 if let Some(spec) = value {
                     binding_sources.push((label.to_string(), spec.as_str()));
@@ -3348,6 +3525,40 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `0.3` written by hand stays `0.3` through a save, not the `f32`
+    /// widened to `f64`.
+    #[test]
+    fn an_f32_volume_round_trips_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = "[general]\naudio_feedback_volume = 0.3\n";
+        std::fs::write(&path, toml).unwrap();
+        let config: Config = toml::from_str(toml).unwrap();
+        crate::config::write::write_config_to(&config, &path).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("audio_feedback_volume = 0.3\n"), "{out}");
+        let fresh = toml::to_string(&config).unwrap();
+        assert!(fresh.contains("audio_feedback_volume = 0.3\n"), "{fresh}");
+        let back: Config = toml::from_str(&fresh).unwrap();
+        assert_eq!(back.general.audio_feedback_volume, 0.3);
+    }
+
+    #[test]
+    fn hex_colors_parse_in_every_form() {
+        assert_eq!(parse_hex_color("#F97316"), Some([255, 0xF9, 0x73, 0x16]));
+        assert_eq!(parse_hex_color(" 456 "), Some([255, 0x44, 0x55, 0x66]));
+        assert_eq!(parse_hex_color("#11223380"), Some([0x80, 0x11, 0x22, 0x33]));
+    }
+
+    /// A multi-byte character used to panic the byte slicing; it is not a
+    /// color, and neither is a sign `from_str_radix` would take.
+    #[test]
+    fn a_hex_color_with_a_non_hex_character_is_none() {
+        for input in ["#é1", "#é12", "#1é", "#ab€", "#+12345", "#12345g", "", "#"] {
+            assert_eq!(parse_hex_color(input), None, "{input:?}");
+        }
+    }
 
     #[test]
     fn config_input_clipboard_fallback_roundtrip() {
@@ -5600,6 +5811,7 @@ mod tests {
             command: None,
             speak: None,
             recording: None,
+            next_profile: None,
         });
         config
             .llm_commands
@@ -5661,6 +5873,7 @@ mod tests {
             command: None,
             speak: Some("Meta+D".to_string()),
             recording: None,
+            next_profile: None,
         });
 
         let warnings = config.validate().unwrap();
@@ -6536,6 +6749,7 @@ mod tests {
             command: Some("Super+Shift+C".to_string()),
             speak: Some("Super+Shift+R".to_string()),
             recording: Some("Super+Shift+M".to_string()),
+            next_profile: None,
         });
         config
             .llm_commands

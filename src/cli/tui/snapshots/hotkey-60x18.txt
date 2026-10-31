@@ -1,0 +1,18 @@
+   ╭────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                           config · ●  │
+   │                                                    │
+   │   Hotkeys                                          │
+   │                                                    │
+   │ ▌ toggle        Alt+D                              │
+   ┏ toggle hotkey ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+   ┃ ▌ modifiers   [x] Super [ ] Ctrl [x] Alt [ ] Shift ┃
+   ┃   key         D                                    ┃
+   ┃   result      Super+Alt+D                          ┃
+   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+   │   Start and stop dictation. Most setups bind       │
+   │   whisrs toggle in the compositor instead.         │
+   │                                                    │
+   │   ! unknown key [general] silense_timeout_ms is    │
+   │     ignored                                        │
+   ╰────────────────────────────────────────────────────╯
+     tab next · h/l change · enter key/save · ? help

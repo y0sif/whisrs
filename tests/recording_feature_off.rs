@@ -46,6 +46,7 @@ fn recording_exits_1_and_says_how_to_get_it() {
         &["recording", "list", "--json"],
         &["recording", "show", "last"],
         &["recording", "summarize", "last"],
+        &["recording", "delete", "2026-10-27_1402_standup", "--yes"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_whisrs"))
             .args(args)

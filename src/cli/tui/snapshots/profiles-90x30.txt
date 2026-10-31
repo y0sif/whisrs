@@ -1,0 +1,30 @@
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                       profiles · ●  │
+   │                                                                                  │
+   │   whisrsd runs on base; offline applies when it restarts                         │
+   │                                                                                  │
+   │     base                  offline · active · 3 keys                              │
+   │     broken   broken       Local whisper backend selected but model file not      │
+   │ ▌ ● offline  3 keys !     found: /m/ggml-base.bin Run 'whisrs setup' to          │
+   │     work     3 keys !     download a model.                                      │
+   │                                                                                  │
+   │                           general.backend = "local-whisper"                      │
+   │                           general.language = "de"                                │
+   │                           local-whisper.model_path = "/m/ggml-base.bin"          │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     enter switch · l edit · n new · d delete · e $EDITOR · esc back · ? help
+
+
+
+
+
+
+

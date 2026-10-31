@@ -225,6 +225,8 @@ pub struct RecordingHeader {
     pub summary_pending: Option<SummaryRequest>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub audio_deleted: bool,
 }
 
 /// The speaker of one segment, as a [`RecordingHeader`] reads it.
@@ -266,16 +268,24 @@ pub fn list(root: &Path) -> anyhow::Result<Vec<(PathBuf, RecordingMeta)>> {
 /// [`list`] by headers ([`read_header`]): what a listing or a lookup reads,
 /// without holding every transcript in memory at once.
 pub fn list_headers(root: &Path) -> anyhow::Result<Vec<(PathBuf, RecordingHeader)>> {
-    list_by(root, read_header, |header| {
-        (header.started_at, header.id.as_str())
-    })
+    list_headers_by(root, read_header)
+}
+
+/// [`list_headers`] with each header read by `read`, which may keep the
+/// ones it read before: the TUI reads the folder every 2 s and parses
+/// again only a `recording.json` that changed.
+pub fn list_headers_by(
+    root: &Path,
+    read: impl FnMut(&Path) -> anyhow::Result<RecordingHeader>,
+) -> anyhow::Result<Vec<(PathBuf, RecordingHeader)>> {
+    list_by(root, read, |header| (header.started_at, header.id.as_str()))
 }
 
 /// The recordings under `root` as `read` gives them, newest first by the
 /// start time and then the id `key` gives.
 fn list_by<T>(
     root: &Path,
-    read: impl Fn(&Path) -> anyhow::Result<T>,
+    mut read: impl FnMut(&Path) -> anyhow::Result<T>,
     key: impl Fn(&T) -> (DateTime<Local>, &str),
 ) -> anyhow::Result<Vec<(PathBuf, T)>> {
     let entries = match fs::read_dir(root) {
@@ -304,9 +314,10 @@ fn list_by<T>(
 }
 
 /// Whether `query` can only name a folder right under the root: not empty,
-/// and no `/` or `..` to climb out of it.
+/// and no `/`, `.` or `..` to name the root or climb out of it. No id has a
+/// dot.
 fn is_plain_folder_name(query: &str) -> bool {
-    !query.is_empty() && !query.contains('/') && !query.contains("..") && !query.contains('\0')
+    !query.is_empty() && !query.contains('/') && !query.contains('.') && !query.contains('\0')
 }
 
 /// Find a recording by `"last"` (the newest), an exact id, or a unique id
@@ -507,6 +518,11 @@ pub fn sweep_retention_guarded<G>(
         let mut meta = match read_meta(&dir) {
             Ok(meta) if due(&meta) => meta,
             Ok(_) => continue,
+            // Deleted since the listing (`whisrs recording delete`).
+            Err(_) if !dir.exists() => {
+                debug!("{} is gone; nothing to sweep", dir.display());
+                continue;
+            }
             Err(e) => {
                 warn!(
                     "failed to read {} for audio retention: {e:#}",
@@ -975,6 +991,15 @@ mod tests {
         write_meta(&outside, &meta).unwrap();
         let err = resolve(&root, "../outside").unwrap_err().to_string();
         assert!(err.contains("no recording matches"), "{err}");
+        // `.` is the root itself, never read as a recording.
+        write_meta(
+            &root,
+            &RecordingMeta::new(".".into(), None, at(2026, 3, 1, 9, 0)),
+        )
+        .unwrap();
+        let err = resolve(&root, ".").unwrap_err().to_string();
+        assert!(err.contains("no recording matches"), "{err}");
+        fs::remove_file(root.join(META_FILE)).unwrap();
         // A folder whose recording.json names another id is not that id.
         fs::rename(&inside, root.join("2026-09-09_0000")).unwrap();
         assert!(resolve(&root, "2026-09-09_0000").is_err());

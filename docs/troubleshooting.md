@@ -43,7 +43,7 @@ The Nix package does this substitution at build time.
 
 Verify your mic is recognized: `arecord -l`. If nothing shows up, make sure ALSA or PulseAudio/PipeWire is installed and your mic is not muted. On PipeWire systems, install `pipewire-alsa` for ALSA compatibility.
 
-If whisrs records from the wrong microphone, set `[audio] device` to the source you want. `whisrs config` lists the available sources, or use a name from `pactl list short sources`. Restart the daemon afterwards (`whisrs restart`) and check its log (`journalctl --user -u whisrs`) for the line saying which device the name resolved to. An unknown name falls back to the system default with a warning that lists the valid names. See [Choosing the microphone](configuration.md#choosing-the-microphone).
+If whisrs records from the wrong microphone, set `[audio] device` to the source you want: a name from `pactl list short sources` (second column), or a description from your sound settings (on PipeWire, `wpctl status` lists them). Restart the daemon afterwards (`whisrs restart`) and check its log (`journalctl --user -u whisrs`) for the line saying which device the name resolved to. An unknown name falls back to the system default with a warning that lists the valid names. See [Choosing the microphone](configuration.md#choosing-the-microphone).
 
 ## Noisy room or quiet mic
 

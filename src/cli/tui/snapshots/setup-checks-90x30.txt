@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                    setup 12/12 · ○  │
+   │                                                                                  │
+   │   System checks                                                                  │
+   │   What dictation needs on this machine. Space does a row; enter finishes.        │
+   │                                                                                  │
+   │ ▌ ○ uinput      permission denied: space installs the udev rule and joins …      │
+   │   ○ service     runs /usr/bin/whisrsd, not /home/ada/.cargo/bin/whisrsd: s…      │
+   │   ○ keybinding  /home/ada/.config/hypr/hyprland.conf binds no whisrs toggl…      │
+   │                                                                                  │
+   │   permission denied: space installs the udev rule and joins the input group      │
+   │   (sudo asks for your password)                                                  │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k move · space do it · enter finish · s skip · backspace back · esc leave
+
+
+
+
+
+
+
+

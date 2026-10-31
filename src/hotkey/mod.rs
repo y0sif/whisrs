@@ -18,7 +18,7 @@ use crate::llm::LlmCommandConfig;
 #[cfg(feature = "recording")]
 use crate::recording::{RecordingAction, RecordingOptions};
 use crate::{Command, HotkeyConfig};
-pub use parse::{parse_hotkey, HotkeyBinding};
+pub use parse::{hotkey_parts, parse_hotkey, HotkeyBinding, KEY_NAMES, MODIFIER_NAMES};
 
 /// Maximum number of attempts to find keyboard input devices.
 const HOTKEY_MAX_RETRIES: u32 = 10;
@@ -155,6 +155,11 @@ fn build_actions(
                 id: None,
                 options: RecordingOptions::default(),
             },
+        ),
+        (
+            "next_profile",
+            &config.next_profile,
+            Command::SwitchProfile { name: None },
         ),
     ];
     for (label, spec, command) in fixed {
@@ -578,6 +583,7 @@ mod tests {
             command: Some("Super+Shift+G".to_string()),
             speak: Some("Super+Shift+R".to_string()),
             recording: Some("Super+Shift+M".to_string()),
+            next_profile: Some("Super+Shift+P".to_string()),
         }
     }
 
@@ -603,6 +609,23 @@ mod tests {
             fields - ignored,
             "every set [hotkeys] field must produce a listener action — a new field \
              needs a line in build_actions' `fixed` table"
+        );
+    }
+
+    /// `[hotkeys] next_profile` sends the switch with no name: the daemon
+    /// picks the next profile.
+    #[test]
+    fn next_profile_hotkey_switches_to_the_next_profile() {
+        let config = HotkeyConfig {
+            next_profile: Some("Super+Shift+P".to_string()),
+            ..Default::default()
+        };
+        let actions = build_actions(&config, &[], &[]);
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(actions[0].command, Command::SwitchProfile { name: None }),
+            "{:?}",
+            actions[0].command
         );
     }
 

@@ -21,7 +21,7 @@ cargo fmt -- --check                           # check formatting (CI)
 ## Running
 
 ```fish
-# First-time setup (interactive, no daemon needed)
+# First-time setup (the TUI wizard, no daemon needed; needs a terminal)
 whisrs setup
 
 # Start the daemon
@@ -38,15 +38,33 @@ whisrs agent     # list [[agents]]; `whisrs agent <name>` records a voice turn f
                  # (same as its hotkey), --text "..." sends a typed one, --new records one (or sends
                  # --text) in a fresh session (same as new_session_hotkey), --reset forgets the session,
                  # --stop stops the running turn. The reply is spoken via [tts] when the turn ends
-whisrs status    # query daemon state
+whisrs status    # query daemon state; on a terminal only, a second line names the active profile (or
+                 # why it did not load); piped, the state is the whole output
+whisrs profile [list|next|base|<name>]   # config profiles (profiles/<name>.toml over config.toml); list (the
+                 # default) reads the files, works with the daemon down; a switch goes through the
+                 # daemon (refused unless idle, then it restarts on the profile), or with it down is
+                 # checked and written to $XDG_STATE_HOME/whisrs/active-profile for its next start
 whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
-whisrs config    # interactive config editor
+whisrs config    # full-screen config editor (TUI): every key by section, w saves (comments kept),
+                 # t tests a key row; Esc goes to Home, which opens Setup, Config, the Mic
+                 # test (a live level meter and a quality line over the last 10 s, by [audio] vad;
+                 # its w writes only [audio] device), Recordings
+                 # (list, preview, transcript; r c n S d are the daemon's actions), Profiles
+                 # (Enter switches through the daemon, n new, d delete, e the file; l opens
+                 # profile mode: rows tagged profile/base/base only, edits go into the profile,
+                 # x takes a key out, w writes only its file) and History (C clears it through
+                 # the daemon; says when [general] history is off); a save restarts the daemon
+                 # only while it is idle (r later), e opens config.toml in $EDITOR. Refuses off
+                 # a terminal
 whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
 whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once
 whisrs recording summarize <id>   # [llm] summary (+ title if untitled) via the queue; [recording] summary = true does it after each transcript
+whisrs recording delete <id> [--yes]   # the whole folder, for good; never `last`; asks [y/N] on a terminal, refuses off one
+                 # without --yes; sends the whole id (the daemon takes no prefix for a delete) and
+                 # refuses it while it records, is queued, processed or held
                  # (every `whisrs recording` line: feature `recording`, in the default and both release builds)
 whisrs mcp       # read-only MCP server on stdio over the recordings folder (feature `mcp`, needs `recording`; no daemon needed)
 
@@ -66,7 +84,8 @@ Cargo workspace: the root package builds two binaries, plus five extracted crate
 src/
 ├── lib.rs                  # Crate root: WhisrsError + re-exports (config types, IPC, service ctl)
 ├── ipc.rs                  # IPC protocol: commands, responses, socket path, wire framing
-├── service.rs              # Init abstraction (systemd/OpenRC): detect, restart, install hints
+├── service.rs              # Init abstraction (systemd/OpenRC): detect, restart, install hints;
+│                           #   restart_self (under the service: its manager; else a re-exec of itself)
 ├── state.rs                # State machine (Idle → Recording → Transcribing → Idle;
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
@@ -89,11 +108,61 @@ src/
 ├── mcp.rs                  # whisrs mcp (feature mcp): read-only rmcp server, 4 tools over the recordings folder
 ├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
+├── cli/tui/                # whisrs config + whisrs setup TUI (ratatui; in the CLI binary only, whisrsd
+│   │                       #   never links it)
+│   ├── mod.rs              #   run(): tty refusal, load (#134 refusals), colour probe, init/restore,
+│   │                       #   the event loop, effects (save, restart, $EDITOR and sudo suspend,
+│   │                       #   a download's .part removed on the way out)
+│   ├── app.rs              #   App: screen stack, dialogs, pure update(Msg) -> Effect
+│   ├── keys.rs             #   key -> Action (pure)
+│   ├── theme.rs            #   colour roles from the overlay theme; 16-colour map, light remap, NO_COLOR
+│   ├── glyphs.rs           #   Unicode and ASCII glyph sets (one char, one column each)
+│   ├── schema.rs           #   every config key as a row (kind, help, feature gate) + coverage tests
+│   │                       #   (every key a row; every typed string in FREE_TEXT with a reason)
+│   ├── options.rs          #   what a row offers: picks (catalog lists, by backend or URL host, worker
+│   │                       #   lists), the unset row, refusals (not built in, coming soon), notes
+│   ├── complete.rs         #   Tab completion of a typed path
+│   ├── form.rs             #   the edit buffer: dotted-path get/set over a toml::Table, checked by serde
+│   ├── worker.rs           #   threads: the 2 s info poll (status for an older daemon; a nudge after
+│   │                       #   a profile switch polls every 250 ms for 5 s), the restart
+│   │                       #   gate (only an idle daemon; silence, a recording, an agent turn or
+│   │                       #   busy skip it; an older one is asked `recording status` too), the
+│   │                       #   lists a picker needs (input devices, ggml-*.bin), the lister injected;
+│   │                       #   the key test, the model download, the mic capture (about 30 readings
+│   │                       #   a second), setup's checks and system steps; the recordings folder
+│   │                       #   (every 2 s while Recordings is open, sent when it changed;
+│   │                       #   `recording status` asked only with one in flight), a recording read
+│   │                       #   whole, the daemon's recording actions, history.jsonl, the profiles
+│   │                       #   folder (each merged over config.toml), switch-profile (with no
+│   │                       #   daemon, the state file, as `whisrs profile` writes it)
+│   ├── widgets/            #   frame + footer, row, text input, dialog, picker (filter by word
+│   │                       #   prefix), hotkey dialog (checked by hotkey::parse_hotkey), level meter,
+│   │                       #   download progress
+│   ├── screens/            #   home.rs (the hub), config.rs (sections, rows, list/map/entry editors, save,
+│   │                       #   `t` key tests; pinned rows for the wizard and Mic; profile mode:
+│   │                       #   load_profile/save_profile, ProfileEdit (set, added, removed), row tags,
+│   │                       #   base-only refusals, x; on base, the active profile's `sets this`),
+│   │                       #   profiles.rs (the Profiles list + pane, n/d/e/l, read_folder), setup.rs (the wizard:
+│   │                       #   steps over its own pinned ConfigScreen, review + write, system checks;
+│   │                       #   tests in setup/tests.rs), mic/ (meter; analysis.rs::analyze is the seam
+│   │                       #   the audio-quality report fills), recordings/ (list, preview cached by
+│   │                       #   id + recording.json mtime, transcript, filter, r/c/n/S/d and their
+│   │                       #   dialogs; read.rs: the folder read, feature `recording`; tests.rs),
+│   │                       #   history.rs (history.jsonl, read-only)
+│   ├── testing.rs, render_tests.rs  #   fixtures; snapshots, styles, layouts (tests only)
+│   └── snapshots/          #   TestBackend row-string snapshots (WHISRS_UPDATE_SNAPSHOTS=1 rewrites)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
 ├── daemon/recording.rs     # Recording sessions, processing queue/worker, recovery, shutdown (feature recording)
 ├── daemon/agent.rs         # Agent runtime: slots, turns, reply FIFO (spoken when Idle), IPC handlers,
 │                           #   hook events, the voice-turn recording sink
 ├── daemon/speak.rs         # Read-aloud: selection, speak --text, agent replies (speak_text)
+├── daemon/profile.rs       # ProfileRuntime (the profile it runs on, its error, the restarter, injected in
+│                           #   tests) and switch-profile: target, already-active answer, the busy guard
+│                           #   (info's checks), dry run (base too), state file, notify, then after
+│                           #   200 ms busy again (a start that slipped in rolls back) and restart_self.
+│                           #   While switching, switching_refusal (one exhaustive match, called by
+│                           #   handle_command and the hotkey/tray loop) refuses every start, and
+│                           #   agent::replies_held holds replies
 ├── recording/              # Recording feature (mic + system audio, transcribed after the stop)
 │   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types: every build (IPC wire);
 │   │                       #   the submodules below are feature `recording`
@@ -151,6 +220,7 @@ src/
 ├── overlay/                # Recording pill + agent overlay (feature-gated), each on its own thread
 │   ├── service.rs          #   Overlay service: picks and drives a backend for each
 │   ├── render.rs           #   Pill rendering: theme, animation state, frame drawing
+│   ├── palette.rs          #   Theme palettes (carbon, ember, cyan, custom): every build, for the TUI too
 │   ├── wayland.rs          #   Pill Wayland layer-shell backend
 │   ├── x11.rs              #   Pill X11 override-redirect backend (placement/shape helpers shared)
 │   ├── layer.rs            #   Shared layer-shell bits: create_layer, layer_action, ARGB copy
@@ -165,8 +235,22 @@ src/
 │   └── gnome.rs            #   GNOME overlay D-Bus broadcaster (pill state + AgentsChanged JSON)
 └── config/
     ├── types.rs            # Config structs, defaults, validation (config.toml)
-    ├── setup.rs            # Interactive onboarding (whisrs setup)
-    └── edit.rs             # whisrs config interactive editor
+    ├── write.rs            # Load (ExistingConfig, refusals) and the format-preserving write: only the
+    │                       #   leaves that changed against the file (a default is never written)
+    ├── vocabulary.rs       # vocabulary.txt, and the save that splits terms between the two stores
+    ├── keys.rs             # mask_api_key, the key summary (env var wins), the masked TOML
+    ├── profile.rs          # Config profiles (#189): names, Paths (config, profiles/, the active-profile
+    │                       #   state file), list, read_active/set_active, next, resolve_target, BASE_ONLY,
+    │                       #   read_table (aliases renamed), merge, effective(_at) (the merged Config,
+    │                       #   table, set paths, dropped keys, unknown keys by file, fallback error), dry_run
+    ├── catalog.rs          # (value, description) lists the pickers offer: languages, models, voices,
+    │                       #   closed choices, downloadable whisper models; each provider list names
+    │                       #   its source URL and check date
+    └── setup/              # whisrs setup's side effects as plain functions (no printing, no asking;
+                            #   programs, network and audio injected in tests): uinput (check, the sudo
+                            #   fix's commands), unit (status, write, #146 repoint, enable), keybind,
+                            #   gnome, model (download to .part, renamed when whole), mic (probe),
+                            #   key_test (one authenticated GET per provider, #[ignore] live tests)
 ```
 
 Injection **policy** lives in the daemon: `type_text_at_cursor`, `paste_via_keyboard`
@@ -282,6 +366,22 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "toggle"}                    // optional "language" overrides general.language for one session
 {"cmd": "cancel"}
 {"cmd": "status"}
+{"cmd": "info"}                      // version, state, recording phase, profile (left out on base),
+                                     // profile_error (the line clients show when the active profile did
+                                     // not load), backend, built features,
+                                     // started_at (Unix ms), busy, agent_turn. Never waits: the state
+                                     // comes from a try_lock of the dictation lock, else the published
+                                     // one with busy = true; busy also covers a held agent runtime
+                                     // lock and a recording start or stop under way, and agent_turn
+                                     // a turn on its way to start. An older daemon hangs up on it (and logs
+                                     // an error), so the TUI asks status and remembers, asking info
+                                     // again every 10th poll; `whisrs status` asks info, then status
+{"cmd": "switch-profile", "name": "offline"}  // name omitted = next; "base" = config.toml alone. Refused
+                                     // unless dictation, read-aloud, recordings and agent turns are idle
+                                     // and the target loads; answers {"status": "profile", "active":
+                                     // "offline", "switching": true}, then restarts the daemon on it
+                                     // (false and no restart: already on it); next passes over what
+                                     // does not load (profile::next_usable), named in "skipped"
 {"cmd": "log", "limit": 20}
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
@@ -294,12 +394,14 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
                                      // reset (--reset) only forgets it;
                                      // list/send/reset/stop answer with an Agents response
 {"cmd": "agent-event", "payload": {...}}  // a harness hook's stdin JSON, from `whisrs agent-hook`
-{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name|summarize", "title": "...", "id": "...",
+{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name|summarize|delete", "title": "...", "id": "...",
  "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video",
  "shared_mic": true, "num_speakers": 3, "participants": ["Sarah", "Omar"],
- "speaker": "S2", "name": "Sarah"}
+ "speaker": "S2", "name": "Sarah", "exact": true}
                                      // all but action optional: title (start/toggle), id (retry/copy/name/summarize,
-                                     // default "last"), speaker + name (name; "" clears), the languages, shared_mic, num_speakers and
+                                     // default "last"; delete: id required, whole, never "last"), exact (the TUI sends it:
+                                     // the id is whole, no prefix or "last"; sent only when true, an older daemon
+                                     // ignores it), speaker + name (name; "" clears), the languages, shared_mic, num_speakers and
                                      // participants (--with) (start/toggle/retry;
                                      // a track's own language wins over "language"), others = system track
                                      // label (start/toggle). Validated by the daemon
@@ -307,15 +409,36 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 ```
 
 Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": "..."}`,
-a `History` variant carrying log entries, a `Recording` variant carrying the recording status, and
-an `Agents` variant carrying agent rows (`{"status": "agents", "agents": [...]}`).
+a `History` variant carrying log entries, a `Recording` variant carrying the recording status,
+an `Agents` variant carrying agent rows (`{"status": "agents", "agents": [...]}`), a
+`Profile` variant answering `switch-profile`, and an
+`Info` variant (`{"status": "info", "info": {...}}`, `DaemonInfo`, every field defaulted so
+later ones are additive; an unknown `state` or `recording` is `None`). `ipc::request_blocking(cmd,
+timeout)` is the same framing on a blocking socket, for callers without a tokio runtime; its
+connect is not bounded, so the TUI only calls it from a worker thread. `status`, `info`, `log`
+and `recording status` skip the state broadcast after the command (they change nothing), and
+`info` and `recording status` are logged at debug (the TUI polls them: `info` every 2 s,
+`recording status` every 2 s while its Recordings screen shows a recording in flight).
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
 `src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
 list/show/path` read the recordings folder directly, which keeps transcript bodies off IPC
-(as does the speaker list `whisrs recording name` prints after the daemon renamed one).
+(as does the speaker list `whisrs recording name` prints after the daemon renamed one, and
+`whisrs recording delete`, which resolves the id there to ask about it, then sends the full id).
 `whisrs mcp` reads it too, but its logic is in the library (`src/mcp.rs`); the CLI only
-starts it with `store::configured_recordings_dir()`.
+starts it with `store::configured_recordings_dir()`. `whisrs profile list` reads the profiles
+folder and the state file through `config::profile`, and a switch with the daemon down is
+checked and written there too (`dry_run`, `set_active`).
+The `whisrs config` and `whisrs setup` TUI (`src/cli/tui/`) lives in the CLI so whisrsd never
+links ratatui; it reads and writes config.toml through the library (`config::write`,
+`config::vocabulary`, `config::keys`, `config::setup`), asks the daemon `info` (or
+`status`), and restarts it after a save through `ServiceManager::restart`, as the old editor
+did. Its Recordings screen reads the recordings folder itself, as `whisrs recording list` does,
+and sends the actions (`retry`, `copy`, `name`, `summarize`, `delete`) by full id. Its Profiles
+screen reads the profiles folder through `config::profile` on a worker, makes and deletes the
+files itself, switches through `switch-profile`, and in profile mode writes only the profile's
+file (toml_edit, `profile::write_profile`). The dialoguer wizard and its deps (`dialoguer`, `indicatif`) are gone; the daemon saves an
+`[[llm_commands]]` instruction through `config::write::write_config`.
 `whisrs agent-hook` (hidden, run by the hooks whisrs puts in the Claude sessions it starts)
 only forwards its stdin to the daemon as `agent-event`, and always exits 0 within two seconds.
 
@@ -440,6 +563,28 @@ a noise switching on (a fan, dishes, a knock) can show as heard too. A session i
 records until the second press or a cancel, as in 0.1.31, and so does a voice too quiet to arm
 auto-stop, whose press then says "too quiet" when the floor-rejected voice still
 reached 160 ms of evidence before the floors (`unfloored_evidence`), else "without speech".
+
+Config profiles (#189): a partial config in `~/.config/whisrs/profiles/<name>.toml`, names
+`[a-z0-9_-]{1,32}` but `base`/`list`/`next`; the active name is one line in
+`$XDG_STATE_HOME/whisrs/active-profile` (none, or `base`: config.toml alone). `load_config_toml_at`
+(daemon/startup.rs) merges it over config.toml (`profile::effective_at`: aliases renamed on both
+sides, `BASE_ONLY` dropped with a warning each (every `api_key`, `[hotkeys]`, `[[llm_commands]]`,
+`[[agents]]`, `[recording] dir`), tables key by key, other values replace, then deserialize and
+`validate`) before the unknown-key warning and `validate_config`; vocabulary.txt merges after. A
+profile that fails falls back to config.toml, warns, notifies and is `info`'s `profile_error`.
+Every other reader (the CLI's recording commands, `whisrs mcp`) stays on config.toml, which the
+base-only list makes safe. A switch (`switch-profile`, `whisrs profile`, `[hotkeys] next_profile`,
+the tray's Profile radio menu) restarts through `service::restart_self`:
+`ServiceManager::restart_queued` (systemd `--no-block`, OpenRC `rc-service` detached: a waiting
+command dies with the unit's own stop) when the cgroup is `whisrs.service` (or
+`RC_SVCNAME=whisrs`), else the SIGTERM path's `shut_down` (daemon/main.rs) and a re-exec of the
+binary `/proc/self/exe` names (` (deleted)` cut off, when a file is there), with the socket set
+aside (`service::socket_aside`); an exec that fails after the shutdown exits. The tray's Restart
+Daemon uses it too (`tray::RestartFn`). A profile's non-table value at a section key is dropped
+like a base-only key (`profile::is_dropped`), and serde errors hide base-only values. Clients
+check with `profile::Check::Client` (a missing key warns, as `validate_to_write`); the daemon's
+`Check::Daemon` decides. A client whose switch finds no daemon asks `profile::unanswered`: down
+(write the state file), back (resend), or restarting (refuse). No hot reload.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 

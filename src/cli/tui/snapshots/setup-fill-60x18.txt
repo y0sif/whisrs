@@ -1,0 +1,18 @@
+   ╭────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                       setup 9/12 · ○  │
+   │                                                    │
+   │   Read aloud (optional)                            │
+   │   Select text and press a hotkey: whisrs reads it  │
+   │   aloud. Jarvis speaks its replies with it too.    │
+   │                                                    │
+   │ ▌ backend  ◂ groq ▸                                │
+   │   model    backend default (canopylabs/orpheus-v…  │
+   │   voice    backend default (autumn)                │
+   │   api_key  uses the [groq] key                     │
+   │   hotkey   not set                                 │
+   │   sample   t says "This is how whisrs reads yo…    │
+   │                                                    │
+   │   Who reads the text: a cloud voice, or            │
+   │   tts-sidecar, your own OpenAI-compatible          │
+   ╰────────────────────────────────────────────────────╯
+     h/l change · space pick · enter next · esc leave

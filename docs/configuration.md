@@ -113,7 +113,7 @@ position = "bottom-center"
 # glow         = "#F0EDF5"
 
 [audio]
-device = "default"         # input device; see "Choosing the microphone" below
+device = "default"         # input device; see "Choosing the microphone" below, or pick it on the Mic test screen (whisrs config, Esc to Home, Mic test)
 vad = "earshot"            # speech detector: "earshot" (a small learned model) or "rms"
                            # (the 0.1.31 loudness test); see "Speech detection" below
 
@@ -488,7 +488,7 @@ response_format = "wav"     # audio format requested from the API
 #                             #   An ISO 639 code, optionally with a region, or "auto"
 # mic_language = "de"         # language of your mic track; default: language
 # system_language = "auto"    # language of the system audio track; default: language
-# mic_device = "alsa_input.usb-..."  # a source name from whisrs config or pactl list short sources
+# mic_device = "alsa_input.usb-..."  # a source name, from pactl list short sources
 #                             #   default: [audio] device
 # system_device = "default"   # "default" = monitor of the default output,
 #                             #   "none" = mic only, or a source name ending in .monitor
@@ -527,6 +527,7 @@ cancel = "Super+Shift+D"
 command = "Super+Shift+G"
 speak = "Super+Shift+R"
 recording = "Super+Shift+M"   # start or stop a recording (mic + system audio)
+next_profile = "Super+Shift+P"   # switch to the next config profile (see Profiles below)
 
 # Dictation-lifecycle hooks: pause playing MPRIS media while dictating, run
 # shell commands fire-and-forget on dictation start/stop.  The child inherits the
@@ -1296,10 +1297,10 @@ without a whisrs release: whisrs reads the output of 1.0.103.
 
 ## Choosing the microphone
 
-`[audio] device` picks the input whisrs records from:
+`[audio] device` picks the input whisrs records from. The easiest way to choose it is the Mic test screen: run `whisrs config`, press Esc to go to Home and open Mic test. It lists the inputs (`h`/`l` step through them, `Enter` opens the list), shows each one's level live against the silence gate, and `w` writes only `[audio] device` (other unsaved Config edits stay unsaved), then restarts the daemon when it is idle. `whisrs setup` has the same meter on its microphone step. By hand, the value is one of:
 
 - `"default"` (or empty): the system default input, through ALSA. With the PipeWire or PulseAudio ALSA plugin installed (the usual setup) this follows the default source set in your sound settings.
-- A PulseAudio or PipeWire source name, such as `alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo`. List them with `pactl list short sources` (second column), or pick one from `whisrs config` under the audio device item. The source description shown in your sound settings also works. Monitor sources (names ending in `.monitor`) record what your speakers play.
+- A PulseAudio or PipeWire source name, such as `alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo`. List them with `pactl list short sources` (second column). The source description shown in your sound settings also works; on PipeWire, `wpctl status` lists the sources by description. Monitor sources (names ending in `.monitor`) record what your speakers play.
 - An ALSA PCM name, such as `pipewire`, `plughw:1,0` or `sysdefault:CARD=PCH` (see `arecord -L`). This also covers systems without a PulseAudio or PipeWire server.
 
 PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matches nothing logs a warning listing the valid names and falls back to the system default. The daemon reads the device when it starts, so restart it after a change (`whisrs restart`); its startup log shows which device the name resolved to. Audio cues and read-aloud playback always use the default output device.
@@ -1608,8 +1609,8 @@ in or unplugged, another output picked), the system track moves to the new
 one within about 2 seconds, and the moment in between is filled with silence
 so the track stays in step with your mic. Set it to `"none"` to record only
 your mic, or to a specific monitor source from `pactl list short sources`
-(names ending in `.monitor`), which is never followed. `whisrs config` lists
-the monitors under "Recording". If the system audio cannot be opened, the
+(names ending in `.monitor`), which is never followed. `pactl list short
+sources` lists the monitors. If the system audio cannot be opened, the
 recording takes your mic only and notes that in the transcript. With
 `mic_device` and `[audio] device` at `"default"`, the mic records the ALSA
 default device, which whisrs does not move. Through PipeWire's ALSA plugin
@@ -1963,6 +1964,104 @@ split a multi-word key across two chunks where Deepgram closes a segment
 `openai-realtime` streams tokens, so a chunk can also end in the middle of a
 word, and a key like "pack" can match the first half of "package". Batch
 backends see the whole transcript and are not affected.
+
+## Profiles
+
+A profile is a partial `config.toml` holding only what differs from it, in
+`~/.config/whisrs/profiles/<name>.toml`. Say one setup dictates through Groq
+and another, for a train with no network, runs offline:
+
+```toml
+# ~/.config/whisrs/profiles/offline.toml
+[general]
+backend = "local-whisper"   # the model in [local-whisper] model_path, ggml-base.en.bin by default
+language = "en"
+```
+
+A name is 1 to 32 of `a-z`, `0-9`, `-` and `_`; `base`, `list` and `next`
+are taken. A file in `profiles/` that is not `.toml`, or whose name breaks the
+rule, is skipped with a warning naming it. Profiles are files: create, edit
+and delete them by hand, or on the Profiles screen of `whisrs config` (below).
+
+**Switching.** `whisrs profile` lists `base` and the profiles, the active one
+marked `*`, a broken one with why, and one that sets base-only keys with the
+keys it sets (ignored). It reads the files, so it works with the daemon
+stopped. `whisrs profile offline` switches to a profile, `whisrs profile base`
+back to `config.toml` alone, and `whisrs profile next` goes base, then the
+profiles by name, wrapping, and passes over a profile that does not load
+(`switching to clean (skipped broken: it does not load)`), refusing with each
+one's why when no other loads. A `[hotkeys] next_profile` key does what `next`
+does, and the tray's Profile menu (shown once a profile exists) picks one.
+
+The daemon checks that the profile loads first, and refuses a switch while it
+dictates, transcribes, reads aloud, records, processes a recording or runs an
+agent turn, naming which, and a switch to base while `config.toml` does not
+load. Otherwise it writes the name, shows a "switching to offline"
+notification, and restarts on it: through its service (systemd or OpenRC)
+when it runs as one, else by starting itself again in place (after the same
+shutdown a stop runs, and from the binary its path names now, so an upgrade
+takes effect), so a daemon started by hand with `whisrsd &` comes back too.
+Until the restart, a dictation, command mode, a read-aloud, a recording or an
+agent turn is refused with `switching profile: try again in a moment`, and
+agent replies wait. If something started anyway, or the restart fails, the
+previous name comes back and a notification says why. With the daemon
+stopped, `whisrs profile <name>` checks the profile and writes the name; it
+applies when the daemon starts. That check counts a backend key missing from
+`config.toml` and your shell as one the daemon's own environment may hold (a
+unit's `Environment=`); the daemon's check decides once it runs. While the
+daemon restarts, `whisrs profile` waits for it, up to 3 seconds, and
+otherwise says `whisrsd is restarting; try again in a moment`.
+
+**In `whisrs config`.** Home's Profiles screen lists `base` and the profiles,
+the active one `●`, each with what its file sets (`3 keys`, `empty`, or
+`broken: <why>`), the base-only keys it sets, and what it warns of (an API
+key the daemon has to find in its own environment is a warning, not broken:
+the daemon's own check decides); from 90 columns the focused one's keys show
+beside the list, an API key named but never its value. `Enter` switches, as
+`whisrs profile <name>` does (a broken profile is refused before anything is
+sent, and the screen follows the daemon's restart to `on offline`, or says
+the restart did not happen). `n` makes one, its name checked as you type, as an empty
+0600 file; `d` deletes one, asking first (never `base` or the active one);
+`e` opens its file in `$EDITOR`. `l` opens it in Config, in profile mode:
+every row shows the value the profile makes over `config.toml`, tagged
+`profile` (the profile sets it), `base` (it comes from `config.toml`) or
+`base only`. An edit goes into the profile, even one at `config.toml`'s
+value; `x` takes a key out of it; `w` checks the merged config, then writes
+only the profile's file, keeping its comments, and restarts the daemon when
+that profile is the active one. Base-only rows refuse edits, and so do the
+vocabulary list (`vocabulary.txt` is every profile's) and the Replacements
+section (`e` sets those in the file). Profile
+mode opens over `config.toml` as saved, so it asks about Config's unsaved
+edits first. On plain Config while a profile is active, the header says
+`base` and a row the profile sets says `offline sets this`: an edit there
+applies once base is active again.
+
+**The active name** is one line in `$XDG_STATE_HOME/whisrs/active-profile`
+(`~/.local/state/whisrs/active-profile` by default). No file, or `base`, is
+`config.toml` alone, so nothing changes until you switch.
+
+**The merge.** At startup the daemon merges the active profile over
+`config.toml`, before the unknown-key check and validation (`vocabulary.txt`
+merges after, as ever). Tables merge key by key; any other value replaces the
+base value, so a profile's `vocabulary = [...]` replaces the list rather than
+adding to it. The section and key aliases (`[local]`, `[asr]`, `[vibevoice]`,
+`[hotkeys] read`) are read as their own names on both sides. An unknown key is
+reported with the file it came from.
+
+**What stays in `config.toml`:** every `api_key`, `[hotkeys]`,
+`[[llm_commands]]`, `[[agents]]` (they carry hotkeys, and a profile must never
+drop the key that switches out of it) and `[recording] dir` (one recordings
+folder for every profile, read by `whisrs recording list/show/path` and
+`whisrs mcp` without the daemon). A profile that sets one has it ignored, with
+a warning naming each key.
+
+A profile that is missing, is not valid TOML, or does not load or validate
+over `config.toml` never stops the daemon: it warns, notifies (when
+`[general] notify` is on), and runs on `config.toml`. `whisrs status` then
+says `profile offline did not load, using base: <why>`; with a profile active
+it adds `profile: offline` under the state. That second line is printed on a
+terminal only: piped or in a status bar, the output is the state alone, as
+before.
 
 ## Environment variables
 

@@ -351,6 +351,22 @@ impl Drop for ReplyHold<'_> {
     }
 }
 
+/// A turn on its way to its slot ([`AgentRuntime::begin_turn`]): from a voice
+/// turn's back-to-Idle, or a typed `send`, until `start_turn` returns. Its
+/// `session_phase` check alone takes seconds, a window in which the daemon
+/// looks idle but a restart would drop the turn. Counted by
+/// [`AgentRuntime::any_turn_running`], which anything that must not restart
+/// the daemon under a turn asks (`info`).
+pub(crate) struct PendingTurn<'a> {
+    rt: &'a AgentRuntime,
+}
+
+impl Drop for PendingTurn<'_> {
+    fn drop(&mut self) {
+        self.rt.pending_turns.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The agent runtime.
 pub(crate) struct AgentRuntime {
     agents: Vec<Arc<Agent>>,
@@ -370,6 +386,8 @@ pub(crate) struct AgentRuntime {
     speak: bool,
     /// Live [`ReplyHold`]s.
     reply_holds: AtomicUsize,
+    /// Live [`PendingTurn`]s.
+    pending_turns: AtomicUsize,
     /// The dictation state, set once the reply queue starts: a recording
     /// start stops an agent reply playing through it.
     daemon_state: OnceLock<Arc<Mutex<DaemonState>>>,
@@ -474,6 +492,7 @@ impl AgentRuntime {
             playing: std::sync::Mutex::new(None),
             speak: config.tts.as_ref().is_some_and(|t| t.enabled),
             reply_holds: AtomicUsize::new(0),
+            pending_turns: AtomicUsize::new(0),
             daemon_state: OnceLock::new(),
             save_seq: AtomicU64::new(0),
             saved_seq: Arc::new(std::sync::Mutex::new(0)),
@@ -502,6 +521,7 @@ impl AgentRuntime {
             playing: std::sync::Mutex::new(None),
             speak: false,
             reply_holds: AtomicUsize::new(0),
+            pending_turns: AtomicUsize::new(0),
             daemon_state: OnceLock::new(),
             save_seq: AtomicU64::new(0),
             saved_seq: Arc::new(std::sync::Mutex::new(0)),
@@ -527,6 +547,31 @@ impl AgentRuntime {
         self.agents
             .iter()
             .any(|a| a.hotkey.is_some() || a.new_session_hotkey.is_some())
+    }
+
+    /// Hold the runtime's lock, as an agent operation does, until the
+    /// result drops.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) -> impl Sized + '_ {
+        self.inner.try_lock().expect("the agent runtime is free")
+    }
+
+    /// Whether a whisrs turn of any agent runs or is on its way
+    /// ([`PendingTurn`]): a restart stops it. `None` while the runtime's lock
+    /// is held, for `info`, which never waits on it.
+    pub(crate) fn any_turn_running(&self) -> Option<bool> {
+        if self.pending_turns.load(Ordering::SeqCst) > 0 {
+            return Some(true);
+        }
+        let inner = self.inner.try_lock().ok()?;
+        Some(inner.slots.values().any(|slot| slot.turn.is_some()))
+    }
+
+    /// Count a turn as running from now until the guard drops: take it before
+    /// a turn's text is ready to go, and hold it until `start_turn` returns.
+    pub(crate) fn begin_turn(&self) -> PendingTurn<'_> {
+        self.pending_turns.fetch_add(1, Ordering::SeqCst);
+        PendingTurn { rt: self }
     }
 
     fn agent(&self, name: &str) -> Option<Arc<Agent>> {
@@ -757,6 +802,12 @@ impl AgentRuntime {
             None => {}
         }
         true
+    }
+
+    /// Wake the reply queue: something that held replies without a
+    /// [`ReplyHold`] (a profile switch) let go.
+    pub(crate) fn wake_replies(&self) {
+        self.utterance_ready.notify_one();
     }
 
     /// Hold agent replies until the guard drops ([`ReplyHold`]).
@@ -1190,12 +1241,16 @@ fn may_speak(state: State, held: bool) -> bool {
 
 /// Whether agent replies wait besides the dictation state: a
 /// [`ReplyHold`] (a command or read-aloud press capturing the selection, a
-/// recording starting), or a recording capturing (a meeting recording does not touch
+/// recording starting), a recording capturing (a meeting recording does not touch
 /// the dictation state, and a reply would play mid-call and land on its
-/// system track). Checked under the dictation lock by `speak_text`, so a
-/// hold taken under that lock is never missed.
+/// system track), or a profile switch under way (its restart would cut the
+/// reply off; one that does not happen wakes the queue). Checked under the
+/// dictation lock by `speak_text`, so a hold taken under that lock is never
+/// missed.
 pub(crate) fn replies_held(context: &DaemonContext) -> bool {
-    context.agents.reply_holds.load(Ordering::SeqCst) > 0 || recording_captures(context)
+    context.agents.reply_holds.load(Ordering::SeqCst) > 0
+        || recording_captures(context)
+        || context.profile.is_switching()
 }
 
 fn recording_captures(_context: &DaemonContext) -> bool {
@@ -1544,6 +1599,7 @@ pub(crate) async fn handle_agent(
             let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
                 return error("nothing to send: the text is empty");
             };
+            let _pending = rt.begin_turn();
             if new {
                 if let Err(message) = reset(&context, &agent).await {
                     return error(&message);
@@ -2618,7 +2674,9 @@ async fn voice_turn_background(
     )
     .await;
 
-    // Back to Idle at once: the turn runs on its own task.
+    // Back to Idle at once: the turn runs on its own task. Running from
+    // here for `info`, until `start_turn` has it in its slot.
+    let _pending = context.agents.begin_turn();
     {
         let mut ds = daemon_state.lock().await;
         let _ = ds.state_machine.transition(Action::TranscriptionDone);
@@ -2773,6 +2831,8 @@ mod tests {
             agents: rt,
             agent_board: tokio::sync::watch::channel(Vec::new()).0,
             agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
+            started_at: 0,
+            profile: crate::profile::ProfileRuntime::inert(),
         })
     }
 
@@ -2795,6 +2855,56 @@ mod tests {
                     .map_or_else(whisrs::agent::progress::Feedback::default, |a| a.feedback),
             ),
         });
+    }
+
+    /// `info` counts a running turn, so a restart after a save leaves it
+    /// alone; a held runtime lock is not known, never waited on.
+    #[tokio::test]
+    async fn info_names_a_running_agent_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis"], dir.path());
+        assert_eq!(context.agents.any_turn_running(), Some(false));
+        install_turn(&context, "jarvis", 1, "check it").await;
+        assert_eq!(context.agents.any_turn_running(), Some(true));
+
+        let ds = Arc::new(Mutex::new(crate::context::DaemonState::new()));
+        let answer = crate::handle_command(whisrs::Command::Info, ds, Arc::clone(&context)).await;
+        let whisrs::Response::Info { info } = answer else {
+            panic!("expected an info response, got {answer:?}");
+        };
+        assert!(info.agent_turn);
+        assert!(!info.busy);
+
+        let held = context.agents.inner.lock().await;
+        assert_eq!(context.agents.any_turn_running(), None);
+        drop(held);
+    }
+
+    /// A turn on its way to its slot (a voice turn back at Idle, a typed
+    /// send, while `session_phase` runs) counts as running.
+    #[tokio::test]
+    async fn a_pending_turn_counts_as_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis"], dir.path());
+        assert_eq!(context.agents.any_turn_running(), Some(false));
+        let first = context.agents.begin_turn();
+        let second = context.agents.begin_turn();
+        // Even with the runtime's lock held.
+        let held = context.agents.inner.lock().await;
+        assert_eq!(context.agents.any_turn_running(), Some(true));
+        drop(held);
+        drop(first);
+        assert_eq!(context.agents.any_turn_running(), Some(true));
+        drop(second);
+        assert_eq!(context.agents.any_turn_running(), Some(false));
+
+        let _pending = context.agents.begin_turn();
+        let ds = Arc::new(Mutex::new(crate::context::DaemonState::new()));
+        let answer = crate::handle_command(whisrs::Command::Info, ds, Arc::clone(&context)).await;
+        let whisrs::Response::Info { info } = answer else {
+            panic!("expected an info response, got {answer:?}");
+        };
+        assert!(info.agent_turn);
     }
 
     fn queued(rt: &AgentRuntime) -> Vec<String> {

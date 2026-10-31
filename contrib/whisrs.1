@@ -13,22 +13,207 @@ It sends commands (toggle, cancel, status) and prints the daemon's response.
 .PP
 The
 .B setup
-subcommand runs an interactive onboarding flow and does not require the daemon.
+subcommand runs an onboarding wizard and does not require the daemon.
 .SH SUBCOMMANDS
 .TP
 .B setup
-Interactive onboarding \(em select a transcription backend, enter an API key,
-test the microphone, and write
-.IR config.toml .
-Does not require the daemon to be running.
+Open the onboarding wizard, a full\-screen TUI, one step at a time: the
+transcription backend; its API key (with a test, below), its server, or a
+whisper.cpp model to download with a progress bar
+.RB ( Enter
+downloads one not on disk and goes on once it is done,
+.B Esc
+cancels it and leaves no partial file); the language; the microphone, with
+a live level meter; filler removal, tones, the overlay and its theme; the
+typing backend; then the optional modes, each asked first (Set it up or
+Skip): recording, command mode, read aloud and Jarvis (one
+.B [[agents]]
+entry, added after the file's own). A review then
+writes
+.I config.toml
+through the same save as
+.BR config ,
+and the last step checks the machine: write access to
+.I /dev/uinput
+(fixed with sudo in the plain terminal, where it may ask for a password),
+the user service (installed and started, or repointed at the
+.B whisrsd
+on
+.B PATH
+when it runs another one), a compositor keybinding for
+.B whisrs toggle
+(appended to Hyprland's or Sway's config only after a yes; Hyprland then
+needs
+.BR "hyprctl reload" ),
+and the GNOME Shell extension on GNOME. Answers are picked from a list or
+stepped, as in
+.BR config ,
+wherever whisrs can list the values; keys, URLs and tokens are typed.
+Keys:
+.B Enter
+the next step,
+.B Backspace
+the step before,
+.B Space
+opens the row's list or input (or flips a toggle),
+.B h
+and
+.B l
+change it in place,
+.B t
+tests the key with one request that sends no audio (valid, rejected,
+limited or unreachable, within 5 seconds), using the key the daemon would:
+a
+.B WHISRS_*_API_KEY
+variable wins over a backend's key in the file, and fills in for an empty
+.B [llm] api_key
+(an ASR sidecar is sent half a second of silence; a whisper model file is
+checked to be one); on read aloud it says a sample sentence with the voice
+picked, and any key stops it,
+.B s
+skips an optional step, at its question or midway (none of a skipped
+mode's keys are written:
+.BR [llm] ,
+.B [tts]
+and the rest stay as they are), and
+.B Esc
+or
+.B q
+leave, asking first about answers not written yet. With a config already
+there, it offers to start fresh (the answers start from the defaults, with
+the file's API keys kept) or only check the machine. The write changes only
+the keys setup asked about, leaving the rest of the file, comments
+included, as it is; the review lists
+each key that changes, a key masked, and the old file is first kept as
+.I config.toml.bak
+(0600). A missing API key is a warning, not a refusal: the daemon then needs
+the
+.B WHISRS_*_API_KEY
+variable in its own environment. A config that cannot be read is refused
+before the TUI opens; one that does not load is written anew from the
+answers and kept as
+.IR config.toml.bak .
+Off an interactive terminal it exits 1, as
+.B config
+does. Does not require the daemon to be running.
 .TP
 .B config
-Open an interactive menu to edit any section of
-.IR config.toml
-\(em backend, language, hotkeys, overlay, command-mode LLM, and more.
-On save, writes the file and restarts the daemon via systemd. Unlike
+Open a full\-screen editor (a TUI) for every key of
+.IR config.toml ,
+by section: backend and API keys, language, hotkeys, overlay, read\-aloud,
+agents, recording, and the rest. A value whisrs can list is picked, not
+recalled:
+.B h
+and
+.B l
+change a choice or step a number
+.RB ( H
+and
+.B L
+by a bigger step),
+.B Enter
+opens a picker that filters as you type (languages, models, voices,
+devices, model files), and a hotkey is built in a dialog of modifiers and
+a key. A value no list has can still be typed, and
+.B Tab
+completes a path.
+.B w
+saves only what changed (a value set back to its default leaves the file,
+and no default is ever written), keeping comments, key order and unknown
+keys, then restarts the
+daemon through its service manager, but only while it is idle: while it
+dictates, records or runs an agent turn the restart is skipped, and
+.B r
+(or
+.BR "whisrs restart" )
+does it later.
+.B e
+opens the file in
+.BR $VISUAL ,
+else
+.BR $EDITOR ,
+else the first of
+.BR nvim ,
+.BR vim ,
+.B vi
+and
+.B nano
+on
+.BR PATH .
+Colours follow the
+.B [overlay]
+theme;
+.B NO_COLOR
+turns them off. Off an interactive terminal (stdin or stdout not a TTY, or
+.BR TERM=dumb )
+it prints where to edit the file and exits 1, changing nothing. Unlike
 .B setup
 this does not touch udev rules, the systemd unit, or compositor keybindings.
+.B Esc
+goes up to Home, which also opens Setup, Recordings, Profiles, History and
+the Mic test: a live level meter of the
+.B [audio] device
+(from \-60 to 0 dBFS, with the silence gate and the peak held) and a
+quality line over the last 10 seconds (speech level, background, SNR, and
+the first warning: too quiet, noisy, clipping), measured with the
+.B [audio] vad
+detector, where
+.B h
+and
+.B l
+or
+.B Enter
+pick the device and
+.B w
+writes only
+.B [audio] device
+(other unsaved edits stay unsaved), then restarts the daemon if it is idle.
+Recordings lists the recordings, newest first, previews one and opens its
+transcript, and retries, copies, names a speaker of, summarizes or deletes
+it through the daemon (a delete, and a retry of a transcribed recording,
+ask first). History shows what dictation typed, newest first, says when
+.B [general] history
+is off, and clears it all with
+.B C
+(asking first), as
+.B whisrs log \-\-clear
+does. Both filter with
+.BR / .
+Profiles lists
+.B base
+and the profiles, the active one marked, each with what its file sets (an
+API key named, never shown).
+.B Enter
+switches to one, as
+.B whisrs profile
+does;
+.B n
+makes one (an empty file, the name checked as it is typed),
+.B d
+deletes one, asking first (not
+.B base
+or the active one), and
+.B e
+opens its file in the editor.
+.B l
+opens it in Config in profile mode: each row shows the value the profile
+makes over
+.IR config.toml ,
+tagged
+.BR profile ,
+.B base
+or
+.BR "base only" ;
+an edit goes into the profile,
+.B x
+takes a key out of it, and
+.B w
+checks the merged config and writes only the profile's file, restarting the
+daemon when it is the active one. Base\-only rows, the vocabulary list and
+the Replacements section refuse edits there. While a profile is active, plain
+Config's header says
+.B base
+and a row the profile sets says so.
 .TP
 .B toggle
 Start or stop dictation. If idle, begins audio capture. If recording,
@@ -179,6 +364,63 @@ Prints one of:
 .BR synthesizing ,
 or
 .BR speaking .
+On a terminal, a second line names the config profile when one other than
+base is active
+.RB ( "profile: offline" ),
+or says why the active one did not load and the daemon runs on base. Off a
+terminal the state is the whole output, so a script or status bar that
+compares it keeps working.
+.TP
+\fBprofile\fR [\fBlist\fR|\fBnext\fR|\fBbase\fR|\fINAME\fR]
+Config profiles: a profile is a partial
+.I config.toml
+in
+.IR ~/.config/whisrs/profiles/NAME.toml ,
+holding only what differs from the base config (for example another backend
+and model). Names are 1 to 32 of a\-z, 0\-9,
+.B \-
+and
+.BR _ ,
+and not
+.BR base ,
+.B list
+or
+.BR next .
+.B list
+(the default) prints
+.B base
+and every profile, the active one marked
+.BR * ,
+with a broken profile's reason or the base\-only keys it sets (ignored), and
+a line above them when the daemon runs on another profile than the next
+start will. It reads the files, so it works with the daemon stopped.
+.BR next ,
+.B base
+or a name switch: the daemon checks the profile loads, refuses while it
+dictates, transcribes, reads aloud, records or runs an agent turn (saying
+which), writes the active name, notifies, and restarts on it (through its
+service, or by starting itself again when it was started by hand).
+.B next
+goes base, then the profiles by name, and wraps, passing over (and naming)
+one that does not load; with no other loading it refuses, saying why for
+each;
+.B [hotkeys] next_profile
+binds it to a key, and the tray's Profile menu picks one. With the daemon stopped
+the profile is checked here (a backend key that only the daemon's
+environment may hold is no failure) and applies when it starts; while the
+daemon restarts it is waited for, up to 3 seconds, and otherwise the switch
+says to try again. API keys,
+.BR [hotkeys] ,
+.BR [[llm_commands]] ,
+.B [[agents]]
+and
+.B [recording] dir
+stay in
+.IR config.toml :
+a profile that sets one has it ignored, with a warning. Exits 1 on a
+refusal. Profiles are created and deleted as files, or on the Profiles
+screen of
+.BR "whisrs config" .
 .TP
 .B restart
 Restart the whisrs daemon. Uses
@@ -367,6 +609,24 @@ recording being transcribed, and a notification says when it is done; if it
 fails, the recording keeps the summary it had and notes why. A summary
 interrupted by a shutdown is made at the next start. One job runs at a
 time: a running summary delays the next transcription until it ends.
+.TP
+\fBdelete\fR \fIID\fR [\fB\-y\fR, \fB\-\-yes\fR]
+Delete the recording for good: its folder, with its audio, transcript and
+summary. The id is a full id or a unique id prefix, never
+.BR last ,
+so the newest recording is not deleted by mistake; the prefix is resolved
+first, and the daemon is sent the whole id, which it requires. On a terminal it names
+what goes and asks
+.B [y/N]
+first, keeping it unless the answer is
+.B y
+or
+.BR yes ;
+.B \-\-yes
+deletes without asking, and is needed off a terminal, where it otherwise
+refuses. The daemon refuses a recording while it is being recorded, is
+queued or being processed (a summary included), or is held by a rename or
+the audio retention sweep.
 .RE
 .IP
 .BR list ,
@@ -445,6 +705,11 @@ Groq API key. Overrides the value in
 OpenAI API key. Overrides the value in
 .IR config.toml .
 .TP
+.B NO_COLOR
+Set and not empty:
+.B whisrs config
+draws without colour.
+.TP
 .B XDG_RUNTIME_DIR
 Directory for the Unix socket. The socket is created at
 .IR $XDG_RUNTIME_DIR/whisrs.sock .
@@ -466,6 +731,19 @@ Permissions should be 0600 since it may contain API keys.
 .TP
 .I $XDG_RUNTIME_DIR/whisrs.sock
 Unix domain socket for CLI\-daemon IPC.
+.TP
+.I ~/.config/whisrs/profiles/NAME.toml
+Config profiles, merged over
+.I config.toml
+by the daemon when active (see
+.BR profile ).
+.TP
+.I $XDG_STATE_HOME/whisrs/active\-profile
+The active profile's name, one line (defaults to
+.IR ~/.local/state/whisrs/active\-profile ).
+No file, or
+.BR base ,
+is the base config alone.
 .TP
 .I ~/.cache/whisrs/recovery/
 Recovery directory for audio that failed transcription.
@@ -490,7 +768,9 @@ Written only when agents are configured.
 Success.
 .TP
 .B 1
-Error (daemon not running, invalid state transition, or setup failure).
+Error (daemon not running, invalid state transition, setup failure, or
+.B whisrs config
+off an interactive terminal).
 .SH EXAMPLES
 Run interactive setup:
 .PP
@@ -520,6 +800,13 @@ Check daemon state:
 .PP
 .RS
 .B whisrs status
+.RE
+.PP
+Switch to the profile in
+.IR ~/.config/whisrs/profiles/offline.toml :
+.PP
+.RS
+.B whisrs profile offline
 .RE
 .PP
 Send a typed turn to the agent named jarvis:

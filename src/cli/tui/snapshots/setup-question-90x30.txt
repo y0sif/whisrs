@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                     setup 9/12 · ○  │
+   │                                                                                  │
+   │   Read aloud (optional)                                                          │
+   │   Select text and press a hotkey: whisrs reads it aloud. Jarvis speaks its       │
+   │   replies with it too.                                                           │
+   │                                                                                  │
+   │ ▌ Set it up      a voice, its key, a hotkey                                      │
+   │   Skip           whisrs config sets it later                                     │
+   │                                                                                  │
+   │   skipped command mode: whisrs config sets it later                              │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k move · enter choose · s skip · backspace back · esc leave
+
+
+
+
+
+
+
+
+

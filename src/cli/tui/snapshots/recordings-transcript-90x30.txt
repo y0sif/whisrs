@@ -1,0 +1,30 @@
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                     recordings · ●  │
+   │                                                                                  │
+   │   Standup · 32m · deepgram · 3 speakers                                          │
+   │                                                                                  │
+   │   Summary                                                                        │
+   │   The TUI ships this week; profiles follow.                                      │
+   │                                                                                  │
+   │   Next steps                                                                     │
+   │   - [ ] Merge the recordings screen                                              │
+   │                                                                                  │
+   │   Transcript                                                                     │
+   │   [00:00:03] Yosif: I think we can ship the TUI this week.                       │
+   │   [00:00:09] Sarah: Do we need the profiles bit first?                           │
+   │   [00:00:14] Speaker 2: No, profiles come after it, in their own branch.         │
+   │   [00:00:20] Yosif: Then the recordings screen goes in today.                    │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k scroll · r retry · c copy · n name · S summary · d delete · ? help
