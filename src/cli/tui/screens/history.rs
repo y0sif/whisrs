@@ -1,6 +1,8 @@
 //! History: the dictations `history.jsonl` keeps, newest first, read on a
 //! worker when the screen opens. `Enter` opens one's whole text, `/`
-//! filters them by their text. Read-only.
+//! filters them by their text, `C` clears them all through the daemon
+//! (asking first), as `whisrs log --clear` does. With `[general] history`
+//! off it says so, since the daemon then adds nothing.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -31,6 +33,13 @@ const DURATION_WIDTH: usize = 6;
 
 /// The widest the backend column gets.
 const BACKEND_MAX: usize = 18;
+
+/// Over the list while `[general] history` is off.
+const OFF_NOTE: &str = "History is off: new dictations are not kept. C clears these.";
+
+/// In place of the list while it is off and the file holds none.
+const OFF_EMPTY: &str = "History is off, so dictations are not kept. Config > General > \
+                         history turns it on.";
 
 /// One dictation, as the screen shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +92,15 @@ fn first_line(text: &str) -> String {
         .join(" ")
 }
 
+/// What a key on History asks of the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    Nothing,
+    Leave,
+    /// `C` on the list: clear the whole history, asking first.
+    Clear,
+}
+
 #[derive(Debug, Default)]
 pub struct History {
     /// The dictations as last read; `None` until the read is back.
@@ -95,6 +113,8 @@ pub struct History {
     open: Option<(usize, usize)>,
     /// How far the open text can scroll and how tall it is, as last drawn.
     shown: Cell<(usize, usize)>,
+    /// A clear was sent and the daemon has not answered yet.
+    pub clearing: bool,
 }
 
 impl History {
@@ -143,8 +163,8 @@ impl History {
         self.cursor = self.cursor.min(self.visible().len().saturating_sub(1));
     }
 
-    /// Handle `action`; `true` when it leaves the screen.
-    pub fn key(&mut self, action: Action) -> bool {
+    /// Handle `action`: what it asks of the app.
+    pub fn key(&mut self, action: Action) -> Asked {
         if let Some(input) = self.typing.as_mut() {
             match action {
                 Action::Enter => {
@@ -162,7 +182,7 @@ impl History {
             }
             self.cursor = 0;
             self.clamp();
-            return false;
+            return Asked::Nothing;
         }
         if let Some((index, at)) = self.open {
             let (most, height) = self.shown.get();
@@ -172,7 +192,7 @@ impl History {
             let to = match action {
                 Action::Back => {
                     self.open = None;
-                    return false;
+                    return Asked::Nothing;
                 }
                 Action::Up => at.saturating_sub(1),
                 Action::Down => at.saturating_add(1).min(most),
@@ -185,7 +205,7 @@ impl History {
                 _ => at,
             };
             self.open = Some((index, to));
-            return false;
+            return Asked::Nothing;
         }
         let last = self.visible().len().saturating_sub(1);
         let at = self.cursor;
@@ -194,7 +214,8 @@ impl History {
                 self.filter.clear();
                 0
             }
-            Action::Back => return true,
+            Action::Back => return Asked::Leave,
+            Action::ClearAll => return Asked::Clear,
             Action::Filter => {
                 self.typing = Some(Input::new(&self.filter, false));
                 at
@@ -217,7 +238,7 @@ impl History {
             _ => at,
         };
         self.clamp();
-        false
+        Asked::Nothing
     }
 }
 
@@ -243,10 +264,12 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         .open
         .and_then(|(index, at)| Some((history.all().get(index)?, at)));
     let visible = history.visible();
+    let kept = app.history_kept();
     let text: Option<(String, Tone)> = match &history.entries {
         _ if open.is_some() => None,
         None => Some(("looking...".into(), Tone::Muted)),
         Some(Err(why)) => Some((format!("cannot read the history: {why}"), Tone::Error)),
+        Some(Ok(all)) if all.is_empty() && !kept => Some((OFF_EMPTY.into(), Tone::Muted)),
         Some(Ok(all)) if all.is_empty() => Some(("No dictations yet".into(), Tone::Muted)),
         Some(Ok(_)) if visible.is_empty() => {
             Some((format!("nothing matches /{}", history.filter), Tone::Muted))
@@ -259,10 +282,16 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
             .map(|line| (line, tone))
             .collect::<Vec<_>>()
     });
+    // Over the dictations the file still holds, a line that none is added.
+    let note = match &history.entries {
+        Some(Ok(all)) if !kept && !all.is_empty() && open.is_none() => wrap(OFF_NOTE, max.max(1)),
+        _ => Vec::new(),
+    };
+    let top = if note.is_empty() { 0 } else { note.len() + 1 };
     let wanted = match (&text, open) {
         (_, Some(_)) => None,
-        (Some(lines), None) => Some((lines.len() + foot) as u16),
-        (None, None) => Some((visible.len() + foot) as u16),
+        (Some(lines), None) => Some((top + lines.len() + foot) as u16),
+        (None, None) => Some((top + visible.len() + foot) as u16),
     };
     let Some(placed) = frame::place(area, wanted) else {
         return frame::too_small(f, ui);
@@ -322,23 +351,34 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         {
             f.render_widget(Paragraph::new(Line::from(line)), at(2 + i));
         }
-    } else if let Some(text) = text {
-        for (y, (line, tone)) in text.into_iter().enumerate() {
+    } else {
+        for (y, line) in note.into_iter().enumerate() {
             if y < room {
                 f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(line, tone.style(ui.theme)))),
+                    Paragraph::new(Line::from(Span::styled(line, ui.theme.muted))),
                     at(y),
                 );
             }
         }
-    } else {
-        draw_list(
-            history,
-            &visible,
-            f,
-            Rect::new(body.x, body.y, body.width, room as u16),
-            ui,
-        );
+        let room = room.saturating_sub(top);
+        if let Some(text) = text {
+            for (y, (line, tone)) in text.into_iter().enumerate() {
+                if y < room {
+                    f.render_widget(
+                        Paragraph::new(Line::from(Span::styled(line, tone.style(ui.theme)))),
+                        at(top + y),
+                    );
+                }
+            }
+        } else {
+            draw_list(
+                history,
+                &visible,
+                f,
+                Rect::new(body.x, body.y + top as u16, body.width, room as u16),
+                ui,
+            );
+        }
     }
 
     for (i, line) in messages.into_iter().enumerate() {
@@ -424,6 +464,7 @@ fn footer(history: &History, f: &mut Frame, rect: Rect, ui: &Ui) {
             ("j/k", "move"),
             ("enter", "open"),
             ("/", "filter"),
+            ("C", "clear"),
             ("esc", "back"),
             ("?", "help"),
         ]
@@ -438,7 +479,11 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::tui::testing::{assert_snapshot, draw, mockup, press, rows, Fixture};
+    use crate::tui::app::{Dialog, Effect, Msg};
+    use crate::tui::testing::{
+        assert_snapshot, draw, mockup, mockup_on, press, rows, Fixture, MOCKUP,
+    };
+    use crate::tui::worker::DaemonView;
 
     fn at(month: u32, day: u32, h: u32, m: u32, s: u32) -> DateTime<Local> {
         Local.with_ymd_and_hms(2026, month, day, h, m, s).unwrap()
@@ -485,11 +530,24 @@ mod tests {
     /// History open from Home, the mockup's config, the file read at a
     /// fixed time.
     fn history(read: Result<Vec<Dictation>, String>) -> Fixture {
-        let mut fixture = mockup();
+        opened(mockup(), read)
+    }
+
+    /// [`history`] on a config with `[general] history` off.
+    fn history_off(read: Result<Vec<Dictation>, String>) -> Fixture {
+        let toml = MOCKUP.replace(
+            "language = \"en\"\n",
+            "language = \"en\"\nhistory = false\n",
+        );
+        assert_ne!(toml, MOCKUP);
+        opened(mockup_on(&toml), read)
+    }
+
+    fn opened(mut fixture: Fixture, read: Result<Vec<Dictation>, String>) -> Fixture {
         press(&mut fixture.app, "\x1bG");
         let effects = press(&mut fixture.app, "\n");
-        assert_eq!(effects, [crate::tui::app::Effect::ReadHistory]);
-        fixture.app.update(crate::tui::app::Msg::HistoryRead(read));
+        assert_eq!(effects, [Effect::ReadHistory]);
+        fixture.app.update(Msg::HistoryRead(read));
         fixture
     }
 
@@ -497,6 +555,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let read = read(&file(dir.path()), at(10, 30, 15, 0, 0));
         history(read)
+    }
+
+    fn three_off() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let read = read(&file(dir.path()), at(10, 30, 15, 0, 0));
+        history_off(read)
+    }
+
+    fn said(fixture: &Fixture) -> String {
+        fixture.app.status.as_ref().expect("a status").text.clone()
+    }
+
+    fn shows(fixture: &Fixture, text: &str) -> bool {
+        rows(&draw(&fixture.app, 90, 30))
+            .iter()
+            .any(|row| row.contains(text))
     }
 
     #[test]
@@ -557,6 +631,88 @@ mod tests {
         assert_eq!(fixture.app.screen(), crate::tui::app::Screen::History);
     }
 
+    /// With `[general] history` off, a line over the list says no new
+    /// dictation is kept, and an empty file says how to turn it on. An open
+    /// dictation has the screen to itself.
+    #[test]
+    fn history_off_is_said() {
+        let off = three_off();
+        assert!(shows(&off, "History is off: new dictations are not kept"));
+        assert!(shows(&off, "Ship the TUI this week."));
+        assert!(!shows(&three(), "History is off"));
+        let empty = history_off(Ok(Vec::new()));
+        assert!(shows(&empty, "History is off, so dictations are not kept"));
+        assert!(!shows(&empty, "No dictations yet"));
+        let mut open = three_off();
+        press(&mut open.app, "\n");
+        assert!(!shows(&open, "History is off"));
+        assert!(shows(&open, "Ship the TUI this week."));
+    }
+
+    /// `C` asks first and only `y` sends the clear; until the daemon
+    /// answers another `C` says so, and a clear that worked reads the file
+    /// again.
+    #[test]
+    fn c_clears_after_asking() {
+        let mut fixture = three();
+        for keep in ["n", "\x1b", "\n"] {
+            assert!(press(&mut fixture.app, "C").is_empty());
+            assert_eq!(
+                fixture.app.dialog,
+                Some(Dialog::ClearHistory { count: Some(3) })
+            );
+            assert!(shows(&fixture, "All 3 dictations go for good."));
+            assert!(press(&mut fixture.app, keep).is_empty(), "{keep:?}");
+            assert_eq!(fixture.app.dialog, None, "{keep:?}");
+            assert_eq!(said(&fixture), "kept the history", "{keep:?}");
+            assert_eq!(fixture.app.screen(), crate::tui::app::Screen::History);
+        }
+        press(&mut fixture.app, "C");
+        assert_eq!(press(&mut fixture.app, "y"), [Effect::ClearHistory]);
+        assert!(fixture.app.history.clearing);
+        assert_eq!(said(&fixture), "clearing the history...");
+        press(&mut fixture.app, "C");
+        assert_eq!(fixture.app.dialog, None);
+        assert!(said(&fixture).starts_with("still clearing the history"));
+        assert_eq!(
+            fixture.app.update(Msg::HistoryCleared(Ok(()))),
+            Some(Effect::ReadHistory)
+        );
+        assert!(!fixture.app.history.clearing);
+        assert_eq!(said(&fixture), "history cleared");
+        fixture.app.update(Msg::HistoryRead(Ok(Vec::new())));
+        assert!(shows(&fixture, "No dictations yet"));
+        press(&mut fixture.app, "C");
+        assert_eq!(fixture.app.dialog, None);
+        assert_eq!(said(&fixture), "the history is empty");
+    }
+
+    /// Nothing is asked while the daemon is down; a clear it refused says
+    /// why and reads nothing; `C` in an open dictation does nothing.
+    #[test]
+    fn c_is_refused_while_the_daemon_is_down() {
+        let mut fixture = three();
+        fixture.app.update(Msg::Daemon(DaemonView::Down));
+        press(&mut fixture.app, "C");
+        assert_eq!(fixture.app.dialog, None);
+        assert!(said(&fixture).starts_with("cannot clear the history: whisrsd is not running"));
+        assert_eq!(
+            fixture.app.update(Msg::HistoryCleared(Err(
+                "failed to clear history: denied".into()
+            ))),
+            None
+        );
+        assert_eq!(said(&fixture), "failed to clear history: denied");
+        let mut open = three();
+        press(&mut open.app, "\nC");
+        assert_eq!(open.app.dialog, None);
+        assert!(open.app.history.open.is_some());
+        // One dictation is said as one.
+        let mut one = history(Ok(three().app.history.all()[..1].to_vec()));
+        press(&mut one.app, "C");
+        assert!(shows(&one, "Its one dictation goes for good."));
+    }
+
     #[test]
     fn history_snapshots() {
         let fixture = three();
@@ -576,5 +732,20 @@ mod tests {
         }
         let empty = history(Ok(Vec::new()));
         assert_snapshot("history-empty-90x30", &rows(&draw(&empty.app, 90, 30)));
+        let off = three_off();
+        for (w, h) in [(60, 18), (90, 30)] {
+            assert_snapshot(
+                &format!("history-off-{w}x{h}"),
+                &rows(&draw(&off.app, w, h)),
+            );
+        }
+        let off_empty = history_off(Ok(Vec::new()));
+        assert_snapshot(
+            "history-off-empty-90x30",
+            &rows(&draw(&off_empty.app, 90, 30)),
+        );
+        let mut asking = three();
+        press(&mut asking.app, "C");
+        assert_snapshot("history-clear-90x30", &rows(&draw(&asking.app, 90, 30)));
     }
 }

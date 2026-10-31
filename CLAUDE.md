@@ -46,8 +46,9 @@ whisrs config    # full-screen config editor (TUI): every key by section, w save
                  # t tests a key row; Esc goes to Home, which opens Setup, Config, the Mic
                  # test (a live level meter; its w writes only [audio] device), Recordings
                  # (list, preview, transcript; r c n S d are the daemon's actions) and History
-                 # (read-only); a save restarts the daemon only while it is idle (r later), e
-                 # opens config.toml in $EDITOR. Refuses off a terminal
+                 # (C clears it through the daemon; says when [general] history is off); a save
+                 # restarts the daemon only while it is idle (r later), e opens config.toml in
+                 # $EDITOR. Refuses off a terminal
 whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
 whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once

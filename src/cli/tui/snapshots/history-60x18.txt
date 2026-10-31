@@ -11,7 +11,7 @@
    │   ! unknown key [general] silense_timeout_ms is    │
    │     ignored                                        │
    ╰────────────────────────────────────────────────────╯
-     j/k move · enter open · / filter · esc back · ? help
+     j/k move · enter open · / filter · C clear · ? help
 
 
 

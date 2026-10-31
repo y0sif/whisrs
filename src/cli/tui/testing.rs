@@ -112,8 +112,12 @@ pub fn mockup() -> Fixture {
 
 /// [`mockup`] with `extra` after [`MOCKUP`]'s text.
 pub fn mockup_with(extra: &str) -> Fixture {
-    let toml = format!("{MOCKUP}{extra}");
-    let mut fixture = app_on(Some(&toml), &[("WHISRS_GROQ_API_KEY", "gsk_live_1234")]);
+    mockup_on(&format!("{MOCKUP}{extra}"))
+}
+
+/// [`mockup`] on `toml` in place of [`MOCKUP`].
+pub fn mockup_on(toml: &str) -> Fixture {
+    let mut fixture = app_on(Some(toml), &[("WHISRS_GROQ_API_KEY", "gsk_live_1234")]);
     let info = DaemonInfo {
         version: "0.2.0".into(),
         state: Some(State::Idle),

@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                        history · ●  │
+   │               ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓               │
+   │ ▌ Oct 30 14:02┃ Clear the history? All 3 dictations go for good. ┃.              │
+   │   Oct 30 11:40┃                                                  ┃omments and …  │
+   │   Oct 29 09:15┃ y clear · n keep                                 ┃van for Frid…  │
+   │               ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛               │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k move · enter open · / filter · C clear · esc back · ? help
+
+
+
+
+
+
+
+
+
+

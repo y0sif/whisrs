@@ -52,6 +52,8 @@ pub enum Action {
     Copy,
     Name,
     Summarize,
+    /// `C` on History: clear it all.
+    ClearAll,
     // Text input.
     Type(char),
     Erase,
@@ -167,6 +169,7 @@ pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
             KeyCode::Char('n') => Some(Action::Name),
             KeyCode::Char('S') => Some(Action::Summarize),
             KeyCode::Char('d') => Some(Action::Delete),
+            KeyCode::Char('C') => Some(Action::ClearAll),
             _ => None,
         },
         Mode::Browse => match key.code {
@@ -401,6 +404,7 @@ mod tests {
             ('n', Action::Name),
             ('S', Action::Summarize),
             ('d', Action::Delete),
+            ('C', Action::ClearAll),
             ('q', Action::Quit),
         ] {
             assert_eq!(

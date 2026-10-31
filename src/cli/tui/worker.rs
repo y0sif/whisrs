@@ -476,6 +476,16 @@ impl Workers {
         });
     }
 
+    /// Ask the daemon to clear the dictation history on a thread of its
+    /// own; the answer comes back as [`Msg::HistoryCleared`].
+    pub fn clear_history(&self) {
+        let (tx, socket, service) = (self.tx.clone(), self.socket.clone(), self.service);
+        std::thread::spawn(move || {
+            let answer = clear_history_on(&socket, service);
+            let _ = tx.send(Msg::HistoryCleared(answer));
+        });
+    }
+
     /// Read the dictation history at `path`; it comes back as
     /// [`Msg::HistoryRead`].
     pub fn read_history(&self, path: PathBuf) {
@@ -528,6 +538,23 @@ fn act_on(socket: &Path, service: ServiceManager, act: &Act) -> Result<(), Strin
              whisrs and not know delete: restart it (whisrs restart)"
                 .to_string(),
         ),
+        Err(RequestError::Closed) => {
+            Err("whisrsd closed the connection without answering".to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `clear-history`, as `whisrs log --clear` sends it.
+fn clear_history_on(socket: &Path, service: ServiceManager) -> Result<(), String> {
+    match whisrs::request_blocking_at(socket, &Command::ClearHistory, Some(ACT_TIMEOUT)) {
+        Ok(Response::Ok { .. }) => Ok(()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("whisrsd gave an answer this whisrs does not know".to_string()),
+        Err(RequestError::NotRunning(_)) => Err(format!(
+            "cannot clear the history: whisrsd is not running. Start it with {}",
+            service.enable_hint().unwrap_or(service.manual_start_hint())
+        )),
         Err(RequestError::Closed) => {
             Err("whisrsd closed the connection without answering".to_string())
         }

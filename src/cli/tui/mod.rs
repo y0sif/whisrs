@@ -504,6 +504,10 @@ fn perform(
                 workers.read_history(app.paths.history());
                 None
             }
+            Effect::ClearHistory => {
+                workers.clear_history();
+                None
+            }
             Effect::Save | Effect::SaveOver => {
                 let overwrite = next == Effect::SaveOver;
                 let saved = screens::config::save(&app.config, &app.paths, overwrite);

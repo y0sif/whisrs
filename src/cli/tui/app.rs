@@ -134,6 +134,8 @@ pub enum Msg {
     },
     /// The dictation history, read.
     HistoryRead(Result<Vec<Dictation>, String>),
+    /// The daemon's answer to [`Effect::ClearHistory`]: done, or why not.
+    HistoryCleared(Result<(), String>),
 }
 
 /// What the loop runs for the app.
@@ -218,6 +220,8 @@ pub enum Effect {
     Recording(Act),
     /// Read the dictation history; answered with [`Msg::HistoryRead`].
     ReadHistory,
+    /// Ask the daemon to clear it; answered with [`Msg::HistoryCleared`].
+    ClearHistory,
     /// Each in turn.
     All(Vec<Effect>),
 }
@@ -278,6 +282,11 @@ pub enum Dialog {
     RetryRecording {
         act: Act,
         lines: Vec<String>,
+    },
+    /// Clear the whole dictation history, of this many dictations (`None`:
+    /// the file did not read)? Keep by default.
+    ClearHistory {
+        count: Option<usize>,
     },
 }
 
@@ -616,6 +625,15 @@ impl App {
                 self.history.read(entries);
                 None
             }
+            Msg::HistoryCleared(answer) => {
+                self.history.clearing = false;
+                let cleared = answer.is_ok();
+                self.status = Some(match answer {
+                    Ok(()) => Notice::new(Tone::Ok, "history cleared"),
+                    Err(why) => Notice::new(Tone::Error, why),
+                });
+                (cleared && self.screen() == Screen::History).then_some(Effect::ReadHistory)
+            }
         }
     }
 
@@ -871,6 +889,49 @@ impl App {
         Some(Effect::ReadHistory)
     }
 
+    /// `[general] history` as saved, which is what the daemon runs on: is
+    /// a dictation added to the history?
+    pub fn history_kept(&self) -> bool {
+        self.config
+            .form
+            .saved("general.history")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    }
+
+    /// `C` on History: ask before the daemon clears it all, unless there is
+    /// nothing to clear or nothing to clear it.
+    fn ask_clear_history(&mut self) -> Option<Effect> {
+        let count = match &self.history.entries {
+            None => return None,
+            Some(Ok(entries)) if entries.is_empty() => {
+                self.status = Some(Notice::new(Tone::Muted, "the history is empty"));
+                return None;
+            }
+            Some(Ok(entries)) => Some(entries.len()),
+            Some(Err(_)) => None,
+        };
+        match self.clear_refusal() {
+            Some(notice) => self.status = Some(notice),
+            None => self.dialog = Some(Dialog::ClearHistory { count }),
+        }
+        None
+    }
+
+    /// Why the history is not cleared now, if it is not: the daemon clears
+    /// it, as `whisrs log --clear` has it do.
+    fn clear_refusal(&self) -> Option<Notice> {
+        if let Some(down) = self.down("clear the history") {
+            return Some(down);
+        }
+        self.history.clearing.then(|| {
+            Notice::new(
+                Tone::Warn,
+                "still clearing the history: wait for whisrsd's answer",
+            )
+        })
+    }
+
     /// Take what a key on Recordings asked for.
     fn recordings_reply(&mut self, reply: recordings::Reply) -> Option<Effect> {
         if let Some(status) = reply.status {
@@ -924,18 +985,8 @@ impl App {
 
     /// Why `act` is not sent now, if it is not.
     fn refusal(&self, act: &Act) -> Option<Notice> {
-        if self.daemon == DaemonView::Down {
-            let start = self
-                .service
-                .enable_hint()
-                .unwrap_or(self.service.manual_start_hint());
-            return Some(Notice::new(
-                Tone::Error,
-                format!(
-                    "cannot {}: whisrsd is not running. Start it with {start}",
-                    act.verb()
-                ),
-            ));
+        if let Some(down) = self.down(act.verb()) {
+            return Some(down);
         }
         self.recordings.is_busy(&act.id).then(|| {
             Notice::new(
@@ -943,6 +994,22 @@ impl App {
                 format!("still working on {}: wait for whisrsd's answer", act.label),
             )
         })
+    }
+
+    /// That the daemon cannot `verb` since it is known to be down, with the
+    /// command that starts it, as Home says.
+    fn down(&self, verb: &str) -> Option<Notice> {
+        if self.daemon != DaemonView::Down {
+            return None;
+        }
+        let start = self
+            .service
+            .enable_hint()
+            .unwrap_or(self.service.manual_start_hint());
+        Some(Notice::new(
+            Tone::Error,
+            format!("cannot {verb}: whisrsd is not running. Start it with {start}"),
+        ))
     }
 
     fn key(&mut self, key: KeyEvent) -> Option<Effect> {
@@ -1064,13 +1131,15 @@ impl App {
                 let reply = self.recordings.key(action, summary_on);
                 self.recordings_reply(reply)
             }
-            Screen::History => {
-                if self.history.key(action) {
+            Screen::History => match self.history.key(action) {
+                history::Asked::Leave => {
                     self.stack.pop();
                     self.home.point(Screen::History);
+                    None
                 }
-                None
-            }
+                history::Asked::Clear => self.ask_clear_history(),
+                history::Asked::Nothing => None,
+            },
         }
     }
 
@@ -1112,6 +1181,20 @@ impl App {
                     Tone::Muted,
                     format!("{} keeps its transcript", act.label),
                 ));
+                None
+            }
+            (Dialog::ClearHistory { .. }, Action::Type('y')) => {
+                // The daemon may have stopped while the question was up.
+                if let Some(notice) = self.clear_refusal() {
+                    self.status = Some(notice);
+                    return None;
+                }
+                self.history.clearing = true;
+                self.status = Some(Notice::new(Tone::Muted, "clearing the history..."));
+                Some(Effect::ClearHistory)
+            }
+            (Dialog::ClearHistory { .. }, _) => {
+                self.status = Some(Notice::new(Tone::Muted, "kept the history"));
                 None
             }
             (Dialog::Unsaved(after), Action::Type('w')) => {
@@ -1578,6 +1661,21 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
             lines.push(keys(&[("y", "delete"), ("n", "keep")]));
             lines
         }
+        Dialog::ClearHistory { count } => {
+            let question = match count {
+                Some(1) => "Clear the history? Its one dictation goes for good.".to_string(),
+                Some(n) => format!("Clear the history? All {n} dictations go for good."),
+                None => "Clear the history? Everything in history.jsonl goes for good.".to_string(),
+            };
+            let mut lines: Vec<Line<'static>> =
+                crate::tui::widgets::wrap(&question, question_width)
+                    .into_iter()
+                    .map(Line::from)
+                    .collect();
+            lines.push(Line::default());
+            lines.push(keys(&[("y", "clear"), ("n", "keep")]));
+            lines
+        }
         Dialog::RetryRecording { lines: text, .. } => {
             let mut lines = Vec::new();
             for (i, paragraph) in text.iter().enumerate() {
@@ -1679,6 +1777,7 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
                     ("ctrl+d u", "half a page; pgdn pgup a page, g G the ends"),
                     ("enter", "the whole text; esc back to the list"),
                     ("/", "filter by the text"),
+                    ("C", "clear the whole history, asking first"),
                     ("esc", "clear the filter, else back to Home"),
                     ("q", "quit, asking first about unsaved edits"),
                 ],

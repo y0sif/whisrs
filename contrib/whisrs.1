@@ -167,8 +167,13 @@ writes only
 Recordings lists the recordings, newest first, previews one and opens its
 transcript, and retries, copies, names a speaker of, summarizes or deletes
 it through the daemon (a delete, and a retry of a transcribed recording,
-ask first). History shows what dictation typed, newest first. Both filter
-with
+ask first). History shows what dictation typed, newest first, says when
+.B [general] history
+is off, and clears it all with
+.B C
+(asking first), as
+.B whisrs log \-\-clear
+does. Both filter with
 .BR / .
 .TP
 .B toggle

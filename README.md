@@ -227,7 +227,7 @@ For the full reference (overlay, `[input]`, `[tts]`, `[llm]`, `[hotkeys]`, `[hoo
 
 ```
 whisrs setup     # Onboarding wizard (TUI): backend, key or model download, mic, service, keybinding
-whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle. Esc goes to Home, which opens Setup, Config, a Mic test (a live level meter; its w saves only [audio] device), Recordings (list, preview and transcript; retry, copy, name a speaker, summarize, delete) and History (what dictation typed)
+whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle. Esc goes to Home, which opens Setup, Config, a Mic test (a live level meter; its w saves only [audio] device), Recordings (list, preview and transcript; retry, copy, name a speaker, summarize, delete) and History (what dictation typed; C clears it, asking first)
 whisrs toggle    # Start/stop dictation (uses general.language)
 whisrs toggle -l en  # Start/stop dictation, overriding the language for this session
 whisrs cancel    # Cancel dictation, discard audio
