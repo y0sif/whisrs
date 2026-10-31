@@ -12,8 +12,13 @@
 //! order and unknown keys kept, 0600, atomic, `vocabulary.txt` by its own
 //! rules) and restarts the daemon. An invalid config is refused with the
 //! error shown and every edit kept.
+//!
+//! On a profile ([`load_profile`], profile mode) the rows show the config
+//! the profile makes over config.toml, each tagged with whose value it is;
+//! an edit goes into the profile, `x` takes a key out of it, and `w` writes
+//! only the profile's file ([`save_profile`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use ratatui::layout::Rect;
@@ -22,6 +27,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use toml::Value;
 use whisrs::config::keys::{self, KeySummary};
+use whisrs::config::profile;
 use whisrs::config::setup::key_test::{
     Outcome as Checked, Source as KeySource, Target as TestTarget, Tested,
 };
@@ -32,7 +38,7 @@ use whisrs::overlay::palette::Palette;
 
 use crate::tui::app::{App, Dialog};
 use crate::tui::complete;
-use crate::tui::form::Form;
+use crate::tui::form::{self, Form};
 use crate::tui::keys::{Action, Mode};
 use crate::tui::options::{self, Listed, Listing, Lists};
 use crate::tui::schema::{
@@ -365,6 +371,274 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The sections a profile does not set from here: the replacements, a map
+/// of their own. `e` sets them in the profile's file.
+const BASE_SECTIONS: [&str; 1] = ["Replacements"];
+
+/// The key a profile does not set from here: the TUI writes the vocabulary
+/// to `vocabulary.txt`, which every profile shares. `e` sets a profile's
+/// own list in its file.
+const VOCABULARY: &str = "general.vocabulary";
+
+/// Config on a profile: what it sets, as loaded and as edited, over
+/// config.toml as loaded.
+pub struct ProfileEdit {
+    pub name: String,
+    /// config.toml as loaded: what a row the profile does not set shows,
+    /// and what `x` puts back.
+    base: Form,
+    /// The dotted paths its file sets, as loaded.
+    set: BTreeSet<String>,
+    /// Edited since: each is written at `w`, even at config.toml's value.
+    added: BTreeSet<String>,
+    /// Taken out with `x` since: removed from the file at `w`.
+    removed: BTreeSet<String>,
+}
+
+impl ProfileEdit {
+    /// Whether the profile sets `path`, as edited.
+    pub fn sets(&self, path: &str) -> bool {
+        self.added.contains(path) || (self.set.contains(path) && !self.removed.contains(path))
+    }
+
+    /// `profiles/<name>.toml`, as messages name it.
+    pub fn label(&self) -> String {
+        profile::label(&self.name)
+    }
+}
+
+/// What [`load_profile`] read: the config profile `name` makes over
+/// config.toml, ready to edit, and what its file sets.
+pub struct ProfileLoad {
+    pub loaded: Loaded,
+    pub edit: ProfileEdit,
+}
+
+/// Load profile `name` over config.toml for profile mode, as the daemon
+/// merges it (`config::profile::merge`), `vocabulary.txt` after. A profile
+/// that is not TOML, or does not load over config.toml, is refused with
+/// why: there is no config to show, and `e` fixes it. One that loads but
+/// does not validate opens, its error a notice.
+pub fn load_profile(paths: &Paths, name: &str) -> Result<ProfileLoad, String> {
+    let base = read(paths).map_err(|(_, message)| {
+        format!(
+            "config.toml does not load: {}",
+            message.lines().next().unwrap_or_default()
+        )
+    })?;
+    let base_text = read_base(paths)?;
+    let label = profile::label(name);
+    let text = std::fs::read_to_string(paths.profile_paths().profile(name))
+        .map_err(|e| format!("cannot read {label}: {e}"))?;
+    let eff = profile::effective_checked(&base_text, name, Some(&text), profile::Check::Client)?;
+    let why = || {
+        eff.error
+            .clone()
+            .unwrap_or_else(|| format!("{label} does not load"))
+    };
+    let over = profile::read_table(&text).map_err(|_| why())?;
+    let under = profile::read_table(&base_text).map_err(|e| e.message().to_string())?;
+    let merged = profile::merge(&under, &over);
+    let mut config: whisrs::Config = Value::Table(merged.table).try_into().map_err(|_| why())?;
+    let (vocabulary, _) = VocabularyBaseline::load(&mut config, &paths.vocabulary);
+    let mut notices: Vec<Notice> = eff
+        .warnings
+        .iter()
+        .map(|w| Notice::new(Tone::Warn, w.clone()))
+        .collect();
+    if let Some(error) = &eff.error {
+        notices.push(Notice::new(Tone::Error, one_line(error)));
+    }
+    Ok(ProfileLoad {
+        loaded: Loaded {
+            form: Form::new(config)?,
+            vocabulary,
+            fresh: false,
+            notices,
+            disk: base.disk,
+        },
+        edit: ProfileEdit {
+            name: name.to_string(),
+            base: base.form,
+            set: merged.set,
+            added: BTreeSet::new(),
+            removed: BTreeSet::new(),
+        },
+    })
+}
+
+/// config.toml's text: empty when there is no file.
+fn read_base(paths: &Paths) -> Result<String, String> {
+    match std::fs::read_to_string(&paths.config) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("cannot read config.toml: {e}")),
+    }
+}
+
+/// What a profile's save did.
+pub struct ProfileSaved {
+    pub name: String,
+    /// The state file names it: the daemon runs on it once restarted.
+    pub active: bool,
+    pub warnings: Vec<String>,
+    /// The profile as it is now on disk, to edit on from.
+    pub load: ProfileLoad,
+}
+
+/// Profile mode's `w`: the keys edited set and the ones `x` took out
+/// removed, onto the profile's file as it is on disk now (toml_edit:
+/// comments, order and every other key kept), only where the value changed.
+/// The config it then makes over config.toml is validated first: refused,
+/// nothing is written and every edit stays. Written whole, 0600.
+pub fn save_profile(screen: &ConfigScreen, paths: &Paths) -> Result<ProfileSaved, String> {
+    let edit = screen
+        .profile
+        .as_ref()
+        .ok_or_else(|| "not a profile".to_string())?;
+    let profiles = paths.profile_paths();
+    let label = edit.label();
+    let text = match std::fs::read_to_string(profiles.profile(&edit.name)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {label}: {e}")),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|_| format!("{label} is not valid TOML any more: e opens it to fix it, then w"))?;
+    let file = profile::read_table(&text).unwrap_or_default();
+    for path in &edit.removed {
+        remove_leaf(&mut doc, path);
+    }
+    for path in &edit.added {
+        match screen.form.effective(path) {
+            Some(value) if form::lookup(&file, path) == Some(value) => {}
+            Some(value) => set_leaf(&mut doc, path, value)?,
+            None => remove_leaf(&mut doc, path),
+        }
+    }
+    let written = doc.to_string();
+    let warnings = check_profile(&read_base(paths)?, &edit.name, &written)?;
+    if written != text {
+        profile::write_profile(&profiles, &edit.name, &written)
+            .map_err(|e| format!("cannot write {label}: {e}"))?;
+    }
+    Ok(ProfileSaved {
+        name: edit.name.clone(),
+        active: profile::read_active(&profiles.state) == Ok(Some(edit.name.clone())),
+        warnings,
+        load: load_profile(paths, &edit.name)?,
+    })
+}
+
+/// The config profile `name`'s file, `text`, would make over config.toml as
+/// `base_text` has it, checked as a client checks it (`Check::Client`: a key
+/// that may live in whisrsd's environment alone is a warning, and an error
+/// config.toml alone has too is not the profile's): refused when it does
+/// not load, else its warnings. No error quotes a base-only value.
+fn check_profile(base_text: &str, name: &str, text: &str) -> Result<Vec<String>, String> {
+    let eff = profile::effective_checked(base_text, name, Some(text), profile::Check::Client)?;
+    if let Some(why) = eff.error {
+        return Err(one_line(&why));
+    }
+    Ok(eff
+        .config
+        .validate_to_write()
+        .map(|warnings| warnings.into_iter().map(|w| w.message).collect())
+        .unwrap_or_default())
+}
+
+/// The key a profile's file spells the top-level `section` with: its own
+/// name, else the alias the file has it under (`[local]`), so a write never
+/// puts the section there twice.
+fn spelled(doc: &toml_edit::DocumentMut, section: &str) -> String {
+    if doc.contains_key(section) {
+        return section.to_string();
+    }
+    profile::ALIASES
+        .iter()
+        .filter(|(at, _, name)| at.is_empty() && *name == section)
+        .map(|(_, alias, _)| *alias)
+        .find(|alias| doc.contains_key(alias))
+        .unwrap_or(section)
+        .to_string()
+}
+
+/// Set the dotted `path` of a profile's file to `value`, making the tables
+/// on the way (inline ones inside an inline table).
+fn set_leaf(doc: &mut toml_edit::DocumentMut, path: &str, value: &Value) -> Result<(), String> {
+    // A TOML value as toml_edit holds it: parsed back from its own text.
+    let parsed: toml_edit::DocumentMut = format!("v = {value}")
+        .parse()
+        .map_err(|_| format!("{path}: the value does not write as TOML"))?;
+    let item = parsed.get("v").cloned().unwrap_or_default();
+    let mut keys: Vec<String> = path.split('.').map(str::to_string).collect();
+    keys[0] = spelled(doc, &keys[0]);
+    put_item(doc.as_item_mut(), &keys, item).map_err(|why| format!("{path}: {why}"))
+}
+
+fn put_item(
+    at: &mut toml_edit::Item,
+    keys: &[String],
+    item: toml_edit::Item,
+) -> Result<(), String> {
+    let inline = at.is_inline_table();
+    let table = at
+        .as_table_like_mut()
+        .ok_or_else(|| "a key on the way is not a table in the file".to_string())?;
+    let Some((first, rest)) = keys.split_first() else {
+        return Err("empty path".to_string());
+    };
+    if rest.is_empty() {
+        table.insert(first, item);
+        return Ok(());
+    }
+    if !table.contains_key(first) {
+        let empty = if inline {
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(Default::default()))
+        } else {
+            toml_edit::table()
+        };
+        table.insert(first, empty);
+    }
+    let next = table.get_mut(first).expect("the table was just made");
+    put_item(next, rest, item)
+}
+
+/// Take the dotted `path` out of a profile's file. A table it leaves empty
+/// goes too, unless a comment heads it.
+fn remove_leaf(doc: &mut toml_edit::DocumentMut, path: &str) {
+    let mut keys: Vec<String> = path.split('.').map(str::to_string).collect();
+    keys[0] = spelled(doc, &keys[0]);
+    take_item(doc.as_table_mut(), &keys);
+}
+
+fn take_item(table: &mut dyn toml_edit::TableLike, keys: &[String]) {
+    let Some((first, rest)) = keys.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        table.remove(first);
+        return;
+    }
+    let Some(item) = table.get_mut(first) else {
+        return;
+    };
+    let Some(inner) = item.as_table_like_mut() else {
+        return;
+    };
+    take_item(inner, rest);
+    let emptied = inner.is_empty();
+    let commented = item
+        .as_table()
+        .and_then(|t| t.decor().prefix())
+        .and_then(|prefix| prefix.as_str())
+        .is_some_and(|prefix| prefix.contains('#'));
+    if emptied && !commented {
+        table.remove(first);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Sections,
@@ -549,9 +823,36 @@ pub struct ConfigScreen {
     pub tests: BTreeMap<String, Test>,
     /// The spinner's frame, while a test runs.
     pub spin: usize,
+    /// Profile mode: the profile edited, over config.toml.
+    pub profile: Option<ProfileEdit>,
+    /// On base, the active profile and the paths it sets: its rows say it
+    /// overrides them.
+    pub overrides: Option<(String, BTreeSet<String>)>,
 }
 
 impl ConfigScreen {
+    /// Profile mode on what [`load_profile`] read.
+    pub fn on_profile(load: ProfileLoad, env: Env) -> ConfigScreen {
+        let mut screen = ConfigScreen::new(load.loaded, env);
+        screen.profile = Some(load.edit);
+        screen
+    }
+
+    /// Edit on from the profile as read again, where the cursor was.
+    pub fn reload_profile(&mut self, load: ProfileLoad) {
+        self.profile = Some(load.edit);
+        self.reloaded(load.loaded);
+    }
+
+    /// Whether anything is edited and not saved: in profile mode, a key
+    /// added to the profile or taken out of it too.
+    pub fn is_dirty(&self) -> bool {
+        self.form.is_dirty()
+            || self.profile.as_ref().is_some_and(|edit| {
+                !edit.removed.is_empty() || edit.added.iter().any(|p| !edit.set.contains(p))
+            })
+    }
+
     pub fn new(loaded: Loaded, env: Env) -> ConfigScreen {
         ConfigScreen {
             form: loaded.form,
@@ -572,6 +873,8 @@ impl ConfigScreen {
             unpinned: None,
             tests: BTreeMap::new(),
             spin: 0,
+            profile: None,
+            overrides: None,
         }
     }
 
@@ -693,6 +996,10 @@ impl ConfigScreen {
 
     pub fn discard(&mut self) {
         self.form.discard();
+        if let Some(edit) = &mut self.profile {
+            edit.added.clear();
+            edit.removed.clear();
+        }
         self.close();
         self.clamp();
     }
@@ -1089,6 +1396,28 @@ impl ConfigScreen {
             return self.field_key(field, path, action);
         }
         let view = self.view().clone();
+        if self.profile.is_some() {
+            // An entry opens to be looked at; what would change one is not.
+            let edited = match (&view, self.current().body, action) {
+                (
+                    View::List { path, .. },
+                    _,
+                    Action::Add | Action::Delete | Action::Enter | Action::Right,
+                ) => Some(path.clone()),
+                (View::Section { .. }, Body::Entries(entries), Action::Add | Action::Delete) => {
+                    Some(entries.path.to_string())
+                }
+                (
+                    View::Section { .. },
+                    Body::Map(map),
+                    Action::Add | Action::Delete | Action::Enter | Action::Right,
+                ) => Some(map.path.to_string()),
+                _ => None,
+            };
+            if let Some(why) = edited.and_then(|path| self.refusal(&path)) {
+                return Outcome::say(Tone::Warn, why);
+            }
+        }
         match (&view, self.current().body, action) {
             (View::List { path, field, .. }, _, Action::Add) => {
                 if matches!(field.kind, Kind::List { items: Some(_), .. }) {
@@ -1171,6 +1500,16 @@ impl ConfigScreen {
     }
 
     fn field_key(&mut self, field: &'static Field, path: &str, action: Action) -> Outcome {
+        if self.profile.is_some() {
+            if changes(&field.kind, action) {
+                if let Some(why) = self.refusal(path) {
+                    return Outcome::say(Tone::Warn, why);
+                }
+            }
+            if action == Action::Reset {
+                return self.take_out(field, path);
+            }
+        }
         let current = self.form.effective(path).cloned();
         let picked = picked(&field.kind);
         match (&field.kind, action) {
@@ -1625,13 +1964,31 @@ impl ConfigScreen {
     }
 
     fn set(&mut self, path: &str, field: &Field, value: Option<Value>) -> Outcome {
+        // A profile's file holds values: no key in it unsets config.toml's.
+        let unsets_base = self
+            .profile
+            .as_ref()
+            .is_some_and(|edit| value.is_none() && edit.base.effective(path).is_some());
+        if unsets_base {
+            return Outcome::say(
+                Tone::Warn,
+                format!(
+                    "{}: a profile cannot unset what config.toml sets; pick a value, or x for \
+                     config.toml's",
+                    field.label
+                ),
+            );
+        }
         let result = self.form.set(path, value);
         self.apply(path, field, result)
     }
 
     fn apply(&mut self, path: &str, field: &Field, result: Result<bool, String>) -> Outcome {
+        // Only a change is an edit: a commit or a pick of the value there
+        // already pins nothing into a profile.
         if result == Ok(true) {
             self.tests.remove(path);
+            self.mark(path);
         }
         match result {
             Ok(true) => Outcome {
@@ -1646,9 +2003,82 @@ impl ConfigScreen {
     fn set_list(&mut self, path: &str, list: Vec<String>) -> Outcome {
         let value = Value::Array(list.into_iter().map(Value::String).collect());
         match self.form.set(path, Some(value)) {
-            Ok(_) => Outcome::default(),
+            Ok(changed) => {
+                if changed {
+                    self.mark(path);
+                }
+                Outcome::default()
+            }
             Err(why) => Outcome::say(Tone::Error, why),
         }
+    }
+
+    /// In profile mode, `path` was changed: the profile sets it now, even
+    /// at config.toml's value; or, left unset as config.toml leaves it, no
+    /// longer does.
+    fn mark(&mut self, path: &str) {
+        let has = self.form.effective(path).is_some();
+        let Some(edit) = self.profile.as_mut() else {
+            return;
+        };
+        if has {
+            edit.added.insert(path.to_string());
+            edit.removed.remove(path);
+        } else {
+            edit.added.remove(path);
+            if edit.set.contains(path) {
+                edit.removed.insert(path.to_string());
+            }
+        }
+    }
+
+    /// Profile mode's `x`: the key out of the profile, its row back at
+    /// config.toml's value.
+    fn take_out(&mut self, field: &Field, path: &str) -> Outcome {
+        let Some(edit) = self.profile.as_ref() else {
+            return Outcome::default();
+        };
+        if !edit.sets(path) {
+            return Outcome::say(Tone::Muted, format!("{} does not set this", edit.name));
+        }
+        let base = edit.base.value(path).cloned();
+        let changed = match self.form.set(path, base) {
+            Ok(changed) => changed,
+            Err(why) => return Outcome::say(Tone::Error, format!("{}: {why}", field.label)),
+        };
+        if let Some(edit) = self.profile.as_mut() {
+            edit.added.remove(path);
+            if edit.set.contains(path) {
+                edit.removed.insert(path.to_string());
+            }
+        }
+        if changed {
+            self.tests.remove(path);
+        }
+        Outcome {
+            flash: Some(path.to_string()),
+            ..Outcome::default()
+        }
+    }
+
+    /// In profile mode, why the key at `path`, a row of this section, is not
+    /// set from here, if it is not.
+    fn refusal(&self, path: &str) -> Option<String> {
+        let edit = self.profile.as_ref()?;
+        if profile::is_base_only(path) {
+            return Some(profile::BASE_ONLY_NOTE.to_string());
+        }
+        if path == VOCABULARY {
+            return Some(format!(
+                "the vocabulary is edited on base, as vocabulary.txt is every profile's: e sets \
+                 a list in {}",
+                edit.label()
+            ));
+        }
+        let title = self.current().title;
+        BASE_SECTIONS
+            .contains(&title)
+            .then(|| format!("{title} is edited on base: e sets it in {}", edit.label()))
     }
 
     fn set_map(&mut self, path: &str, pairs: BTreeMap<String, String>) -> Outcome {
@@ -1962,6 +2392,24 @@ fn means_unset(path: &str, text: &str) -> bool {
 /// `at` moved `step` around a ring of `len`.
 fn cycle(at: usize, len: usize, step: i64) -> usize {
     (at as i64 + step).rem_euclid(len as i64) as usize
+}
+
+/// Whether `action` on a row of `kind` changes its value, or opens what
+/// does; moving and opening a list are not.
+fn changes(kind: &Kind, action: Action) -> bool {
+    match action {
+        Action::Reset => true,
+        Action::Enter => !matches!(kind, Kind::List { .. }),
+        Action::Toggle => matches!(
+            kind,
+            Kind::Bool | Kind::Choice(_) | Kind::MaybeChoice { .. } | Kind::MaybeBool { .. }
+        ),
+        Action::Left | Action::Right => {
+            matches!(kind, Kind::Bool | Kind::Int(_) | Kind::Float { .. }) || picked(kind)
+        }
+        Action::BigLeft | Action::BigRight => matches!(kind, Kind::Int(_) | Kind::Float { .. }),
+        _ => false,
+    }
 }
 
 /// Whether a row is picked (`h`/`l` step its values, `Enter` opens its
@@ -2372,6 +2820,35 @@ fn describe(screen: &ConfigScreen, item: &Item, env: &Env, ui: &Ui) -> (String, 
     }
 }
 
+/// The word at a row's end. In profile mode, whose value the row shows: an
+/// accent `profile` for a key the profile sets, `base only` for one it
+/// cannot, `base` for one it leaves to config.toml. On base, `offline sets
+/// this` for a key the active profile overrides.
+fn tag(screen: &ConfigScreen, item: &Item) -> Option<(String, Tone)> {
+    let path = match item {
+        Item::Field { path, .. } => path.clone(),
+        Item::Pair(key) => match screen.current().body {
+            Body::Map(map) => format!("{}.{key}", map.path),
+            _ => return None,
+        },
+        Item::Entry(_) => screen.entries()?.path.to_string(),
+        Item::Element(_) | Item::Heading(_) => return None,
+    };
+    if let Some(edit) = &screen.profile {
+        return Some(if edit.sets(&path) {
+            ("profile".to_string(), Tone::Accent)
+        } else if screen.refusal(&path).is_some() {
+            ("base only".to_string(), Tone::Muted)
+        } else {
+            ("base".to_string(), Tone::Muted)
+        });
+    }
+    let (name, paths) = screen.overrides.as_ref()?;
+    paths
+        .contains(&path)
+        .then(|| (format!("{name} sets this"), Tone::Muted))
+}
+
 /// The key an item flashes under.
 fn flash_key(item: &Item) -> Option<&str> {
     match item {
@@ -2413,6 +2890,7 @@ fn help(screen: &ConfigScreen, item: Option<&Item>) -> String {
         }
         (_, Some(Item::Field { field, path })) => {
             let mut text = field.help.to_string();
+            text.push_str(&layer_note(screen, path));
             if let Some(gate) = field.gate.filter(|gate| !gate.built()) {
                 text.push_str(&format!(
                     " This whisrs was built without the {} feature, so the daemon ignores it.",
@@ -2450,6 +2928,28 @@ fn help(screen: &ConfigScreen, item: Option<&Item>) -> String {
     }
 }
 
+/// What the help adds about whose value a row is: in profile mode, that
+/// the profile sets it (and `x` takes it out), leaves it to config.toml,
+/// or cannot set it; on base, that the active profile overrides it.
+fn layer_note(screen: &ConfigScreen, path: &str) -> String {
+    if let Some(edit) = &screen.profile {
+        let name = &edit.name;
+        return if let Some(why) = screen.refusal(path) {
+            format!(" Base only: {why}.")
+        } else if edit.sets(path) {
+            format!(" {name} sets this; x puts back config.toml's value.")
+        } else {
+            format!(" From config.toml; an edit sets it in {name}.")
+        };
+    }
+    match &screen.overrides {
+        Some((name, paths)) if paths.contains(path) => {
+            format!(" {name} sets this, so an edit here applies once base is active.")
+        }
+        _ => String::new(),
+    }
+}
+
 fn article(noun: &str) -> &'static str {
     if noun.starts_with(['a', 'e', 'i', 'o', 'u']) {
         "an"
@@ -2477,10 +2977,25 @@ fn body_rows(messages: usize) -> u16 {
 }
 
 pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
-    let screen = &app.config;
+    draw(app, &app.config, f, ui);
+}
+
+/// Config in profile mode, on the profile being edited.
+pub fn view_profile(app: &App, f: &mut Frame, ui: &Ui) {
+    if let Some(screen) = &app.profile_config {
+        draw(app, screen, f, ui);
+    }
+}
+
+fn draw(app: &App, screen: &ConfigScreen, f: &mut Frame, ui: &Ui) {
     let area = f.area();
     let max = usize::from(frame::body_width(area.width).saturating_sub(2));
-    let messages = app.messages(ui, max);
+    let messages = if screen.profile.is_some() {
+        let notices = [app.notices.as_slice(), app.profile_notices.as_slice()].concat();
+        frame::messages(&notices, app.status.as_ref(), ui, max)
+    } else {
+        app.messages(ui, max)
+    };
     let Some(placed) = frame::place(area, Some(body_rows(messages.len()))) else {
         return frame::too_small(f, ui);
     };
@@ -2489,12 +3004,18 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
     } else {
         format!("config /{}", screen.filter)
     };
+    // What is edited: the profile, or base while one is active.
+    let profile = match &screen.profile {
+        Some(edit) => Some(format!("profile {}", edit.name)),
+        None => app.header_profile().map(|_| profile::BASE.to_string()),
+    };
     let body = frame::draw(
         f,
         placed.frame,
         ui,
         Header {
             screen: &name,
+            profile: profile.as_deref(),
             daemon: app.daemon_up(),
             live: None,
         },
@@ -2571,6 +3092,17 @@ pub fn draw_open(screen: &ConfigScreen, f: &mut Frame, frame: Rect, detail: Rect
 }
 
 impl ConfigScreen {
+    /// The path the current level edits as a whole: the list open, or the
+    /// section's entries or map; empty for a section of rows.
+    fn current_path(&self) -> &str {
+        match (self.view(), self.current().body) {
+            (View::List { path, .. }, _) => path,
+            (_, Body::Entries(entries)) => entries.path,
+            (_, Body::Map(map)) => map.path,
+            (_, Body::Rows(_)) => "",
+        }
+    }
+
     fn typing_filter(&self) -> bool {
         matches!(
             self.editing,
@@ -2779,6 +3311,7 @@ pub fn draw_rows(
         };
         on.then_some(&editing.input)
     };
+    let tags: Vec<Option<(String, Tone)>> = items.iter().map(|item| tag(screen, item)).collect();
     for (i, (label, value, look)) in rows.into_iter().enumerate().skip(offset).take(height) {
         let item = &items[i];
         let y = top + (i - offset) as u16;
@@ -2802,6 +3335,7 @@ pub fn draw_rows(
             at_max: look.at_max,
             flash: flash.is_some_and(|key| Some(key) == flash_key(item)),
             input: input_on(item),
+            tag: tags[i].as_ref().map(|(text, tone)| (text.as_str(), *tone)),
             ..Row::new(&label, value)
         };
         row.draw(
@@ -2917,21 +3451,36 @@ fn footer(screen: &ConfigScreen, f: &mut Frame, rect: Rect, ui: &Ui) {
                 let item = items.get(screen.view().cursor());
                 let testable =
                     matches!(item, Some(Item::Field { path, .. }) if key_target(path).is_some());
-                let change = match item {
+                let mut change = match item {
+                    Some(Item::Field { path, .. }) if screen.refusal(path).is_some() => vec![],
                     Some(Item::Field { field, .. }) => verbs(field, ui),
                     Some(Item::Entry(_)) => vec![pair("enter", "open")],
+                    _ if screen.refusal(screen.current_path()).is_some() => vec![],
                     _ => vec![pair("enter", "edit")],
                 };
+                // In profile mode, on a key the profile sets: back to base.
+                if let (Some(edit), Some(Item::Field { path, .. })) = (&screen.profile, item) {
+                    if edit.sets(path) {
+                        change.push(pair("x", "base"));
+                    }
+                }
                 let lists = matches!(screen.view(), View::List { .. })
                     || matches!(
                         (screen.view(), screen.current().body),
                         (View::Section { .. }, Body::Entries(_) | Body::Map(_))
                     );
                 let mut keys = vec![pair("j/k", "move")];
+                // A list profile mode leaves to config.toml has no a or d.
+                let fixed = screen.refusal(screen.current_path()).is_some();
                 if lists {
-                    keys.push(pair("a", "add"));
+                    if !fixed {
+                        keys.push(pair("a", "add"));
+                    }
                     keys.extend(change);
-                    keys.extend([pair("d", "delete"), pair("esc", "back")]);
+                    if !fixed {
+                        keys.push(pair("d", "delete"));
+                    }
+                    keys.push(pair("esc", "back"));
                     keys.extend([pair("w", "save"), pair("?", "help")]);
                 } else {
                     keys.push(pair("tab", "pane"));
@@ -4533,7 +5082,7 @@ mod tests {
         open(&mut fixture, "Hotkeys");
         let labels = labels(&fixture);
         assert_eq!(
-            labels[5..],
+            labels[6..],
             [
                 "Agents",
                 "jarvis",
@@ -4544,7 +5093,7 @@ mod tests {
             ]
         );
         // The cursor passes over the headings, both ways.
-        to_path(&mut fixture, "hotkeys.recording");
+        to_path(&mut fixture, "hotkeys.next_profile");
         press(&mut fixture.app, "j");
         let screen = &fixture.app.config;
         assert!(matches!(
@@ -4555,7 +5104,7 @@ mod tests {
         let screen = &fixture.app.config;
         assert!(matches!(
             screen.items().get(screen.view().cursor()),
-            Some(Item::Field { path, .. }) if path == "hotkeys.recording"
+            Some(Item::Field { path, .. }) if path == "hotkeys.next_profile"
         ));
     }
 
@@ -4643,5 +5192,606 @@ mod tests {
             fixture.app.config.items().is_empty(),
             !cfg!(feature = "recording")
         );
+    }
+}
+
+/// Config in profile mode, and base Config while a profile is active.
+#[cfg(test)]
+mod profile_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    use super::*;
+    use crate::tui::app::{After, Dialog, Effect, Msg, Screen};
+    use crate::tui::testing::{
+        assert_snapshot, chord, daemon_on, draw, mockup, mockup_profiles, mockup_with,
+        open_profile, open_profiles, press, rows, type_text, with_profiles, Fixture, PROFILES,
+    };
+
+    fn on(fixture: &Fixture) -> &ConfigScreen {
+        fixture.app.profile_config.as_ref().expect("profile mode")
+    }
+
+    /// Profile mode on `name` of [`PROFILES`], `active` in the state file.
+    fn profile_mode(name: &str, active: Option<&str>) -> Fixture {
+        let fixture = mockup_profiles(PROFILES, active);
+        entered(fixture, name)
+    }
+
+    /// `fixture` on Profiles, then in profile mode on `name`.
+    fn entered(mut fixture: Fixture, name: &str) -> Fixture {
+        open_profiles(&mut fixture);
+        open_profile(&mut fixture, name);
+        assert_eq!(fixture.app.screen(), Screen::Profile);
+        fixture
+    }
+
+    /// Open section `title`, the focus on its rows.
+    fn section(fixture: &mut Fixture, title: &str) {
+        let index = SECTIONS.iter().position(|s| s.title == title).unwrap();
+        if on(fixture).focus == Focus::Detail {
+            press(&mut fixture.app, "\t");
+        }
+        press(&mut fixture.app, &format!("g{}\n", "j".repeat(index)));
+        assert_eq!(on(fixture).current().title, title);
+    }
+
+    /// The cursor onto the row of `path`.
+    fn to(fixture: &mut Fixture, path: &str) {
+        let at = on(fixture)
+            .items()
+            .iter()
+            .position(|item| matches!(item, Item::Field { path: p, .. } if p == path))
+            .unwrap_or_else(|| panic!("no row {path}"));
+        press(&mut fixture.app, &format!("g{}", "j".repeat(at)));
+    }
+
+    /// The tag of the row of `path` in the current section of `screen`.
+    fn tag_of(screen: &ConfigScreen, path: &str) -> Option<(String, Tone)> {
+        let item = screen
+            .items()
+            .into_iter()
+            .find(|item| matches!(item, Item::Field { path: p, .. } if p == path))
+            .unwrap_or_else(|| panic!("no row {path}"));
+        tag(screen, &item)
+    }
+
+    fn said(fixture: &Fixture) -> Notice {
+        fixture.app.status.clone().expect("a status")
+    }
+
+    fn drawn(fixture: &Fixture, w: u16, h: u16) -> Vec<String> {
+        rows(&draw(&fixture.app, w, h))
+    }
+
+    fn file(fixture: &Fixture, name: &str) -> String {
+        std::fs::read_to_string(fixture.app.paths.profile_paths().profile(name)).unwrap()
+    }
+
+    /// Profile mode's `w`, as the loop runs it.
+    fn save(fixture: &mut Fixture) -> Option<Effect> {
+        assert_eq!(press(&mut fixture.app, "w"), [Effect::SaveProfile]);
+        let saved = save_profile(on(fixture), &fixture.app.paths);
+        fixture.app.update(Msg::ProfileSaved(saved))
+    }
+
+    fn profile() -> (String, Tone) {
+        ("profile".to_string(), Tone::Accent)
+    }
+
+    fn base() -> (String, Tone) {
+        ("base".to_string(), Tone::Muted)
+    }
+
+    fn base_only() -> (String, Tone) {
+        ("base only".to_string(), Tone::Muted)
+    }
+
+    /// Each row says whose value it shows: the profile's, base's, or base
+    /// only; the values are the merge's.
+    #[test]
+    fn each_row_says_whose_value_it_is() {
+        let mut fixture = profile_mode("offline", None);
+        assert!(drawn(&fixture, 90, 30)
+            .iter()
+            .any(|r| r.contains("config \u{00B7} profile offline \u{00B7} \u{25CF}")));
+        let config = on(&fixture).form.config();
+        assert_eq!(config.general.backend, "local-whisper");
+        assert_eq!(config.general.language, "de");
+        assert_eq!(
+            config.deepgram.as_ref().unwrap().api_key,
+            "dg-0123456789abcdef9f2c"
+        );
+        section(&mut fixture, "General");
+        let screen = on(&fixture);
+        assert_eq!(tag_of(screen, "general.language"), Some(profile()));
+        assert_eq!(tag_of(screen, "general.silence_timeout_ms"), Some(base()));
+        section(&mut fixture, "Backend & keys");
+        let row = drawn(&fixture, 90, 30)
+            .into_iter()
+            .find(|r| r.contains("local-whisper"))
+            .expect("the backend row");
+        assert!(
+            row.trim_end_matches(['\u{2502}', ' ']).ends_with("profile"),
+            "{row}"
+        );
+        let screen = on(&fixture);
+        assert_eq!(tag_of(screen, "general.backend"), Some(profile()));
+        assert_eq!(tag_of(screen, "deepgram.api_key"), Some(base_only()));
+        assert_eq!(tag_of(screen, "local-whisper.model_path"), Some(profile()));
+        section(&mut fixture, "Vocabulary");
+        assert_eq!(
+            tag_of(on(&fixture), "general.vocabulary"),
+            Some(base_only())
+        );
+        assert_eq!(tag_of(on(&fixture), "general.prompt"), Some(base()));
+        section(&mut fixture, "Hotkeys");
+        assert_eq!(tag_of(on(&fixture), "hotkeys.toggle"), Some(base_only()));
+    }
+
+    /// Base-only rows, the vocabulary list and the Replacements section
+    /// refuse every edit, saying why; nothing is edited.
+    #[test]
+    fn base_only_rows_refuse_edits() {
+        let mut fixture = profile_mode("offline", None);
+        section(&mut fixture, "Backend & keys");
+        to(&mut fixture, "deepgram.api_key");
+        for key in ["\n", "x"] {
+            assert!(press(&mut fixture.app, key).is_empty());
+            assert_eq!(
+                said(&fixture),
+                Notice::new(Tone::Warn, profile::BASE_ONLY_NOTE),
+                "{key:?}"
+            );
+            assert_eq!(on(&fixture).mode(), Mode::Browse);
+        }
+        // t still tests it, on this profile's config.
+        assert!(matches!(
+            press(&mut fixture.app, "t").as_slice(),
+            [Effect::TestKey {
+                origin: crate::tui::app::Origin::Profile,
+                ..
+            }]
+        ));
+        section(&mut fixture, "Hotkeys");
+        to(&mut fixture, "hotkeys.toggle");
+        press(&mut fixture.app, "\n");
+        assert_eq!(said(&fixture).text, profile::BASE_ONLY_NOTE);
+        assert_eq!(on(&fixture).mode(), Mode::Browse);
+
+        let vocabulary = "the vocabulary is edited on base, as vocabulary.txt is every \
+                          profile's: e sets a list in profiles/offline.toml";
+        section(&mut fixture, "Vocabulary");
+        // The list opens to be looked at; a and d are refused.
+        to(&mut fixture, "general.vocabulary");
+        press(&mut fixture.app, "\n");
+        assert!(matches!(on(&fixture).view(), View::List { .. }));
+        for key in ["a", "d", "\n"] {
+            fixture.app.status = None;
+            press(&mut fixture.app, key);
+            assert_eq!(said(&fixture).text, vocabulary, "{key:?}");
+        }
+        press(&mut fixture.app, "\x1b");
+        section(&mut fixture, "Replacements");
+        press(&mut fixture.app, "a");
+        assert_eq!(
+            said(&fixture).text,
+            "Replacements is edited on base: e sets it in profiles/offline.toml"
+        );
+        section(&mut fixture, "Agents");
+        press(&mut fixture.app, "a");
+        assert_eq!(said(&fixture).text, profile::BASE_ONLY_NOTE);
+        assert!(!on(&fixture).is_dirty());
+    }
+
+    /// An edit goes into the profile even at config.toml's value, and `w`
+    /// writes only the profile's file: its comments kept, 0600, config.toml
+    /// as it was.
+    #[test]
+    fn an_edit_is_written_into_the_profile_alone() {
+        let mut fixture = profile_mode("offline", None);
+        let paths = fixture.app.paths.clone();
+        let base_before = std::fs::read(&paths.config).unwrap();
+        section(&mut fixture, "General");
+        to(&mut fixture, "general.notify");
+        assert_eq!(tag_of(on(&fixture), "general.notify"), Some(base()));
+        // Off and on again: config.toml's value, set by the profile now.
+        press(&mut fixture.app, "  ");
+        assert!(on(&fixture).form.config().general.notify);
+        assert_eq!(tag_of(on(&fixture), "general.notify"), Some(profile()));
+        assert!(on(&fixture).is_dirty());
+        to(&mut fixture, "general.silence_timeout_ms");
+        press(&mut fixture.app, "l");
+        assert_eq!(on(&fixture).form.config().general.silence_timeout_ms, 2250);
+
+        assert_eq!(save(&mut fixture), Some(Effect::ReadProfiles));
+        assert_eq!(
+            said(&fixture).text,
+            "saved profiles/offline.toml (not active)"
+        );
+        let text = file(&fixture, "offline");
+        assert!(
+            text.starts_with(
+                "# on the train\n[general]\nbackend = \"local-whisper\"\nlanguage = \"de\"\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("notify = true"), "{text}");
+        assert!(text.contains("silence_timeout_ms = 2250"), "{text}");
+        assert!(
+            text.contains("[local-whisper]\nmodel_path = \"/m/ggml-base.bin\""),
+            "{text}"
+        );
+        let file_path = paths.profile_paths().profile("offline");
+        assert_eq!(
+            std::fs::metadata(&file_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&paths.config).unwrap(), base_before);
+        // Edited on from the file.
+        assert!(!on(&fixture).is_dirty());
+        assert_eq!(tag_of(on(&fixture), "general.notify"), Some(profile()));
+        // A save with nothing to save says so.
+        assert!(press(&mut fixture.app, "w").is_empty());
+        assert_eq!(said(&fixture).text, "no changes to save");
+    }
+
+    /// `x` takes a key out of the profile, back to config.toml's value; on
+    /// a key it does not set it says so. A table left empty leaves the
+    /// file, the comment over the first one stays.
+    #[test]
+    fn x_takes_a_key_out_of_the_profile() {
+        let mut fixture = profile_mode("offline", None);
+        section(&mut fixture, "General");
+        to(&mut fixture, "general.silence_timeout_ms");
+        assert!(press(&mut fixture.app, "x").is_empty());
+        assert_eq!(
+            said(&fixture),
+            Notice::new(Tone::Muted, "offline does not set this")
+        );
+        to(&mut fixture, "general.language");
+        press(&mut fixture.app, "x");
+        assert_eq!(on(&fixture).form.config().general.language, "en");
+        assert_eq!(tag_of(on(&fixture), "general.language"), Some(base()));
+        assert!(on(&fixture).is_dirty());
+        section(&mut fixture, "Backend & keys");
+        to(&mut fixture, "local-whisper.model_path");
+        press(&mut fixture.app, "x");
+        assert_eq!(
+            on(&fixture)
+                .form
+                .config()
+                .local_whisper
+                .as_ref()
+                .unwrap()
+                .model_path,
+            "~/.local/share/whisrs/models/ggml-base.en.bin"
+        );
+        save(&mut fixture);
+        assert_eq!(
+            file(&fixture, "offline"),
+            "# on the train\n[general]\nbackend = \"local-whisper\"\n"
+        );
+        assert_eq!(
+            tag_of(on(&fixture), "local-whisper.model_path"),
+            Some(base())
+        );
+    }
+
+    /// A merged config that does not validate is refused: nothing is
+    /// written, every edit stays.
+    #[test]
+    fn a_merged_config_that_does_not_validate_keeps_the_edits() {
+        let mut fixture = profile_mode("offline", None);
+        section(&mut fixture, "Backend & keys");
+        to(&mut fixture, "general.backend");
+        press(&mut fixture.app, "\n");
+        type_text(&mut fixture.app, "asr-sidecar");
+        press(&mut fixture.app, "\n");
+        assert_eq!(on(&fixture).form.config().general.backend, "asr-sidecar");
+        to(&mut fixture, "asr-sidecar.url");
+        press(&mut fixture.app, "\n");
+        chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut fixture.app, "\n");
+        let before = file(&fixture, "offline");
+        assert_eq!(save(&mut fixture), None);
+        let status = said(&fixture);
+        assert_eq!(status.tone, Tone::Error);
+        assert!(status.text.starts_with("not saved: "), "{}", status.text);
+        assert_eq!(file(&fixture, "offline"), before);
+        assert!(on(&fixture).is_dirty());
+        assert_eq!(on(&fixture).form.config().general.backend, "asr-sidecar");
+    }
+
+    /// A profile's file holds values, so it cannot unset a key config.toml
+    /// sets; the edit is refused, the value kept.
+    #[test]
+    fn a_profile_cannot_unset_what_config_toml_sets() {
+        let base = mockup_with("\n[overlay.colors]\nrecording = \"#ff0000\"\n");
+        let mut fixture = entered(with_profiles(base, PROFILES, None), "offline");
+        section(&mut fixture, "Overlay");
+        to(&mut fixture, "overlay.colors.recording");
+        press(&mut fixture.app, "\n");
+        chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut fixture.app, "\n");
+        assert!(said(&fixture)
+            .text
+            .contains("a profile cannot unset what config.toml sets"));
+        let colors = on(&fixture)
+            .form
+            .config()
+            .overlay
+            .clone()
+            .unwrap()
+            .colors
+            .unwrap();
+        assert_eq!(colors.recording.as_deref(), Some("#ff0000"));
+    }
+
+    /// Esc and q with unsaved edits ask: Esc stays, d drops them, w saves
+    /// them first; `e` asks the same. Clean, Esc is back on Profiles.
+    #[test]
+    fn leaving_with_unsaved_edits_asks() {
+        let edited = || {
+            let mut fixture = profile_mode("offline", None);
+            section(&mut fixture, "General");
+            to(&mut fixture, "general.notify");
+            press(&mut fixture.app, " ");
+            fixture
+        };
+        let unsaved = |after| Some(Dialog::UnsavedProfile(after, "offline".into()));
+        let mut fixture = edited();
+        press(&mut fixture.app, "\x1b\x1b");
+        assert_eq!(fixture.app.dialog, unsaved(After::Leave));
+        assert!(drawn(&fixture, 90, 30)
+            .iter()
+            .any(|r| r.contains("Unsaved changes to profiles/offline.toml.")));
+        press(&mut fixture.app, "\x1b");
+        assert_eq!(fixture.app.dialog, None);
+        assert_eq!(fixture.app.screen(), Screen::Profile);
+        assert!(on(&fixture).is_dirty());
+        press(&mut fixture.app, "\x1b");
+        assert!(press(&mut fixture.app, "d").is_empty());
+        assert_eq!(fixture.app.screen(), Screen::Profiles);
+        assert!(fixture.app.profile_config.is_none());
+        assert!(!file(&fixture, "offline").contains("notify"));
+
+        let mut fixture = edited();
+        press(&mut fixture.app, "q");
+        assert_eq!(fixture.app.dialog, unsaved(After::Quit));
+        assert_eq!(press(&mut fixture.app, "d"), [Effect::Quit]);
+
+        let mut fixture = edited();
+        press(&mut fixture.app, "\x1b\x1b");
+        assert_eq!(press(&mut fixture.app, "w"), [Effect::SaveProfile]);
+        let saved = save_profile(on(&fixture), &fixture.app.paths);
+        fixture.app.update(Msg::ProfileSaved(saved));
+        assert_eq!(fixture.app.screen(), Screen::Profiles);
+        assert!(file(&fixture, "offline").contains("notify = false"));
+
+        let mut fixture = edited();
+        press(&mut fixture.app, "e");
+        assert_eq!(fixture.app.dialog, unsaved(After::Editor));
+        assert_eq!(
+            press(&mut fixture.app, "d"),
+            [Effect::EditProfile("offline".into())]
+        );
+
+        let mut clean = profile_mode("offline", None);
+        assert_eq!(
+            press(&mut clean.app, "e"),
+            [Effect::EditProfile("offline".into())]
+        );
+        press(&mut clean.app, "\x1b");
+        assert_eq!(clean.app.screen(), Screen::Profiles);
+    }
+
+    /// Saving the active profile restarts the daemon, as a base save does.
+    #[test]
+    fn saving_the_active_profile_restarts_the_daemon() {
+        let mut fixture = profile_mode("offline", Some("offline"));
+        section(&mut fixture, "General");
+        to(&mut fixture, "general.notify");
+        press(&mut fixture.app, " ");
+        assert_eq!(
+            save(&mut fixture),
+            Some(Effect::All(vec![Effect::ReadProfiles, Effect::Restart]))
+        );
+        assert_eq!(
+            said(&fixture).text,
+            "saved profiles/offline.toml, restarting the daemon"
+        );
+    }
+
+    /// A profile whose file is not TOML does not open, saying why.
+    #[test]
+    fn a_broken_profile_does_not_open() {
+        let mut fixture = mockup_profiles(PROFILES, None);
+        open_profiles(&mut fixture);
+        open_profile(&mut fixture, "broken");
+        assert_eq!(fixture.app.screen(), Screen::Profiles);
+        let status = said(&fixture);
+        assert_eq!(status.tone, Tone::Error);
+        assert!(status
+            .text
+            .starts_with("cannot open broken in Config: profiles/broken.toml is not valid TOML"));
+    }
+
+    /// The help names profile mode's keys.
+    #[test]
+    fn profile_mode_has_its_help() {
+        let mut fixture = profile_mode("offline", None);
+        press(&mut fixture.app, "?");
+        let drawn = drawn(&fixture, 90, 30);
+        assert!(drawn.iter().any(|r| r.contains("profile keys")));
+        assert!(drawn
+            .iter()
+            .any(|r| r.contains("take it out of the profile")));
+    }
+
+    /// On base, a row the active profile sets says so, and its help that
+    /// an edit applies once base is active; the header says base.
+    #[test]
+    fn base_config_names_what_the_active_profile_sets() {
+        let mut fixture = mockup_profiles(PROFILES, Some("offline"));
+        daemon_on(&mut fixture.app, Some("offline"), None, 1);
+        let config = &fixture.app.config;
+        let tagged = |path: &str| {
+            let item = Item::Field {
+                field: schema::row(path),
+                path: path.to_string(),
+            };
+            tag(config, &item)
+        };
+        assert_eq!(
+            tagged("general.language"),
+            Some(("offline sets this".to_string(), Tone::Muted))
+        );
+        assert_eq!(tagged("general.silence_timeout_ms"), None);
+        press(&mut fixture.app, "\n");
+        let drawn = drawn(&fixture, 90, 30);
+        assert!(drawn
+            .iter()
+            .any(|r| r.contains("config \u{00B7} base \u{00B7} \u{25CF}")));
+        assert!(drawn
+            .iter()
+            .any(|r| r.contains("language") && r.contains("offline sets this")));
+        assert!(row_help(&fixture.app.config)
+            .contains(" offline sets this, so an edit here applies once base is active."));
+        // With no profile active, nothing is tagged.
+        let plain = mockup();
+        assert!(plain.app.config.overrides.is_none());
+        assert!(!rows(&draw(&plain.app, 90, 30))
+            .iter()
+            .any(|r| r.contains("config \u{00B7} base")));
+    }
+
+    /// Mic's `w` with the active profile setting the device says that one
+    /// stays in use.
+    #[test]
+    fn mic_says_the_active_profile_keeps_its_device() {
+        use crate::tui::options::{Device, Listing};
+        let mut fixture = mockup_profiles(
+            &[("loud", "[audio]\ndevice = \"alsa_input.usb-yeti\"\n")],
+            Some("loud"),
+        );
+        daemon_on(&mut fixture.app, Some("loud"), None, 1);
+        press(&mut fixture.app, "\x1bj\n");
+        assert_eq!(fixture.app.screen(), Screen::Mic);
+        fixture
+            .app
+            .update(Msg::Listed(Listing::Devices(Ok(vec![Device {
+                id: "alsa_input.usb-mic".into(),
+                description: "USB mic".into(),
+                monitor: false,
+            }]))));
+        press(&mut fixture.app, "l");
+        assert_eq!(
+            press(&mut fixture.app, "w"),
+            [Effect::SaveDevice { overwrite: false }]
+        );
+        let keys = ["audio.device".to_string()];
+        let saved = save_keys(&fixture.app.config, &keys, false, &fixture.app.paths, false);
+        fixture.app.update(Msg::DeviceSaved(saved));
+        assert!(said(&fixture)
+            .text
+            .ends_with("; loud sets its own device, which stays in use while it is active"));
+    }
+
+    /// The rest of the Vocabulary section is plain `[general]` keys, set in
+    /// the profile as any: the prompt typed, the filler words a list.
+    #[test]
+    fn the_prompt_and_the_filler_words_go_into_the_profile() {
+        let mut fixture = profile_mode("offline", None);
+        section(&mut fixture, "Vocabulary");
+        to(&mut fixture, "general.prompt");
+        press(&mut fixture.app, "\n");
+        assert_eq!(on(&fixture).mode(), Mode::Text);
+        type_text(&mut fixture.app, "Ein Diktat.");
+        press(&mut fixture.app, "\n");
+        assert_eq!(tag_of(on(&fixture), "general.prompt"), Some(profile()));
+        to(&mut fixture, "general.remove_filler_words");
+        press(&mut fixture.app, " ");
+        assert_eq!(
+            tag_of(on(&fixture), "general.remove_filler_words"),
+            Some(profile())
+        );
+        to(&mut fixture, "general.filler_words");
+        press(&mut fixture.app, "\na");
+        type_text(&mut fixture.app, "halt");
+        press(&mut fixture.app, "\n\x1b");
+        assert_eq!(
+            tag_of(on(&fixture), "general.filler_words"),
+            Some(profile())
+        );
+        save(&mut fixture);
+        let text = file(&fixture, "offline");
+        assert!(text.contains("prompt = \"Ein Diktat.\""), "{text}");
+        assert!(text.contains("filler_words = [\"halt\"]"), "{text}");
+        assert!(text.contains("remove_filler_words = "), "{text}");
+    }
+
+    /// A commit or a pick of the value a row has already is no edit: the
+    /// row stays config.toml's, the screen clean, and nothing is pinned.
+    #[test]
+    fn the_value_there_already_pins_nothing() {
+        let mut fixture = profile_mode("offline", None);
+        section(&mut fixture, "General");
+        to(&mut fixture, "general.silence_timeout_ms");
+        press(&mut fixture.app, "\n\n");
+        assert_eq!(
+            tag_of(on(&fixture), "general.silence_timeout_ms"),
+            Some(base())
+        );
+        section(&mut fixture, "Typing");
+        to(&mut fixture, "input.backend");
+        press(&mut fixture.app, "\n");
+        assert_eq!(on(&fixture).mode(), Mode::Picker);
+        press(&mut fixture.app, "\n");
+        assert_eq!(on(&fixture).mode(), Mode::Browse);
+        assert_eq!(tag_of(on(&fixture), "input.backend"), Some(base()));
+        assert!(!on(&fixture).is_dirty());
+        assert!(press(&mut fixture.app, "w").is_empty());
+        assert_eq!(said(&fixture).text, "no changes to save");
+        assert!(!file(&fixture, "offline").contains("silence_timeout_ms"));
+    }
+
+    /// The merged config is checked as a client checks it: a cloud backend
+    /// whose key may be in whisrsd's environment alone saves, warned of.
+    #[test]
+    fn a_key_in_whisrsds_environment_does_not_stop_a_save() {
+        let fixture = mockup_profiles(&[("cloud", "[general]\nbackend = \"openai\"\n")], None);
+        let mut fixture = entered(fixture, "cloud");
+        section(&mut fixture, "General");
+        to(&mut fixture, "general.notify");
+        press(&mut fixture.app, " ");
+        assert_eq!(save(&mut fixture), Some(Effect::ReadProfiles));
+        assert_eq!(
+            said(&fixture).text,
+            "saved profiles/cloud.toml (not active)"
+        );
+        if std::env::var_os("WHISRS_OPENAI_API_KEY").is_none() {
+            assert!(fixture
+                .app
+                .profile_notices
+                .iter()
+                .any(|n| n.text.contains("WHISRS_OPENAI_API_KEY")));
+        }
+    }
+
+    #[test]
+    fn profile_mode_snapshots() {
+        let mut fixture = profile_mode("offline", Some("offline"));
+        daemon_on(&mut fixture.app, Some("offline"), None, 1);
+        // Backend & keys: rows the profile sets, base's and base only.
+        press(&mut fixture.app, "j\n");
+        // Of the default build: without whisper.cpp, its backend says so.
+        if !schema::Gate::LocalWhisper.built() {
+            return;
+        }
+        for (w, h) in [(59, 17), (60, 18), (89, 30), (90, 30), (200, 60)] {
+            assert_snapshot(&format!("profile-config-{w}x{h}"), &drawn(&fixture, w, h));
+        }
     }
 }

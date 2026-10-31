@@ -1,14 +1,13 @@
 //! System tray implementation using ksni (StatusNotifierItem).
 
-use ksni::menu::StandardItem;
+use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Icon, MenuItem, ToolTip, TrayMethods};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-use super::NotifyFn;
+use super::{NotifyFn, ProfileMenu, RestartFn};
 #[cfg(feature = "recording")]
 use crate::recording::{RecordingAction, RecordingOptions, RecordingPhase, RecordingStatus};
-use crate::service::{RestartOutcome, ServiceManager};
 use crate::{Command, State};
 use icons::IconSet;
 
@@ -193,6 +192,10 @@ struct WhisrsTray {
     /// disabled), used to surface menu-callback failures the journal alone
     /// would hide — currently a failed "Restart Daemon" click.
     notify: Option<NotifyFn>,
+    /// The "Profile" submenu, read at start.
+    profiles: ProfileMenu,
+    /// The daemon's restart, for "Restart Daemon".
+    restart: RestartFn,
 }
 
 impl WhisrsTray {
@@ -269,6 +272,10 @@ impl ksni::Tray for WhisrsTray {
         };
         #[cfg(not(feature = "recording"))]
         let description = description.to_string();
+        let description = match &self.profiles.active {
+            Some(profile) => format!("{description}\nprofile: {profile}"),
+            None => description,
+        };
         ToolTip {
             title: "whisrs".to_string(),
             description,
@@ -305,11 +312,14 @@ impl ksni::Tray for WhisrsTray {
             items.extend(recording_menu_items(&self.state.recording));
             items.push(MenuItem::Separator);
         }
+        if let Some(menu) = profile_menu(&self.profiles) {
+            items.extend([menu, MenuItem::Separator]);
+        }
         items.extend([
             MenuItem::Standard(StandardItem {
                 label: "Restart Daemon".to_string(),
                 activate: Box::new(|tray: &mut Self| {
-                    restart_daemon(tray.notify);
+                    restart_daemon(&tray.restart, tray.notify);
                 }),
                 ..Default::default()
             }),
@@ -362,6 +372,49 @@ fn recording_menu_items(recording: &RecordingStatus) -> Vec<MenuItem<WhisrsTray>
     items
 }
 
+/// The "Profile" submenu: base and every profile, the daemon's one
+/// selected; picking one sends the switch. `None` without profiles.
+fn profile_menu(profiles: &ProfileMenu) -> Option<MenuItem<WhisrsTray>> {
+    if profiles.names.is_empty() {
+        return None;
+    }
+    let options: Vec<String> = std::iter::once(crate::config::profile::BASE.to_string())
+        .chain(profiles.names.iter().cloned())
+        .collect();
+    let selected = profiles
+        .active
+        .as_ref()
+        .and_then(|active| options.iter().position(|o| o == active))
+        .unwrap_or(0);
+    let items = options
+        .iter()
+        .map(|name| RadioItem {
+            // A lone `_` marks an access key in a menu label.
+            label: name.replace('_', "__"),
+            ..Default::default()
+        })
+        .collect();
+    Some(
+        SubMenu {
+            label: "Profile".to_string(),
+            submenu: vec![RadioGroup {
+                selected,
+                select: Box::new(move |tray: &mut WhisrsTray, index: usize| {
+                    if let Some(name) = options.get(index) {
+                        tray.send(Command::SwitchProfile {
+                            name: Some(name.clone()),
+                        });
+                    }
+                }),
+                options: items,
+            }
+            .into()],
+            ..Default::default()
+        }
+        .into(),
+    )
+}
+
 #[cfg(feature = "recording")]
 fn recording_command(action: RecordingAction) -> Command {
     Command::Recording {
@@ -372,48 +425,24 @@ fn recording_command(action: RecordingAction) -> Command {
     }
 }
 
-/// Restart the daemon through the detected service manager, from the tray menu.
+/// Restart the daemon from the tray menu, through the daemon's own restart
+/// ([`crate::service::restart_self`]: its service when it runs under one,
+/// else a re-exec after the shutdown SIGTERM runs).
 ///
 /// This cannot go through the daemon's own command loop: a successful restart
-/// kills this very process before it could reply. Runs on its own thread
-/// because ksni menu callbacks must not block and the restart is a subprocess
-/// round-trip.
+/// kills this very process before it could reply. `restart_self` runs on its
+/// own thread because ksni menu callbacks must not block.
 ///
-/// Failure raises a desktop toast (when `notify` is set): without one, a click
-/// on a setup with no installed service would silently do nothing, since log
-/// warnings are invisible from the tray.
-fn restart_daemon(notify: Option<NotifyFn>) {
+/// Failure raises a desktop toast (when `notify` is set), since log warnings
+/// are invisible from the tray.
+fn restart_daemon(restart: &RestartFn, notify: Option<NotifyFn>) {
     info!("tray: restart requested");
-    std::thread::spawn(move || {
-        let manager = ServiceManager::detect();
-        match manager.restart() {
-            // When this daemon runs under the service, the manager kills it
-            // mid-restart, so this line is normally never reached.
-            RestartOutcome::Restarted => {
-                info!("tray: daemon restarted via {}", manager.name())
-            }
-            RestartOutcome::NoService => {
-                warn!("tray: no whisrs user service installed — restart the daemon manually");
-                if let Some(notify) = notify {
-                    notify(
-                        "whisrs",
-                        "Restart from the tray needs an installed whisrs user service. \
-                         Restart the daemon manually.",
-                    );
-                }
-            }
-            RestartOutcome::Failed => {
-                let hint = manager.restart_hint().unwrap_or("the restart command");
-                warn!("tray: `{hint}` failed");
-                if let Some(notify) = notify {
-                    notify(
-                        "whisrs",
-                        &format!("Daemon restart failed: `{hint}` returned an error."),
-                    );
-                }
-            }
+    restart(Box::new(move |why| {
+        warn!("tray: restart failed: {why}");
+        if let Some(notify) = notify {
+            notify("whisrs", &format!("Daemon restart failed: {why}"));
         }
-    });
+    }));
 }
 
 /// Quit from the tray menu by sending the daemon SIGTERM, so it takes the
@@ -446,6 +475,8 @@ pub async fn spawn_tray(
     #[cfg(feature = "recording")] recording_rx: watch::Receiver<RecordingStatus>,
     cmd_tx: mpsc::Sender<Command>,
     notify: Option<NotifyFn>,
+    profiles: ProfileMenu,
+    restart: RestartFn,
 ) {
     // Retry spawning the tray with exponential backoff.
     let mut delay = TRAY_INITIAL_DELAY;
@@ -460,6 +491,8 @@ pub async fn spawn_tray(
             },
             cmd_tx: cmd_tx.clone(),
             notify,
+            profiles: profiles.clone(),
+            restart: std::sync::Arc::clone(&restart),
         };
 
         match tray.spawn().await {
@@ -570,6 +603,8 @@ mod tests {
             },
             cmd_tx,
             notify: None,
+            profiles: ProfileMenu::default(),
+            restart: std::sync::Arc::new(|_| panic!("a tray test restarted the daemon")),
         }
     }
 
@@ -642,6 +677,96 @@ mod tests {
             matches!(cmd, Command::Toggle { language: None }),
             "expected Command::Toggle {{ language: None }}, got {cmd:?}"
         );
+    }
+
+    /// "Restart Daemon" goes through the daemon's own restart, handing it
+    /// what to do when nothing restarted.
+    #[test]
+    fn restart_daemon_uses_the_daemons_restart() {
+        let (cmd_tx, _rx) = mpsc::channel(1);
+        let mut tray = tray_with(cmd_tx, State::Idle);
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce(String) + Send>>();
+        let tx = std::sync::Mutex::new(tx);
+        tray.restart = std::sync::Arc::new(move |on_failure| {
+            tx.lock().unwrap().send(on_failure).unwrap();
+        });
+        let mut menu = tray.menu();
+        let item = menu
+            .iter_mut()
+            .find_map(|i| match i {
+                MenuItem::Standard(s) if s.label == "Restart Daemon" => Some(s),
+                _ => None,
+            })
+            .expect("a Restart Daemon item");
+        let activate = std::mem::replace(&mut item.activate, Box::new(|_: &mut WhisrsTray| {}));
+        activate(&mut tray);
+        let on_failure = rx.try_recv().expect("the daemon's restart ran");
+        // With notifications off, a failure is only logged.
+        on_failure("`systemctl --user restart --no-block whisrs.service` failed".into());
+    }
+
+    /// Without profiles there is no "Profile" submenu, and the tooltip names
+    /// none.
+    #[test]
+    fn no_profile_submenu_without_profiles() {
+        let (cmd_tx, _rx) = mpsc::channel(1);
+        let tray = tray_with(cmd_tx, State::Idle);
+        assert!(tray
+            .menu()
+            .iter()
+            .all(|i| !matches!(i, MenuItem::SubMenu(_) | MenuItem::RadioGroup(_))));
+        assert!(!tray.tool_tip().description.contains("profile"));
+    }
+
+    /// With profiles, the submenu offers base and each of them, the daemon's
+    /// one selected; picking one sends its switch. The tooltip names it.
+    #[test]
+    fn the_profile_submenu_offers_base_and_the_profiles() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let mut tray = tray_with(cmd_tx, State::Idle);
+        tray.profiles = ProfileMenu {
+            names: vec!["my_laptop".into(), "offline".into()],
+            active: Some("offline".into()),
+        };
+        let menu = tray.menu();
+        let submenu = menu
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::SubMenu(s) if s.label == "Profile" => Some(s),
+                _ => None,
+            })
+            .expect("a Profile submenu");
+        let [MenuItem::RadioGroup(group)] = submenu.submenu.as_slice() else {
+            panic!("the submenu is one radio group");
+        };
+        let labels: Vec<&str> = group.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["base", "my__laptop", "offline"]);
+        assert_eq!(group.selected, 2);
+
+        for (index, name) in [(0, "base"), (1, "my_laptop")] {
+            (group.select)(&mut tray, index);
+            let cmd = cmd_rx.try_recv().expect("a switch is queued");
+            assert!(
+                matches!(&cmd, Command::SwitchProfile { name: Some(n) } if n == name),
+                "{cmd:?}"
+            );
+        }
+        assert_eq!(
+            tray.tool_tip().description,
+            "Idle, ready to dictate\nprofile: offline"
+        );
+
+        tray.profiles.active = None;
+        let menu = tray.menu();
+        let selected = menu.iter().find_map(|i| match i {
+            MenuItem::SubMenu(s) => match s.submenu.as_slice() {
+                [MenuItem::RadioGroup(g)] => Some(g.selected),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(selected, Some(0), "base");
+        assert_eq!(tray.tool_tip().description, "Idle, ready to dictate");
     }
 
     /// Every icon set (each dictation state and both recording phases) ships

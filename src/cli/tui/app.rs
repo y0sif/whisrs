@@ -3,29 +3,37 @@
 //! the loop to run. Nothing here touches the terminal, the disk or the
 //! daemon, so key sequences are tested without any of them.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
+use whisrs::config::profile::{self as profile_files, BASE};
 use whisrs::config::setup::key_test::{Target, Tested};
 use whisrs::config::setup::mic::{Probe, ProbeError};
 use whisrs::service::ServiceManager;
-use whisrs::OverlayConfig;
+use whisrs::{InfoAnswer, OverlayConfig};
 
 use super::keys::{self, Action, Mode};
 use super::options::Listing;
 use super::schema::{self, ListKind};
-use super::screens::config::{ConfigScreen, Found, Loaded, SaveError, Saved, Test};
+use super::screens::config::{
+    ConfigScreen, Found, Loaded, ProfileLoad, ProfileSaved, SaveError, Saved, Test,
+};
 use super::screens::history::{Dictation, History};
 use super::screens::mic::analysis::MicReading;
 use super::screens::mic::{self, Meter};
+use super::screens::profiles::{self, Ask, Folder, Profiles, Switching};
 use super::screens::recordings::{self, Act, Detail, Item, Recordings, Wanted};
 use super::screens::setup::{self, Checks, Existing, Reply, Setup, SystemAction};
 use super::screens::{config, history, home};
 use super::widgets::{dialog, frame, Notice, Tone, Ui};
-use super::worker::{DaemonView, Download, RestartReport};
+use super::worker::{DaemonView, Download, RestartReport, Switched, NUDGED_FOR};
 use super::{tilde, Entry, Env, Paths};
+
+/// How long a switch whisrsd took is followed: a restart that has not
+/// come by then did not happen.
+const SWITCH_GIVE_UP: Duration = Duration::from_secs(10);
 
 /// A screen of the stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +43,9 @@ pub enum Screen {
     Setup,
     Mic,
     Recordings,
+    Profiles,
+    /// Config on a profile: profile mode.
+    Profile,
     History,
 }
 
@@ -43,6 +54,8 @@ pub enum Screen {
 pub enum Origin {
     Config,
     Setup,
+    /// Config in profile mode.
+    Profile,
 }
 
 /// A capture's news, from the Mic worker.
@@ -136,6 +149,23 @@ pub enum Msg {
     HistoryRead(Result<Vec<Dictation>, String>),
     /// The daemon's answer to [`Effect::ClearHistory`]: done, or why not.
     HistoryCleared(Result<(), String>),
+    /// The profiles folder, read.
+    ProfilesRead(Result<Folder, String>),
+    /// What the switch to profile `name` came to.
+    Switched {
+        name: String,
+        answer: Result<Switched, String>,
+    },
+    /// Profile `name` was made, or why not.
+    ProfileCreated(String, Result<(), String>),
+    /// Profile `name` was deleted, or why not.
+    ProfileDeleted(String, Result<(), String>),
+    /// Profile `name` read for profile mode, or why it cannot be.
+    ProfileOpened(String, Result<ProfileLoad, String>),
+    /// The answer to [`Effect::SaveProfile`].
+    ProfileSaved(Result<ProfileSaved, String>),
+    /// `$EDITOR` on profile `name`'s file ended, or did not start.
+    ProfileEdited(String, Result<(), String>),
 }
 
 /// What the loop runs for the app.
@@ -222,17 +252,43 @@ pub enum Effect {
     ReadHistory,
     /// Ask the daemon to clear it; answered with [`Msg::HistoryCleared`].
     ClearHistory,
+    /// Read the profiles folder on a worker; answered with
+    /// [`Msg::ProfilesRead`].
+    ReadProfiles,
+    /// Ask the daemon at once, then often for a few seconds.
+    PollSoon,
+    /// Switch to this profile (`base` too); answered with [`Msg::Switched`].
+    SwitchProfile(String),
+    /// Make this profile, an empty file; answered with
+    /// [`Msg::ProfileCreated`].
+    CreateProfile(String),
+    /// Delete this profile's file; answered with [`Msg::ProfileDeleted`].
+    DeleteProfile(String),
+    /// Read this profile for profile mode; answered with
+    /// [`Msg::ProfileOpened`].
+    OpenProfile(String),
+    /// Validate profile mode's edits and write the profile's file; answered
+    /// with [`Msg::ProfileSaved`].
+    SaveProfile,
+    /// Leave the TUI for `$EDITOR` on this profile's file; answered with
+    /// [`Msg::ProfileEdited`].
+    EditProfile(String),
     /// Each in turn.
     All(Vec<Effect>),
 }
 
 /// What the unsaved-changes dialog was opened for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum After {
     Quit,
     Editor,
     /// Open Setup, which writes config.toml itself.
     Setup,
+    /// Open this profile in Config, which shows it over config.toml as
+    /// saved.
+    Profile(String),
+    /// Leave profile mode.
+    Leave,
 }
 
 /// Whose keys the help lists.
@@ -244,12 +300,17 @@ pub enum HelpFor {
     Setup,
     Mic,
     Recordings,
+    Profiles,
+    /// Config in profile mode.
+    Profile,
     History,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dialog {
     Unsaved(After),
+    /// Unsaved edits to profile mode's profile, by name.
+    UnsavedProfile(After, String),
     Help(HelpFor),
     /// Delete entry `index` of the current section's list.
     DeleteEntry {
@@ -288,6 +349,10 @@ pub enum Dialog {
     ClearHistory {
         count: Option<usize>,
     },
+    /// Delete this profile's file for good? Keep by default.
+    DeleteProfile {
+        name: String,
+    },
 }
 
 pub struct App {
@@ -304,6 +369,14 @@ pub struct App {
     pub mic: Meter,
     pub recordings: Recordings,
     pub history: History,
+    pub profiles: Profiles,
+    /// Config on a profile, while profile mode is open.
+    pub profile_config: Option<ConfigScreen>,
+    /// What loading or saving the profile found: dropped keys, unknown
+    /// ones, its error.
+    pub profile_notices: Vec<Notice>,
+    /// Setup wrote keys the active profile sets too: said at its end.
+    setup_overridden: Option<String>,
     /// The last capture started.
     mic_session: u64,
     /// Spinner frames so far.
@@ -380,6 +453,10 @@ impl App {
             mic: Meter::default(),
             recordings: Recordings::new(cfg!(feature = "recording")),
             history: History::default(),
+            profiles: Profiles::default(),
+            profile_config: None,
+            profile_notices: Vec::new(),
+            setup_overridden: None,
             mic_session: 0,
             ticks: 0,
             orphans: Vec::new(),
@@ -400,11 +477,57 @@ impl App {
         *self.stack.last().expect("the stack always holds Home")
     }
 
+    /// What the loop runs before the first frame: the profiles folder, for
+    /// Home's row and the header.
+    pub fn opened(&mut self) -> Option<Effect> {
+        Some(Effect::ReadProfiles)
+    }
+
+    /// The profile in use: the daemon's (from `info`) when it answers, else
+    /// the one the state file names. `None` is base.
+    pub fn active_profile(&self) -> Option<String> {
+        match &self.daemon {
+            DaemonView::Up(InfoAnswer::Info(info)) => info.profile.clone(),
+            _ => self.profiles.active().map(str::to_string),
+        }
+    }
+
+    /// The header's profile part: `profile offline` while one other than
+    /// base is in use.
+    pub fn header_profile(&self) -> Option<String> {
+        self.active_profile().map(|name| format!("profile {name}"))
+    }
+
+    /// Base Config's tags follow the profile in use: the paths it sets, if
+    /// it loads.
+    fn sync_overrides(&mut self) {
+        self.config.overrides = self.active_profile().and_then(|name| {
+            let item = self.profiles.item(&name)?;
+            item.error.is_none().then(|| (name, item.set.clone()))
+        });
+    }
+
+    /// Whether profile mode holds unsaved edits.
+    fn profile_dirty(&self) -> bool {
+        self.profile_config
+            .as_ref()
+            .is_some_and(ConfigScreen::is_dirty)
+    }
+
+    /// The profile profile mode is on.
+    fn profile_name(&self) -> Option<String> {
+        self.profile_config
+            .as_ref()
+            .and_then(|screen| screen.profile.as_ref())
+            .map(|edit| edit.name.clone())
+    }
+
     /// The overlay theme as edited, which colours the TUI too: setup's
     /// answer while setup is open, so the accent follows it live.
     pub fn overlay(&self) -> OverlayConfig {
-        let form = match (&self.setup, self.screen()) {
-            (Some(setup), Screen::Setup) => &setup.editor.form,
+        let form = match (&self.setup, self.screen(), &self.profile_config) {
+            (Some(setup), Screen::Setup, _) => &setup.editor.form,
+            (_, Screen::Profile, Some(screen)) => &screen.form,
             _ => &self.config.form,
         };
         form.config().overlay.clone().unwrap_or_default()
@@ -435,7 +558,13 @@ impl App {
     /// Whether a spinner turns: a key test or a look at the machine runs.
     pub fn spinning(&self) -> bool {
         self.config.tests.values().any(|t| *t == Test::Running)
+            || self
+                .profile_config
+                .as_ref()
+                .is_some_and(|screen| screen.tests.values().any(|t| *t == Test::Running))
             || self.setup.as_ref().is_some_and(Setup::spinning)
+            // Ticks for a switch, which gives up when nothing came.
+            || self.profiles.switching.is_some()
     }
 
     /// The daemon dot: up, down, or not known yet.
@@ -456,8 +585,19 @@ impl App {
         match msg {
             Msg::Key(key) => self.key(key),
             Msg::Daemon(view) => {
+                // A switch made elsewhere (the hotkey, the tray, whisrs
+                // profile) shows as a new profile or a new start.
+                let seen = |view: &DaemonView| match view {
+                    DaemonView::Up(InfoAnswer::Info(info)) => {
+                        Some((info.profile.clone(), info.started_at))
+                    }
+                    _ => None,
+                };
+                let moved = seen(&view).is_some() && seen(&view) != seen(&self.daemon);
                 self.daemon = view;
-                None
+                self.sync_overrides();
+                let followed = self.switched();
+                (moved || followed).then_some(Effect::ReadProfiles)
             }
             Msg::Saved(Ok(saved)) => self.saved(saved),
             Msg::Saved(Err(SaveError::Failed(why))) => {
@@ -485,7 +625,8 @@ impl App {
             Msg::Restarted(report) => self.restarted(report),
             Msg::Reloaded(reload) => {
                 self.reloaded(reload);
-                None
+                // config.toml is what every profile goes over.
+                (self.screen() == Screen::Profiles).then_some(Effect::ReadProfiles)
             }
             Msg::EditorFailed(why) => {
                 self.status = Some(Notice::new(Tone::Error, why));
@@ -494,6 +635,9 @@ impl App {
             Msg::Listed(listing) => {
                 if let Some(setup) = &mut self.setup {
                     setup.editor.listed(listing.clone());
+                }
+                if let Some(screen) = &mut self.profile_config {
+                    screen.listed(listing.clone());
                 }
                 self.config.listed(listing);
                 // It came: a row that was looking for it is not any more.
@@ -511,6 +655,13 @@ impl App {
                 match (origin, &mut self.setup) {
                     (Origin::Setup, Some(setup)) => self.status = Some(setup.tested(tested)),
                     (Origin::Setup, None) => {}
+                    (Origin::Profile, _) => {
+                        let label = schema::find(&path).map_or("key", |field| field.label);
+                        self.status = Some(config::test_notice(label, &tested));
+                        if let Some(screen) = &mut self.profile_config {
+                            screen.tests.insert(path, Test::Done(tested));
+                        }
+                    }
                     (Origin::Config, _) => {
                         let label = schema::find(&path).map_or("key", |field| field.label);
                         self.status = Some(config::test_notice(label, &tested));
@@ -586,11 +737,14 @@ impl App {
             Msg::Tick => {
                 self.ticks += 1;
                 self.config.spin = self.ticks;
+                if let Some(screen) = &mut self.profile_config {
+                    screen.spin = self.ticks;
+                }
                 if let Some(setup) = &mut self.setup {
                     setup.spin = self.ticks;
                     setup.editor.spin = self.ticks;
                 }
-                None
+                self.switch_given_up().then_some(Effect::ReadProfiles)
             }
             Msg::Recordings(folder) => {
                 let wanted = self.recordings.read(folder);
@@ -634,7 +788,368 @@ impl App {
                 });
                 (cleared && self.screen() == Screen::History).then_some(Effect::ReadHistory)
             }
+            Msg::ProfilesRead(folder) => {
+                self.profiles.read(folder);
+                self.sync_overrides();
+                None
+            }
+            Msg::Switched { name, answer } => self.switch_answered(name, answer),
+            Msg::ProfileCreated(name, made) => match made {
+                Ok(()) => {
+                    self.status = Some(Notice::new(
+                        Tone::Muted,
+                        format!("made {}", profile_files::label(&name)),
+                    ));
+                    // The read after it lands the cursor on the new row.
+                    self.profiles.back_on(&name);
+                    let open = self.open_profile(name);
+                    all(std::iter::once(Effect::ReadProfiles).chain(open).collect())
+                }
+                Err(why) => {
+                    self.status = Some(Notice::new(Tone::Error, why));
+                    None
+                }
+            },
+            Msg::ProfileDeleted(name, deleted) => {
+                self.status = Some(match deleted {
+                    Ok(()) => Notice::new(
+                        Tone::Muted,
+                        format!("deleted {}", profile_files::label(&name)),
+                    ),
+                    Err(why) => Notice::new(Tone::Error, why),
+                });
+                Some(Effect::ReadProfiles)
+            }
+            Msg::ProfileOpened(name, opened) => {
+                self.profile_opened(name, opened);
+                None
+            }
+            Msg::ProfileSaved(saved) => self.profile_saved(saved),
+            Msg::ProfileEdited(name, edited) => match edited {
+                Ok(()) => {
+                    self.status = Some(Notice::new(
+                        Tone::Muted,
+                        format!("read {} again", profile_files::label(&name)),
+                    ));
+                    let reopen = (self.profile_name().as_deref() == Some(name.as_str()))
+                        .then_some(Effect::OpenProfile(name));
+                    all(std::iter::once(Effect::ReadProfiles)
+                        .chain(reopen)
+                        .collect())
+                }
+                Err(why) => {
+                    self.status = Some(Notice::new(Tone::Error, why));
+                    None
+                }
+            },
         }
+    }
+
+    /// The daemon took a switch, or did not; with no daemon, the state file
+    /// was written. The folder is read again either way: the dot moves.
+    fn switch_answered(
+        &mut self,
+        name: String,
+        answer: Result<Switched, String>,
+    ) -> Option<Effect> {
+        self.profiles.asked = None;
+        match answer {
+            Ok(Switched::Restarting) => {
+                let (before, from) = match &self.daemon {
+                    DaemonView::Up(InfoAnswer::Info(info)) => {
+                        (Some(info.started_at), info.profile.clone())
+                    }
+                    _ => (None, self.active_profile()),
+                };
+                self.status = Some(Notice::new(Tone::Muted, format!("switching to {name}...")));
+                self.profiles.switching = Some(Switching {
+                    name,
+                    before,
+                    from: from.unwrap_or_else(|| BASE.to_string()),
+                    since: Instant::now(),
+                });
+                Some(Effect::All(vec![Effect::ReadProfiles, Effect::PollSoon]))
+            }
+            Ok(Switched::Busy) => {
+                self.status = Some(Notice::new(Tone::Warn, profile_files::RESTARTING));
+                None
+            }
+            Ok(Switched::Already) => {
+                self.status = Some(Notice::new(Tone::Muted, format!("already on {name}")));
+                Some(Effect::ReadProfiles)
+            }
+            Ok(Switched::Offline(line)) => {
+                self.status = Some(Notice::new(Tone::Muted, line));
+                Some(Effect::ReadProfiles)
+            }
+            Err(why) => {
+                self.status = Some(Notice::new(Tone::Error, why));
+                None
+            }
+        }
+    }
+
+    /// A switch is under way: once `info` comes from a new start, say what
+    /// it runs on; once the quick polls after it are over with the same
+    /// start, that the restart did not happen. Whether it is over.
+    fn switched(&mut self) -> bool {
+        let Some(switching) = &self.profiles.switching else {
+            return false;
+        };
+        let DaemonView::Up(InfoAnswer::Info(info)) = &self.daemon else {
+            return false;
+        };
+        let name = &switching.name;
+        let on = info.profile.as_deref().unwrap_or(BASE);
+        // With no start time from before, only the one asked for tells.
+        let restarted = match switching.before {
+            Some(before) => info.started_at != before,
+            None => on == name,
+        };
+        let status = if restarted && on == name {
+            Notice::new(Tone::Ok, format!("on {name}"))
+        } else if restarted {
+            match &info.profile_error {
+                Some(error) => Notice::new(Tone::Warn, error.clone()),
+                None => Notice::new(Tone::Warn, format!("whisrsd came back on {on}, not {name}")),
+            }
+        } else if switching.since.elapsed() >= NUDGED_FOR {
+            Notice::new(
+                Tone::Warn,
+                format!("the restart did not happen: whisrsd is still on {on}"),
+            )
+        } else {
+            return false;
+        };
+        self.status = Some(status);
+        self.profiles.switching = None;
+        true
+    }
+
+    /// A switch followed for [`SWITCH_GIVE_UP`] with no new start is over:
+    /// say what whisrsd is on, or that it is not back. Whether it gave up.
+    fn switch_given_up(&mut self) -> bool {
+        let Some(switching) = &self.profiles.switching else {
+            return false;
+        };
+        if switching.since.elapsed() < SWITCH_GIVE_UP {
+            return false;
+        }
+        let status = match &self.daemon {
+            DaemonView::Up(InfoAnswer::Info(info)) => Notice::new(
+                Tone::Warn,
+                format!(
+                    "the restart did not happen: whisrsd is still on {}",
+                    info.profile.as_deref().unwrap_or(BASE)
+                ),
+            ),
+            _ => Notice::new(
+                Tone::Warn,
+                format!("whisrsd is not back since the switch to {}", switching.name),
+            ),
+        };
+        self.status = Some(status);
+        self.profiles.switching = None;
+        true
+    }
+
+    /// Open Profiles: the folder is read again.
+    fn open_profiles(&mut self) -> Option<Effect> {
+        self.stack.push(Screen::Profiles);
+        self.status = None;
+        self.profiles.opened();
+        Some(Effect::ReadProfiles)
+    }
+
+    /// Take what a key on Profiles asked for.
+    fn profiles_reply(&mut self, reply: profiles::Reply) -> Option<Effect> {
+        if let Some(status) = reply.status {
+            self.status = Some(status);
+        }
+        if let Some(dialog) = reply.dialog {
+            self.dialog = Some(dialog);
+        }
+        if reply.leave {
+            self.stack.pop();
+            self.home.point(Screen::Profiles);
+            return None;
+        }
+        match reply.ask? {
+            Ask::Switch(name) => self.switch_profile(name),
+            // Base is plain Config, over Profiles: Esc comes back here.
+            Ask::Open(name) if name == BASE => {
+                self.stack.push(Screen::Config);
+                None
+            }
+            Ask::Open(name) => self.open_profile(name),
+            Ask::Create(name) => Some(Effect::CreateProfile(name)),
+            Ask::Edit(name) if name == BASE => self.editor(),
+            Ask::Edit(name) => Some(Effect::EditProfile(name)),
+        }
+    }
+
+    /// Send a switch, one at a time.
+    fn switch_profile(&mut self, name: String) -> Option<Effect> {
+        if let Some(other) = self.profiles.asked.as_ref().or(self
+            .profiles
+            .switching
+            .as_ref()
+            .map(|switching| &switching.name))
+        {
+            self.status = Some(Notice::new(
+                Tone::Warn,
+                format!("still switching to {other}: wait for whisrsd"),
+            ));
+            return None;
+        }
+        self.status = Some(Notice::new(
+            Tone::Muted,
+            format!("asking whisrsd to switch to {name}"),
+        ));
+        self.profiles.asked = Some(name.clone());
+        Some(Effect::SwitchProfile(name))
+    }
+
+    /// Open profile mode on `name`, over config.toml as saved: Config's
+    /// unsaved edits are asked about first.
+    fn open_profile(&mut self, name: String) -> Option<Effect> {
+        if self.config.form.is_dirty() {
+            self.dialog = Some(Dialog::Unsaved(After::Profile(name)));
+            return None;
+        }
+        Some(Effect::OpenProfile(name))
+    }
+
+    /// Profile mode opens on what was read, or reads it again in place.
+    fn profile_opened(&mut self, name: String, opened: Result<ProfileLoad, String>) {
+        let load = match opened {
+            Ok(load) => load,
+            Err(why) => {
+                self.status = Some(Notice::new(
+                    Tone::Error,
+                    format!("cannot open {name} in Config: {why}"),
+                ));
+                return;
+            }
+        };
+        self.profile_notices = load.loaded.notices.clone();
+        let same = self.profile_name().as_deref() == Some(name.as_str());
+        match &mut self.profile_config {
+            Some(screen) if same => screen.reload_profile(load),
+            _ => self.profile_config = Some(ConfigScreen::on_profile(load, self.env.clone())),
+        }
+        if self.screen() != Screen::Profile {
+            self.stack.push(Screen::Profile);
+            self.status = None;
+        }
+    }
+
+    /// Leave profile mode, back to Profiles; unsaved edits are asked about.
+    fn leave_profile(&mut self) -> Option<Effect> {
+        if let Some(name) = self.profile_name().filter(|_| self.profile_dirty()) {
+            self.dialog = Some(Dialog::UnsavedProfile(After::Leave, name));
+            return None;
+        }
+        self.close_profile();
+        None
+    }
+
+    fn close_profile(&mut self) {
+        if let Some(name) = self.profile_name() {
+            self.profiles.back_on(&name);
+        }
+        if self.screen() == Screen::Profile {
+            self.stack.pop();
+        }
+        self.profile_config = None;
+        self.profile_notices.clear();
+    }
+
+    /// Profile mode's `w`.
+    fn save_profile(&mut self) -> Option<Effect> {
+        if !self.profile_dirty() {
+            self.status = Some(Notice::new(Tone::Muted, "no changes to save"));
+            return match self.pending.take() {
+                Some(After::Quit) => Some(Effect::Quit),
+                Some(After::Leave) => {
+                    self.close_profile();
+                    None
+                }
+                Some(After::Editor) => self.profile_name().map(Effect::EditProfile),
+                _ => None,
+            };
+        }
+        Some(Effect::SaveProfile)
+    }
+
+    /// Profile mode's `e`: the profile's file, unsaved edits asked about
+    /// first.
+    fn profile_editor(&mut self) -> Option<Effect> {
+        let name = self.profile_name()?;
+        if self.profile_dirty() {
+            self.dialog = Some(Dialog::UnsavedProfile(After::Editor, name));
+            return None;
+        }
+        Some(Effect::EditProfile(name))
+    }
+
+    /// The answer to profile mode's save: edit on from the file as it is
+    /// now, and restart the daemon when it runs on this profile, as a base
+    /// save does.
+    fn profile_saved(&mut self, saved: Result<ProfileSaved, String>) -> Option<Effect> {
+        let saved = match saved {
+            Ok(saved) => saved,
+            Err(why) => {
+                self.pending = None;
+                self.status = Some(Notice::new(Tone::Error, format!("not saved: {why}")));
+                return None;
+            }
+        };
+        let label = profile_files::label(&saved.name);
+        self.profile_notices = saved.load.loaded.notices.clone();
+        self.profile_notices.extend(
+            saved
+                .warnings
+                .iter()
+                .map(|w| Notice::new(Tone::Warn, format!("warning: {}", w.replace('\n', " ")))),
+        );
+        if let Some(screen) = &mut self.profile_config {
+            screen.reload_profile(saved.load);
+        }
+        let said = if saved.active {
+            format!("saved {label}, restarting the daemon")
+        } else {
+            format!("saved {label} (not active)")
+        };
+        let restart = saved.active.then_some(Effect::Restart);
+        let mut effects = vec![Effect::ReadProfiles];
+        match self.pending.take() {
+            Some(After::Editor) => {
+                self.status = Some(Notice::new(Tone::Ok, format!("saved {label}")));
+                effects.push(Effect::EditProfile(saved.name));
+            }
+            Some(After::Quit) => {
+                self.farewell.push(format!("Saved {label}."));
+                self.status = Some(Notice::new(Tone::Muted, said));
+                match restart {
+                    Some(restart) => {
+                        self.quitting = true;
+                        effects.push(restart);
+                    }
+                    None => effects.push(Effect::Quit),
+                }
+            }
+            Some(After::Leave) => {
+                self.close_profile();
+                self.status = Some(Notice::new(Tone::Muted, said));
+                effects.extend(restart);
+            }
+            _ => {
+                self.status = Some(Notice::new(Tone::Muted, said));
+                effects.extend(restart);
+            }
+        }
+        all(effects)
     }
 
     /// Open setup on what [`setup_load`] found. `disk` is the config on
@@ -713,6 +1228,10 @@ impl App {
                     ));
                 }
                 self.config.reloaded(saved.loaded);
+                self.setup_overridden = self.overridden_by_profile();
+                if let Some(text) = &self.setup_overridden {
+                    self.notices.push(Notice::new(Tone::Warn, text.clone()));
+                }
                 let kept = saved
                     .backup
                     .as_ref()
@@ -751,6 +1270,25 @@ impl App {
                 self.reply(reply)
             }
         }
+    }
+
+    /// Setup wrote config.toml: what of it the active profile sets too, and
+    /// so keeps as it has it while it is active.
+    fn overridden_by_profile(&self) -> Option<String> {
+        let (name, paths) = self.config.overrides.as_ref()?;
+        let asked = self.setup.as_ref()?.asked();
+        let both: Vec<&str> = asked
+            .iter()
+            .filter(|key| paths.contains(*key))
+            .map(String::as_str)
+            .collect();
+        (!both.is_empty()).then(|| {
+            format!(
+                "the active profile {name} sets {} too, so its values stay in use while it is \
+                 active",
+                both.join(", ")
+            )
+        })
     }
 
     /// Do what setup's reply asks. A step change clears what the step
@@ -850,6 +1388,9 @@ impl App {
             "  Change a setting with whisrs config; run whisrs setup again for the rest."
                 .to_string(),
         ]);
+        if let Some(text) = self.setup_overridden.take() {
+            self.farewell.push(format!("Note: {text}."));
+        }
         Some(Effect::Quit)
     }
 
@@ -1029,6 +1570,11 @@ impl App {
                 Screen::Home => Mode::Browse,
                 Screen::Recordings => self.recordings.mode(),
                 Screen::History => self.history.mode(),
+                Screen::Profiles => self.profiles.mode(),
+                Screen::Profile => self
+                    .profile_config
+                    .as_ref()
+                    .map_or(Mode::Browse, ConfigScreen::mode),
             }
         };
         let action = keys::action(key, mode)?;
@@ -1056,17 +1602,25 @@ impl App {
             }));
             return None;
         }
+        if mode == Mode::Profiles && action == Action::Help {
+            self.dialog = Some(Dialog::Help(HelpFor::Profiles));
+            return None;
+        }
         if mode == Mode::Browse {
             let setup = self.screen() == Screen::Setup;
+            let profile = self.screen() == Screen::Profile;
             match action {
                 Action::Help => {
                     self.dialog = Some(Dialog::Help(match self.screen() {
                         Screen::Setup => HelpFor::Setup,
                         Screen::Mic => HelpFor::Mic,
+                        Screen::Profile => HelpFor::Profile,
                         _ => HelpFor::Rows,
                     }));
                     return None;
                 }
+                Action::Save if profile => return self.save_profile(),
+                Action::Editor if profile => return self.profile_editor(),
                 Action::Save if self.screen() == Screen::Mic => return self.save_device(),
                 Action::Save if !setup => return self.save(),
                 Action::Editor if !setup => return self.editor(),
@@ -1082,6 +1636,7 @@ impl App {
                 }
                 Screen::Mic => self.open_mic(),
                 Screen::Recordings => self.open_recordings(),
+                Screen::Profiles => self.open_profiles(),
                 Screen::History => self.open_history(),
                 // Setup writes config.toml itself: Config's edits first.
                 Screen::Setup if self.config.form.is_dirty() => {
@@ -1089,7 +1644,7 @@ impl App {
                     None
                 }
                 Screen::Setup => Some(Effect::OpenSetup),
-                Screen::Home => None,
+                Screen::Home | Screen::Profile => None,
             },
             Screen::Config => {
                 let outcome = self.config.key(action);
@@ -1140,6 +1695,21 @@ impl App {
                 history::Asked::Clear => self.ask_clear_history(),
                 history::Asked::Nothing => None,
             },
+            Screen::Profiles => {
+                let running = match &self.daemon {
+                    DaemonView::Up(InfoAnswer::Info(info)) => info.profile.clone(),
+                    _ => None,
+                };
+                let reply = self.profiles.key(action, running.as_deref());
+                self.profiles_reply(reply)
+            }
+            Screen::Profile => {
+                let outcome = self.profile_config.as_mut()?.key(action);
+                if outcome.leave {
+                    return self.leave_profile();
+                }
+                self.outcome(outcome, Origin::Profile)
+            }
         }
     }
 
@@ -1151,7 +1721,11 @@ impl App {
         self.flash = outcome.flash;
         self.dialog = outcome.dialog;
         if let Some((path, target)) = outcome.test {
-            self.config.tests.insert(path.clone(), Test::Running);
+            let tests = match (origin, &mut self.profile_config) {
+                (Origin::Profile, Some(screen)) => &mut screen.tests,
+                _ => &mut self.config.tests,
+            };
+            tests.insert(path.clone(), Test::Running);
             return Some(Effect::TestKey {
                 origin,
                 path,
@@ -1197,17 +1771,44 @@ impl App {
                 self.status = Some(Notice::new(Tone::Muted, "kept the history"));
                 None
             }
+            (Dialog::DeleteProfile { name }, Action::Type('y')) => {
+                Some(Effect::DeleteProfile(name.clone()))
+            }
+            // Keep is the default: anything else.
+            (Dialog::DeleteProfile { name }, _) => {
+                self.status = Some(Notice::new(Tone::Muted, format!("kept {name}")));
+                None
+            }
             (Dialog::Unsaved(after), Action::Type('w')) => {
-                self.pending = Some(*after);
+                self.pending = Some(after.clone());
                 self.save()
             }
             (Dialog::Unsaved(after), Action::Type('d')) => {
                 self.config.discard();
-                Some(match after {
-                    After::Quit => Effect::Quit,
-                    After::Editor => Effect::OpenEditor,
-                    After::Setup => Effect::OpenSetup,
-                })
+                match after {
+                    After::Quit => Some(Effect::Quit),
+                    After::Editor => Some(Effect::OpenEditor),
+                    After::Setup => Some(Effect::OpenSetup),
+                    After::Profile(name) => Some(Effect::OpenProfile(name.clone())),
+                    After::Leave => None,
+                }
+            }
+            (Dialog::UnsavedProfile(after, _), Action::Type('w')) => {
+                self.pending = Some(after.clone());
+                self.save_profile()
+            }
+            (Dialog::UnsavedProfile(after, name), Action::Type('d')) => {
+                if let Some(screen) = &mut self.profile_config {
+                    screen.discard();
+                }
+                match after {
+                    After::Quit => Some(Effect::Quit),
+                    After::Editor => Some(Effect::EditProfile(name.clone())),
+                    _ => {
+                        self.close_profile();
+                        None
+                    }
+                }
             }
             (Dialog::DeleteEntry { index, name }, Action::Type('d')) => {
                 self.status = Some(self.config.delete_entry(*index, name));
@@ -1300,6 +1901,14 @@ impl App {
             self.dialog = Some(Dialog::Unwritten { quit: true });
             return None;
         }
+        // Profile mode opens over a saved config.toml, and Config is not
+        // reached from it: the profile is the only one with edits.
+        if let Some(name) = self.profile_name() {
+            if self.screen() == Screen::Profile && self.profile_dirty() && !self.quitting {
+                self.dialog = Some(Dialog::UnsavedProfile(After::Quit, name));
+                return None;
+            }
+        }
         if self.config.form.is_dirty() && !self.quitting {
             self.dialog = Some(Dialog::Unsaved(After::Quit));
             None
@@ -1324,7 +1933,8 @@ impl App {
                 Some(After::Quit) => Some(Effect::Quit),
                 Some(After::Editor) => Some(Effect::OpenEditor),
                 Some(After::Setup) => Some(Effect::OpenSetup),
-                None => None,
+                Some(After::Profile(name)) => Some(Effect::OpenProfile(name)),
+                Some(After::Leave) | None => None,
             };
         }
         Some(Effect::Save)
@@ -1362,9 +1972,16 @@ impl App {
                         .map(|w| Notice::new(Tone::Warn, format!("warning: {w}"))),
                 );
                 self.config.settled("audio.device", saved.loaded);
+                // The device the daemon opens is the active profile's own.
+                let own = match &self.config.overrides {
+                    Some((name, paths)) if paths.contains("audio.device") => format!(
+                        "; {name} sets its own device, which stays in use while it is active"
+                    ),
+                    _ => String::new(),
+                };
                 self.status = Some(Notice::new(
                     Tone::Muted,
-                    format!("saved [audio] device to {file}, restarting the daemon"),
+                    format!("saved [audio] device to {file}, restarting the daemon{own}"),
                 ));
                 Some(Effect::Restart)
             }
@@ -1439,6 +2056,16 @@ impl App {
                 ));
                 Some(Effect::All(vec![Effect::Restart, Effect::OpenSetup]))
             }
+            Some(After::Profile(name)) => {
+                self.status = Some(Notice::new(
+                    Tone::Muted,
+                    format!("saved {file}, restarting the daemon"),
+                ));
+                Some(Effect::All(vec![
+                    Effect::Restart,
+                    Effect::OpenProfile(name),
+                ]))
+            }
             Some(After::Quit) => {
                 self.quitting = true;
                 self.farewell.push(format!("Saved {file}."));
@@ -1448,7 +2075,7 @@ impl App {
                 ));
                 Some(Effect::Restart)
             }
-            None => {
+            Some(After::Leave) | None => {
                 self.status = Some(Notice::new(
                     Tone::Muted,
                     format!("saved {file}, restarting the daemon"),
@@ -1553,6 +2180,8 @@ impl App {
             Screen::Setup => setup::view(self, f, ui),
             Screen::Mic => mic::view(self, f, ui),
             Screen::Recordings => recordings::view(self, f, ui),
+            Screen::Profiles => profiles::view(self, f, ui),
+            Screen::Profile => config::view_profile(self, f, ui),
             Screen::History => history::view(self, f, ui),
         }
         if let Some(dialog) = &self.dialog {
@@ -1566,10 +2195,21 @@ impl App {
                 Dialog::Help(HelpFor::Mic) => "mic keys",
                 Dialog::Help(HelpFor::Recordings) => "recordings keys",
                 Dialog::Help(HelpFor::History) => "history keys",
+                Dialog::Help(HelpFor::Profiles) => "profiles keys",
+                Dialog::Help(HelpFor::Profile) => "profile keys",
                 _ => "",
             };
             dialog::draw_titled(f, area, ui, title, dialog_lines(dialog, ui, width));
         }
+    }
+}
+
+/// `effects` as one effect: none, the one, or each in turn.
+fn all(mut effects: Vec<Effect>) -> Option<Effect> {
+    match effects.len() {
+        0 => None,
+        1 => effects.pop(),
+        _ => Some(Effect::All(effects)),
     }
 }
 
@@ -1605,6 +2245,28 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
             Line::default(),
             keys(&[("w", "save"), ("d", "discard"), ("esc", "stay")]),
         ],
+        Dialog::UnsavedProfile(_, name) => vec![
+            Line::from(format!(
+                "Unsaved changes to {}.",
+                profile_files::label(name)
+            )),
+            Line::default(),
+            keys(&[("w", "save"), ("d", "discard"), ("esc", "stay")]),
+        ],
+        Dialog::DeleteProfile { name } => {
+            let question = format!(
+                "Delete profile {name}? {} goes for good.",
+                profile_files::label(name)
+            );
+            let mut lines: Vec<Line<'static>> =
+                crate::tui::widgets::wrap(&question, question_width)
+                    .into_iter()
+                    .map(Line::from)
+                    .collect();
+            lines.push(Line::default());
+            lines.push(keys(&[("y", "delete"), ("n", "keep")]));
+            lines
+        }
         Dialog::DeleteEntry { name, .. } => vec![
             Line::from(format!("Delete {name}? It goes when you save.")),
             Line::default(),
@@ -1770,6 +2432,43 @@ fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
                     (
                         "",
                         "Every action is the daemon's: it says why when it cannot.",
+                    ),
+                ],
+                HelpFor::Profiles => &[
+                    ("j k", "move, g G first and last"),
+                    ("enter", "switch to it: whisrsd restarts on it"),
+                    ("l", "open it in Config; on base, plain Config"),
+                    ("n", "a new profile: type its name"),
+                    ("d", "delete it, asking first; not base or the active one"),
+                    ("e", "edit its file in $EDITOR"),
+                    ("esc", "back to Home"),
+                    ("q", "quit"),
+                    (
+                        "",
+                        "A profile holds only what differs from config.toml. Api keys, hotkeys, \
+                         [[llm_commands]], [[agents]] and [recording] dir stay in config.toml.",
+                    ),
+                ],
+                HelpFor::Profile => &[
+                    ("j k", "move, g G first and last"),
+                    ("h l", "change a value, step a number; else panes"),
+                    ("enter", "pick from a list, or type a value"),
+                    ("space", "flip a toggle, or the next value"),
+                    ("x", "take it out of the profile: config.toml's value"),
+                    ("/", "filter the rows; esc clears it"),
+                    ("tab", "the other pane"),
+                    (
+                        "w",
+                        "save the profile; restart the daemon if it is the active one",
+                    ),
+                    ("e", "edit the profile's file in $EDITOR"),
+                    ("t", "test a key row, on this profile's config"),
+                    ("esc", "back to Profiles, asking first about unsaved edits"),
+                    ("q", "quit, asking first about unsaved edits"),
+                    (
+                        "",
+                        "An edit goes into the profile, even at config.toml's value. A row \
+                         tagged base only stays in config.toml.",
                     ),
                 ],
                 HelpFor::History => &[

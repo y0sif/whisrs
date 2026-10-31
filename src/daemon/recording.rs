@@ -469,6 +469,32 @@ impl RecordingRuntime {
         self.status().phase
     }
 
+    /// Show a recording in `phase` (capturing, or processing), as a start or
+    /// the worker would.
+    #[cfg(test)]
+    pub(crate) fn show_for_test(&self, phase: RecordingPhase) {
+        let active = ActiveRecording {
+            id: "test".into(),
+            title: None,
+            started_at: Local::now(),
+            dir: PathBuf::from("/nonexistent/test"),
+            network_retry: false,
+            job: Job::Transcribe,
+        };
+        self.update(|v| match phase {
+            RecordingPhase::Idle => *v = RecordingView::default(),
+            RecordingPhase::Recording => v.capturing = Some(active),
+            RecordingPhase::Processing => v.processing = Some(active),
+        });
+    }
+
+    /// Hold the session lock, as a start or stop does, until the result
+    /// drops.
+    #[cfg(test)]
+    pub(crate) fn hold_session_for_test(&self) -> impl Sized + '_ {
+        self.session.try_lock().expect("the session is free")
+    }
+
     /// The recording status, for a task that waits for a recording to stop
     /// (agent replies are held while one captures).
     pub(crate) fn subscribe(&self) -> watch::Receiver<RecordingStatus> {
@@ -3017,6 +3043,7 @@ mod tests {
             agent_board: watch::channel(Vec::new()).0,
             agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
             started_at: 0,
+            profile: crate::profile::ProfileRuntime::inert(),
         };
         (Arc::new(context), queue_rx)
     }

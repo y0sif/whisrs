@@ -549,6 +549,13 @@ impl AgentRuntime {
             .any(|a| a.hotkey.is_some() || a.new_session_hotkey.is_some())
     }
 
+    /// Hold the runtime's lock, as an agent operation does, until the
+    /// result drops.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) -> impl Sized + '_ {
+        self.inner.try_lock().expect("the agent runtime is free")
+    }
+
     /// Whether a whisrs turn of any agent runs or is on its way
     /// ([`PendingTurn`]): a restart stops it. `None` while the runtime's lock
     /// is held, for `info`, which never waits on it.
@@ -795,6 +802,12 @@ impl AgentRuntime {
             None => {}
         }
         true
+    }
+
+    /// Wake the reply queue: something that held replies without a
+    /// [`ReplyHold`] (a profile switch) let go.
+    pub(crate) fn wake_replies(&self) {
+        self.utterance_ready.notify_one();
     }
 
     /// Hold agent replies until the guard drops ([`ReplyHold`]).
@@ -1228,12 +1241,16 @@ fn may_speak(state: State, held: bool) -> bool {
 
 /// Whether agent replies wait besides the dictation state: a
 /// [`ReplyHold`] (a command or read-aloud press capturing the selection, a
-/// recording starting), or a recording capturing (a meeting recording does not touch
+/// recording starting), a recording capturing (a meeting recording does not touch
 /// the dictation state, and a reply would play mid-call and land on its
-/// system track). Checked under the dictation lock by `speak_text`, so a
-/// hold taken under that lock is never missed.
+/// system track), or a profile switch under way (its restart would cut the
+/// reply off; one that does not happen wakes the queue). Checked under the
+/// dictation lock by `speak_text`, so a hold taken under that lock is never
+/// missed.
 pub(crate) fn replies_held(context: &DaemonContext) -> bool {
-    context.agents.reply_holds.load(Ordering::SeqCst) > 0 || recording_captures(context)
+    context.agents.reply_holds.load(Ordering::SeqCst) > 0
+        || recording_captures(context)
+        || context.profile.is_switching()
 }
 
 fn recording_captures(_context: &DaemonContext) -> bool {
@@ -2812,6 +2829,7 @@ mod tests {
             agent_board: tokio::sync::watch::channel(Vec::new()).0,
             agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
             started_at: 0,
+            profile: crate::profile::ProfileRuntime::inert(),
         })
     }
 

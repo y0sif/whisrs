@@ -5,12 +5,12 @@
    │ ▌ Config                                           │
    │   Mic test                                         │
    │   Recordings                                       │
+   │   Profiles                                         │
    │   History                                          │
    │                                                    │
    │   daemon      running · idle · v0.2.0              │
    │   backend     deepgram-streaming                   │
    │   language    en                                   │
-   │   hotkeys     toggle Alt+D · recording Alt+Shift…  │
    │                                                    │
    │   ! unknown key [general] silense_timeout_ms is    │
    │     ignored                                        │

@@ -21,6 +21,7 @@ mod hooks;
 mod injection;
 mod notify;
 mod pipeline;
+mod profile;
 #[cfg(feature = "recording")]
 mod recording;
 mod selection;
@@ -86,12 +87,18 @@ async fn main() -> Result<()> {
 
     check_uinput_access();
 
-    let (config, config_warning) = load_config();
+    let startup::LoadedConfig {
+        config,
+        warning: config_warning,
+        profile,
+        profile_error,
+    } = load_config();
     validate_config(&config);
     check_audio_devices(&config.audio.device);
     let notify = config.general.notify;
 
-    // Notify user if config parsing failed and defaults are being used.
+    // Notify user if config parsing failed and defaults are being used, or
+    // the profile did not load.
     if let Some(msg) = config_warning {
         if notify {
             send_notification("whisrs", &msg);
@@ -146,6 +153,11 @@ async fn main() -> Result<()> {
     let agent_overlay_config = config.agent_overlay.clone().unwrap_or_default();
     let agent_overlay_enabled =
         agents.is_enabled() && agent_overlay_config.enabled(overlay_enabled);
+    // The tray's Profile submenu: the profiles there are now.
+    let profile_menu = whisrs::tray::ProfileMenu {
+        names: profile_names(),
+        active: profile.clone(),
+    };
     let context = Arc::new(DaemonContext {
         config,
         window_tracker,
@@ -160,6 +172,7 @@ async fn main() -> Result<()> {
         agent_board: tokio::sync::watch::channel(Vec::new()).0,
         agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
         started_at,
+        profile: crate::profile::ProfileRuntime::new(profile, profile_error),
     });
 
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
@@ -174,6 +187,15 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 info!("internal command (hotkey/tray): {}", cmd.log_summary());
+                // A press shows nobody the answer, so a refusal while a
+                // profile switch is under way is notified.
+                if let Some(message) = crate::profile::switching_refusal(&dispatch_ctx, &cmd) {
+                    info!("{} refused: {message}", cmd.log_summary());
+                    if dispatch_ctx.notify_error() {
+                        send_notification("whisrs", &message);
+                    }
+                    continue;
+                }
                 // A recording start can spend seconds opening devices; run it
                 // aside so a dictation hotkey pressed meanwhile is not held
                 // behind it. Recordings never touch the dictation state, so
@@ -203,8 +225,10 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 // A hotkey press shows nobody the response, so an agent
-                // error is notified here (unless it already was).
+                // error is notified here (unless it already was), and so is a
+                // refused profile switch.
                 let is_agent = matches!(cmd, Command::Agent { .. });
+                let is_switch = matches!(cmd, Command::SwitchProfile { .. });
                 let response =
                     handle_command(cmd, Arc::clone(&dispatch_state), Arc::clone(&dispatch_ctx))
                         .await;
@@ -214,6 +238,9 @@ async fn main() -> Result<()> {
                         && !crate::agent::error_already_notified(message)
                     {
                         send_notification("whisrs", &format!("Agent: {message}"));
+                    }
+                    if is_switch && dispatch_ctx.notify_error() {
+                        send_notification("whisrs", message);
                     }
                 }
                 // Broadcast state for tray.
@@ -231,12 +258,19 @@ async fn main() -> Result<()> {
         let tray_notify = context
             .notify_error()
             .then_some(send_notification as whisrs::tray::NotifyFn);
+        // "Restart Daemon" restarts as a profile switch does.
+        let tray_restart: whisrs::tray::RestartFn = {
+            let context = Arc::clone(&context);
+            Arc::new(move |on_failure| context.profile.restart(Arc::clone(&context), on_failure))
+        };
         tokio::spawn(whisrs::tray::spawn_tray(
             context.state_tx.subscribe_ui(),
             #[cfg(feature = "recording")]
             recording_rx,
             cmd_tx.clone(),
             tray_notify,
+            profile_menu,
+            tray_restart,
         ));
     }
 
@@ -307,6 +341,9 @@ async fn main() -> Result<()> {
 
     let listener = bind_socket(&sock_path)?;
     info!("listening on {}", sock_path.display());
+    // What a re-exec (a profile switch) set aside, now that the socket is
+    // this daemon's.
+    let _ = std::fs::remove_file(whisrs::service::socket_aside(&sock_path));
 
     // Only now, with the socket ours: a second whisrsd that exits at the
     // check above must not also recover and process the same recordings.
@@ -348,7 +385,6 @@ async fn main() -> Result<()> {
         signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
     let sock_path_clone = sock_path.clone();
-    #[cfg(feature = "recording")]
     let shutdown_ctx = Arc::clone(&context);
     tokio::spawn(async move {
         let name = tokio::select! {
@@ -356,8 +392,7 @@ async fn main() -> Result<()> {
             _ = sigint.recv() => "SIGINT",
         };
         info!("received {name}, shutting down");
-        #[cfg(feature = "recording")]
-        crate::recording::shutdown(&shutdown_ctx).await;
+        shut_down(&shutdown_ctx).await;
         let _ = std::fs::remove_file(&sock_path_clone);
         std::process::exit(0);
     });
@@ -408,13 +443,15 @@ async fn handle_connection(
         info!("received command: {}", cmd.log_summary());
     }
 
-    let read_only = is_read_only(&cmd);
+    // A profile switch changes no dictation state either, and its answer
+    // must go out before the restart it schedules: no wait for the lock.
+    let skip_publish = is_read_only(&cmd) || matches!(cmd, Command::SwitchProfile { .. });
     let response = handle_command(cmd, Arc::clone(&daemon_state), Arc::clone(&context)).await;
 
     // Broadcast state for tray updates. A read-only command changed nothing
     // to broadcast, and the TUI's `info` poll must not wait for the
     // dictation lock here either.
-    if !read_only {
+    if !skip_publish {
         context.state_tx.publish(&*daemon_state.lock().await);
     }
 
@@ -444,11 +481,23 @@ fn is_recording_status(cmd: &Command) -> bool {
     )
 }
 
+/// What a stop does before the process ends, on SIGTERM or SIGINT and
+/// before a re-exec: a recording in progress is finalized, so the next start
+/// transcribes it.
+pub(crate) async fn shut_down(_context: &DaemonContext) {
+    #[cfg(feature = "recording")]
+    crate::recording::shutdown(_context).await;
+}
+
 async fn handle_command(
     cmd: Command,
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) -> Response {
+    if let Some(message) = crate::profile::switching_refusal(&context, &cmd) {
+        info!("{} refused: {message}", cmd.log_summary());
+        return Response::Error { message };
+    }
     match cmd {
         Command::Toggle { language } => handle_toggle(daemon_state, context, language).await,
         Command::Cancel => handle_cancel(daemon_state, context).await,
@@ -533,6 +582,27 @@ async fn handle_command(
                 message: RECORDING_MISSING.to_string(),
             }
         }
+        Command::SwitchProfile { name } => {
+            crate::profile::handle_switch_profile(daemon_state, context, name).await
+        }
+    }
+}
+
+/// The profiles there are, for the tray. Files that are no profile are
+/// named in the log.
+fn profile_names() -> Vec<String> {
+    let dir = whisrs::config::profile::profiles_dir();
+    match whisrs::config::profile::list(&dir) {
+        Ok(listing) => {
+            for skipped in &listing.skipped {
+                tracing::warn!("{}", skipped.warning());
+            }
+            listing.names
+        }
+        Err(e) => {
+            tracing::warn!("cannot read {}: {e}", dir.display());
+            Vec::new()
+        }
     }
 }
 
@@ -547,6 +617,8 @@ fn daemon_info(state: whisrs::State, context: &DaemonContext) -> DaemonInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         state: Some(state),
         recording: Some(recording),
+        profile: context.profile.active.clone(),
+        profile_error: context.profile.error(),
         backend: context.config.general.backend.clone(),
         features: whisrs::built_features(),
         started_at: context.started_at,
@@ -635,6 +707,7 @@ mod tests {
             agent_board: tokio::sync::watch::channel(Vec::new()).0,
             agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
             started_at: 1_793_000_000_000,
+            profile: crate::profile::ProfileRuntime::inert(),
         })
     }
 
@@ -653,6 +726,8 @@ mod tests {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 state: Some(whisrs::State::Idle),
                 recording: Some(whisrs::recording::RecordingPhase::Idle),
+                profile: None,
+                profile_error: None,
                 backend: "deepgram".to_string(),
                 features: whisrs::built_features(),
                 started_at: 1_793_000_000_000,
@@ -660,6 +735,29 @@ mod tests {
                 agent_turn: false,
             }
         );
+    }
+
+    /// `info` names the profile the daemon runs on, or why the active one
+    /// did not load.
+    #[tokio::test]
+    async fn info_names_the_profile() {
+        let why = "profile offline did not load, using base: profiles/offline.toml does not exist";
+        for (active, error) in [(Some("offline"), None), (None, Some(why))] {
+            let mut context = Arc::into_inner(info_context()).expect("one owner");
+            context.profile = crate::profile::ProfileRuntime::with(
+                whisrs::config::profile::Paths::under(std::path::Path::new("/nonexistent")),
+                active.map(String::from),
+                error.map(String::from),
+                Arc::new(|_, _| panic!("info restarted the daemon")),
+            );
+            let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
+            let response = handle_command(Command::Info, daemon_state, Arc::new(context)).await;
+            let Response::Info { info } = response else {
+                panic!("expected an info response, got {response:?}");
+            };
+            assert_eq!(info.profile.as_deref(), active);
+            assert_eq!(info.profile_error.as_deref(), error);
+        }
     }
 
     /// `info` answers while the dictation lock is held (`handle_toggle` holds
@@ -733,6 +831,7 @@ mod tests {
             Command::ClearHistory,
             Command::CommandMode,
             Command::Speak,
+            Command::SwitchProfile { name: None },
         ] {
             assert!(!is_read_only(&changes), "{}", changes.log_summary());
         }
@@ -762,6 +861,7 @@ mod tests {
             agent_board: tokio::sync::watch::channel(Vec::new()).0,
             agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
             started_at: 0,
+            profile: crate::profile::ProfileRuntime::inert(),
         });
         let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
         for action in [

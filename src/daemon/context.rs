@@ -300,6 +300,8 @@ pub(crate) struct DaemonContext {
     pub(crate) agent_overlay_shown: AtomicBool,
     /// When this whisrsd started, in Unix milliseconds, for `info`.
     pub(crate) started_at: u64,
+    /// The config profile it runs on, and `switch-profile`'s state.
+    pub(crate) profile: crate::profile::ProfileRuntime,
 }
 
 impl DaemonContext {

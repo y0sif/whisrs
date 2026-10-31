@@ -3,7 +3,7 @@
    │                                                    │
    │   Hotkeys                                          │
    │                                                    │
-   │ ▌ toggle     Alt+D                                 │
+   │ ▌ toggle        Alt+D                              │
    ┏ toggle hotkey ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
    ┃ ▌ modifiers   [x] Super [ ] Ctrl [x] Alt [ ] Shift ┃
    ┃   key         D                                    ┃

@@ -2292,6 +2292,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         ui,
         Header {
             screen: &name,
+            profile: app.header_profile().as_deref(),
             daemon: app.daemon_up(),
             live: (setup.step == Step::Mic).then(|| app.mic.level()).flatten(),
         },

@@ -196,7 +196,7 @@ fn to_table(config: &Config) -> Result<Table, String> {
 }
 
 /// The value at a dotted path. A numeric segment indexes an array.
-fn lookup<'a>(table: &'a Table, path: &str) -> Option<&'a Value> {
+pub fn lookup<'a>(table: &'a Table, path: &str) -> Option<&'a Value> {
     let mut segments = path.split('.');
     let mut current = table.get(segments.next()?)?;
     for seg in segments {

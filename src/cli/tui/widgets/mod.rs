@@ -30,6 +30,8 @@ pub enum Tone {
     Plain,
     Muted,
     Faint,
+    /// The accent: a profile's own value.
+    Accent,
     Ok,
     Warn,
     Error,
@@ -43,6 +45,7 @@ impl Tone {
             Tone::Plain => Style::new(),
             Tone::Muted => theme.muted,
             Tone::Faint => theme.faint,
+            Tone::Accent => theme.accent,
             Tone::Ok => theme.ok,
             Tone::Warn => theme.warn,
             Tone::Error => theme.error,

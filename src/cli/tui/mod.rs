@@ -1,6 +1,7 @@
 //! The TUI behind `whisrs config` and `whisrs setup`: a full-screen editor
-//! for config.toml, the onboarding wizard and a microphone test, with Home
-//! as the hub, built on ratatui.
+//! for config.toml and its profiles, the onboarding wizard, a microphone
+//! test, the recordings and the dictation history, with Home as the hub,
+//! built on ratatui.
 //!
 //! It lives in the CLI binary, so the daemon never links ratatui. Everything
 //! it decides is in [`app::App::update`], which is pure: keys and worker
@@ -113,6 +114,10 @@ pub struct Paths {
     pub xdg_config: PathBuf,
     /// The user's data folder (`~/.local/share`): GNOME extensions.
     pub xdg_data: PathBuf,
+    /// `profiles/` beside config.toml.
+    pub profiles: PathBuf,
+    /// The active profile's name: `$XDG_STATE_HOME/whisrs/active-profile`.
+    pub state: PathBuf,
 }
 
 impl Paths {
@@ -125,6 +130,17 @@ impl Paths {
             models: whisrs::config::setup::default_model_dir(),
             xdg_config: dirs::config_dir().unwrap_or_else(|| PathBuf::from("~/.config")),
             xdg_data: data,
+            profiles: whisrs::config::profile::profiles_dir(),
+            state: whisrs::config::profile::active_profile_path(),
+        }
+    }
+
+    /// Where the profiles and the active name are, for `config::profile`.
+    fn profile_paths(&self) -> whisrs::config::profile::Paths {
+        whisrs::config::profile::Paths {
+            config: self.config.clone(),
+            profiles: self.profiles.clone(),
+            state: self.state.clone(),
         }
     }
 
@@ -319,6 +335,8 @@ fn event_loop(
     depth: Depth,
     ground: Ground,
 ) -> anyhow::Result<()> {
+    let first = app.opened();
+    perform(terminal, app, workers, first)?;
     let mut redraw = true;
     let mut flash_until: Option<Instant> = None;
     loop {
@@ -400,8 +418,9 @@ fn perform(
                 path,
                 target,
             } => {
-                let config = match (origin, &app.setup) {
-                    (Origin::Setup, Some(setup)) => setup.editor.form.config().clone(),
+                let config = match (origin, &app.setup, &app.profile_config) {
+                    (Origin::Setup, Some(setup), _) => setup.editor.form.config().clone(),
+                    (Origin::Profile, _, Some(screen)) => screen.form.config().clone(),
                     _ => app.config.form.config().clone(),
                 };
                 workers.test_key(origin, path, config, target);
@@ -507,6 +526,42 @@ fn perform(
             Effect::ClearHistory => {
                 workers.clear_history();
                 None
+            }
+            Effect::ReadProfiles => {
+                workers.read_profiles(app.paths.profile_paths());
+                None
+            }
+            Effect::PollSoon => {
+                workers.poll_soon();
+                None
+            }
+            Effect::SwitchProfile(name) => {
+                workers.switch_profile(name, app.paths.profile_paths());
+                None
+            }
+            Effect::CreateProfile(name) => {
+                let made = screens::profiles::create(&app.paths.profile_paths(), &name);
+                app.update(Msg::ProfileCreated(name, made))
+            }
+            Effect::DeleteProfile(name) => {
+                let deleted = screens::profiles::delete(&app.paths.profile_paths(), &name);
+                app.update(Msg::ProfileDeleted(name, deleted))
+            }
+            Effect::OpenProfile(name) => {
+                let opened = screens::config::load_profile(&app.paths, &name);
+                app.update(Msg::ProfileOpened(name, opened))
+            }
+            Effect::SaveProfile => match &app.profile_config {
+                Some(screen) => {
+                    let saved = screens::config::save_profile(screen, &app.paths);
+                    app.update(Msg::ProfileSaved(saved))
+                }
+                None => None,
+            },
+            Effect::EditProfile(name) => {
+                let file = app.paths.profile_paths().profile(&name);
+                let edited = suspend_for_editor(terminal, &app.env, &file)?;
+                app.update(Msg::ProfileEdited(name, edited))
             }
             Effect::Save | Effect::SaveOver => {
                 let overwrite = next == Effect::SaveOver;

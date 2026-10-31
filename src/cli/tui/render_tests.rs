@@ -5,7 +5,10 @@
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 
-use super::testing::{assert_snapshot, draw, mockup, mockup_with, press, rows, theme, Fixture};
+use super::testing::{
+    assert_snapshot, daemon_on, draw, mockup, mockup_profiles, mockup_with, press, rows, theme,
+    Fixture, PROFILES,
+};
 
 const SIZES: [(u16, u16); 5] = [(59, 17), (60, 18), (89, 30), (90, 30), (200, 60)];
 
@@ -99,7 +102,7 @@ fn hotkeys_with_an_agent() -> Fixture {
     let mut fixture =
         mockup_with("\n[[agents]]\nname = \"jarvis\"\nhotkey = \"Super+J\"\ndir = \"/tmp\"\n");
     // Hotkeys is the seventh section; the cursor on the agent's key.
-    press(&mut fixture.app, "jjjjjj\njjjjj");
+    press(&mut fixture.app, "jjjjjj\njjjjjj");
     fixture
 }
 
@@ -126,12 +129,62 @@ fn a_notice_is_never_cut_on_home() {
         .iter()
         .any(|r| r.trim_matches(['\u{2502}', ' ']) == "ignored"));
     assert!(!short.iter().any(|r| r.contains("built with")));
-    assert!(short.iter().any(|r| r.contains("hotkeys")));
+    assert!(!short.iter().any(|r| r.contains("hotkeys")));
+    assert!(short.iter().any(|r| r.contains("language")));
     let tall = rows(&draw(&fixture.app, 60, 24));
     assert!(tall.iter().any(|r| r.contains("built with")));
     assert!(tall
         .iter()
         .any(|r| r.trim_matches(['\u{2502}', ' ']) == "ignored"));
+}
+
+/// Home names the profile: in the header while one other than base is in
+/// use, and in its row, with how many there are; with the daemon on
+/// another than the state file, that it applies at the restart; and a
+/// profile that did not load is a warning.
+#[test]
+fn home_names_the_profile() {
+    let mut fixture = mockup_profiles(PROFILES, Some("offline"));
+    press(&mut fixture.app, "\x1b");
+    let row = |fixture: &Fixture| {
+        rows(&draw(&fixture.app, 90, 30))
+            .into_iter()
+            .find(|r| r.contains("profile  "))
+            .expect("the profile row")
+    };
+    assert!(row(&fixture).contains("offline, applies when whisrsd restarts"));
+    daemon_on(&mut fixture.app, Some("offline"), None, 1);
+    assert!(
+        row(&fixture).contains("offline (3 profiles)"),
+        "{}",
+        row(&fixture)
+    );
+    for (w, h) in [(60, 18), (90, 30)] {
+        assert_snapshot(
+            &format!("home-profile-{w}x{h}"),
+            &rows(&draw(&fixture.app, w, h)),
+        );
+    }
+    let why = "profile offline did not load, using base: profiles/offline.toml is not valid TOML";
+    daemon_on(&mut fixture.app, None, Some(why), 2);
+    let drawn = rows(&draw(&fixture.app, 90, 30));
+    assert!(drawn
+        .iter()
+        .any(|r| r.contains("! profile offline did not load, using base:")));
+    assert!(row(&fixture).contains("offline (3 profiles)"));
+    assert!(!drawn.iter().any(|r| r.contains("home \u{00B7} profile")));
+    // No profiles: base alone.
+    let mut base = mockup();
+    press(&mut base.app, "\x1b");
+    let row = rows(&draw(&base.app, 90, 30))
+        .into_iter()
+        .find(|r| r.contains("profile  "))
+        .unwrap();
+    assert!(
+        row.trim_end_matches(['\u{2502}', ' '])
+            .ends_with("profile     base"),
+        "{row}"
+    );
 }
 
 #[test]
@@ -270,6 +323,18 @@ fn no_size_panics() {
     states.push(hotkey());
     states.push(hotkeys_with_an_agent());
     states.push(mic());
+    let mut profiles = mockup_profiles(PROFILES, Some("offline"));
+    super::testing::open_profiles(&mut profiles);
+    states.push(profiles);
+    let mut naming = mockup_profiles(PROFILES, None);
+    super::testing::open_profiles(&mut naming);
+    press(&mut naming.app, "nlong-name");
+    states.push(naming);
+    let mut profile = mockup_profiles(PROFILES, None);
+    super::testing::open_profiles(&mut profile);
+    super::testing::open_profile(&mut profile, "offline");
+    press(&mut profile.app, "\nj");
+    states.push(profile);
     for fixture in &states {
         for w in [1, 2, 10, 40, 59, 60, 61, 70, 89, 90, 91, 120, 199, 200, 250] {
             for h in [1, 2, 5, 17, 18, 19, 25, 30, 60, 90] {

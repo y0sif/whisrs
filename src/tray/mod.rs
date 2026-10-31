@@ -19,6 +19,20 @@ pub use service::spawn_tray;
 /// notifications disabled.
 pub type NotifyFn = fn(&str, &str);
 
+/// Restart the daemon from the tray's "Restart Daemon": the daemon's own
+/// restart (`service::restart_self` with its shutdown), handed what to do
+/// when nothing restarted.
+pub type RestartFn = std::sync::Arc<dyn Fn(Box<dyn FnOnce(String) + Send>) + Send + Sync>;
+
+/// The tray's "Profile" submenu, read when the tray starts: the profiles
+/// there are (sorted) and the one the daemon runs on (`None`: base).
+/// Without profiles there is no submenu.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileMenu {
+    pub names: Vec<String>,
+    pub active: Option<String>,
+}
+
 #[cfg(not(feature = "tray"))]
 pub async fn spawn_tray(
     _state_rx: tokio::sync::watch::Receiver<crate::State>,
@@ -27,6 +41,8 @@ pub async fn spawn_tray(
     >,
     _cmd_tx: tokio::sync::mpsc::Sender<crate::Command>,
     _notify: Option<NotifyFn>,
+    _profiles: ProfileMenu,
+    _restart: RestartFn,
 ) {
     // Tray feature not enabled — no-op.
 }

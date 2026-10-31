@@ -77,10 +77,13 @@ pub fn too_small(f: &mut Frame, ui: &Ui) {
     f.render_widget(Paragraph::new(line), Rect::new(x, y, w, 1.min(area.height)));
 }
 
-/// What the header names: the screen, and whether the daemon is up
-/// (`None` while not known yet).
+/// What the header names: the screen, the profile when it says one, and
+/// whether the daemon is up (`None` while not known yet).
 pub struct Header<'a> {
     pub screen: &'a str,
+    /// After the screen: `profile offline` while one other than base is
+    /// active, or what Config edits (`base`, `profile offline`).
+    pub profile: Option<&'a str>,
     pub daemon: Option<bool>,
     /// The microphone's level, 0 to 1, while it is live: the waveform
     /// follows it.
@@ -128,11 +131,15 @@ pub fn draw(f: &mut Frame, rect: Rect, ui: &Ui, header: Header) -> Rect {
         Some(false) => (ui.glyphs.down, Tone::Muted),
         None => (ui.glyphs.down, Tone::Faint),
     };
-    let status = Line::from(vec![
-        Span::styled(header.screen, ui.theme.muted),
-        Span::styled(format!(" {} ", ui.glyphs.separator), ui.theme.faint),
-        Span::styled(dot, dot_tone.style(ui.theme)),
-    ]);
+    let sep = || Span::styled(format!(" {} ", ui.glyphs.separator), ui.theme.faint);
+    let mut status = vec![Span::styled(header.screen, ui.theme.muted)];
+    if let Some(profile) = header.profile {
+        status.push(sep());
+        status.push(Span::styled(profile, ui.theme.muted));
+    }
+    status.push(sep());
+    status.push(Span::styled(dot, dot_tone.style(ui.theme)));
+    let status = Line::from(status);
     let row = Rect::new(content.x, content.y, content.width, 1);
     f.render_widget(Paragraph::new(title), row);
     let w = (status.width() as u16).min(content.width);

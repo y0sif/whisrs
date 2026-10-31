@@ -150,8 +150,8 @@ it prints where to edit the file and exits 1, changing nothing. Unlike
 .B setup
 this does not touch udev rules, the systemd unit, or compositor keybindings.
 .B Esc
-goes up to Home, which also opens Setup, Recordings, History and the Mic
-test: a live level meter of the
+goes up to Home, which also opens Setup, Recordings, Profiles, History and
+the Mic test: a live level meter of the
 .B [audio] device
 (from \-60 to 0 dBFS, with the silence gate and the peak held), where
 .B h
@@ -175,6 +175,41 @@ is off, and clears it all with
 .B whisrs log \-\-clear
 does. Both filter with
 .BR / .
+Profiles lists
+.B base
+and the profiles, the active one marked, each with what its file sets (an
+API key named, never shown).
+.B Enter
+switches to one, as
+.B whisrs profile
+does;
+.B n
+makes one (an empty file, the name checked as it is typed),
+.B d
+deletes one, asking first (not
+.B base
+or the active one), and
+.B e
+opens its file in the editor.
+.B l
+opens it in Config in profile mode: each row shows the value the profile
+makes over
+.IR config.toml ,
+tagged
+.BR profile ,
+.B base
+or
+.BR "base only" ;
+an edit goes into the profile,
+.B x
+takes a key out of it, and
+.B w
+checks the merged config and writes only the profile's file, restarting the
+daemon when it is the active one. Base\-only rows, the vocabulary list and
+the Replacements section refuse edits there. While a profile is active, plain
+Config's header says
+.B base
+and a row the profile sets says so.
 .TP
 .B toggle
 Start or stop dictation. If idle, begins audio capture. If recording,
@@ -325,6 +360,63 @@ Prints one of:
 .BR synthesizing ,
 or
 .BR speaking .
+On a terminal, a second line names the config profile when one other than
+base is active
+.RB ( "profile: offline" ),
+or says why the active one did not load and the daemon runs on base. Off a
+terminal the state is the whole output, so a script or status bar that
+compares it keeps working.
+.TP
+\fBprofile\fR [\fBlist\fR|\fBnext\fR|\fBbase\fR|\fINAME\fR]
+Config profiles: a profile is a partial
+.I config.toml
+in
+.IR ~/.config/whisrs/profiles/NAME.toml ,
+holding only what differs from the base config (for example another backend
+and model). Names are 1 to 32 of a\-z, 0\-9,
+.B \-
+and
+.BR _ ,
+and not
+.BR base ,
+.B list
+or
+.BR next .
+.B list
+(the default) prints
+.B base
+and every profile, the active one marked
+.BR * ,
+with a broken profile's reason or the base\-only keys it sets (ignored), and
+a line above them when the daemon runs on another profile than the next
+start will. It reads the files, so it works with the daemon stopped.
+.BR next ,
+.B base
+or a name switch: the daemon checks the profile loads, refuses while it
+dictates, transcribes, reads aloud, records or runs an agent turn (saying
+which), writes the active name, notifies, and restarts on it (through its
+service, or by starting itself again when it was started by hand).
+.B next
+goes base, then the profiles by name, and wraps, passing over (and naming)
+one that does not load; with no other loading it refuses, saying why for
+each;
+.B [hotkeys] next_profile
+binds it to a key, and the tray's Profile menu picks one. With the daemon stopped
+the profile is checked here (a backend key that only the daemon's
+environment may hold is no failure) and applies when it starts; while the
+daemon restarts it is waited for, up to 3 seconds, and otherwise the switch
+says to try again. API keys,
+.BR [hotkeys] ,
+.BR [[llm_commands]] ,
+.B [[agents]]
+and
+.B [recording] dir
+stay in
+.IR config.toml :
+a profile that sets one has it ignored, with a warning. Exits 1 on a
+refusal. Profiles are created and deleted as files, or on the Profiles
+screen of
+.BR "whisrs config" .
 .TP
 .B restart
 Restart the whisrs daemon. Uses
@@ -636,6 +728,19 @@ Permissions should be 0600 since it may contain API keys.
 .I $XDG_RUNTIME_DIR/whisrs.sock
 Unix domain socket for CLI\-daemon IPC.
 .TP
+.I ~/.config/whisrs/profiles/NAME.toml
+Config profiles, merged over
+.I config.toml
+by the daemon when active (see
+.BR profile ).
+.TP
+.I $XDG_STATE_HOME/whisrs/active\-profile
+The active profile's name, one line (defaults to
+.IR ~/.local/state/whisrs/active\-profile ).
+No file, or
+.BR base ,
+is the base config alone.
+.TP
 .I ~/.cache/whisrs/recovery/
 Recovery directory for audio that failed transcription.
 .TP
@@ -691,6 +796,13 @@ Check daemon state:
 .PP
 .RS
 .B whisrs status
+.RE
+.PP
+Switch to the profile in
+.IR ~/.config/whisrs/profiles/offline.toml :
+.PP
+.RS
+.B whisrs profile offline
 .RE
 .PP
 Send a typed turn to the agent named jarvis:

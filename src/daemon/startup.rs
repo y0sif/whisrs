@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
+use whisrs::config::profile::{self, Paths};
 use whisrs::config::types::{unknown_config_keys, unknown_keys_warning};
 use whisrs::service::ServiceManager;
 use whisrs::Config;
@@ -41,12 +42,35 @@ pub(crate) fn bind_socket(path: &std::path::Path) -> Result<tokio::net::UnixList
     Ok(listener)
 }
 
-/// Load configuration from config.toml, falling back to defaults.
-/// Returns (Config, Option<warning_message>) — the warning is set when config
-/// parsing fails and defaults are used, so the caller can notify the user.
-pub(crate) fn load_config() -> (Config, Option<String>) {
+/// The config the daemon runs on, and what the load has to tell the user.
+pub(crate) struct LoadedConfig {
+    pub(crate) config: Config,
+    /// What to notify, one line each: config.toml fell back to defaults,
+    /// unknown or ignored keys, a profile that did not load.
+    pub(crate) warning: Option<String>,
+    /// The profile merged in: `None` is base.
+    pub(crate) profile: Option<String>,
+    /// Why the active profile did not load ([`profile::not_loaded`]).
+    pub(crate) profile_error: Option<String>,
+}
+
+impl LoadedConfig {
+    fn new(config: Config, warnings: Vec<String>) -> Self {
+        Self {
+            config,
+            warning: (!warnings.is_empty()).then(|| warnings.join("\n")),
+            profile: None,
+            profile_error: None,
+        }
+    }
+}
+
+/// Load configuration from config.toml and the active profile, falling back
+/// to defaults. The warning is set when parsing fails and defaults are used,
+/// or a profile did not load, so the caller can notify the user.
+pub(crate) fn load_config() -> LoadedConfig {
     load_config_from(
-        &whisrs::config_path(),
+        &Paths::current(),
         &whisrs::config::vocabulary::vocabulary_path(),
     )
 }
@@ -55,15 +79,13 @@ pub(crate) fn load_config() -> (Config, Option<String>) {
 /// is testable without mutating `XDG_CONFIG_HOME` (env mutation races with the
 /// parallel test runner).
 ///
-/// The merge must run before `validate_config`, so the keyterm limits count the
-/// terms the backends actually receive.
-fn load_config_from(
-    config_path: &std::path::Path,
-    vocabulary_path: &std::path::Path,
-) -> (Config, Option<String>) {
-    let (mut config, warning) = load_config_toml_at(config_path);
-    merge_vocabulary_file_at(&mut config, vocabulary_path);
-    (config, warning)
+/// The profile merges into config.toml before the unknown-key check and
+/// `validate_config`, and `vocabulary.txt` after it, so the keyterm limits
+/// count the terms the backends actually receive.
+fn load_config_from(paths: &Paths, vocabulary_path: &std::path::Path) -> LoadedConfig {
+    let mut loaded = load_config_toml_at(paths);
+    merge_vocabulary_file_at(&mut loaded.config, vocabulary_path);
+    loaded
 }
 
 /// Merge `vocabulary.txt` into `[general] vocabulary`, config.toml's terms
@@ -92,35 +114,41 @@ fn merge_vocabulary_file_at(config: &mut Config, path: &std::path::Path) {
     }
 }
 
-fn load_config_toml_at(config_path: &std::path::Path) -> (Config, Option<String>) {
-    if config_path.exists() {
+/// config.toml with the active profile merged in. Without one (no state
+/// file, or `base`) it is config.toml alone, as before profiles. A profile
+/// that does not load falls back to config.toml with a warning; a
+/// config.toml that does not load falls back to defaults, as ever.
+fn load_config_toml_at(paths: &Paths) -> LoadedConfig {
+    let config_path = paths.config.as_path();
+    let mut warnings = Vec::new();
+    let active = match profile::read_active(&paths.state) {
+        Ok(active) => active,
+        Err(why) => {
+            let msg = format!("the active profile did not load, using base: {why}");
+            warn!("{msg}");
+            warnings.push(msg);
+            None
+        }
+    };
+    let failed = |msg: String, mut warnings: Vec<String>| {
+        error!("{msg}");
+        warnings.insert(0, msg);
+        let mut loaded = LoadedConfig::new(default_config(), warnings);
+        if let Some(name) = &active {
+            loaded.profile_error = Some(profile::not_loaded(name, "config.toml did not load"));
+        }
+        loaded
+    };
+
+    let contents = if config_path.exists() {
         match std::fs::read_to_string(config_path) {
-            Ok(contents) => match toml::from_str::<Config>(&contents) {
-                Ok(config) => {
-                    info!("loaded config from {}", config_path.display());
-                    let unknown = unknown_config_keys(&contents);
-                    let Some(msg) = unknown_keys_warning(config_path, &unknown) else {
-                        return (config, None);
-                    };
-                    warn!("{msg}");
-                    return (config, Some(msg));
-                }
-                Err(e) => {
-                    let msg = format!(
-                        "Failed to parse config at {}: {e} — using defaults",
-                        config_path.display()
-                    );
-                    error!("{msg}");
-                    return (default_config(), Some(msg));
-                }
-            },
+            Ok(contents) => contents,
             Err(e) => {
                 let msg = format!(
                     "Failed to read config at {}: {e} — using defaults",
                     config_path.display()
                 );
-                error!("{msg}");
-                return (default_config(), Some(msg));
+                return failed(msg, warnings);
             }
         }
     } else {
@@ -128,8 +156,72 @@ fn load_config_toml_at(config_path: &std::path::Path) -> (Config, Option<String>
             "no config file found at {}; using defaults",
             config_path.display()
         );
+        if active.is_none() {
+            return LoadedConfig::new(default_config(), warnings);
+        }
+        String::new()
+    };
+    let config = match toml::from_str::<Config>(&contents) {
+        Ok(config) => config,
+        Err(e) => {
+            let msg = format!(
+                "Failed to parse config at {}: {e} — using defaults",
+                config_path.display()
+            );
+            return failed(msg, warnings);
+        }
+    };
+
+    let Some(name) = active else {
+        info!("loaded config from {}", config_path.display());
+        let unknown = unknown_config_keys(&contents);
+        if let Some(msg) = unknown_keys_warning(config_path, &unknown) {
+            warn!("{msg}");
+            warnings.push(msg);
+        }
+        return LoadedConfig::new(config, warnings);
+    };
+
+    let eff = match profile::effective_at(paths, &name) {
+        Ok(eff) => eff,
+        // config.toml loaded a moment ago: it changed since.
+        Err(why) => {
+            let msg = profile::not_loaded(&name, &why);
+            warn!("{msg}");
+            warnings.push(msg.clone());
+            let mut loaded = LoadedConfig::new(config, warnings);
+            loaded.profile_error = Some(msg);
+            return loaded;
+        }
+    };
+    if let Some(msg) = unknown_keys_warning(config_path, &eff.unknown_base) {
+        warn!("{msg}");
+        warnings.push(msg);
     }
-    (default_config(), None)
+    for msg in &eff.warnings {
+        warn!("{msg}");
+    }
+    warnings.extend(eff.warnings);
+    match eff.error {
+        None => {
+            info!(
+                "loaded config from {} with profile {name} ({})",
+                config_path.display(),
+                profile::label(&name)
+            );
+            let mut loaded = LoadedConfig::new(eff.config, warnings);
+            loaded.profile = Some(name);
+            loaded
+        }
+        Some(why) => {
+            let msg = profile::not_loaded(&name, &why);
+            warn!("{msg}");
+            warnings.push(msg.clone());
+            let mut loaded = LoadedConfig::new(eff.config, warnings);
+            loaded.profile_error = Some(msg);
+            loaded
+        }
+    }
 }
 
 /// The built-in default configuration, used by every `load_config` fallback
@@ -372,6 +464,18 @@ pub(crate) fn validate_config(config: &Config) {
 mod tests {
     use super::*;
 
+    /// [`load_config_from`] on a config.toml in a temp dir, with no profile
+    /// (the state file would be beside it, and is not there).
+    fn load_pair(
+        config_path: &std::path::Path,
+        vocab_path: &std::path::Path,
+    ) -> (Config, Option<String>) {
+        let paths = Paths::under(config_path.parent().expect("in a temp dir"));
+        let loaded = load_config_from(&paths, vocab_path);
+        assert_eq!(loaded.profile, None);
+        (loaded.config, loaded.warning)
+    }
+
     /// A config.toml + vocabulary.txt pair in a fresh temp dir.
     ///
     /// Both paths are passed explicitly, so nothing here touches
@@ -385,7 +489,7 @@ mod tests {
         if let Some(contents) = vocabulary_txt {
             std::fs::write(&vocab_path, contents).expect("write vocabulary.txt");
         }
-        let (config, _) = load_config_from(&config_path, &vocab_path);
+        let (config, _) = load_pair(&config_path, &vocab_path);
         (dir, config)
     }
 
@@ -466,7 +570,7 @@ mod tests {
         whisrs::config::vocabulary::write_vocabulary_file(&vocab_path, &migrated)
             .expect("write vocabulary.txt");
 
-        let (config, _) = load_config_from(&config_path, &vocab_path);
+        let (config, _) = load_pair(&config_path, &vocab_path);
         assert_eq!(config.general.vocabulary, migrated);
     }
 
@@ -486,7 +590,7 @@ mod tests {
         let vocab_path = dir.path().join("vocabulary.txt");
         std::fs::write(&vocab_path, "NixOS\nClaude Code\n").expect("write vocabulary.txt");
 
-        let (config, warning) = load_config_from(&config_path, &vocab_path);
+        let (config, warning) = load_pair(&config_path, &vocab_path);
 
         assert_eq!(config.general.vocabulary, vec!["NixOS", "Claude Code"]);
         let warning = warning.expect("a parse failure must be reported to the user");
@@ -503,7 +607,7 @@ mod tests {
         let vocab_path = dir.path().join("vocabulary.txt");
         std::fs::write(&vocab_path, "NixOS\n").expect("write vocabulary.txt");
 
-        let (config, warning) = load_config_from(&config_path, &vocab_path);
+        let (config, warning) = load_pair(&config_path, &vocab_path);
         assert_eq!(config.general.vocabulary, vec!["NixOS"]);
         assert!(warning.is_some(), "an unreadable config must be reported");
     }
@@ -531,7 +635,7 @@ mod tests {
         whisrs::config::vocabulary::write_vocabulary_file(&vocab_path, &[])
             .expect("write an empty vocabulary.txt");
 
-        let (config, _) = load_config_from(&config_path, &vocab_path);
+        let (config, _) = load_pair(&config_path, &vocab_path);
         assert!(
             config.general.vocabulary.is_empty(),
             "deleted terms came back: {:?}",
@@ -581,6 +685,179 @@ mod tests {
             "the warning must count the file-sourced terms: {}",
             warning.message
         );
+    }
+
+    /// A config.toml, a vocabulary.txt and profiles in a temp dir, `active`
+    /// in the state file.
+    fn with_profiles(
+        config_toml: Option<&str>,
+        vocabulary_txt: Option<&str>,
+        profiles: &[(&str, &str)],
+        active: Option<&str>,
+    ) -> (tempfile::TempDir, LoadedConfig) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = Paths::under(dir.path());
+        if let Some(contents) = config_toml {
+            std::fs::write(&paths.config, contents).expect("write config.toml");
+        }
+        let vocab_path = dir.path().join("vocabulary.txt");
+        if let Some(contents) = vocabulary_txt {
+            std::fs::write(&vocab_path, contents).expect("write vocabulary.txt");
+        }
+        std::fs::create_dir_all(&paths.profiles).expect("profiles dir");
+        for (name, contents) in profiles {
+            std::fs::write(paths.profile(name), contents).expect("write a profile");
+        }
+        if let Some(active) = active {
+            std::fs::create_dir_all(paths.state.parent().unwrap()).unwrap();
+            std::fs::write(&paths.state, format!("{active}\n")).expect("write the state file");
+        }
+        let loaded = load_config_from(&paths, &vocab_path);
+        (dir, loaded)
+    }
+
+    const SIDECAR_BASE: &str = "[general]\nbackend = \"asr-sidecar\"\n\
+                                vocabulary = [\"Base\"]\n[asr-sidecar]\nmodel = \"m\"\n";
+
+    /// The profile is merged before the unknown-key check and validation:
+    /// its unknown key is named with its file, and the config validates
+    /// only because the profile names a backend that exists. `vocabulary.txt`
+    /// merges after it, so the profile's list comes first.
+    #[test]
+    fn the_profile_merges_before_the_checks_and_vocabulary_after() {
+        let base = "[general]\nbackend = \"nope\"\nvocabulary = [\"Base\"]\n\
+                    [asr-sidecar]\nmodel = \"m\"\n";
+        assert!(
+            toml::from_str::<Config>(base).unwrap().validate().is_err(),
+            "premise: the base alone does not validate"
+        );
+        let (_dir, loaded) = with_profiles(
+            Some(base),
+            Some("File\n"),
+            &[(
+                "offline",
+                "[general]\nbackend = \"asr-sidecar\"\nvocabulary = [\"Profile\"]\n\
+                 silense_timeout_ms = 1\n[asr-sidecar]\nurl = \"http://127.0.0.1:1\"\n",
+            )],
+            Some("offline"),
+        );
+        assert_eq!(loaded.profile.as_deref(), Some("offline"));
+        assert_eq!(loaded.profile_error, None);
+        let config = &loaded.config;
+        assert_eq!(
+            config.asr_sidecar.as_ref().unwrap().url,
+            "http://127.0.0.1:1"
+        );
+        assert_eq!(config.asr_sidecar.as_ref().unwrap().model, "m");
+        assert!(config.validate().is_ok());
+        assert_eq!(config.general.vocabulary, ["Profile", "File"]);
+        assert_eq!(
+            loaded.warning.as_deref(),
+            Some(
+                "Unknown keys in config at profiles/offline.toml ignored: \
+                 general.silense_timeout_ms"
+            )
+        );
+    }
+
+    /// A missing or broken profile runs on base, says why, and is
+    /// remembered for `info`. Its dropped keys are told too.
+    #[test]
+    fn a_profile_that_does_not_load_runs_on_base() {
+        for (profile, why) in [
+            (None, "profiles/offline.toml does not exist"),
+            (
+                Some("[general\n"),
+                "profiles/offline.toml is not valid TOML (line 1, column 9)",
+            ),
+            (
+                Some("[groq]\napi_key = \"gsk_p\"\n[general]\nbackend = \"nope\"\n"),
+                "the config with profiles/offline.toml is not valid: ",
+            ),
+        ] {
+            let profiles: Vec<(&str, &str)> = profile.map(|p| ("offline", p)).into_iter().collect();
+            let (_dir, loaded) =
+                with_profiles(Some(SIDECAR_BASE), None, &profiles, Some("offline"));
+            assert_eq!(loaded.profile, None, "{profile:?}");
+            let error = loaded.profile_error.expect("the profile failed");
+            let line = format!("profile offline did not load, using base: {why}");
+            assert!(error.starts_with(&line), "{profile:?}: {error}");
+            let warning = loaded.warning.expect("the user is told");
+            assert!(warning.contains(&error), "{warning}");
+            assert!(!warning.contains("gsk_p"), "{warning}");
+            assert_eq!(loaded.config.general.backend, "asr-sidecar", "base");
+            assert_eq!(loaded.config.general.vocabulary, ["Base"]);
+        }
+
+        let (_dir, loaded) = with_profiles(
+            Some(SIDECAR_BASE),
+            None,
+            &[("offline", "[hotkeys]\ntoggle = \"Super+P\"\n")],
+            Some("offline"),
+        );
+        assert_eq!(
+            loaded.profile.as_deref(),
+            Some("offline"),
+            "applied all the same"
+        );
+        let warning = loaded.warning.unwrap();
+        assert!(
+            warning.starts_with("profiles/offline.toml: hotkeys is ignored"),
+            "{warning}"
+        );
+    }
+
+    /// No state file, or `base` in it, is config.toml alone. A state file
+    /// naming no valid profile is told and runs on base.
+    #[test]
+    fn base_and_a_bad_state_file_run_on_config_toml() {
+        for active in [None, Some("base")] {
+            let (_dir, loaded) = with_profiles(
+                Some(SIDECAR_BASE),
+                None,
+                &[("offline", "[general]\nlanguage = \"de\"\n")],
+                active,
+            );
+            assert_eq!((loaded.profile, loaded.profile_error), (None, None));
+            assert_eq!(loaded.warning, None);
+            assert_eq!(loaded.config.general.language, "en");
+        }
+        let (_dir, loaded) = with_profiles(Some(SIDECAR_BASE), None, &[], Some("Not Valid"));
+        assert_eq!(loaded.profile, None);
+        let warning = loaded.warning.unwrap();
+        assert!(
+            warning.starts_with("the active profile did not load, using base: "),
+            "{warning}"
+        );
+    }
+
+    /// With no config.toml a profile goes over the defaults; with a broken
+    /// one the defaults win, as without profiles, and the profile is not
+    /// applied.
+    #[test]
+    fn a_profile_over_no_config_toml_and_over_a_broken_one() {
+        let (_dir, loaded) = with_profiles(
+            None,
+            None,
+            &[("offline", "[general]\nbackend = \"local-whisper\"\n")],
+            Some("offline"),
+        );
+        assert_eq!(loaded.profile.as_deref(), Some("offline"));
+        assert_eq!(loaded.config.general.backend, "local-whisper");
+
+        let (_dir, loaded) = with_profiles(
+            Some("this is [ not toml"),
+            None,
+            &[("offline", "[general]\nbackend = \"local-whisper\"\n")],
+            Some("offline"),
+        );
+        assert_eq!(loaded.profile, None);
+        assert_eq!(loaded.config.general.backend, "groq", "the defaults");
+        assert_eq!(
+            loaded.profile_error.as_deref(),
+            Some("profile offline did not load, using base: config.toml did not load")
+        );
+        assert!(loaded.warning.unwrap().contains("using defaults"));
     }
 
     /// The socket is 0600 from the first accept, and still takes connections.

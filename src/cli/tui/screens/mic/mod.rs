@@ -191,6 +191,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         ui,
         Header {
             screen: "mic",
+            profile: app.header_profile().as_deref(),
             daemon: app.daemon_up(),
             live: app.mic.level(),
         },

@@ -1861,3 +1861,39 @@ fn a_refusal_does_not_outlive_its_step() {
     assert!(shown_rows(&fixture).is_empty());
     assert_eq!(status(&fixture), "");
 }
+
+/// Setup writes config.toml; a key it wrote that the active profile sets
+/// too is named at the end, as the one in use while that profile is.
+#[test]
+fn setup_names_what_the_active_profile_overrides() {
+    let fixture = setup_on(None, &[]);
+    let mut fixture = crate::tui::testing::with_profiles(
+        fixture,
+        &[("travel", "[general]\nlanguage = \"fr\"\n")],
+        Some("travel"),
+    );
+    assert!(fixture.app.config.overrides.is_some());
+    press(&mut fixture.app, "\n");
+    type_text(&mut fixture.app, "gsk_test_0123456789");
+    press(&mut fixture.app, "\n\n ");
+    type_text(&mut fixture.app, "ger");
+    press(&mut fixture.app, "\n");
+    press(&mut fixture.app, "\n\n");
+    press(&mut fixture.app, "\n\n");
+    skip_modes(&mut fixture);
+    press(&mut fixture.app, "\n");
+    assert_eq!(write(&mut fixture), Some(Effect::Checks));
+    let notice = "the active profile travel sets general.language too, so its values stay in \
+                  use while it is active";
+    assert!(
+        fixture.app.notices.iter().any(|n| n.text == notice),
+        "{:?}",
+        fixture.app.notices
+    );
+    fixture.app.update(Msg::Checked(Box::new(checks())));
+    assert_eq!(press(&mut fixture.app, "\n"), [Effect::Quit]);
+    assert_eq!(
+        fixture.app.farewell.last().map(String::as_str),
+        Some(format!("Note: {notice}.").as_str())
+    );
+}

@@ -6,13 +6,13 @@
    │   Audio                   command             not set                            │
    │   Vocabulary              speak               not set                            │
    │   Replacements            recording           Alt+Shift+M                        │
-   │   Typing                  Agents ──────────────────────────────────────────────  │
-   │   Hotkeys               ▌ jarvis              Super+J                            │
-   │   Overlay                 jarvis new session  not set                            │
-   │   Read aloud (TTS)                                                               │
-   │   Agents  1               The hotkey of agent jarvis: records a voice turn for   │
-   │   LLM                     this agent. Its other settings are under Agents.       │
-   │   LLM commands                                                                   │
+   │   Typing                  next_profile        not set                            │
+   │   Hotkeys                 Agents ──────────────────────────────────────────────  │
+   │   Overlay               ▌ jarvis              Super+J                            │
+   │   Read aloud (TTS)        jarvis new session  not set                            │
+   │   Agents  1                                                                      │
+   │   LLM                     The hotkey of agent jarvis: records a voice turn for   │
+   │   LLM commands            this agent. Its other settings are under Agents.       │
    │   Recording                                                                      │
    │   Hooks                                                                          │
    │                                                                                  │

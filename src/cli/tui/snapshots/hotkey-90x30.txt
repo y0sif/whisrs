@@ -1,15 +1,15 @@
    ╭──────────────────────────────────────────────────────────────────────────────────╮
    │ whisrs ▁▃▅▃▁                                                         config · ●  │
    │                                                                                  │
-   │   General               ▌ toggle     Alt+D                                       │
-   │   Backend & keys          cancel     not set                                     │
-   │   Audio                   command    not set                                     │
-   │   Vocabulary              speak      not set                                     │
-   │   Replacements            recording  Alt+Shift+M                                 │
-   │   Typing                                                                         │
-   │   Hotkeys                 Start and stop dictation. Most setups bind whisrs      │
-   │   Overlay                 toggle in the compositor instead.                      │
-   │   Read aloud (TTS)                                                               │
+   │   General               ▌ toggle        Alt+D                                    │
+   │   Backend & keys          cancel        not set                                  │
+   │   Audio                   command       not set                                  │
+   │   Vocabulary              speak         not set                                  │
+   │   Replacements            recording     Alt+Shift+M                              │
+   │   Typing                  next_profile  not set                                  │
+   │   Hotkeys                                                                        │
+   │   Overlay                 Start and stop dictation. Most setups bind whisrs      │
+   │   Read aloud (TTS)        toggle in the compositor instead.                      │
    │   Agents     ┏ toggle hotkey ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓              │
    │   LLM        ┃ ▌ modifiers   [x] Super [ ] Ctrl [x] Alt [ ] Shift ┃              │
    │   LLM command┃   key         D                                    ┃              │

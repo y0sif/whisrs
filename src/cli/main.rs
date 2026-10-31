@@ -8,13 +8,14 @@ use clap::{Args, Parser, Subcommand};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
+use whisrs::config::profile::{self, Check, Paths, Unanswered};
 use whisrs::history::HistoryEntry;
 #[cfg(feature = "recording")]
 use whisrs::recording::{store, RecordingAction, RecordingMeta, RecordingOptions, RecordingState};
 use whisrs::recording::{RecordingPhase, RecordingStatus};
 use whisrs::{
-    encode_message, read_message, service::ServiceManager, socket_path, Command, RequestError,
-    Response, RestartOutcome, State,
+    encode_message, read_message, service::ServiceManager, socket_path, Command, DaemonInfo,
+    InfoAnswer, RequestError, Response, RestartOutcome, State,
 };
 
 const ASCII_BANNER: &str = concat!(
@@ -64,9 +65,18 @@ enum SubCmd {
     },
     /// Cancel the current dictation and discard its audio
     Cancel,
-    /// Query the dictation state (idle, recording, transcribing); for a
-    /// recording see `whisrs recording status`
+    /// Query the dictation state (idle, recording, transcribing), and the
+    /// config profile when one is active; for a recording see `whisrs
+    /// recording status`
     Status,
+    /// List the config profiles (the default), or switch to one: next, base,
+    /// or a profile's name (profiles/<name>.toml beside config.toml). A
+    /// switch restarts the daemon on it, and is refused while it is busy
+    Profile {
+        /// list, next, base, or a profile's name
+        #[arg(value_name = "list|next|base|NAME")]
+        target: Option<String>,
+    },
     /// Show recent transcription history
     Log {
         /// Number of entries to show (default: 20)
@@ -425,6 +435,7 @@ async fn main() -> anyhow::Result<()> {
             send_command(Command::Cancel).await?;
         }
         SubCmd::Status => cmd_status().await?,
+        SubCmd::Profile { target } => cmd_profile(target).await?,
         SubCmd::Log { limit, clear } => {
             if clear {
                 send_command(Command::ClearHistory).await?;
@@ -594,22 +605,275 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
             Some(state) => println!("{}", format_state(state, use_color)),
             None => println!("unknown"),
         },
+        Response::Profile {
+            active,
+            switching,
+            skipped,
+        } => {
+            println!("{}", switch_answer(&active, switching, &skipped))
+        }
         Response::Error { message } => exit_with_error(&message),
     }
 
     Ok(())
 }
 
-/// `whisrs status`: the state, asked with `status` and never `info`, which a
-/// daemon older than `info` logs an error for. No timeout, as before.
+/// `whisrs status`: the state, then the profile line ([`status_lines`]).
+/// Asked with `info`; a daemon older than it hangs up (and logs an error for
+/// it) and is asked `status`. No timeout, as before.
 async fn cmd_status() -> anyhow::Result<()> {
-    match tokio::task::spawn_blocking(|| whisrs::request_status_blocking(None)).await? {
-        Ok(state) => println!("{}", format_state(state, is_tty())),
+    match tokio::task::spawn_blocking(|| whisrs::request_info_blocking(None)).await? {
+        Ok(answer) => {
+            for line in status_lines(&answer, is_tty()) {
+                println!("{line}");
+            }
+        }
         Err(RequestError::NotRunning(_)) => exit_not_running(),
         Err(RequestError::Daemon(message)) => exit_with_error(&message),
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// What `whisrs status` prints: the state as ever, then, on a terminal only
+/// (`tty`, which colours the state too), `profile: <name>` when one other
+/// than base is active, or why the active one did not load. Off one the
+/// state is the whole output, so a script or status bar that compares it
+/// keeps working. An older daemon says nothing of profiles.
+fn status_lines(answer: &InfoAnswer, tty: bool) -> Vec<String> {
+    let state = match answer.state() {
+        Some(state) => format_state(state, tty),
+        None => "unknown".to_string(),
+    };
+    let mut lines = vec![state];
+    if !tty {
+        return lines;
+    }
+    if let InfoAnswer::Info(info) = answer {
+        if let Some(error) = &info.profile_error {
+            lines.push(error.clone());
+        } else if let Some(profile) = &info.profile {
+            lines.push(format!("profile: {profile}"));
+        }
+    }
+    lines
+}
+
+/// How long a profile switch waits for the daemon's answer.
+const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `whisrs profile [list|next|base|<name>]`. `list` (the default) reads the
+/// profiles folder and the state file, so it works with the daemon down. A
+/// switch goes through the daemon, which checks and restarts; with the
+/// daemon down it is checked here and written for its next start.
+async fn cmd_profile(target: Option<String>) -> anyhow::Result<()> {
+    let paths = Paths::current();
+    let target = target.unwrap_or_else(|| "list".to_string());
+    if target == "list" {
+        let daemon = tokio::task::spawn_blocking(|| {
+            whisrs::request_info_blocking(Some(std::time::Duration::from_secs(2)))
+        })
+        .await?;
+        let daemon = match daemon {
+            Ok(InfoAnswer::Info(info)) => Some(info),
+            _ => None,
+        };
+        let (lines, warnings) = match profile_list(&paths, daemon.as_ref()) {
+            Ok(listed) => listed,
+            Err(why) => exit_with_error(&why),
+        };
+        for warning in warnings {
+            if is_tty() {
+                eprintln!("{YELLOW}warning:{RESET} {warning}");
+            } else {
+                eprintln!("warning: {warning}");
+            }
+        }
+        for line in lines {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
+    let name = (target != "next").then_some(target);
+    let switched =
+        tokio::task::spawn_blocking(move || switch_profile(&paths, &socket_path(), name)).await?;
+    match switched {
+        Ok(line) => println!("{line}"),
+        Err(why) => exit_with_error(&why),
+    }
+    Ok(())
+}
+
+/// A switch from the CLI: sent to the daemon at `socket`. One that does not
+/// answer is down, and the switch is checked and written for its next start
+/// ([`switch_offline`]), unless it looks to be restarting
+/// ([`profile::unanswered`]): then it is waited for and sent the switch, or
+/// still restarting, refused. The line to print, or the refusal.
+fn switch_profile(
+    paths: &Paths,
+    socket: &std::path::Path,
+    name: Option<String>,
+) -> Result<String, String> {
+    let cmd = Command::SwitchProfile { name: name.clone() };
+    let send = || whisrs::request_blocking_at(socket, &cmd, Some(SWITCH_TIMEOUT));
+    let mut answer = send();
+    if matches!(answer, Err(RequestError::NotRunning(_))) {
+        match profile::unanswered(socket, &paths.state) {
+            Unanswered::Down => return switch_offline(paths, name.as_deref()),
+            Unanswered::Back => answer = send(),
+            Unanswered::Restarting => return Err(profile::RESTARTING.to_string()),
+        }
+    }
+    match answer {
+        Ok(Response::Profile {
+            active,
+            switching,
+            skipped,
+        }) => Ok(switch_answer(&active, switching, &skipped)),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected daemon response: {other:?}")),
+        // Back a moment ago, gone again.
+        Err(RequestError::NotRunning(_)) => Err(profile::RESTARTING.to_string()),
+        Err(RequestError::Closed) if older_daemon_cannot_parse(&cmd) => Err(
+            "whisrsd closed the connection without answering. It may be older than this \
+             whisrs and not know this command: restart it (whisrs restart)."
+                .to_string(),
+        ),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The daemon's answer to a switch, as `whisrs profile` prints it, with
+/// what `next` skipped.
+fn switch_answer(active: &str, switching: bool, skipped: &[String]) -> String {
+    if switching {
+        profile::switching_line(active, skipped)
+    } else {
+        format!("already on {active}")
+    }
+}
+
+/// A switch with the daemon down: checked as a client checks it (a key that
+/// may be in the daemon's environment alone is no failure), then written to
+/// the state file for its next start. The error is the refusal.
+fn switch_offline(paths: &Paths, asked: Option<&str>) -> Result<String, String> {
+    let listing = profile::list(&paths.profiles)
+        .map_err(|e| format!("cannot read {}: {e}", paths.profiles.display()))?;
+    let (current, readable) = match profile::read_active(&paths.state) {
+        Ok(current) => (current, true),
+        Err(_) => (None, false),
+    };
+    // `next` passes over what would not load, as the daemon's does.
+    let (target, skipped) = match asked.map(str::trim) {
+        None | Some("next") => {
+            profile::next_usable(paths, &listing.names, current.as_deref(), Check::Client)?
+        }
+        asked => (
+            profile::resolve_target(&listing.names, current.as_deref(), asked)?,
+            Vec::new(),
+        ),
+    };
+    let shown = target.as_deref().unwrap_or(profile::BASE);
+    if readable && target == current {
+        return Ok(format!("already on {shown} (whisrsd is not running)"));
+    }
+    profile::switch_check(paths, target.as_deref(), Check::Client)?;
+    profile::set_active(&paths.state, target.as_deref())
+        .map_err(|e| format!("cannot write {}: {e}", paths.state.display()))?;
+    Ok(format!(
+        "whisrsd is not running; {shown} applies when it starts{}",
+        profile::skipped_note(&skipped)
+    ))
+}
+
+/// What `whisrs profile list` prints: one line per profile, base first, the
+/// active one (as the state file names it) marked `*`, a broken one or one
+/// setting base-only keys noted; above them the daemon's line when it runs
+/// on another. Beside them the warnings: files skipped, a state file that
+/// names no profile, or a profile with no file.
+fn profile_list(
+    paths: &Paths,
+    daemon: Option<&DaemonInfo>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let listing = profile::list(&paths.profiles)
+        .map_err(|e| format!("cannot read {}: {e}", paths.profiles.display()))?;
+    let mut warnings: Vec<String> = listing.skipped.iter().map(|s| s.warning()).collect();
+    let active = match profile::read_active(&paths.state) {
+        Ok(active) => active,
+        Err(why) => {
+            warnings.push(why);
+            None
+        }
+    };
+    if let Some(name) = active
+        .as_deref()
+        .filter(|a| !listing.names.iter().any(|n| n == a))
+    {
+        warnings.push(format!(
+            "the active profile {name} has no file ({}): whisrsd starts on base",
+            profile::label(name)
+        ));
+    }
+
+    let mut lines = Vec::new();
+    if let Some(info) = daemon {
+        if let Some(error) = &info.profile_error {
+            lines.push(error.clone());
+        } else if info.profile != active {
+            lines.push(format!(
+                "whisrsd runs on {}; {} applies when it restarts",
+                info.profile.as_deref().unwrap_or(profile::BASE),
+                active.as_deref().unwrap_or(profile::BASE)
+            ));
+        }
+    }
+    let width = listing
+        .names
+        .iter()
+        .map(String::len)
+        .chain([profile::BASE.len()])
+        .max()
+        .unwrap_or_default();
+    let row = |name: &str, note: Option<String>| {
+        let marker = if active.as_deref().unwrap_or(profile::BASE) == name {
+            '*'
+        } else {
+            ' '
+        };
+        match note {
+            Some(note) => format!("{marker} {name:<width$}  ({note})"),
+            None => format!("{marker} {name}"),
+        }
+    };
+    lines.push(row(profile::BASE, None));
+    let mut base_error = None;
+    for name in &listing.names {
+        let note = match profile::effective_at_checked(paths, name, Check::Client) {
+            Ok(eff) => match eff.error {
+                Some(why) => Some(format!("broken: {why}")),
+                None if !eff.dropped.is_empty() => {
+                    Some(format!("base only, ignored: {}", eff.dropped.join(", ")))
+                }
+                None => None,
+            },
+            Err(why) => {
+                base_error.get_or_insert(why);
+                None
+            }
+        };
+        lines.push(row(name, note));
+    }
+    if let Some(why) = base_error {
+        warnings.push(format!("the profiles were not checked: {why}"));
+    }
+    if listing.names.is_empty() {
+        lines.push(format!(
+            "no profiles yet: add one as {}",
+            paths.profiles.join("<name>.toml").display()
+        ));
+    }
+    Ok((lines, warnings))
 }
 
 /// A `--text` value: `-` reads stdin.
@@ -804,8 +1068,8 @@ async fn request(cmd: Command) -> anyhow::Result<Response> {
 }
 
 /// Whether a daemon older than this whisrs may not parse `cmd`: `speak-text`,
-/// `agent` and `agent-event` are new with agent mode, `info` and `recording
-/// delete` after it.
+/// `agent` and `agent-event` are new with agent mode, `info`, `recording
+/// delete` and `switch-profile` after it.
 fn older_daemon_cannot_parse(cmd: &Command) -> bool {
     matches!(
         cmd,
@@ -817,6 +1081,7 @@ fn older_daemon_cannot_parse(cmd: &Command) -> bool {
                 action: whisrs::recording::RecordingAction::Delete,
                 ..
             }
+            | Command::SwitchProfile { .. }
     )
 }
 
@@ -1332,6 +1597,9 @@ mod tests {
             payload: serde_json::json!({}),
         }));
         assert!(older_daemon_cannot_parse(&Command::Info));
+        assert!(older_daemon_cannot_parse(&Command::SwitchProfile {
+            name: None
+        }));
         let recording = |action| Command::Recording {
             action,
             title: None,
@@ -1353,6 +1621,317 @@ mod tests {
         ] {
             assert!(!older_daemon_cannot_parse(&old), "{}", old.log_summary());
         }
+    }
+
+    #[test]
+    fn profile_is_a_subcommand() {
+        let cli = Cli::try_parse_from(["whisrs", "profile"]).unwrap();
+        assert!(matches!(cli.command, SubCmd::Profile { target: None }));
+        for word in ["list", "next", "base", "offline"] {
+            let cli = Cli::try_parse_from(["whisrs", "profile", word]).unwrap();
+            assert!(
+                matches!(&cli.command, SubCmd::Profile { target: Some(t) } if t == word),
+                "{word}"
+            );
+        }
+        assert!(Cli::try_parse_from(["whisrs", "profile", "a", "b"]).is_err());
+    }
+
+    /// A config.toml that validates in any environment (the sidecar needs
+    /// no key), `profiles` beside it, and `active` in the state file.
+    fn profile_dir(profiles: &[(&str, &str)], active: Option<&str>) -> (tempfile::TempDir, Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::write(
+            &paths.config,
+            "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"http://127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&paths.profiles).unwrap();
+        for (name, contents) in profiles {
+            std::fs::write(paths.profile(name), contents).unwrap();
+        }
+        if let Some(active) = active {
+            profile::set_active(&paths.state, Some(active)).unwrap();
+        }
+        (dir, paths)
+    }
+
+    #[test]
+    fn profile_list_marks_the_active_one_and_notes_the_rest() {
+        let (_dir, paths) = profile_dir(
+            &[
+                ("offline", "[general]\nlanguage = \"de\"\n"),
+                ("work", "[hotkeys]\ntoggle = \"Super+W\"\n"),
+                ("broken", "[general\n"),
+            ],
+            Some("offline"),
+        );
+        std::fs::write(paths.profiles.join("notes.txt"), "").unwrap();
+        let (lines, warnings) = profile_list(&paths, None).unwrap();
+        assert_eq!(
+            lines,
+            [
+                "  base",
+                "  broken   (broken: profiles/broken.toml is not valid TOML (line 1, column 9))",
+                "* offline",
+                "  work     (base only, ignored: hotkeys)",
+            ]
+        );
+        assert_eq!(warnings, ["skipped profiles/notes.txt: not a .toml file"]);
+
+        // The daemon's line, when it runs on another than the state file.
+        let on = |profile: Option<&str>, error: Option<&str>| DaemonInfo {
+            profile: profile.map(String::from),
+            profile_error: error.map(String::from),
+            ..Default::default()
+        };
+        let (lines, _) = profile_list(&paths, Some(&on(None, None))).unwrap();
+        assert_eq!(
+            lines[0],
+            "whisrsd runs on base; offline applies when it restarts"
+        );
+        let (lines, _) = profile_list(&paths, Some(&on(Some("offline"), None))).unwrap();
+        assert_eq!(lines[0], "  base");
+        let why = "profile offline did not load, using base: x";
+        let (lines, _) = profile_list(&paths, Some(&on(None, Some(why)))).unwrap();
+        assert_eq!(lines[0], why);
+    }
+
+    #[test]
+    fn profile_list_without_profiles_says_how_to_add_one() {
+        let (_dir, paths) = profile_dir(&[], None);
+        let (lines, warnings) = profile_list(&paths, None).unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "* base");
+        assert!(
+            lines[1].starts_with("no profiles yet: add one as "),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].ends_with("profiles/<name>.toml"), "{}", lines[1]);
+        assert!(warnings.is_empty());
+
+        // The state file names one whose file is gone.
+        profile::set_active(&paths.state, Some("gone")).unwrap();
+        let (lines, warnings) = profile_list(&paths, None).unwrap();
+        assert_eq!(lines[0], "  base");
+        assert_eq!(
+            warnings,
+            ["the active profile gone has no file (profiles/gone.toml): whisrsd starts on base"]
+        );
+    }
+
+    /// With the daemon down a switch is checked as the daemon checks it,
+    /// then written for its next start.
+    #[test]
+    fn a_switch_with_the_daemon_down_writes_the_state_file() {
+        let (_dir, paths) = profile_dir(
+            &[
+                ("offline", "[general]\nlanguage = \"de\"\n"),
+                ("broken", "[general]\nbackend = \"nope\"\n"),
+            ],
+            None,
+        );
+        assert_eq!(
+            switch_offline(&paths, Some("offline")).as_deref(),
+            Ok("whisrsd is not running; offline applies when it starts")
+        );
+        assert_eq!(
+            profile::read_active(&paths.state),
+            Ok(Some("offline".into()))
+        );
+        assert_eq!(
+            switch_offline(&paths, Some("offline")).as_deref(),
+            Ok("already on offline (whisrsd is not running)")
+        );
+        let refusal = switch_offline(&paths, Some("broken")).unwrap_err();
+        assert!(
+            refusal.starts_with("cannot switch to broken: "),
+            "{refusal}"
+        );
+        assert!(switch_offline(&paths, Some("gone")).is_err());
+        assert_eq!(
+            profile::read_active(&paths.state),
+            Ok(Some("offline".into()))
+        );
+
+        // next: broken, offline (sorted), then base.
+        assert_eq!(
+            switch_offline(&paths, None).as_deref(),
+            Ok("whisrsd is not running; base applies when it starts")
+        );
+        assert_eq!(profile::read_active(&paths.state), Ok(None));
+        // From base it passes over broken, which does not load.
+        assert_eq!(
+            switch_offline(&paths, None).as_deref(),
+            Ok(
+                "whisrsd is not running; offline applies when it starts (skipped broken: it does \
+                not load)"
+            )
+        );
+    }
+
+    #[test]
+    fn status_shows_the_profile_on_a_terminal_only() {
+        let info = |profile: Option<&str>, error: Option<&str>| {
+            InfoAnswer::Info(DaemonInfo {
+                state: Some(State::Idle),
+                profile: profile.map(String::from),
+                profile_error: error.map(String::from),
+                ..Default::default()
+            })
+        };
+        let why = "profile offline did not load, using base: profiles/offline.toml does not exist";
+        for (profile, error, second) in [
+            (Some("offline"), None, Some("profile: offline")),
+            (None, Some(why), Some(why)),
+            (None, None, None),
+        ] {
+            let answer = info(profile, error);
+            // Off a terminal the output is the state alone, as ever.
+            assert_eq!(status_lines(&answer, false), ["idle"]);
+            let lines = status_lines(&answer, true);
+            assert_eq!(lines[0], format_state(State::Idle, true));
+            assert_eq!(lines.get(1).map(String::as_str), second);
+            assert!(lines.len() <= 2, "{lines:?}");
+        }
+    }
+
+    /// A daemon at `path` that binds after `delay`, then answers each
+    /// connection with the next of `answers`. Joins to the commands it saw.
+    fn fake_daemon_at(
+        path: std::path::PathBuf,
+        delay: std::time::Duration,
+        answers: Vec<Response>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{Read, Write};
+
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let mut seen = Vec::new();
+            for answer in answers {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut len = [0u8; 4];
+                stream.read_exact(&mut len).unwrap();
+                let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+                stream.read_exact(&mut body).unwrap();
+                let cmd: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                seen.push(cmd["cmd"].as_str().unwrap_or_default().to_string());
+                stream.write_all(&encode_message(&answer).unwrap()).unwrap();
+            }
+            seen
+        })
+    }
+
+    /// A daemon that does not answer just after the active name changed is
+    /// restarting: it is waited for and gets the switch, and the client
+    /// writes nothing. One that is simply down gets the switch written for
+    /// its next start.
+    #[test]
+    fn a_switch_during_a_restart_waits_for_the_daemon() {
+        let (dir, paths) = profile_dir(&[("offline", "")], Some("work"));
+        let socket = dir.path().join("whisrs.sock");
+        let daemon = fake_daemon_at(
+            socket.clone(),
+            std::time::Duration::from_millis(300),
+            vec![
+                Response::Ok { state: State::Idle },
+                Response::Profile {
+                    active: "offline".into(),
+                    switching: true,
+                    skipped: vec!["broken".into()],
+                },
+            ],
+        );
+        assert_eq!(
+            switch_profile(&paths, &socket, Some("offline".into())).as_deref(),
+            Ok("switching to offline (skipped broken: it does not load)")
+        );
+        assert_eq!(daemon.join().unwrap(), ["status", "switch-profile"]);
+        assert_eq!(profile::read_active(&paths.state), Ok(Some("work".into())));
+
+        let (dir, paths) = profile_dir(&[("offline", "")], None);
+        let socket = dir.path().join("whisrs.sock");
+        assert_eq!(
+            switch_profile(&paths, &socket, Some("offline".into())).as_deref(),
+            Ok("whisrsd is not running; offline applies when it starts")
+        );
+    }
+
+    /// With the daemon down, a profile whose backend key is in no config
+    /// and not in this shell is no failure: the daemon's environment may
+    /// hold it, and its own dry run decides.
+    #[test]
+    fn a_key_only_the_daemon_may_have_does_not_refuse_an_offline_switch() {
+        if std::env::var_os("WHISRS_GROQ_API_KEY").is_some() {
+            return;
+        }
+        let (_dir, paths) = profile_dir(&[("cloud", "[general]\nbackend = \"groq\"\n")], None);
+        assert!(
+            profile::dry_run(&paths, "cloud").is_err(),
+            "premise: the daemon refuses"
+        );
+        let (lines, _) = profile_list(&paths, None).unwrap();
+        assert_eq!(lines[1], "  cloud");
+        assert_eq!(
+            switch_offline(&paths, Some("cloud")).as_deref(),
+            Ok("whisrsd is not running; cloud applies when it starts")
+        );
+    }
+
+    /// With the daemon down a switch to base is refused too while
+    /// config.toml does not load.
+    #[test]
+    fn an_offline_switch_to_base_is_refused_on_a_broken_config_toml() {
+        let (_dir, paths) = profile_dir(&[("offline", "")], Some("offline"));
+        std::fs::write(&paths.config, "[general\n").unwrap();
+        assert_eq!(
+            switch_offline(&paths, Some("base")),
+            Err("cannot switch to base: config.toml is not valid TOML (line 1, column 9)".into())
+        );
+        assert_eq!(
+            profile::read_active(&paths.state),
+            Ok(Some("offline".into()))
+        );
+    }
+
+    /// `whisrs status` against a daemon older than `info`: it hangs up on
+    /// `info`, is asked `status`, and the state is the whole answer.
+    #[test]
+    fn status_falls_back_to_status_on_an_older_daemon() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whisrs.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for answer in [
+                None,
+                Some(Response::Ok {
+                    state: State::Transcribing,
+                }),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut len = [0u8; 4];
+                stream.read_exact(&mut len).unwrap();
+                let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+                stream.read_exact(&mut body).unwrap();
+                let cmd: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                seen.push(cmd["cmd"].as_str().unwrap_or_default().to_string());
+                if let Some(answer) = answer {
+                    stream.write_all(&encode_message(&answer).unwrap()).unwrap();
+                }
+            }
+            seen
+        });
+        let answer =
+            whisrs::request_info_blocking_at(&path, Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+        assert_eq!(status_lines(&answer, false), ["transcribing"]);
+        assert_eq!(daemon.join().unwrap(), ["info", "status"]);
     }
 
     #[cfg(not(feature = "mcp"))]

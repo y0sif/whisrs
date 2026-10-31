@@ -139,6 +139,42 @@ impl ServiceManager {
         }
     }
 
+    /// [`Self::restart`] from inside the service it restarts
+    /// ([`restart_self`]): the restart is queued, not waited for. Waiting
+    /// races this process's own stop, which ends the waiting command too
+    /// (`systemctl` exits 143) and reads as a failure. systemd queues the
+    /// job (`--no-block`); OpenRC has no such flag, so `rc-service` is
+    /// started in a process group of its own and not waited for.
+    pub fn restart_queued(self) -> RestartOutcome {
+        if !self.service_installed() {
+            return RestartOutcome::NoService;
+        }
+        let Some((program, args)) = self.queued_restart() else {
+            return RestartOutcome::NoService;
+        };
+        let ok = match self {
+            Self::OpenRc => spawn_detached(program, args),
+            _ => run_ok(program, args),
+        };
+        if ok {
+            RestartOutcome::Restarted
+        } else {
+            RestartOutcome::Failed
+        }
+    }
+
+    /// The command [`Self::restart_queued`] runs.
+    fn queued_restart(self) -> Option<(&'static str, &'static [&'static str])> {
+        match self {
+            Self::Systemd => Some((
+                "systemctl",
+                &["--user", "restart", "--no-block", SYSTEMD_UNIT],
+            )),
+            Self::OpenRc => Some(("rc-service", &["--user", OPENRC_SERVICE, "restart"])),
+            Self::None => None,
+        }
+    }
+
     /// Command that enables the service to start at login, and starts it now.
     ///
     /// `None` when no service manager was detected, in which case callers
@@ -184,6 +220,160 @@ impl ServiceManager {
             Self::OpenRc => Some(config.join("rc/init.d")),
             Self::None => None,
         }
+    }
+}
+
+/// Restart this whisrsd from inside it: a profile switch, the tray's
+/// "Restart Daemon". Returns at once; the work runs on a thread of its own.
+///
+/// Under its service (systemd: its cgroup is `whisrs.service`; OpenRC:
+/// `RC_SVCNAME=whisrs`) the service manager restarts it. Otherwise, or with
+/// no service installed, it re-execs itself (`/proc/self/exe`, the same
+/// arguments): with a unit installed but the daemon started by hand,
+/// [`ServiceManager::restart`] would start a second daemon that exits on the
+/// socket this one holds, and `Restart=on-failure` would retry it for good.
+///
+/// The service's restart is queued ([`ServiceManager::restart_queued`]); its
+/// stop sends SIGTERM, whose handler shuts the daemon down. A re-exec runs
+/// `prepare` first instead, the same shutdown, and starts the binary the
+/// daemon's path names now, so an upgrade takes effect.
+///
+/// When nothing restarted, `on_failure` gets why. Before `prepare` the daemon
+/// keeps running and keeps its socket; after it (a failed exec) the daemon
+/// is shut down, so the process exits once `on_failure` has run.
+pub fn restart_self(
+    socket: PathBuf,
+    prepare: impl FnOnce() + Send + 'static,
+    on_failure: impl FnOnce(String) + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
+        let rc_svcname = std::env::var("RC_SVCNAME").ok();
+        if let Some(manager) = running_service(cgroup.as_deref(), rc_svcname.as_deref()) {
+            match manager.restart_queued() {
+                // Queued: the manager stops this process next.
+                RestartOutcome::Restarted => return,
+                RestartOutcome::Failed => {
+                    let (program, args) = manager.queued_restart().unwrap_or_default();
+                    on_failure(format!("`{program} {}` failed", args.join(" ")));
+                    return;
+                }
+                RestartOutcome::NoService => {}
+            }
+        }
+        let failed = reexec(&socket, prepare);
+        let prepared = failed.prepared;
+        on_failure(failed.why);
+        if prepared {
+            // Shut down already: end as a stop does, once the notification
+            // `on_failure` sent has had a moment to go out.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let _ = std::fs::remove_file(&socket);
+            std::process::exit(1);
+        }
+    });
+}
+
+/// The service this process runs as, if it runs as one: its cgroup (the
+/// text of `/proc/self/cgroup`) ends in `/whisrs.service`, or OpenRC set
+/// `RC_SVCNAME` to `whisrs`.
+fn running_service(cgroup: Option<&str>, rc_svcname: Option<&str>) -> Option<ServiceManager> {
+    let unit = format!("/{SYSTEMD_UNIT}");
+    if cgroup.is_some_and(|text| text.lines().any(|line| line.trim_end().ends_with(&unit))) {
+        Some(ServiceManager::Systemd)
+    } else if rc_svcname == Some(OPENRC_SERVICE) {
+        Some(ServiceManager::OpenRc)
+    } else {
+        None
+    }
+}
+
+/// Where the socket waits while this daemon re-execs: put back if the exec
+/// fails, so the daemon stays reachable. The new daemon removes it.
+pub fn socket_aside(socket: &Path) -> PathBuf {
+    let mut aside = socket.as_os_str().to_owned();
+    aside.push(".restart");
+    PathBuf::from(aside)
+}
+
+/// A re-exec that did not happen.
+struct ExecFailed {
+    why: String,
+    /// `prepare` ran: the daemon is shut down.
+    prepared: bool,
+}
+
+/// Replace this process with a fresh start of itself ([`exec_target`]), the
+/// same arguments. `prepare` runs once the binary is found, just before.
+/// Returns only when the exec did not happen.
+fn reexec(socket: &Path, prepare: impl FnOnce()) -> ExecFailed {
+    use std::os::unix::process::CommandExt;
+
+    let link = std::fs::read_link("/proc/self/exe").ok();
+    let target = exec_target(link.as_deref(), Path::is_file);
+    if let Err(e) = std::fs::metadata(&target) {
+        return ExecFailed {
+            why: format!("could not restart whisrsd: {}: {e}", target.display()),
+            prepared: false,
+        };
+    }
+    prepare();
+    let aside = socket_aside(socket);
+    let moved = std::fs::rename(socket, &aside).is_ok();
+    let mut args = std::env::args_os();
+    let arg0 = args.next().unwrap_or_else(|| "whisrsd".into());
+    let error = Command::new(&target).arg0(arg0).args(args).exec();
+    if moved {
+        let _ = std::fs::rename(&aside, socket);
+    }
+    ExecFailed {
+        why: format!("could not restart whisrsd ({error}), so it stopped: start it again"),
+        prepared: true,
+    }
+}
+
+/// What a re-exec runs: the path `/proc/self/exe` links to, a trailing
+/// ` (deleted)` cut off, when a file is there (an upgrade put the new binary
+/// in place of this one), else `/proc/self/exe`, this process's own binary
+/// even when deleted.
+fn exec_target(link: Option<&Path>, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+
+    const THIS: &str = "/proc/self/exe";
+    let Some(link) = link else {
+        return PathBuf::from(THIS);
+    };
+    let bytes = link.as_os_str().as_bytes();
+    let path = Path::new(std::ffi::OsStr::from_bytes(
+        bytes.strip_suffix(b" (deleted)").unwrap_or(bytes),
+    ));
+    if exists(path) {
+        path.to_path_buf()
+    } else {
+        PathBuf::from(THIS)
+    }
+}
+
+/// Start a command in a process group of its own, and leave it: it is
+/// reaped on a thread, its outcome unread. Whether it started.
+fn spawn_detached(program: &str, args: &[&str]) -> bool {
+    use std::os::unix::process::CommandExt;
+
+    let child = Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn();
+    match child {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -272,6 +462,102 @@ mod tests {
         assert!(none.enable_hint().is_none());
         assert!(none.restart_hint().is_none());
         assert!(none.status_hint().is_none());
+    }
+
+    /// Only the whisrs unit's own cgroup, or OpenRC's service name for it,
+    /// counts as running under the service: a daemon started by hand on a
+    /// machine with the unit installed re-execs itself instead.
+    #[test]
+    fn running_service_reads_the_cgroup_and_rc_svcname() {
+        let unit = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/whisrs.service\n";
+        assert_eq!(
+            running_service(Some(unit), None),
+            Some(ServiceManager::Systemd)
+        );
+        let v1 =
+            "12:pids:/user.slice\n1:name=systemd:/user.slice/user@1000.service/whisrs.service\n";
+        assert_eq!(
+            running_service(Some(v1), None),
+            Some(ServiceManager::Systemd)
+        );
+        for by_hand in [
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foot.scope\n",
+            "0::/user.slice/user-1000.slice/session-2.scope\n",
+            "0::/user.slice/user@1000.service/app.slice/my-whisrs.service.d\n",
+            "",
+        ] {
+            assert_eq!(running_service(Some(by_hand), None), None, "{by_hand}");
+        }
+        assert_eq!(running_service(None, None), None);
+        assert_eq!(
+            running_service(None, Some("whisrs")),
+            Some(ServiceManager::OpenRc)
+        );
+        assert_eq!(running_service(None, Some("pipewire")), None);
+    }
+
+    /// A restart from inside the service is queued, never waited for: a
+    /// waiting `systemctl` dies with the unit's stop and reads as a failure.
+    /// `whisrs restart` keeps waiting.
+    #[test]
+    fn a_restart_from_inside_is_queued() {
+        assert_eq!(
+            ServiceManager::Systemd.queued_restart(),
+            Some((
+                "systemctl",
+                &["--user", "restart", "--no-block", "whisrs.service"][..]
+            ))
+        );
+        assert_eq!(
+            ServiceManager::OpenRc.queued_restart(),
+            Some(("rc-service", &["--user", "whisrs", "restart"][..]))
+        );
+        assert_eq!(ServiceManager::None.queued_restart(), None);
+        assert_eq!(
+            ServiceManager::None.restart_queued(),
+            RestartOutcome::NoService
+        );
+        assert!(ServiceManager::Systemd
+            .restart_hint()
+            .is_some_and(|hint| !hint.contains("--no-block")));
+    }
+
+    /// A detached command starts and is not waited for.
+    #[test]
+    fn a_detached_command_is_not_waited_for() {
+        let started = std::time::Instant::now();
+        assert!(spawn_detached("sleep", &["5"]));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!spawn_detached("/nonexistent/whisrs-no-such-program", &[]));
+    }
+
+    /// A re-exec runs the binary at the daemon's path when one is there (an
+    /// upgrade replaced the deleted one), else this process's own.
+    #[test]
+    fn a_reexec_runs_the_binary_at_the_path() {
+        let installed = |p: &Path| p == Path::new("/usr/bin/whisrsd");
+        assert_eq!(
+            exec_target(Some(Path::new("/usr/bin/whisrsd (deleted)")), installed),
+            Path::new("/usr/bin/whisrsd")
+        );
+        assert_eq!(
+            exec_target(Some(Path::new("/usr/bin/whisrsd")), installed),
+            Path::new("/usr/bin/whisrsd")
+        );
+        let gone = |_: &Path| false;
+        assert_eq!(
+            exec_target(Some(Path::new("/usr/bin/whisrsd (deleted)")), gone),
+            Path::new("/proc/self/exe")
+        );
+        assert_eq!(exec_target(None, installed), Path::new("/proc/self/exe"));
+    }
+
+    #[test]
+    fn the_socket_waits_beside_itself() {
+        assert_eq!(
+            socket_aside(Path::new("/run/user/1000/whisrs.sock")),
+            Path::new("/run/user/1000/whisrs.sock.restart")
+        );
     }
 
     #[test]

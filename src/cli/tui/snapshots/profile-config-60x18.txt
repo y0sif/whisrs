@@ -1,0 +1,18 @@
+   ╭────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁         config · profile offline · ●  │
+   │                                                    │
+   │   Backend & keys                                   │
+   │                                                    │
+   │ ▌ backend           ◂ local-whisper ▸     profile  │
+   │   deepgram api_key  set ****9f2c        base only  │
+   │   deepgram model    nova-3                   base  │
+   │                                                    │
+   │   The transcription backend. Its key or model is   │
+   │   below. local-vosk and local-parakeet are not     │
+   │   implemented yet; e edits their sections in       │
+   │   config.toml. offline sets this; x puts back      │
+   │                                                    │
+   │   ! unknown key [general] silense_timeout_ms is    │
+   │     ignored                                        │
+   ╰────────────────────────────────────────────────────╯
+     j/k move · tab pane · h/l change · ? help

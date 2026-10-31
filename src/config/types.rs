@@ -260,6 +260,9 @@ pub struct HotkeyConfig {
     pub speak: Option<String>,
     /// Hotkey to start or stop a recording of mic + system audio (e.g. "Super+Shift+M").
     pub recording: Option<String>,
+    /// Hotkey to switch to the next config profile: base, then the
+    /// profiles by name, wrapping (e.g. "Super+Shift+P").
+    pub next_profile: Option<String>,
 }
 
 /// Recording-lifecycle hooks. `media_auto_pause` pauses the MPRIS players
@@ -1310,6 +1313,27 @@ pub fn unknown_config_keys(contents: &str) -> Vec<String> {
         .collect();
     unknown.sort();
     unknown.dedup();
+    unknown
+}
+
+/// [`unknown_config_keys`], each key beside its path (its table keys, an
+/// array index in decimal), so a profile merge can tell which file set it.
+pub(crate) fn unknown_config_keys_with_paths(contents: &str) -> Vec<(Vec<String>, String)> {
+    let mut unknown: Vec<(Vec<String>, String)> = unknown_config_key_paths(contents)
+        .iter()
+        .map(|path| {
+            let keys = path
+                .iter()
+                .map(|seg| match seg {
+                    Seg::Key(key) => key.clone(),
+                    Seg::Index(index) => index.to_string(),
+                })
+                .collect();
+            (keys, render_path(path))
+        })
+        .collect();
+    unknown.sort_by(|a, b| a.1.cmp(&b.1));
+    unknown.dedup_by(|a, b| a.1 == b.1);
     unknown
 }
 
@@ -2500,6 +2524,7 @@ impl Config {
                 // with nothing there.
                 #[cfg(feature = "recording")]
                 ("[hotkeys] recording", &hotkeys.recording),
+                ("[hotkeys] next_profile", &hotkeys.next_profile),
             ] {
                 if let Some(spec) = value {
                     binding_sources.push((label.to_string(), spec.as_str()));
@@ -5684,6 +5709,7 @@ mod tests {
             command: None,
             speak: None,
             recording: None,
+            next_profile: None,
         });
         config
             .llm_commands
@@ -5745,6 +5771,7 @@ mod tests {
             command: None,
             speak: Some("Meta+D".to_string()),
             recording: None,
+            next_profile: None,
         });
 
         let warnings = config.validate().unwrap();
@@ -6620,6 +6647,7 @@ mod tests {
             command: Some("Super+Shift+C".to_string()),
             speak: Some("Super+Shift+R".to_string()),
             recording: Some("Super+Shift+M".to_string()),
+            next_profile: None,
         });
         config
             .llm_commands

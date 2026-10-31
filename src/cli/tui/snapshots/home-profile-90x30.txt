@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                         home · profile offline · ●  │
+   │                                                                                  │
+   │   Setup                   daemon      running · idle · v0.2.0                    │
+   │ ▌ Config                  backend     local-whisper                              │
+   │   Mic test                language    de                                         │
+   │   Recordings              profile     offline (3 profiles)                       │
+   │   Profiles                hotkeys     toggle Alt+D · recording Alt+Shift+M       │
+   │   History                 built with  local-whisper tray overlay hooks rec mcp   │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k move · enter open · ? help · q quit
+
+
+
+
+
+
+
+
+

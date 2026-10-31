@@ -1,9 +1,10 @@
 //! Home, the hub: the screens on the left, and on the right what the daemon
 //! is doing (from `info`, or `status` for an older daemon) beside the
-//! config's backend, language and hotkeys.
+//! config's backend, language, profile and hotkeys.
 
 use ratatui::layout::Rect;
 use ratatui::Frame;
+use whisrs::config::profile::BASE;
 use whisrs::recording::RecordingPhase;
 use whisrs::InfoAnswer;
 
@@ -11,7 +12,7 @@ use crate::tui::app::{App, Screen};
 use crate::tui::keys::Action;
 use crate::tui::widgets::frame::{self, Header};
 use crate::tui::widgets::row::{Row, Value};
-use crate::tui::widgets::{Tone, Ui};
+use crate::tui::widgets::{Notice, Tone, Ui};
 use crate::tui::worker::DaemonView;
 
 /// The screens Home opens, and their names.
@@ -20,6 +21,7 @@ const SCREENS: &[(Screen, &str)] = &[
     (Screen::Config, "Config"),
     (Screen::Mic, "Mic test"),
     (Screen::Recordings, "Recordings"),
+    (Screen::Profiles, "Profiles"),
     (Screen::History, "History"),
 ];
 
@@ -63,7 +65,14 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
     let two_panes = area.width >= frame::TWO_PANES;
     let mut info = info_rows(app, ui);
     let width = frame::body_width(area.width).saturating_sub(2);
-    let messages = app.messages(ui, usize::from(width));
+    // A profile that did not load is said here, where the daemon is.
+    let mut notices = app.notices.clone();
+    if let DaemonView::Up(InfoAnswer::Info(info)) = &app.daemon {
+        if let Some(error) = &info.profile_error {
+            notices.push(Notice::new(Tone::Warn, error.clone()));
+        }
+    }
+    let messages = frame::messages(&notices, app.status.as_ref(), ui, usize::from(width));
     let rows = |info: usize| match (two_panes, info) {
         (true, _) => SCREENS.len().max(info),
         (false, 0) => SCREENS.len(),
@@ -91,6 +100,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         ui,
         Header {
             screen: "home",
+            profile: app.header_profile().as_deref(),
             daemon: app.daemon_up(),
             live: None,
         },
@@ -155,6 +165,25 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
     );
 }
 
+/// The profile row, once the folder is read: the state file's profile and
+/// how many there are (`base (2 profiles)`), or, with the daemon on
+/// another, that it applies when whisrsd restarts.
+fn profile_row(app: &App, info: Option<&whisrs::DaemonInfo>) -> Option<Value> {
+    let count = app.profiles.count()?;
+    let active = app.profiles.active();
+    let name = active.unwrap_or(BASE);
+    let elsewhere =
+        info.is_some_and(|info| info.profile_error.is_none() && info.profile.as_deref() != active);
+    Some(match count {
+        _ if elsewhere => {
+            Value::plain(format!("{name},")).then("applies when whisrsd restarts", Tone::Muted)
+        }
+        0 => Value::plain(name),
+        1 => Value::plain(name).then("(1 profile)", Tone::Muted),
+        n => Value::plain(name).then(format!("({n} profiles)"), Tone::Muted),
+    })
+}
+
 /// The right pane: the daemon, then the config.
 fn info_rows(app: &App, ui: &Ui) -> Vec<(&'static str, Value)> {
     let config = app.config.form.config();
@@ -214,12 +243,23 @@ fn info_rows(app: &App, ui: &Ui) -> Vec<(&'static str, Value)> {
         }
     }
 
+    // The profile in use runs on its own backend and language.
+    let profile = app
+        .active_profile()
+        .and_then(|name| app.profiles.item(&name));
     let backend = info
         .map(|info| info.backend.as_str())
         .filter(|backend| !backend.is_empty())
+        .or_else(|| profile.and_then(|p| p.backend.as_deref()))
         .unwrap_or(&config.general.backend);
+    let language = profile
+        .and_then(|p| p.language.as_deref())
+        .unwrap_or(&config.general.language);
     rows.push(("backend", Value::plain(backend)));
-    rows.push(("language", Value::plain(&config.general.language)));
+    rows.push(("language", Value::plain(language)));
+    if let Some(profile) = profile_row(app, info) {
+        rows.push(("profile", profile));
+    }
 
     let hotkeys: Vec<(String, Tone)> = config
         .hotkeys

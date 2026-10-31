@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+   ╭─────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                      profiles · ●  │
+   │                                                                                 │
+   │   whisrsd runs on base; offline applies when it restarts                        │
+   │                                                                                 │
+   │     base     config.toml                                                        │
+   │     broken   broken: profiles/broken.toml is not valid TOML (line 1, column 9)  │
+   │ ▌ ● offline  3 keys · Local whisper backend selected but model file not found…  │
+   │     work     3 keys · base only, ignored: groq.api_key, hotkeys                 │
+   │                                                                                 │
+   │   ! unknown key [general] silense_timeout_ms is ignored                         │
+   ╰─────────────────────────────────────────────────────────────────────────────────╯
+     enter switch · l edit · n new · d delete · e $EDITOR · esc back · ? help
+
+
+
+
+
+
+
+
+

@@ -221,17 +221,30 @@ Env-var overrides: `WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, `WHISRS_OPE
 
 For the full reference (overlay, `[input]`, `[tts]`, `[llm]`, `[hotkeys]`, `[hooks]`, backend sections, GNOME extension setup), see [docs/configuration.md](docs/configuration.md).
 
+### Profiles
+
+A profile holds only what differs from `config.toml`, in `~/.config/whisrs/profiles/<name>.toml`:
+
+```toml
+# ~/.config/whisrs/profiles/offline.toml
+[general]
+backend = "local-whisper"
+```
+
+`whisrs profile offline` switches to it (the daemon checks it loads, then restarts on it), `whisrs profile base` switches back, and `whisrs profile next` (or a `[hotkeys] next_profile` key, or the tray's Profile menu) goes to the next one. `whisrs config`'s Profiles screen does the same, makes and deletes profiles, and edits one in Config, each row tagged with whose value it is. API keys, `[hotkeys]`, `[[llm_commands]]`, `[[agents]]` and `[recording] dir` stay in `config.toml`. Details: [docs/configuration.md](docs/configuration.md#profiles).
+
 ---
 
 ## CLI Commands
 
 ```
 whisrs setup     # Onboarding wizard (TUI): backend, key or model download, mic, service, keybinding
-whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle. Esc goes to Home, which opens Setup, Config, a Mic test (a live level meter; its w saves only [audio] device), Recordings (list, preview and transcript; retry, copy, name a speaker, summarize, delete) and History (what dictation typed; C clears it, asking first)
+whisrs config    # Full-screen editor (TUI) for ~/.config/whisrs/config.toml: values picked from lists or stepped; a save restarts the daemon when it is idle. Esc goes to Home, which opens Setup, Config, a Mic test (a live level meter; its w saves only [audio] device), Recordings (list, preview and transcript; retry, copy, name a speaker, summarize, delete), Profiles (switch, new, delete; l edits a profile in Config, w writing only its file) and History (what dictation typed; C clears it, asking first)
 whisrs toggle    # Start/stop dictation (uses general.language)
 whisrs toggle -l en  # Start/stop dictation, overriding the language for this session
 whisrs cancel    # Cancel dictation, discard audio
-whisrs status    # Query daemon state
+whisrs status    # Query daemon state (on a terminal, also the config profile when one is active)
+whisrs profile   # List config profiles (~/.config/whisrs/profiles/<name>.toml); whisrs profile offline | next | base switches
 whisrs restart   # Restart the daemon (uses the systemd or OpenRC user service when present)
 whisrs command   # Command mode: select text + speak instruction → LLM rewrite
 whisrs llm-command <name>      # Toggle a named [[llm_commands]] entry (see config.toml)

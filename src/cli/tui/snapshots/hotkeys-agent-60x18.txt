@@ -3,8 +3,8 @@
    │                                                    │
    │   Hotkeys                                          │
    │                                                    │
-   │   speak               not set                      │
    │   recording           Alt+Shift+M                  │
+   │   next_profile        not set                      │
    │   Agents ────────────────────────────────────────  │
    │ ▌ jarvis              Super+J                      │
    │                                                    │

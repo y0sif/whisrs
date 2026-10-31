@@ -1,7 +1,7 @@
 //! The TUI's threads: the daemon poll, the restart after a save, the lists
 //! a picker needs (sound devices, model files), the API key test, the model
-//! download, the microphone capture, read aloud's sample and setup's system
-//! checks. Every request
+//! download, the microphone capture, read aloud's sample, setup's system
+//! checks, the profiles folder and a profile switch. Every request
 //! to the daemon, the network or the sound server is made here, never on the
 //! loop that draws and reads keys: a blocking connect to a daemon that
 //! stopped accepting has no timeout, a sound server can be slow to answer,
@@ -33,12 +33,28 @@ use super::options::{self, Device, Listing};
 use super::schema::ListKind;
 use super::screens::history;
 use super::screens::mic::analysis;
+use super::screens::profiles;
 use super::screens::recordings::{self, Act, Wanted};
 use super::screens::setup::{Checks, SystemAction};
 use super::Env;
 
 /// How often the daemon is asked what it is doing.
 const POLL_EVERY: Duration = Duration::from_secs(2);
+
+/// How often it is asked for a while after a nudge ([`Workers::poll_soon`]):
+/// a profile switch restarts it, and the screen follows it back.
+const POLL_QUICK: Duration = Duration::from_millis(250);
+
+/// How long a nudge keeps the polls quick. The answer at its end is sent
+/// even when it did not change: a restart that did not happen shows so.
+pub const NUDGED_FOR: Duration = Duration::from_secs(5);
+
+/// How many quick polls a nudge buys.
+const QUICK_POLLS: u32 = (NUDGED_FOR.as_millis() / POLL_QUICK.as_millis()) as u32;
+
+/// How long a profile switch may take to answer: the daemon checks the
+/// profile loads first.
+const SWITCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long one answer may take.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
@@ -170,6 +186,8 @@ pub struct Workers {
     /// Wakes the recordings folder's reader for a read now; dropped, it
     /// stops.
     recordings: Mutex<Option<Sender<()>>>,
+    /// Wakes the poll for a few quick polls ([`Workers::poll_soon`]).
+    nudge: Mutex<Option<Sender<()>>>,
 }
 
 impl Workers {
@@ -195,7 +213,10 @@ impl Workers {
             mic: Mutex::new(None),
             speech: Mutex::new(None),
             recordings: Mutex::new(None),
+            nudge: Mutex::new(None),
         };
+        let (nudge, nudged) = mpsc::channel();
+        *lock(&workers.nudge) = Some(nudge);
         let (tx, socket, older) = (
             workers.tx.clone(),
             workers.socket.clone(),
@@ -203,6 +224,7 @@ impl Workers {
         );
         std::thread::spawn(move || {
             let mut last = None;
+            let mut quick = 0;
             for polls in 0u32.. {
                 let view = poll(&socket, &older, polls % REPROBE_EVERY == 0);
                 if last.as_ref() != Some(&view) {
@@ -211,10 +233,31 @@ impl Workers {
                     }
                     last = Some(view);
                 }
-                std::thread::sleep(POLL_EVERY);
+                let wait = if quick > 0 {
+                    quick -= 1;
+                    if quick == 0 {
+                        last = None;
+                    }
+                    POLL_QUICK
+                } else {
+                    POLL_EVERY
+                };
+                match nudged.recv_timeout(wait) {
+                    Ok(()) => quick = QUICK_POLLS,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             }
         });
         workers
+    }
+
+    /// Ask the daemon at once, then often for a few seconds: a switch is
+    /// restarting it.
+    pub fn poll_soon(&self) {
+        if let Some(nudge) = lock(&self.nudge).as_ref() {
+            let _ = nudge.send(());
+        }
     }
 
     /// Restart the daemon, on a thread of its own, if it is idle (or, with
@@ -486,6 +529,26 @@ impl Workers {
         });
     }
 
+    /// Read the profiles folder, each profile merged over config.toml, on a
+    /// thread of its own; it comes back as [`Msg::ProfilesRead`].
+    pub fn read_profiles(&self, paths: whisrs::config::profile::Paths) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::ProfilesRead(profiles::read_folder(&paths)));
+        });
+    }
+
+    /// Ask the daemon to switch to profile `name` on a thread of its own;
+    /// with no daemon, write the state file for its next start, as `whisrs
+    /// profile` does. The answer comes back as [`Msg::Switched`].
+    pub fn switch_profile(&self, name: String, paths: whisrs::config::profile::Paths) {
+        let (tx, socket) = (self.tx.clone(), self.socket.clone());
+        std::thread::spawn(move || {
+            let answer = switch_on(&socket, &paths, &name);
+            let _ = tx.send(Msg::Switched { name, answer });
+        });
+    }
+
     /// Read the dictation history at `path`; it comes back as
     /// [`Msg::HistoryRead`].
     pub fn read_history(&self, path: PathBuf) {
@@ -541,6 +604,64 @@ fn act_on(socket: &Path, service: ServiceManager, act: &Act) -> Result<(), Strin
         Err(RequestError::Closed) => {
             Err("whisrsd closed the connection without answering".to_string())
         }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// What a profile switch came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Switched {
+    /// The daemon took it and restarts on it now.
+    Restarting,
+    /// The daemon was on it already.
+    Already,
+    /// The daemon is restarting and did not answer again in time: nothing
+    /// was sent or written (`profile::RESTARTING`).
+    Busy,
+    /// No daemon: the state file names it for the next start, or it did
+    /// already; the line says which.
+    Offline(String),
+}
+
+/// `switch-profile` to `name` (`base` too) at `socket`. A daemon that does
+/// not answer is down, and the state file at `paths` is written, checked as
+/// a client checks it, unless it looks to be restarting
+/// (`profile::unanswered`, which waits for it): then the switch is sent
+/// again once it is back, and nothing is written while it is not.
+fn switch_on(
+    socket: &Path,
+    paths: &whisrs::config::profile::Paths,
+    name: &str,
+) -> Result<Switched, String> {
+    use whisrs::config::profile::{unanswered, Unanswered};
+    let cmd = Command::SwitchProfile {
+        name: Some(name.to_string()),
+    };
+    let send = || whisrs::request_blocking_at(socket, &cmd, Some(SWITCH_TIMEOUT));
+    let mut answer = send();
+    if matches!(answer, Err(RequestError::NotRunning(_))) {
+        match unanswered(socket, &paths.state) {
+            Unanswered::Down => {
+                return crate::switch_offline(paths, Some(name)).map(Switched::Offline)
+            }
+            Unanswered::Back => answer = send(),
+            Unanswered::Restarting => return Ok(Switched::Busy),
+        }
+    }
+    match answer {
+        Ok(Response::Profile {
+            switching: true, ..
+        }) => Ok(Switched::Restarting),
+        Ok(Response::Profile { .. }) => Ok(Switched::Already),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("whisrsd gave an answer this whisrs does not know".to_string()),
+        // Back a moment ago, gone again.
+        Err(RequestError::NotRunning(_)) => Ok(Switched::Busy),
+        Err(RequestError::Closed) => Err(
+            "whisrsd closed the connection without answering. It may be older than this whisrs \
+             and not know profiles: restart it (whisrs restart)"
+                .to_string(),
+        ),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -1273,6 +1394,7 @@ mod list_tests {
             mic: Mutex::new(None),
             speech: Mutex::new(None),
             recordings: Mutex::new(None),
+            nudge: Mutex::new(None),
         };
         workers.list(ListKind::Devices);
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -1442,6 +1564,7 @@ mod list_tests {
             mic: Mutex::new(None),
             speech: Mutex::new(None),
             recordings: Mutex::new(None),
+            nudge: Mutex::new(None),
         };
         workers.mic_start(7, "nope".into());
         let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -1489,6 +1612,7 @@ mod list_tests {
             mic: Mutex::new(None),
             speech: Mutex::new(None),
             recordings: Mutex::new(None),
+            nudge: Mutex::new(None),
         };
         {
             // Another probe, or a listing, holds the lock meanwhile.
@@ -1547,6 +1671,7 @@ mod list_tests {
             mic: Mutex::new(None),
             speech: Mutex::new(None),
             recordings: Mutex::new(None),
+            nudge: Mutex::new(None),
         };
         let config: Config = toml::from_str("").unwrap();
         let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -1920,6 +2045,7 @@ mod tests {
             mic: Mutex::new(None),
             speech: Mutex::new(None),
             recordings: Mutex::new(None),
+            nudge: Mutex::new(None),
         };
         let read = || match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Msg::Recordings(Ok(items))) => items,
@@ -1940,6 +2066,198 @@ mod tests {
         workers.stop_recordings();
         workers.refresh_recordings();
         assert!(lock(&workers.recordings).is_none());
+    }
+
+    /// A profile switch goes to the daemon by name; its answers, its
+    /// refusal and a hang-up (an older daemon) each read as the screen says
+    /// them.
+    #[test]
+    fn a_profile_switch_is_asked_of_the_daemon() {
+        let profile = |switching| {
+            Answer(Response::Profile {
+                active: "offline".into(),
+                switching,
+                skipped: Vec::new(),
+            })
+        };
+        let refusal = "cannot switch profile while a recording is being transcribed";
+        let (dir, path, daemon) = fake_daemon(vec![
+            profile(true),
+            profile(false),
+            Answer(Response::Error {
+                message: refusal.into(),
+            }),
+            HangUp,
+        ]);
+        let paths = whisrs::config::profile::Paths::under(dir.path());
+        assert_eq!(
+            switch_on(&path, &paths, "offline"),
+            Ok(Switched::Restarting)
+        );
+        assert_eq!(switch_on(&path, &paths, "offline"), Ok(Switched::Already));
+        assert_eq!(
+            switch_on(&path, &paths, "offline"),
+            Err(refusal.to_string())
+        );
+        let older = switch_on(&path, &paths, "offline").unwrap_err();
+        assert!(older.contains("may be older than this whisrs"), "{older}");
+        assert_eq!(daemon.join(), vec!["switch-profile"; 4]);
+        assert!(!paths.state.exists(), "the daemon writes the state file");
+    }
+
+    /// The state file at `paths` as if written a minute ago: no switch is
+    /// under way, so a daemon that does not answer is down.
+    fn aged(paths: &whisrs::config::profile::Paths) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&paths.state)
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+    }
+
+    /// With no daemon, a switch is checked as a client checks it and
+    /// written to the state file for its next start.
+    #[test]
+    fn with_no_daemon_a_switch_writes_the_state_file() {
+        use whisrs::config::profile::{read_active, Paths};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        // Valid in any environment: the sidecar needs no key.
+        std::fs::write(
+            &paths.config,
+            "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"http://127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&paths.profiles).unwrap();
+        std::fs::write(paths.profile("offline"), "[general]\nlanguage = \"de\"\n").unwrap();
+        std::fs::write(paths.profile("broken"), "[general\n").unwrap();
+        let none = dir.path().join("none.sock");
+        assert_eq!(
+            switch_on(&none, &paths, "offline"),
+            Ok(Switched::Offline(
+                "whisrsd is not running; offline applies when it starts".into()
+            ))
+        );
+        assert_eq!(read_active(&paths.state), Ok(Some("offline".into())));
+        aged(&paths);
+        assert_eq!(
+            switch_on(&none, &paths, "offline"),
+            Ok(Switched::Offline(
+                "already on offline (whisrsd is not running)".into()
+            ))
+        );
+        let broken = switch_on(&none, &paths, "broken").unwrap_err();
+        assert!(broken.starts_with("cannot switch to broken: "), "{broken}");
+        assert_eq!(read_active(&paths.state), Ok(Some("offline".into())));
+        assert_eq!(
+            switch_on(&none, &paths, "base"),
+            Ok(Switched::Offline(
+                "whisrsd is not running; base applies when it starts".into()
+            ))
+        );
+        assert_eq!(read_active(&paths.state), Ok(None));
+    }
+
+    /// A daemon that does not answer right after a switch is restarting:
+    /// it is waited for and sent the switch once back, and while it does
+    /// not come back nothing is written.
+    #[test]
+    fn a_switch_while_whisrsd_restarts_waits_for_it() {
+        use whisrs::config::profile::{read_active, set_active, Paths};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(&paths.profiles).unwrap();
+        std::fs::write(paths.profile("offline"), "").unwrap();
+        // Written just now: a switch's restart may be under way.
+        set_active(&paths.state, Some("offline")).unwrap();
+        let none = dir.path().join("none.sock");
+        assert_eq!(switch_on(&none, &paths, "base"), Ok(Switched::Busy));
+        assert_eq!(read_active(&paths.state), Ok(Some("offline".into())));
+
+        // Its socket set aside for a re-exec, then back: the switch is sent.
+        let socket = dir.path().join("whisrs.sock");
+        std::fs::write(whisrs::service::socket_aside(&socket), "").unwrap();
+        aged(&paths);
+        let back = socket.clone();
+        let daemon = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let listener = UnixListener::bind(&back).unwrap();
+            let mut seen = Vec::new();
+            for answer in [
+                Response::Ok { state: State::Idle },
+                Response::Profile {
+                    active: "base".into(),
+                    switching: true,
+                    skipped: Vec::new(),
+                },
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut len = [0u8; 4];
+                stream.read_exact(&mut len).unwrap();
+                let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+                stream.read_exact(&mut body).unwrap();
+                let cmd: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                seen.push(cmd["cmd"].as_str().unwrap_or_default().to_string());
+                stream
+                    .write_all(&whisrs::encode_message(&answer).unwrap())
+                    .unwrap();
+            }
+            seen
+        });
+        assert_eq!(switch_on(&socket, &paths, "base"), Ok(Switched::Restarting));
+        assert_eq!(daemon.join().unwrap(), ["status", "switch-profile"]);
+        assert_eq!(read_active(&paths.state), Ok(Some("offline".into())));
+    }
+
+    /// The profiles folder is read on a worker and comes back as a message;
+    /// a nudge has the poll ask the daemon again at once.
+    #[test]
+    fn the_folder_is_read_and_the_poll_nudged() {
+        let started = |at| {
+            info(DaemonInfo {
+                started_at: at,
+                ..idle()
+            })
+        };
+        let (dir, path, _daemon) = fake_daemon(vec![started(1), started(2)]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers = Workers::start(
+            tx,
+            &path,
+            ServiceManager::None,
+            Lister {
+                devices: Vec::new,
+                models: dir.path().to_path_buf(),
+                home: None,
+            },
+            Env::default(),
+            Tools::real(),
+        );
+        let next = |within: Duration| rx.recv_timeout(within).expect("a message");
+        let at = |msg: Msg| match msg {
+            Msg::Daemon(DaemonView::Up(InfoAnswer::Info(info))) => info.started_at,
+            _ => panic!("not the daemon's info"),
+        };
+        assert_eq!(at(next(Duration::from_secs(5))), 1);
+        // Well before the 2 s poll.
+        workers.poll_soon();
+        assert_eq!(at(next(POLL_EVERY / 2)), 2);
+
+        let paths = whisrs::config::profile::Paths::under(dir.path());
+        std::fs::create_dir_all(&paths.profiles).unwrap();
+        std::fs::write(paths.profile("offline"), "").unwrap();
+        workers.read_profiles(paths);
+        loop {
+            match next(Duration::from_secs(5)) {
+                Msg::ProfilesRead(Ok(folder)) => {
+                    assert_eq!(folder.items[0].name, "offline");
+                    break;
+                }
+                Msg::Daemon(_) => {}
+                _ => panic!("not the folder"),
+            }
+        }
     }
 
     /// After one hang-up on `info`, an older daemon is asked `status` only,

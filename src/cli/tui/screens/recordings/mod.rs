@@ -1178,6 +1178,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
         ui,
         Header {
             screen: &header_name(screen),
+            profile: app.header_profile().as_deref(),
             daemon: app.daemon_up(),
             live: None,
         },
@@ -1343,6 +1344,7 @@ fn reader(app: &App, f: &mut Frame, ui: &Ui) {
         ui,
         Header {
             screen: "recordings",
+            profile: app.header_profile().as_deref(),
             daemon: app.daemon_up(),
             live: None,
         },

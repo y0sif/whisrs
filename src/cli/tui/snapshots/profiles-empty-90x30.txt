@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                                       profiles · ●  │
+   │                                                                                  │
+   │ ▌ ● base                  base · active · config.toml                            │
+   │                                                                                  │
+   │                           The base config, which every profile goes over. l      │
+   │                           opens Config on it, e the file.                        │
+   │                                                                                  │
+   │   No profiles yet: n makes one. A profile holds only what differs from           │
+   │   config.toml, and whisrs runs on base plus the active one.                      │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     enter switch · l edit · n new · d delete · e $EDITOR · esc back · ? help
+
+
+
+
+
+
+
+

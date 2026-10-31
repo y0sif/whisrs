@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod keys;
+pub mod profile;
 pub mod setup;
 pub mod types;
 pub mod vocabulary;

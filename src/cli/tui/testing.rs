@@ -32,6 +32,8 @@ pub fn paths(dir: &std::path::Path) -> Paths {
         models: dir.join("models"),
         xdg_config: dir.join("xdg-config"),
         xdg_data: dir.join("xdg-data"),
+        profiles: dir.join("profiles"),
+        state: dir.join("state").join("active-profile"),
     }
 }
 
@@ -104,8 +106,8 @@ toggle = "Alt+D"
 recording = "Alt+Shift+M"
 "#;
 
-/// The mockups' app: [`MOCKUP`], a Groq key in this shell, and a daemon
-/// that answered `info`.
+/// The mockups' app: [`MOCKUP`], a Groq key in this shell, a daemon that
+/// answered `info`, and the profiles folder read (none: base).
 pub fn mockup() -> Fixture {
     mockup_with("")
 }
@@ -122,6 +124,8 @@ pub fn mockup_on(toml: &str) -> Fixture {
         version: "0.2.0".into(),
         state: Some(State::Idle),
         recording: Some(RecordingPhase::Idle),
+        profile: None,
+        profile_error: None,
         backend: "deepgram-streaming".into(),
         features: [
             "local-whisper",
@@ -140,7 +144,97 @@ pub fn mockup_on(toml: &str) -> Fixture {
     fixture
         .app
         .update(Msg::Daemon(DaemonView::Up(InfoAnswer::Info(info))));
+    read_profiles(&mut fixture.app);
     fixture
+}
+
+/// The profiles folder of `app`'s temp dir read, as the worker reads it.
+pub fn read_profiles(app: &mut App) {
+    let folder = super::screens::profiles::read_folder(&app.paths.profile_paths());
+    app.update(Msg::ProfilesRead(folder));
+}
+
+/// Three profiles for the mockup's config: `offline` (local whisper, in
+/// German, commented), `work` (French, with base-only keys, a Groq key
+/// among them) and `broken` (not TOML).
+pub const PROFILES: &[(&str, &str)] = &[
+    (
+        "offline",
+        "# on the train\n[general]\nbackend = \"local-whisper\"\nlanguage = \"de\"\n\n\
+         [local-whisper]\nmodel_path = \"/m/ggml-base.bin\"\n",
+    ),
+    (
+        "work",
+        "[general]\nlanguage = \"fr\"\n[hotkeys]\ntoggle = \"Super+W\"\n\
+         [groq]\napi_key = \"gsk_profile_secret\"\n",
+    ),
+    ("broken", "[general\nbackend = \"groq\"\n"),
+];
+
+/// [`mockup`] with `profiles` in `profiles/`, `active` in the state file,
+/// the folder read.
+pub fn mockup_profiles(profiles: &[(&str, &str)], active: Option<&str>) -> Fixture {
+    with_profiles(mockup(), profiles, active)
+}
+
+/// `fixture` with `profiles` in `profiles/`, `active` in the state file,
+/// the folder read.
+pub fn with_profiles(
+    mut fixture: Fixture,
+    profiles: &[(&str, &str)],
+    active: Option<&str>,
+) -> Fixture {
+    let paths = fixture.app.paths.profile_paths();
+    std::fs::create_dir_all(&paths.profiles).unwrap();
+    for (name, text) in profiles {
+        std::fs::write(paths.profile(name), text).unwrap();
+    }
+    if let Some(active) = active {
+        whisrs::config::profile::set_active(&paths.state, Some(active)).unwrap();
+    }
+    read_profiles(&mut fixture.app);
+    fixture
+}
+
+/// A daemon that answered `info` as the mockup's does, on `profile`, with
+/// `error` for a profile that did not load, started at `at`. It names no
+/// backend, so Home shows the profile's.
+pub fn daemon_on(app: &mut App, profile: Option<&str>, error: Option<&str>, at: u64) {
+    let info = DaemonInfo {
+        version: "0.2.0".into(),
+        state: Some(State::Idle),
+        recording: Some(RecordingPhase::Idle),
+        profile: profile.map(String::from),
+        profile_error: error.map(String::from),
+        features: [
+            "local-whisper",
+            "tray",
+            "overlay",
+            "hooks",
+            "recording",
+            "mcp",
+        ]
+        .map(String::from)
+        .to_vec(),
+        started_at: at,
+        ..Default::default()
+    };
+    app.update(Msg::Daemon(DaemonView::Up(InfoAnswer::Info(info))));
+}
+
+/// Profiles open from Home, the folder read.
+pub fn open_profiles(fixture: &mut Fixture) {
+    press(&mut fixture.app, "\x1bgjjjj");
+    assert_eq!(press(&mut fixture.app, "\n"), [Effect::ReadProfiles]);
+    read_profiles(&mut fixture.app);
+}
+
+/// Profile mode on `name` from Profiles, read as the loop reads it.
+pub fn open_profile(fixture: &mut Fixture, name: &str) {
+    let load = super::screens::config::load_profile(&fixture.app.paths, name);
+    fixture
+        .app
+        .update(Msg::ProfileOpened(name.to_string(), load));
 }
 
 /// Press each key of `keys`: a character, or `\n` Enter, `\x1b` Esc, `\t`

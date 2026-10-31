@@ -54,6 +54,8 @@ pub enum Action {
     Summarize,
     /// `C` on History: clear it all.
     ClearAll,
+    /// `n` on Profiles: a new one.
+    New,
     // Text input.
     Type(char),
     Erase,
@@ -84,6 +86,10 @@ pub enum Mode {
     /// opened moves as rows do, `Ctrl+D`/`Ctrl+U` by half a page, and a
     /// recording's actions have their letters (`r`, `c`, `n`, `S`, `d`).
     Read,
+    /// The Profiles list: rows move as on Config, `Enter` switches, `l`
+    /// opens the profile in Config, `n` makes one, `d` deletes, `e` edits
+    /// its file.
+    Profiles,
 }
 
 pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
@@ -110,10 +116,20 @@ pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
         KeyCode::Up => Some(Action::Up),
         KeyCode::Down => Some(Action::Down),
         // Only where a list moves: in a dialog a page key is no answer.
-        KeyCode::PageUp if matches!(mode, Mode::Browse | Mode::Picker | Mode::Read) => {
+        KeyCode::PageUp
+            if matches!(
+                mode,
+                Mode::Browse | Mode::Picker | Mode::Read | Mode::Profiles
+            ) =>
+        {
             Some(Action::PageUp)
         }
-        KeyCode::PageDown if matches!(mode, Mode::Browse | Mode::Picker | Mode::Read) => {
+        KeyCode::PageDown
+            if matches!(
+                mode,
+                Mode::Browse | Mode::Picker | Mode::Read | Mode::Profiles
+            ) =>
+        {
             Some(Action::PageDown)
         }
         _ => None,
@@ -170,6 +186,19 @@ pub fn action(key: KeyEvent, mode: Mode) -> Option<Action> {
             KeyCode::Char('S') => Some(Action::Summarize),
             KeyCode::Char('d') => Some(Action::Delete),
             KeyCode::Char('C') => Some(Action::ClearAll),
+            _ => None,
+        },
+        Mode::Profiles => match key.code {
+            KeyCode::Char('j') => Some(Action::Down),
+            KeyCode::Char('k') => Some(Action::Up),
+            KeyCode::Char('g') | KeyCode::Home => Some(Action::First),
+            KeyCode::Char('G') | KeyCode::End => Some(Action::Last),
+            KeyCode::Char('l') => Some(Action::Right),
+            KeyCode::Char('q') => Some(Action::Quit),
+            KeyCode::Char('?') => Some(Action::Help),
+            KeyCode::Char('n') => Some(Action::New),
+            KeyCode::Char('d') => Some(Action::Delete),
+            KeyCode::Char('e') => Some(Action::Editor),
             _ => None,
         },
         Mode::Browse => match key.code {
@@ -424,6 +453,40 @@ mod tests {
         assert_eq!(
             action(press(KeyCode::Char('r')), Mode::Browse),
             Some(Action::Restart)
+        );
+    }
+
+    /// The Profiles list has its letters: `l` opens, `n` makes one, `d`
+    /// deletes, `e` edits the file; `w`, `h`, `x` and `/` mean nothing there.
+    #[test]
+    fn the_profiles_list_has_its_own_letters() {
+        for (c, want) in [
+            ('j', Action::Down),
+            ('k', Action::Up),
+            ('G', Action::Last),
+            ('l', Action::Right),
+            ('n', Action::New),
+            ('d', Action::Delete),
+            ('e', Action::Editor),
+            ('?', Action::Help),
+            ('q', Action::Quit),
+        ] {
+            assert_eq!(
+                action(press(KeyCode::Char(c)), Mode::Profiles),
+                Some(want),
+                "{c}"
+            );
+        }
+        for c in ['w', 'h', 'x', '/', 'r', 's'] {
+            assert_eq!(action(press(KeyCode::Char(c)), Mode::Profiles), None, "{c}");
+        }
+        assert_eq!(
+            action(press(KeyCode::Enter), Mode::Profiles),
+            Some(Action::Enter)
+        );
+        assert_eq!(
+            action(press(KeyCode::PageDown), Mode::Profiles),
+            Some(Action::PageDown)
         );
     }
 

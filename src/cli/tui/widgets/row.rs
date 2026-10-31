@@ -70,6 +70,9 @@ pub struct Row<'a> {
     /// Shows the gutter column at all (the rows of a list do; info rows do
     /// not, but keep its indent).
     pub gutter: bool,
+    /// A word at the row's right end, in its tone: whose value it is
+    /// (`profile`, `base`).
+    pub tag: Option<(&'a str, Tone)>,
 }
 
 impl Row<'_> {
@@ -85,6 +88,7 @@ impl Row<'_> {
             flash: false,
             input: None,
             gutter: true,
+            tag: None,
         }
     }
 
@@ -116,6 +120,13 @@ impl Row<'_> {
         spans.push(Span::raw(" ".repeat(pad)));
 
         let mut room = room.saturating_sub(label_room);
+        // The tag keeps its column, a space before it, ahead of the value.
+        let tag = self
+            .tag
+            .filter(|(text, _)| !text.is_empty() && width(text) + 1 < room);
+        if let Some((text, _)) = tag {
+            room -= width(text) + 1;
+        }
         if let Some(input) = self.input {
             spans.extend(input.spans(ui, room));
         } else {
@@ -150,6 +161,12 @@ impl Row<'_> {
                     arrow(self.at_max),
                 ));
             }
+        }
+        if let Some((text, tone)) = tag {
+            let used: usize = spans.iter().map(Span::width).sum();
+            let end = usize::from(area.width).saturating_sub(width(text));
+            spans.push(Span::raw(" ".repeat(end.saturating_sub(used).max(1))));
+            spans.push(Span::styled(text.to_string(), tone.style(theme)));
         }
         Line::from(spans).render(area, buf);
     }

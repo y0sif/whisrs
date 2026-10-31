@@ -1,0 +1,30 @@
+   ╭──────────────────────────────────────────────────────────────────────────────────╮
+   │ whisrs ▁▃▅▃▁                                       config · profile offline · ●  │
+   │                                                                                  │
+   │   General               ▌ backend           ◂ local-whisper ▸           profile  │
+   │   Backend & keys          deepgram api_key  set ****9f2c              base only  │
+   │   Audio                   deepgram model    nova-3                         base  │
+   │   Vocabulary              groq api_key      WHISRS_GROQ_API_KEY (thi… base only  │
+   │   Replacements            groq model        whisper-large-v3-turbo         base  │
+   │   Typing                  openai api_key    not set                   base only  │
+   │   Hotkeys                 openai model      gpt-4o-mini-transcribe         base  │
+   │   Overlay                 openai languages  none                           base  │
+   │   Read aloud (TTS)        whisper model     /m/ggml-base.bin            profile  │
+   │   Agents                  segmentation      silence                        base  │
+   │   LLM                     phrase silence    400 ms                         base  │
+   │   LLM commands            flash_attn        off                            base  │
+   │   Recording               sidecar url       http://127.0.0.1:8765/transcr… base  │
+   │   Hooks                   sidecar model     microsoft/VibeVoice-ASR-HF     base  │
+   │                           sidecar api_key   not set, optional         base only  │
+   │                           realtime url      empty                          base  │
+   │                           realtime model    Whisper-Tiny                   base  │
+   │                           realtime profile  lemonade                       base  │
+   │                                                                                  │
+   │                           The transcription backend. Its key or model is below.  │
+   │                           local-vosk and local-parakeet are not implemented      │
+   │                           yet; e edits their sections in config.toml. offline    │
+   │                           sets this; x puts back config.toml's value.            │
+   │                                                                                  │
+   │   ! unknown key [general] silense_timeout_ms is ignored                          │
+   ╰──────────────────────────────────────────────────────────────────────────────────╯
+     j/k move · tab pane · h/l change · enter pick · x base · w save · ? help

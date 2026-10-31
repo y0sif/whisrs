@@ -106,6 +106,14 @@ pub enum Command {
         #[serde(flatten)]
         options: RecordingOptions,
     },
+    /// Switch the config profile (`config::profile`): a profile's name,
+    /// `base`, or `None` for the next one. The daemon checks it loads, writes
+    /// the active name and restarts on it; refused unless everything is idle.
+    #[serde(rename = "switch-profile")]
+    SwitchProfile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 fn default_log_limit() -> usize {
@@ -138,6 +146,17 @@ pub enum Response {
     Info {
         info: DaemonInfo,
     },
+    /// The answer to `switch-profile`: the profile switched to (`base` for
+    /// the base config). `switching` when the daemon restarts on it now,
+    /// false when it was already on it. `skipped`: the profiles `next`
+    /// passed over on the way, which do not load.
+    Profile {
+        active: String,
+        #[serde(default)]
+        switching: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped: Vec<String>,
+    },
 }
 
 /// What `info` answers. Every field has a default, so a field added later is
@@ -157,6 +176,13 @@ pub struct DaemonInfo {
     /// `None` for a phase this client does not know, as `state`.
     #[serde(deserialize_with = "known_variant")]
     pub recording: Option<RecordingPhase>,
+    /// The config profile this whisrsd runs on: `None` is base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Why the active profile did not load, as the line clients show
+    /// (`config::profile::not_loaded`): the daemon runs on base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_error: Option<String>,
     /// `[general] backend` as configured.
     pub backend: String,
     /// The cargo features this whisrsd was built with ([`built_features`]).
@@ -1183,6 +1209,8 @@ mod tests {
             version: "0.2.0".to_string(),
             state: Some(State::Recording),
             recording: Some(RecordingPhase::Processing),
+            profile: None,
+            profile_error: None,
             backend: "deepgram-streaming".to_string(),
             features: vec!["tray".to_string(), "recording".to_string()],
             started_at: 1_793_000_000_000,
@@ -1214,6 +1242,86 @@ mod tests {
         assert!(matches!(parsed, Response::Info { info } if info == sample_info()));
     }
 
+    /// `switch-profile` names the profile, or leaves it out for the next one.
+    #[test]
+    fn switch_profile_wire_format() {
+        for (cmd, json) in [
+            (
+                Command::SwitchProfile {
+                    name: Some("offline".into()),
+                },
+                r#"{"cmd":"switch-profile","name":"offline"}"#,
+            ),
+            (
+                Command::SwitchProfile { name: None },
+                r#"{"cmd":"switch-profile"}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&cmd).unwrap(), json);
+            let parsed: Command = serde_json::from_str(json).unwrap();
+            assert_eq!(format!("{parsed:?}"), format!("{cmd:?}"));
+        }
+
+        let resp = Response::Profile {
+            active: "offline".into(),
+            switching: true,
+            skipped: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"profile","active":"offline","switching":true}"#
+        );
+        let resp = Response::Profile {
+            active: "clean".into(),
+            switching: true,
+            skipped: vec!["broken".into()],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"profile","active":"clean","switching":true,"skipped":["broken"]}"#
+        );
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::Profile { skipped, .. } if skipped == ["broken"]));
+        let parsed: Response = serde_json::from_str(r#"{"status":"profile","active":"base"}"#)
+            .expect("switching defaults");
+        assert!(matches!(
+            parsed,
+            Response::Profile { active, switching: false, skipped } if active == "base" && skipped.is_empty()
+        ));
+    }
+
+    /// `info` names the profile, and why one did not load; on base it sends
+    /// neither, so its answer reads as before.
+    #[test]
+    fn info_carries_the_profile() {
+        let info = DaemonInfo {
+            profile: Some("offline".into()),
+            ..sample_info()
+        };
+        let json = serde_json::to_string(&Response::Info { info: info.clone() }).unwrap();
+        assert!(json.contains(r#""recording":"processing","profile":"offline","backend""#));
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::Info { info: back } if back == info));
+
+        let why = "profile offline did not load, using base: profiles/offline.toml does not exist";
+        let parsed: Response = serde_json::from_str(&format!(
+            r#"{{"status":"info","info":{{"profile_error":"{why}"}}}}"#
+        ))
+        .unwrap();
+        let Response::Info { info } = parsed else {
+            panic!("not an info response: {parsed:?}");
+        };
+        assert_eq!(
+            (info.profile, info.profile_error.as_deref()),
+            (None, Some(why))
+        );
+
+        let base = serde_json::to_string(&sample_info()).unwrap();
+        assert!(!base.contains("profile"), "{base}");
+    }
+
     /// Fields come and go additively: a missing one takes its default, and
     /// one this client does not know (a later daemon's) is ignored.
     #[test]
@@ -1221,10 +1329,9 @@ mod tests {
         let empty: Response = serde_json::from_str(r#"{"status":"info","info":{}}"#).unwrap();
         assert!(matches!(empty, Response::Info { info } if info == DaemonInfo::default()));
 
-        let later: Response = serde_json::from_str(
-            r#"{"status":"info","info":{"state":"speaking","profile":"offline"}}"#,
-        )
-        .unwrap();
+        let later: Response =
+            serde_json::from_str(r#"{"status":"info","info":{"state":"speaking","uptime_ms":12}}"#)
+                .unwrap();
         let Response::Info { info } = later else {
             panic!("not an info response: {later:?}");
         };

@@ -768,6 +768,12 @@ const HOTKEYS: &[Field] = &[
         RECORDING_HOTKEY,
         Gate::Recording,
     ),
+    field(
+        "hotkeys.next_profile",
+        "next_profile",
+        HOTKEY,
+        "Switch to the next config profile: base, then the profiles by name.",
+    ),
 ];
 
 const COMMAND_HOTKEY: &str = "Command mode: speak an instruction, the LLM rewrites the selection.";
@@ -1483,6 +1489,7 @@ mod tests {
                 command: some("c"),
                 speak: some("d"),
                 recording: some("e"),
+                next_profile: some("f"),
             }),
             hooks: Some(HooksConfig {
                 media_auto_pause: true,
