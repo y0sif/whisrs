@@ -248,6 +248,7 @@ impl LocalWhisperBackend {
                 if holds_speech(&window, config.vad) {
                     let samples_f32 = i16_to_f32(&window);
                     let lang = config.language.clone();
+                    let is_multilingual = ctx.is_multilingual();
                     let prompt = prompt.clone();
                     let mut decode_state = state;
 
@@ -256,6 +257,7 @@ impl LocalWhisperBackend {
                             &mut decode_state,
                             &samples_f32,
                             &lang,
+                            is_multilingual,
                             prompt.as_deref(),
                         );
                         (decode_state, result)
@@ -310,6 +312,7 @@ impl LocalWhisperBackend {
             if holds_speech(remaining, config.vad) {
                 let samples_f32 = i16_to_f32(remaining);
                 let lang = config.language.clone();
+                let is_multilingual = ctx.is_multilingual();
                 let prompt = prompt.clone();
                 // Final decode of the stream — the state is consumed.
                 let mut decode_state = state;
@@ -319,6 +322,7 @@ impl LocalWhisperBackend {
                         &mut decode_state,
                         &samples_f32,
                         &lang,
+                        is_multilingual,
                         prompt.as_deref(),
                     );
                     (decode_state, result)
@@ -375,6 +379,7 @@ impl LocalWhisperBackend {
 
         let ctx = Arc::clone(ctx);
         let language = config.language.clone();
+        let is_multilingual = ctx.is_multilingual();
         let prompt = config.prompt.clone().filter(|p| !p.is_empty());
         let phrase_silence_ms = self.phrase_silence_ms;
         let vad = config.vad;
@@ -386,6 +391,7 @@ impl LocalWhisperBackend {
                 &i16_to_f32(&buffer),
                 &windows,
                 &language,
+                is_multilingual,
                 prompt.as_deref(),
             )
         })
@@ -563,10 +569,17 @@ async fn decode_phrase(
 
     let samples_f32 = i16_to_f32(&phrase);
     let lang = config.language.clone();
+    let is_multilingual = ctx.is_multilingual();
     let prompt = config.prompt.clone().filter(|p| !p.is_empty());
 
     match tokio::task::spawn_blocking(move || {
-        let result = run_whisper_inference(&mut state, &samples_f32, &lang, prompt.as_deref());
+        let result = run_whisper_inference(
+            &mut state,
+            &samples_f32,
+            &lang,
+            is_multilingual,
+            prompt.as_deref(),
+        );
         (state, result)
     })
     .await
@@ -610,10 +623,11 @@ fn run_whisper_inference(
     state: &mut whisper_rs::WhisperState,
     audio: &[f32],
     language: &str,
+    is_multilingual: bool,
     prompt: Option<&str>,
 ) -> anyhow::Result<String> {
     state
-        .full(full_params(language, prompt), audio)
+        .full(full_params(language, is_multilingual, prompt), audio)
         .map_err(|e| anyhow::anyhow!("whisper inference failed: {e}"))?;
 
     let mut text = String::new();
@@ -624,9 +638,24 @@ fn run_whisper_inference(
     Ok(text.trim().to_string())
 }
 
+fn decoder_language(language: &str, multilingual: bool) -> Option<&str> {
+    let language = language.trim();
+    if language.is_empty() {
+        return None;
+    }
+    if language.eq_ignore_ascii_case("auto") {
+        return if multilingual { None } else { Some("en") };
+    }
+    Some(language)
+}
+
 /// Decode parameters shared by every whisper call, dictation and recordings
 /// alike, so the invariants below cannot drift between the two.
-fn full_params<'a>(language: &'a str, prompt: Option<&str>) -> whisper_rs::FullParams<'a, 'a> {
+fn full_params<'a>(
+    language: &'a str,
+    is_multilingual: bool,
+    prompt: Option<&str>,
+) -> whisper_rs::FullParams<'a, 'a> {
     use whisper_rs::{FullParams, SamplingStrategy};
 
     // `best_of: 1` is load-bearing beyond decode quality: it keeps whisper.cpp's
@@ -636,9 +665,7 @@ fn full_params<'a>(language: &'a str, prompt: Option<&str>) -> whisper_rs::FullP
     // the returned state.
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-    if language != "auto" {
-        params.set_language(Some(language));
-    }
+    params.set_language(decoder_language(language, is_multilingual));
 
     // Static vocabulary/context hint (config `prompt` + `vocabulary`).
     if let Some(prompt) = prompt {
@@ -696,9 +723,10 @@ fn run_whisper_segments(
     state: &mut whisper_rs::WhisperState,
     audio: &[f32],
     language: &str,
+    is_multilingual: bool,
     prompt: Option<&str>,
 ) -> anyhow::Result<Vec<RawSegment>> {
-    let mut params = full_params(language, prompt);
+    let mut params = full_params(language, is_multilingual, prompt);
     params.set_n_max_text_ctx(0);
     state
         .full(params, audio)
@@ -789,10 +817,11 @@ fn decode_batch_windows(
     samples: &[f32],
     windows: &[DecodeWindow],
     language: &str,
+    is_multilingual: bool,
     prompt: Option<&str>,
 ) -> anyhow::Result<String> {
     decode_each_window(samples, windows, prompt, |buf| {
-        run_whisper_inference(state, buf, language, prompt)
+        run_whisper_inference(state, buf, language, is_multilingual, prompt)
     })
 }
 
@@ -897,7 +926,13 @@ fn decode_recording_windows(
         if buf.len() < MIN_DECODE_SAMPLES {
             buf.resize(MIN_DECODE_SAMPLES, 0);
         }
-        match run_whisper_segments(&mut state, &i16_to_f32(&buf), language, prompt) {
+        match run_whisper_segments(
+            &mut state,
+            &i16_to_f32(&buf),
+            language,
+            ctx.is_multilingual(),
+            prompt,
+        ) {
             Ok(raw) => segments.extend(place_window_segments(raw, window)),
             Err(e) => {
                 warn!("whisper recording window at {window_start_ms} ms failed: {e}");
@@ -939,6 +974,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
 
         let ctx = Arc::clone(ctx);
         let language = config.language.clone();
+        let is_multilingual = ctx.is_multilingual();
         let prompt = config.prompt.clone();
 
         // Up to one decode window, a single `full()` call over the whole
@@ -946,7 +982,13 @@ impl TranscriptionBackend for LocalWhisperBackend {
         if fits_one_decode_window(samples_i16.len()) {
             return tokio::task::spawn_blocking(move || {
                 let mut state = create_state(&ctx)?;
-                run_whisper_inference(&mut state, &samples_f32, &language, prompt.as_deref())
+                run_whisper_inference(
+                    &mut state,
+                    &samples_f32,
+                    &language,
+                    is_multilingual,
+                    prompt.as_deref(),
+                )
             })
             .await?;
         }
@@ -963,6 +1005,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 &samples_f32,
                 &windows,
                 &language,
+                is_multilingual,
                 prompt.as_deref(),
             )
         })
@@ -1075,6 +1118,17 @@ mod tests {
                 || msg.contains("not found"),
             "unexpected error: {msg}"
         );
+    }
+    #[test]
+    fn decoder_language_resolution() {
+        assert_eq!(decoder_language("auto", true), None);
+        assert_eq!(decoder_language("auto", false), Some("en"));
+        assert_eq!(decoder_language("AUTO", true), None);
+        assert_eq!(decoder_language("AUTO", false), Some("en"));
+        assert_eq!(decoder_language("", true), None);
+        assert_eq!(decoder_language("", false), None);
+        assert_eq!(decoder_language(" de ", true), Some("de"));
+        assert_eq!(decoder_language(" de ", false), Some("de"));
     }
 
     #[test]
