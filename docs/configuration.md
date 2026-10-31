@@ -297,6 +297,10 @@ model = "gpt-4o-mini-transcribe"
 # In the current whisrs typing pipeline, replaceable interim partials are kept
 # internal and only completed phrases are typed at the cursor.
 # Note (Lemonade): load the model server-side (not just `pull`) or it returns empty text.
+# NVIDIA's Nemotron 3.5 ASR Streaming in nemo-speech works with profile
+# "lemonade". Run the server with --endpointing to type each phrase at a
+# pause; without it everything is typed only after you stop. See
+# contrib/asr-sidecars/nemo-speech/.
 [openai-compatible-realtime]
 url = "ws://localhost:12345/realtime"
 model = "Whisper-Tiny"
@@ -351,8 +355,9 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 
 # Generic local ASR sidecar — talks to a small HTTP service that hosts the
 # model (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR, …). Keeps
-# Python/PyTorch out of the Rust daemon. See contrib/asr-sidecars/ for
-# ready-to-run sidecars and the wire-format contract.
+# Python/PyTorch out of the Rust daemon. See contrib/asr-sidecars/ (nemo-speech
+# among them) for ready-to-run sidecars and the wire-format contract.
+# For hosted models through OpenRouter, see "ASR sidecar servers" below.
 #
 # The contract is the OpenAI /v1/audio/transcriptions shape (multipart
 # file/model/language in, {"text": ...} back), so this is also the backend for
@@ -423,6 +428,8 @@ backend = "groq"            # groq | openai | deepgram | tts-sidecar
 # model = "..."             # optional; backend default when unset.
 #                           #   groq: canopylabs/orpheus-v1-english, openai: gpt-4o-mini-tts,
 #                           #   deepgram: aura-2-thalia-en, tts-sidecar: kokoro
+#                           #   groq also speaks Saudi Arabic: see "Read-aloud in
+#                           #   Arabic" below
 # voice = "..."             # optional; backend default (groq: autumn, openai: alloy,
 #                           #   tts-sidecar: af_heart). Ignored by deepgram (voice is in the model id).
 response_format = "wav"     # audio format requested from the API
@@ -636,6 +643,88 @@ terminal, each run of line breaks becomes a single space, whether the text is
 typed or pasted. A `clipboard_only` copy keeps its line breaks. This uses the
 same terminal detection, so it does not fire on KDE and GNOME. Control characters such as Escape and Backspace are removed from
 everything whisrs types, pastes or copies, wherever it is going.
+
+## ASR sidecar servers
+
+The `asr-sidecar` backend posts to any server that speaks OpenAI's
+`/v1/audio/transcriptions`, on your machine or hosted. Local recipes are in
+[`contrib/asr-sidecars/`](../contrib/asr-sidecars/):
+[`nemo-speech`](../contrib/asr-sidecars/nemo-speech/) runs NVIDIA's Nemotron
+3.5 ASR Streaming (live dictation and recordings) and Parakeet TDT v3 (batch
+dictation) from one prebuilt binary with no Python, and
+`moonshine`, `parakeet` and `vibevoice` are Python servers.
+
+### OpenRouter
+
+[OpenRouter](https://openrouter.ai/) serves hosted speech-to-text models from
+several providers behind one OpenAI-compatible endpoint, so `asr-sidecar`
+reaches them as they are:
+
+```toml
+[general]
+backend = "asr-sidecar"
+
+[asr-sidecar]
+url = "https://openrouter.ai/api/v1/audio/transcriptions"
+model = "microsoft/mai-transcribe-2"
+api_key = "sk-or-..."   # or leave it out and set WHISRS_ASR_SIDECAR_API_KEY
+```
+
+Some picks, each checked on 2026-10-31 with the request whisrs sends:
+
+| `model` | Price per hour of audio | Note |
+|---|---|---|
+| `microsoft/mai-transcribe-2` | $0.10 | 60 languages |
+| `elevenlabs/scribe-v2` | $0.22 | |
+| `mistralai/voxtral-mini-transcribe-3-0` | $0.21 | compact |
+| `nvidia/nemotron-3.5-transcribe` | $0.12 | open-weight |
+| `qwen/qwen3-asr-1.7b` | $0.027 | 30 languages |
+| `openai/whisper-large-v3-turbo` | $0.012 | cheapest here |
+
+Prices are OpenRouter's list prices
+(`https://openrouter.ai/api/v1/models?output_modalities=transcription`).
+OpenRouter picks the provider, and a request can cost more than the list price: an 8-second
+`whisper-large-v3-turbo` request that went to Groq was billed as 10 seconds
+at about $0.04 an hour.
+
+- No model is free.
+- `[general] vocabulary` and `prompt` do nothing: whisrs sends them as the
+  `hotwords` field, which OpenRouter accepts and ignores.
+- Recordings take more requests. No model returns `segments` (timed lines),
+  so whisrs sends a recording's first chunk (up to 10 minutes of speech)
+  whole once, then transcribes that chunk and every later one a phrase per
+  request. That first chunk is paid twice, and a provider that bills a
+  minimum per request (Groq above: 10 seconds) bills it for every short
+  phrase. The whole-chunk request is made once per recording, or once per
+  daemon start when `[general] backend` is `asr-sidecar` too. Each phrase is
+  also transcribed without the words around it, which costs accuracy against
+  the same audio sent whole.
+
+## Read-aloud in Arabic
+
+Groq's Orpheus also speaks Saudi Arabic. It needs a Groq key:
+`[tts] api_key`, `[groq] api_key` or `WHISRS_GROQ_API_KEY`.
+
+```toml
+[tts]
+enabled = true
+backend = "groq"
+model = "canopylabs/orpheus-arabic-saudi"
+voice = "noura"
+```
+
+Its voices are `abdullah`, `fahad` and `sultan` (male) and `lulwa`, `noura`
+and `aisha` (female), from
+[Groq's Orpheus docs](https://console.groq.com/docs/text-to-speech/orpheus)
+(checked 2026-10-31). Set `voice` with the model: the default, `autumn`, is
+an English voice. The pickers in `whisrs config` list both models and all
+their voices.
+
+The model needs a one-time step: an admin of your Groq organization accepts
+its terms in the Groq console, at
+<https://console.groq.com/playground?model=canopylabs%2Forpheus-arabic-saudi>.
+Until then every request fails with a 400 `model_terms_required` error whose
+message holds that URL.
 
 ## Agent mode
 

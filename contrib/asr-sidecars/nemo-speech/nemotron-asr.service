@@ -1,0 +1,26 @@
+[Unit]
+Description=Nemotron 3.5 ASR Streaming sidecar for whisrs (nemo-speech serve)
+Documentation=https://github.com/y0sif/whisrs/blob/main/contrib/asr-sidecars/nemo-speech/README.md
+
+[Service]
+Type=simple
+# CPU build. For the Vulkan build, use the -vulkan directory and --device vulkan:0.
+# --endpointing ends a phrase at each pause, so live dictation types it then;
+# without it nothing is typed until the dictation stops.
+ExecStart=%h/.local/share/nemo-speech/nemo-speech-0.2.0-linux-x86_64-cpu/bin/nemo-speech serve \
+    --host 127.0.0.1 --port 8772 --no-ui --device cpu \
+    --asr-model %h/.local/share/nemo-speech/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf \
+    --endpointing
+# Keep any model nemo-speech downloads on its own beside the binary.
+Environment=NEMO_SPEECH_MODEL_DIR=%h/.local/share/nemo-speech/models
+# No Nice=: live dictation waits on this server.
+Restart=on-failure
+RestartSec=5
+# Nemotron peaked at 1.44 GB on a 600 s file, the longest request a recording
+# sends. Past this cap the kernel stops the sidecar alone, not your session.
+# No swap, so the cap stops it instead of swapping.
+MemoryMax=4G
+MemorySwapMax=0
+
+[Install]
+WantedBy=default.target

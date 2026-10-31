@@ -1,0 +1,26 @@
+[Unit]
+Description=Parakeet TDT v3 ASR sidecar for whisrs batch dictation (nemo-speech serve)
+Documentation=https://github.com/y0sif/whisrs/blob/main/contrib/asr-sidecars/nemo-speech/README.md
+
+[Service]
+Type=simple
+# CPU build. For the Vulkan build, use the -vulkan directory and --device vulkan:0.
+# Batch only: Parakeet TDT has no live mode, so no --endpointing.
+ExecStart=%h/.local/share/nemo-speech/nemo-speech-0.2.0-linux-x86_64-cpu/bin/nemo-speech serve \
+    --host 127.0.0.1 --port 8773 --no-ui --device cpu \
+    --asr-model %h/.local/share/nemo-speech/models/nvidia/parakeet-tdt-0.6b-v3/541d1f99c6b0c3cd0b11a95167540bb8edefd82b/parakeet-tdt-0.6b-v3.q8_0.gguf
+# Keep any model nemo-speech downloads on its own beside the binary.
+Environment=NEMO_SPEECH_MODEL_DIR=%h/.local/share/nemo-speech/models
+# No Nice=: dictation waits on this server.
+Restart=on-failure
+RestartSec=5
+# Batch dictation only, not recordings: a recording sends its first chunk (up
+# to 10 minutes of speech) whole, and on 4 CPU cores Parakeet peaked at
+# 3.56 GB on 300 s of audio and was killed at this cap on 360 s. Past the cap
+# the kernel stops the sidecar alone, not your session. No swap, so the cap
+# stops it instead of swapping.
+MemoryMax=4G
+MemorySwapMax=0
+
+[Install]
+WantedBy=default.target
