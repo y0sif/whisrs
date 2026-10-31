@@ -110,10 +110,14 @@ async fn main() -> Result<()> {
     // Wait for compositor environment on boot (WAYLAND_DISPLAY, etc.).
     // Must run before window tracker detection and any clipboard operations.
     import_compositor_env().await;
-    warm_keyboard(
-        std::time::Duration::from_millis(config.input.key_delay_ms),
-        config.input.backend,
-    );
+    // Off the startup path: the prewarm sleeps 1 s so X11 can attach the
+    // device keymap. It holds the keyboard lock throughout, so an early
+    // injection waits for it and reuses that keyboard.
+    {
+        let key_delay = std::time::Duration::from_millis(config.input.key_delay_ms);
+        let backend = config.input.backend;
+        tokio::task::spawn_blocking(move || warm_keyboard(key_delay, backend));
+    }
     // Open the keyboards the pre-injection modifier check reads (#154) now,
     // off the hot path, so the first dictation does not pay for it. Always:
     // selection capture (speak, command) checks modifiers even when
