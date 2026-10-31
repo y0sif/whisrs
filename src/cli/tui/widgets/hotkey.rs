@@ -16,9 +16,9 @@ use super::{dialog, wrap, Ui};
 use crate::tui::keys::Action;
 
 /// Where the dialog's focus is: a modifier, the key, or the result.
-const KEY: usize = 4;
-const RESULT: usize = 5;
-const STOPS: usize = 6;
+pub const KEY: usize = 4;
+pub const RESULT: usize = 5;
+pub const STOPS: usize = 6;
 
 /// What a key in the dialog asks of the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,8 +89,18 @@ impl HotkeyDialog {
         Some(parts.join("+"))
     }
 
+    /// The modifiers, in [`MODIFIER_NAMES`]' order: on or off.
+    pub fn mods(&self) -> [bool; 4] {
+        self.mods
+    }
+
+    /// The part with the focus: a modifier (0 to 3), [`KEY`] or [`RESULT`].
+    pub fn focus(&self) -> usize {
+        self.focus
+    }
+
     /// The result if the parser takes it, else why not.
-    fn checked(&self) -> Result<String, String> {
+    pub fn checked(&self) -> Result<String, String> {
         let result = self.result().ok_or_else(|| "pick a key".to_string())?;
         whisrs::hotkey::parse_hotkey(&result)
             .map(|_| result)

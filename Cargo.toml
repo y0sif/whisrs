@@ -101,6 +101,10 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 realfft = { version = "3.5", optional = true }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "blocking", "rustls-tls"] }
+# Agent access to the `whisrs config` TUI: its widget tree and inputs over a
+# 0600 socket, read by the `taria-mcp` bridge. CLI binary only. It asks for
+# the same ratatui (0.30.2, default features off) as above.
+taria-ratatui = "0.4.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 swayipc = "3"

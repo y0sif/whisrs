@@ -16,7 +16,7 @@ use crate::tui::widgets::{Notice, Tone, Ui};
 use crate::tui::worker::DaemonView;
 
 /// The screens Home opens, and their names.
-const SCREENS: &[(Screen, &str)] = &[
+pub const SCREENS: &[(Screen, &str)] = &[
     (Screen::Setup, "Setup"),
     (Screen::Config, "Config"),
     (Screen::Mic, "Mic test"),
@@ -50,6 +50,11 @@ impl Home {
             _ => {}
         }
         None
+    }
+
+    /// The cursor, into [`SCREENS`].
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 
     /// Put the cursor on `screen`'s row: the one just left.
@@ -185,7 +190,7 @@ fn profile_row(app: &App, info: Option<&whisrs::DaemonInfo>) -> Option<Value> {
 }
 
 /// The right pane: the daemon, then the config.
-fn info_rows(app: &App, ui: &Ui) -> Vec<(&'static str, Value)> {
+pub fn info_rows(app: &App, ui: &Ui) -> Vec<(&'static str, Value)> {
     let config = app.config.form.config();
     let sep = ui.glyphs.separator;
     let mut rows = Vec::new();

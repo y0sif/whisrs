@@ -49,6 +49,12 @@ const LABEL_WIDTH: usize = 12;
 /// What `t` on read aloud says, with the voice picked.
 pub const SAMPLE: &str = "This is how whisrs reads your text aloud.";
 
+/// The first step's two rows, when a config is there, and what each does.
+pub const EXISTING: [(&str, &str); 2] = [
+    ("Start fresh", "answer every question again"),
+    ("System checks only", "keep the config, check the machine"),
+];
+
 /// A step of the wizard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
@@ -249,7 +255,7 @@ pub enum SystemAction {
 
 /// What a check row's `Space` does.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Fix {
+pub enum Fix {
     /// The sudo commands, in the plain terminal.
     Uinput,
     System(SystemAction),
@@ -261,16 +267,16 @@ enum Fix {
 }
 
 /// A row of the last step.
-struct CheckRow {
-    label: &'static str,
+pub struct CheckRow {
+    pub label: &'static str,
     /// Done, to do, or something to look at.
-    mark: Mark,
-    text: String,
-    fix: Option<Fix>,
+    pub mark: Mark,
+    pub text: String,
+    pub fix: Option<Fix>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mark {
+pub enum Mark {
     Done,
     ToDo,
     Look,
@@ -461,6 +467,26 @@ impl Setup {
         self.editor.form.config().general.backend.clone()
     }
 
+    /// The cursor on setup's own rows: the choice, the question, the checks.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// An optional step shows its rows, not its question.
+    pub fn filling(&self) -> bool {
+        self.filling
+    }
+
+    /// Whether `Backspace` has a step to go back to.
+    pub fn has_previous(&self) -> bool {
+        (self.step.optional() && self.filling) || !self.back.is_empty()
+    }
+
+    /// The whisper model picker, while it is open.
+    pub fn model_picker(&self) -> Option<&Picker> {
+        self.picker.as_ref()
+    }
+
     /// The rows on screen now: none while an optional step asks its
     /// question.
     fn rows(&self) -> Vec<(&'static Field, String)> {
@@ -613,12 +639,12 @@ impl Setup {
     }
 
     /// The step is local whisper's model.
-    fn model_step(&self) -> bool {
+    pub fn model_step(&self) -> bool {
         self.step == Step::Key && matches!(self.backend().as_str(), "local-whisper" | "local")
     }
 
     /// The key the step tests with `t`.
-    fn target(&self) -> Option<Target> {
+    pub fn target(&self) -> Option<Target> {
         match self.step {
             Step::Key => Some(Target::Backend(self.backend())),
             Step::Command if self.filling => Some(Target::Llm),
@@ -1281,12 +1307,12 @@ impl Setup {
         Reply::default()
     }
 
-    fn whisper_model(&self) -> &'static WhisperModel {
+    pub fn whisper_model(&self) -> &'static WhisperModel {
         &catalog::WHISPER_MODELS[self.model]
     }
 
     /// Whether model `name` is in the models folder, as last listed.
-    fn has_model(&self, name: &str) -> bool {
+    pub fn has_model(&self, name: &str) -> bool {
         match &self.editor.lists.models {
             Listed::Ready(files) => files.iter().any(|file| {
                 file.path.file_name().and_then(|n| n.to_str()) == Some(&model::file_name(name))
@@ -1658,7 +1684,7 @@ impl Setup {
     }
 
     /// The last step's rows; `daemon_up` notes a daemon started by hand.
-    fn check_rows(&self, daemon_up: bool) -> Vec<CheckRow> {
+    pub fn check_rows(&self, daemon_up: bool) -> Vec<CheckRow> {
         let Some(checks) = &self.checks else {
             return Vec::new();
         };
@@ -1820,7 +1846,7 @@ impl Setup {
     }
 
     /// The step's title and what to know first.
-    fn intro(&self) -> (String, String) {
+    pub fn intro(&self) -> (String, String) {
         let env_note = |var: &str| match self.env.get(var).filter(|v| !v.is_empty()) {
             Some(_) => format!(
                 " {var} is set in this shell and wins over a key here; the daemon must see it in \
@@ -1971,15 +1997,17 @@ impl Setup {
             .to_string()
     }
 
-    /// The review: each answer, and what the write will do.
-    fn review(&self, ui: &Ui) -> Vec<(String, Shown)> {
+    /// The review: each answer, and what the write will do. A key in the
+    /// file shows masked, or with `masked` off as `set` alone.
+    pub fn review(&self, ui: &Ui, masked: bool) -> Vec<(String, Shown)> {
         let config = self.editor.form.config();
         let sep = ui.glyphs.separator;
         let on = |b: bool| if b { "on" } else { "off" };
         let mut rows = vec![("backend".to_string(), Shown::plain(&config.general.backend))];
         let key = match keys::key_summary_from(config, |var| self.env.get(var).map(str::to_string))
         {
-            KeySummary::File { masked } => Some(Shown::plain(format!("set {masked}"))),
+            KeySummary::File { masked: key } if masked => Some(Shown::plain(format!("set {key}"))),
+            KeySummary::File { .. } => Some(Shown::plain("set")),
             KeySummary::Env { var, .. } => {
                 Some(Shown::plain(var).then("(this shell)", Tone::Muted))
             }
@@ -2105,7 +2133,7 @@ impl Setup {
     }
 
     /// What the write will do, and what it would refuse.
-    fn review_notes(&self) -> Vec<Notice> {
+    pub fn review_notes(&self) -> Vec<Notice> {
         let mut notes = Vec::new();
         let local = matches!(self.backend().as_str(), "local-whisper" | "local");
         if local && !self.has_model(self.whisper_model().name) {
@@ -2374,7 +2402,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
 
 impl Setup {
     /// How many rows the editor draws on this step.
-    fn editor_rows(&self) -> usize {
+    pub fn editor_rows(&self) -> usize {
         match self.step {
             Step::Existing | Step::Review | Step::Checks => 0,
             _ if self.model_step() => 0,
@@ -2418,7 +2446,7 @@ impl Setup {
     }
 
     /// An optional step's question: its two rows, each with what it means.
-    fn question(&self) -> [(&'static str, String); 2] {
+    pub fn question(&self) -> [(&'static str, String); 2] {
         let kept = |section: &str| match self.existing {
             Some(_) => format!("{section} stays as config.toml has it"),
             None => "whisrs config sets it later".to_string(),
@@ -2470,7 +2498,7 @@ impl Setup {
             Step::Existing => "System checks only".len() + 2,
             step if step.optional() && !self.filling => "Keep as it is".len() + 2,
             Step::Review => self
-                .review(ui)
+                .review(ui, true)
                 .iter()
                 .map(|(label, _)| crate::tui::widgets::width(label) + 2)
                 .max()
@@ -2490,13 +2518,7 @@ impl Setup {
         };
         match self.step {
             Step::Existing => {
-                for (i, (name, about)) in [
-                    ("Start fresh", "answer every question again"),
-                    ("System checks only", "keep the config, check the machine"),
-                ]
-                .into_iter()
-                .enumerate()
-                {
+                for (i, (name, about)) in EXISTING.into_iter().enumerate() {
                     lines.push(row(
                         name,
                         Shown::muted(about),
@@ -2552,7 +2574,7 @@ impl Setup {
                 lines.extend(app.mic.lines(width, ui));
             }
             Step::Review => {
-                for (label, value) in self.review(ui) {
+                for (label, value) in self.review(ui, true) {
                     lines.push(row(&label, value, false, false, false));
                 }
                 if let Some(changes) = self.changes() {
@@ -2680,7 +2702,7 @@ impl Setup {
     }
 
     /// What `t` does on this step, before it ran.
-    fn test_hint(&self) -> &'static str {
+    pub fn test_hint(&self) -> &'static str {
         match (self.step, self.backend().as_str()) {
             (Step::Command, _) => "t tests the key, sending no audio",
             (_, "asr-sidecar" | "asr" | "vibevoice") => {

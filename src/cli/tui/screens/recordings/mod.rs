@@ -11,6 +11,7 @@ mod read;
 mod tests;
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -75,7 +76,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    fn word(self) -> &'static str {
+    pub fn word(self) -> &'static str {
         match self {
             Phase::Recording => "recording",
             Phase::Queued => "queued",
@@ -154,7 +155,7 @@ impl Item {
     }
 
     /// The row's one note, and how it reads.
-    fn note(&self) -> Option<(String, Tone)> {
+    pub fn note(&self) -> Option<(String, Tone)> {
         let speakers = |n: usize| match n {
             0 => None,
             1 => Some(("1 speaker".to_string(), Tone::Muted)),
@@ -436,7 +437,7 @@ struct Reading {
 
 /// `n`: the speaker picker, then the name input.
 #[derive(Debug, Clone)]
-enum Naming {
+pub enum Naming {
     Picking {
         id: String,
         label: String,
@@ -482,6 +483,15 @@ pub struct Recordings {
     /// How far the open transcript can scroll and how tall it is, as last
     /// drawn: a key moves within that.
     shown: Cell<(usize, usize)>,
+    /// Each recording's serial, given on first sight and never given again
+    /// in the session: an agent's node id for it, which a recording deleted
+    /// and made again under the same id does not inherit.
+    serials: HashMap<String, u64>,
+    next_serial: u64,
+    /// How many rows the list had room for as last drawn, and the open
+    /// transcript's turns on screen then (the first, the one after the last).
+    listed: Cell<Option<usize>>,
+    turns: Cell<Option<(usize, usize)>>,
 }
 
 impl Recordings {
@@ -499,6 +509,10 @@ impl Recordings {
             naming: None,
             busy: Vec::new(),
             shown: Cell::new((usize::MAX, PAGE)),
+            serials: HashMap::new(),
+            next_serial: 1,
+            listed: Cell::new(None),
+            turns: Cell::new(None),
         }
     }
 
@@ -521,7 +535,7 @@ impl Recordings {
         }
     }
 
-    fn entries(&self) -> &[Item] {
+    pub fn entries(&self) -> &[Item] {
         match &self.folder {
             Some(Ok(entries)) => entries,
             _ => &[],
@@ -529,7 +543,7 @@ impl Recordings {
     }
 
     /// The entries the filter keeps, by index.
-    fn visible(&self) -> Vec<usize> {
+    pub fn visible(&self) -> Vec<usize> {
         self.entries()
             .iter()
             .enumerate()
@@ -543,7 +557,7 @@ impl Recordings {
     }
 
     /// The entry under the cursor.
-    fn focused(&self) -> Option<&Item> {
+    pub fn focused(&self) -> Option<&Item> {
         let visible = self.visible();
         visible.get(self.cursor).map(|&i| &self.entries()[i])
     }
@@ -606,6 +620,17 @@ impl Recordings {
     /// transcript or a name flow on one that is gone closes, and the
     /// recording under the cursor is read whole if it changed.
     pub fn read(&mut self, folder: Result<Vec<Item>, String>) -> Option<Wanted> {
+        if let Ok(items) = &folder {
+            // A recording gone from the folder takes its serial with it.
+            self.serials
+                .retain(|id, _| items.iter().any(|item| item.id == *id));
+            for item in items {
+                if !self.serials.contains_key(&item.id) {
+                    self.serials.insert(item.id.clone(), self.next_serial);
+                    self.next_serial += 1;
+                }
+            }
+        }
         self.folder = Some(folder);
         self.refocus();
         if let Some(reading) = &self.open {
@@ -662,13 +687,14 @@ impl Recordings {
         if let Some(Ok(items)) = &mut self.folder {
             items.retain(|item| item.id != act.id);
         }
+        self.serials.remove(&act.id);
         self.refocus();
         self.want()
     }
 
     /// `entry` read whole: at its stamp, else an earlier read while the new
     /// one comes.
-    fn detail(&self, entry: &Item) -> Option<&Result<Detail, String>> {
+    pub fn detail(&self, entry: &Item) -> Option<&Result<Detail, String>> {
         self.cache
             .iter()
             .rev()
@@ -752,6 +778,7 @@ impl Recordings {
                 };
                 self.open = Some(Reading { id, scroll: 0 });
                 self.shown.set((usize::MAX, PAGE));
+                self.turns.set(None);
                 Reply {
                     read: self.want(),
                     ..Reply::default()
@@ -1018,8 +1045,55 @@ impl Recordings {
     }
 }
 
+/// What the agent tree reads of the screen.
+impl Recordings {
+    /// The cursor, into [`Recordings::visible`].
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The recording whose transcript is open, and how far down it is.
+    pub fn reading(&self) -> Option<(&Item, usize)> {
+        let reading = self.open.as_ref()?;
+        Some((self.entry(&reading.id)?, reading.scroll))
+    }
+
+    /// The filter being typed.
+    pub fn typing(&self) -> Option<&Input> {
+        self.typing.as_ref()
+    }
+
+    /// The speaker picker or the name input, while one is open.
+    pub fn naming(&self) -> Option<&Naming> {
+        self.naming.as_ref()
+    }
+
+    /// The serial of recording `id`, as the agent's node ids carry it.
+    pub fn serial(&self, id: &str) -> Option<u64> {
+        self.serials.get(id).copied()
+    }
+
+    /// The recording with `serial`, by its place in [`Recordings::visible`].
+    pub fn find_serial(&self, serial: u64) -> Option<usize> {
+        self.visible()
+            .iter()
+            .position(|&i| self.serials.get(&self.entries()[i].id) == Some(&serial))
+    }
+
+    /// How many rows the list had room for as last drawn.
+    pub fn listed(&self) -> Option<usize> {
+        self.listed.get()
+    }
+
+    /// The open transcript's turns as last drawn: the first, and the one
+    /// after the last.
+    pub fn turns(&self) -> Option<(usize, usize)> {
+        self.turns.get()
+    }
+}
+
 /// What the body holds when it is not the list.
-fn body_text(app: &App, width: usize) -> Option<Vec<(String, Tone)>> {
+pub fn body_text(app: &App, width: usize) -> Option<Vec<(String, Tone)>> {
     let screen = &app.recordings;
     let lines = |text: &str, tone: Tone| -> Vec<(String, Tone)> {
         wrap(text, width.max(1))
@@ -1080,7 +1154,7 @@ fn pad(text: &str, columns: usize) -> String {
 
 /// The preview's head and a transcript's: `Standup · 32m · deepgram · 3
 /// speakers`.
-fn summary_line(entry: &Item, detail: Option<&Detail>, ui: &Ui) -> String {
+pub fn summary_line(entry: &Item, detail: Option<&Detail>, ui: &Ui) -> String {
     let mut parts = vec![entry
         .title
         .clone()
@@ -1101,7 +1175,7 @@ fn summary_line(entry: &Item, detail: Option<&Detail>, ui: &Ui) -> String {
 }
 
 /// Why `entry` shows no transcript.
-fn no_transcript(entry: &Item, detail: &Detail) -> String {
+pub fn no_transcript(entry: &Item, detail: &Detail) -> String {
     let why = detail
         .error
         .as_deref()
@@ -1239,6 +1313,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
 fn draw_list(screen: &Recordings, visible: &[usize], f: &mut Frame, area: Rect, ui: &Ui) {
     let height = usize::from(area.height);
     let offset = crate::tui::widgets::scroll(visible.len(), screen.cursor, height);
+    screen.listed.set(Some(height));
     // The gutter and its space.
     let room = usize::from(area.width).saturating_sub(2 + DATE_WIDTH);
     let tail = DURATION_WIDTH + 2 + STATUS_WIDTH;
@@ -1375,6 +1450,14 @@ fn reader(app: &App, f: &mut Frame, ui: &Ui) {
     let most = lines.len().saturating_sub(height);
     screen.shown.set((most, height));
     let offset = reading.scroll.min(most);
+    screen.turns.set(turns_on_screen(
+        detail,
+        lines.len(),
+        offset,
+        height,
+        max,
+        ui,
+    ));
     for (i, line) in lines.into_iter().skip(offset).take(height).enumerate() {
         f.render_widget(Paragraph::new(line), at(body.y + 2 + i as u16));
     }
@@ -1386,6 +1469,37 @@ fn reader(app: &App, f: &mut Frame, ui: &Ui) {
     }
     footer(screen, f, placed.footer, ui);
     draw_naming(screen, f, placed.frame, body, ui);
+}
+
+/// The turns of a transcript `total` lines long that are on screen from
+/// line `offset`, `height` lines: the first, and the one after the last.
+fn turns_on_screen(
+    detail: Option<&Result<Detail, String>>,
+    total: usize,
+    offset: usize,
+    height: usize,
+    max: usize,
+    ui: &Ui,
+) -> Option<(usize, usize)> {
+    let Some(Ok(detail)) = detail else {
+        return None;
+    };
+    let sizes: Vec<usize> = detail
+        .lines
+        .iter()
+        .map(|text| turn_lines(text, max, ui).len())
+        .collect();
+    // The summary and the headings come before the turns.
+    let mut at = total.saturating_sub(sizes.iter().sum());
+    let (mut first, mut end) = (None, 0);
+    for (i, size) in sizes.into_iter().enumerate() {
+        if at + size > offset && at < offset + height {
+            first.get_or_insert(i);
+            end = i + 1;
+        }
+        at += size;
+    }
+    Some((first.unwrap_or(end), end))
 }
 
 /// The transcript view's lines, `max` columns wide.

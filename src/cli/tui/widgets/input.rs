@@ -30,6 +30,17 @@ impl Input {
         self.chars.iter().collect()
     }
 
+    /// Whether it takes a key: shown as bullets, and to an agent as its
+    /// length alone.
+    pub fn is_secret(&self) -> bool {
+        self.secret
+    }
+
+    /// How many characters it holds.
+    pub fn count(&self) -> usize {
+        self.chars.len()
+    }
+
     /// Apply an editing action; `false` for one that is not editing.
     pub fn apply(&mut self, action: Action) -> bool {
         match action {

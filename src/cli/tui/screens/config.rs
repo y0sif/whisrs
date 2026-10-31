@@ -657,6 +657,11 @@ enum View {
         path: String,
         field: &'static Field,
         cursor: usize,
+        /// Each item's serial, with the item it was given for: an agent's id
+        /// for the row. An item added gets a new one, a deleted one takes
+        /// its own with it, an edit keeps it, and the list open again, or
+        /// changed under it, gets all new ones; none is given twice.
+        serials: Vec<(u64, String)>,
     },
 }
 
@@ -680,7 +685,7 @@ impl View {
 
 /// A row of the detail pane.
 #[derive(Clone)]
-enum Item {
+pub enum Item {
     Field {
         field: &'static Field,
         path: String,
@@ -828,6 +833,8 @@ pub struct ConfigScreen {
     /// On base, the active profile and the paths it sets: its rows say it
     /// overrides them.
     pub overrides: Option<(String, BTreeSet<String>)>,
+    /// The next list item's serial ([`View::List`]).
+    next_serial: u64,
 }
 
 impl ConfigScreen {
@@ -875,6 +882,7 @@ impl ConfigScreen {
             spin: 0,
             profile: None,
             overrides: None,
+            next_serial: 1,
         }
     }
 
@@ -1245,8 +1253,26 @@ impl ConfigScreen {
             .map_or_else(|| format!("{} {}", entries.noun, index + 1), str::to_string)
     }
 
-    /// Keep every cursor on a row after the rows changed.
+    /// Keep every cursor on a row after the rows changed, and every list's
+    /// serials on its items: a list changed under them gets new ones.
     fn clamp(&mut self) {
+        for at in 0..self.views.len() {
+            let stale = match &self.views[at] {
+                View::List { path, serials, .. } => {
+                    let items = self.list(path);
+                    (serials.len() != items.len()
+                        || serials.iter().zip(&items).any(|((_, was), now)| was != now))
+                    .then(|| path.clone())
+                }
+                _ => None,
+            };
+            if let Some(path) = stale {
+                let fresh = self.fresh_serials(&path);
+                if let View::List { serials, .. } = &mut self.views[at] {
+                    *serials = fresh;
+                }
+            }
+        }
         if let Some(entries) = self.entries() {
             let count = self.form.entries(entries.path).len();
             self.views.retain(|view| match view {
@@ -1448,6 +1474,13 @@ impl ConfigScreen {
                     let mut list = self.list(path);
                     list.remove(index);
                     let outcome = self.set_list(path, list);
+                    if outcome.status.is_none() {
+                        self.with_serials(|serials, _| {
+                            if index < serials.len() {
+                                serials.remove(index);
+                            }
+                        });
+                    }
                     self.clamp();
                     return outcome;
                 }
@@ -1622,10 +1655,12 @@ impl ConfigScreen {
                 });
             }
             (Kind::List { .. }, Action::Enter | Action::Right) => {
+                let serials = self.fresh_serials(path);
                 self.views.push(View::List {
                     path: path.to_string(),
                     field,
                     cursor: 0,
+                    serials,
                 });
             }
             (_, Action::Left) if self.pinned.is_none() => self.focus = Focus::Sections,
@@ -2282,11 +2317,46 @@ impl ConfigScreen {
         let added = index.is_none();
         let len = list.len();
         let outcome = self.set_list(path, list);
+        if outcome.status.is_none() {
+            let text = text.to_string();
+            self.with_serials(|serials, next| match index {
+                Some(i) if i < serials.len() && text.is_empty() => {
+                    serials.remove(i);
+                }
+                Some(i) if i < serials.len() => serials[i].1 = text,
+                Some(_) => {}
+                None => {
+                    serials.push((*next, text));
+                    *next += 1;
+                }
+            });
+        }
         if added {
             self.view_mut().set_cursor(len - 1);
         }
         self.clamp();
         outcome
+    }
+
+    /// New serials for every item of the list at `path`.
+    fn fresh_serials(&mut self, path: &str) -> Vec<(u64, String)> {
+        self.list(path)
+            .into_iter()
+            .map(|item| {
+                let serial = self.next_serial;
+                self.next_serial += 1;
+                (serial, item)
+            })
+            .collect()
+    }
+
+    /// Change the open list's serials with `change`, which gets the next
+    /// serial to give too.
+    fn with_serials(&mut self, change: impl FnOnce(&mut Vec<(u64, String)>, &mut u64)) {
+        let next = &mut self.next_serial;
+        if let Some(View::List { serials, .. }) = self.views.last_mut() {
+            change(serials, next);
+        }
     }
 }
 
@@ -2696,9 +2766,24 @@ fn color(screen: &ConfigScreen, path: &str, text: Option<&str>, ui: &Ui) -> Show
     }
 }
 
-/// Where a key comes from: the env var, which wins as in the daemon, the
-/// file (masked), or nowhere (#142).
-fn secret(screen: &ConfigScreen, path: &str, env: &Env) -> Shown {
+/// Where a key row's key comes from, as the daemon would find it (#142).
+enum KeyFrom {
+    /// In the file, masked as the row shows it.
+    File(String),
+    /// A `WHISRS_*_API_KEY` env var, which wins as in the daemon.
+    Env(&'static str),
+    /// None of its own: read aloud uses this provider's key.
+    Uses(String),
+    NotNeeded,
+    /// Nowhere; `warn` when the backend in use needs it.
+    NotSet {
+        warn: bool,
+    },
+    Optional,
+}
+
+/// Where the key at `path` comes from.
+fn key_from(screen: &ConfigScreen, path: &str, env: &Env) -> KeyFrom {
     let config = screen.form.config();
     let section = path.split('.').next().unwrap_or_default();
     let backend = match section {
@@ -2710,17 +2795,15 @@ fn secret(screen: &ConfigScreen, path: &str, env: &Env) -> Shown {
                 .and_then(Value::as_str)
                 .filter(|key| !key.is_empty());
             return match (key, section) {
-                (Some(key), _) => Shown::plain(format!("set {}", keys::mask_api_key(key))),
+                (Some(key), _) => KeyFrom::File(keys::mask_api_key(key)),
                 (None, "tts") => {
                     let tts = config.tts.as_ref().map_or("groq", |t| t.backend.as_str());
                     match tts {
-                        "groq" | "openai" | "deepgram" => {
-                            Shown::muted(format!("uses the [{tts}] key"))
-                        }
-                        _ => Shown::muted("not needed"),
+                        "groq" | "openai" | "deepgram" => KeyFrom::Uses(tts.to_string()),
+                        _ => KeyFrom::NotNeeded,
                     }
                 }
-                (None, _) => Shown::muted("not set"),
+                (None, _) => KeyFrom::NotSet { warn: false },
             };
         }
     };
@@ -2734,12 +2817,25 @@ fn secret(screen: &ConfigScreen, path: &str, env: &Env) -> Shown {
         other => other,
     } == backend;
     match keys::key_summary_from(&as_backend, |var| env.get(var).map(str::to_string)) {
-        KeySummary::File { masked } => Shown::plain(format!("set {masked}")),
-        KeySummary::Env { var, .. } => Shown::plain(var).then("(this shell)", Tone::Muted),
-        KeySummary::NotSet if active => Shown::of("not set", Tone::Warn),
-        KeySummary::NotSet => Shown::muted("not set"),
-        KeySummary::Optional(_) => Shown::muted("not set, optional"),
-        KeySummary::NotNeeded => Shown::muted("not needed"),
+        KeySummary::File { masked } => KeyFrom::File(masked),
+        KeySummary::Env { var, .. } => KeyFrom::Env(var),
+        KeySummary::NotSet => KeyFrom::NotSet { warn: active },
+        KeySummary::Optional(_) => KeyFrom::Optional,
+        KeySummary::NotNeeded => KeyFrom::NotNeeded,
+    }
+}
+
+/// Where a key comes from: the env var, which wins as in the daemon, the
+/// file (masked), or nowhere (#142).
+fn secret(screen: &ConfigScreen, path: &str, env: &Env) -> Shown {
+    match key_from(screen, path, env) {
+        KeyFrom::File(masked) => Shown::plain(format!("set {masked}")),
+        KeyFrom::Env(var) => Shown::plain(var).then("(this shell)", Tone::Muted),
+        KeyFrom::Uses(tts) => Shown::muted(format!("uses the [{tts}] key")),
+        KeyFrom::NotNeeded => Shown::muted("not needed"),
+        KeyFrom::NotSet { warn: true } => Shown::of("not set", Tone::Warn),
+        KeyFrom::NotSet { warn: false } => Shown::muted("not set"),
+        KeyFrom::Optional => Shown::muted("not set, optional"),
     }
 }
 
@@ -3112,6 +3208,301 @@ impl ConfigScreen {
             })
         )
     }
+}
+
+/// What is being typed, as the agent tree reads it.
+pub struct Typed<'a> {
+    /// What the input is for: the row's label, `filter`, `name`, a map key.
+    pub label: String,
+    pub input: &'a Input,
+    /// The section's filter, not a value.
+    pub filter: bool,
+}
+
+/// What the agent tree reads of the screen: the state the frame is drawn
+/// from, nothing drawn.
+impl ConfigScreen {
+    /// The sections the filter keeps, by index into [`SECTIONS`].
+    pub fn shown_sections(&self) -> Vec<usize> {
+        self.visible()
+    }
+
+    /// The section open.
+    pub fn section(&self) -> usize {
+        self.section
+    }
+
+    /// How many entries or keys section `index` holds; `None` for rows.
+    pub fn section_count(&self, index: usize) -> Option<usize> {
+        match SECTIONS[index].body {
+            Body::Entries(entries) => Some(self.form.entries(entries.path).len()),
+            Body::Map(map) => Some(self.map(map.path).len()),
+            Body::Rows(_) => None,
+        }
+    }
+
+    /// The section list has the keys.
+    pub fn on_sections(&self) -> bool {
+        self.focus == Focus::Sections
+    }
+
+    /// Only some rows show, with no section list (setup's step, Mic).
+    pub fn is_pinned(&self) -> bool {
+        self.pinned.is_some()
+    }
+
+    /// Whether the section open is in this build.
+    pub fn is_built(&self) -> bool {
+        self.built()
+    }
+
+    /// The rows of the level open, and the one with the cursor.
+    pub fn rows(&self) -> Vec<Item> {
+        self.items()
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.view().cursor()
+    }
+
+    /// Where the rows are, as the crumb names it: the section, an entry of
+    /// it, or a list being edited.
+    pub fn level_name(&self) -> String {
+        let section = self.current();
+        match self.view() {
+            View::Section { .. } => section.title.to_string(),
+            View::Entry { index, .. } => {
+                format!("{}: {}", section.title, self.entry_name(*index))
+            }
+            View::List { field, .. } => format!("{}: {}", section.title, field.label),
+        }
+    }
+
+    /// The row's label and value as the row reads, in plain text: a key is
+    /// never in it, masked or not ([`ConfigScreen::key_word`] says where it
+    /// comes from), a share is its percentage, not its bar, and a test that
+    /// runs says `testing`, not a spinner's frame.
+    pub fn row_text(&self, item: &Item, env: &Env, ui: &Ui) -> (String, String) {
+        let (label, value, _) = describe(self, item, env, ui);
+        let Item::Field { field, path } = item else {
+            return (label, plain(&value));
+        };
+        let mut text = match field.kind {
+            Kind::Secret => self.key_word(path, env),
+            Kind::Float { percent: true, .. } => {
+                let level = self
+                    .form
+                    .effective(path)
+                    .and_then(Value::as_float)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                format!("{:.0}%", level * 100.0)
+            }
+            _ => plain(&shown(self, field, path, env, ui)),
+        };
+        if let Some(test) = self.tests.get(path) {
+            let word = match test {
+                Test::Running => "testing".to_string(),
+                done => test_word(done, 0, ui).0,
+            };
+            text.push_str(&format!(" {} {word}", ui.glyphs.separator));
+        }
+        (label, text)
+    }
+
+    /// Where the key at `path` comes from, in words that never hold it:
+    /// `set`, `from $WHISRS_GROQ_API_KEY`, `not set`.
+    pub fn key_word(&self, path: &str, env: &Env) -> String {
+        match key_from(self, path, env) {
+            KeyFrom::File(_) => "set".to_string(),
+            KeyFrom::Env(var) => format!("from ${var}"),
+            KeyFrom::Uses(tts) => format!("uses the [{tts}] key"),
+            KeyFrom::NotNeeded => "not needed".to_string(),
+            KeyFrom::NotSet { .. } => "not set".to_string(),
+            KeyFrom::Optional => "not set, optional".to_string(),
+        }
+    }
+
+    /// The word at the row's end: whose value it is (`profile`, `base`,
+    /// `base only`, `offline sets this`).
+    pub fn tag_text(&self, item: &Item) -> Option<String> {
+        tag(self, item).map(|(text, _)| text)
+    }
+
+    /// Whether profile mode leaves the key at `path` to config.toml.
+    pub fn base_only(&self, path: &str) -> bool {
+        self.refusal(path).is_some()
+    }
+
+    /// The open input, if one is.
+    pub fn typed(&self) -> Option<Typed<'_>> {
+        let editing = self.editing.as_ref()?;
+        let label = match &editing.target {
+            Target::Field { field, .. } => field.label.to_string(),
+            Target::Element { index: Some(_), .. } => "item".to_string(),
+            Target::Element { index: None, .. } => "new item".to_string(),
+            Target::NewKey => screen_map_label(self.current()).to_string(),
+            Target::PairValue { key } => key.clone(),
+            Target::EntryName => "name".to_string(),
+            Target::Filter => "filter".to_string(),
+        };
+        Some(Typed {
+            label,
+            input: &editing.input,
+            filter: matches!(editing.target, Target::Filter),
+        })
+    }
+
+    /// The open picker, if one is.
+    pub fn picking(&self) -> Option<&Picker> {
+        self.picker.as_ref().map(|picking| &picking.picker)
+    }
+
+    /// Whether the open picker lists what whisrs did not write: devices,
+    /// model files, a path's completions.
+    pub fn picking_relays(&self) -> bool {
+        let field = match self.picker.as_ref().map(|picking| &picking.purpose) {
+            Some(Purpose::Field { field, .. } | Purpose::Element { field, .. }) => field,
+            _ => return false,
+        };
+        matches!(field.kind, Kind::Path { .. })
+            || source(&field.kind).is_some_and(|from| from.list().is_some())
+    }
+
+    /// The open hotkey dialog, if one is.
+    pub fn hotkeying(&self) -> Option<&HotkeyDialog> {
+        self.hotkey.as_ref().map(|open| &open.dialog)
+    }
+
+    /// The filter kept.
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Whether `text`, given to the row at `path` as its editor takes a
+    /// value (typed into its input, or picked or typed in its picker),
+    /// lands: listed and not refused, or typed where the row takes typing,
+    /// through the row's check, into a config that still loads. An agent's
+    /// value that would not is refused before any editor opens, rather than
+    /// left open with an error.
+    pub fn takes(&self, field: &'static Field, path: &str, text: &str) -> bool {
+        let text = text.trim();
+        let value = if picked(&field.kind) {
+            let options = self.options(field, path);
+            let chosen = if text == "unset" && options.unset.is_some() {
+                None
+            } else {
+                let listed = options.find(text);
+                if listed.is_some_and(|pick| pick.refused.is_some()) {
+                    return false;
+                }
+                // Unlisted, it is the picker's typed row, which a value
+                // listed in another case keeps away.
+                let typed = options.open
+                    && !text.is_empty()
+                    && !options
+                        .picks
+                        .iter()
+                        .any(|pick| pick.value.eq_ignore_ascii_case(text));
+                if listed.is_none() && !typed {
+                    return false;
+                }
+                let written = self.written(&field.kind, text);
+                match check_of(&field.kind).map_or(Ok(written.clone()), |check| check(&written)) {
+                    Ok(text) => Some(text),
+                    Err(_) => return false,
+                }
+            };
+            to_value(&field.kind, chosen)
+        } else {
+            // A one-line input would flatten it, so it does not open.
+            let lines = self
+                .form
+                .effective(path)
+                .and_then(Value::as_str)
+                .is_some_and(|now| now.contains('\n'));
+            if matches!(field.kind, Kind::Text { .. }) && lines {
+                return false;
+            }
+            match parse(field, &self.written(&field.kind, text)) {
+                Ok(Some(value)) => value,
+                // It changes nothing, and the input closes.
+                Ok(None) => return true,
+                Err(_) => return false,
+            }
+        };
+        let unsets_base = self
+            .profile
+            .as_ref()
+            .is_some_and(|edit| value.is_none() && edit.base.effective(path).is_some());
+        if unsets_base {
+            return false;
+        }
+        let mut form = self.form.clone();
+        form.set(path, value).is_ok()
+    }
+
+    /// Whether `text` lands as an item of the list open: one its picker
+    /// lists, or takes typed, through the list's check; any text, for a
+    /// list typed into.
+    pub fn takes_item(&self, text: &str) -> bool {
+        let View::List { field, path, .. } = self.view() else {
+            return false;
+        };
+        let Kind::List {
+            items: Some((_, check)),
+            ..
+        } = field.kind
+        else {
+            return true;
+        };
+        let text = text.trim();
+        let options = self.options(field, path);
+        match options.find(text) {
+            Some(pick) if pick.refused.is_some() => return false,
+            Some(_) => {}
+            None if options.open
+                && !text.is_empty()
+                && !options
+                    .picks
+                    .iter()
+                    .any(|pick| pick.value.eq_ignore_ascii_case(text)) => {}
+            None => return false,
+        }
+        check(text).is_ok()
+    }
+
+    /// The serial of item `index` of the list open: its row's id.
+    pub fn item_serial(&self, index: usize) -> Option<u64> {
+        match self.view() {
+            View::List { serials, .. } => serials.get(index).map(|(serial, _)| *serial),
+            _ => None,
+        }
+    }
+
+    /// Whether the level open is a list whose items are picked, not typed.
+    pub fn level_suggests(&self) -> bool {
+        matches!(
+            self.view(),
+            View::List { field, .. } if matches!(field.kind, Kind::List { items: Some(_), .. })
+        )
+    }
+
+    /// Whether `a` adds and `d` deletes here: a list, entries or a map,
+    /// that profile mode does not leave to config.toml.
+    pub fn edits_list(&self) -> bool {
+        let lists = matches!(self.view(), View::List { .. })
+            || matches!(
+                (self.view(), self.current().body),
+                (View::Section { .. }, Body::Entries(_) | Body::Map(_))
+            );
+        lists && self.built() && self.refusal(self.current_path()).is_none()
+    }
+}
+
+/// A value's parts as one line of text.
+fn plain(value: &Shown) -> String {
+    value.parts.iter().map(|(text, _)| text.as_str()).collect()
 }
 
 fn sections(screen: &ConfigScreen, f: &mut Frame, area: Rect, ui: &Ui) {

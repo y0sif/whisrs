@@ -89,6 +89,16 @@ impl Picker {
         self.filter.text()
     }
 
+    /// The row with the cursor, into [`Picker::rows`].
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The value set now, marked in the list; `None` is unset.
+    pub fn current(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
+
     /// Replace the filter (a completed path).
     pub fn set_filter(&mut self, text: &str) {
         self.filter = Input::new(text, false);

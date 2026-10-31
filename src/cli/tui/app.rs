@@ -514,8 +514,22 @@ impl App {
             .is_some_and(ConfigScreen::is_dirty)
     }
 
+    /// Whether answering the dialog up with `letter` ends in `$EDITOR`: the
+    /// unsaved-changes question `e` asked, and an overwrite of a file that
+    /// changed on disk while a save for `e` was asked.
+    pub fn answer_opens_editor(&self, letter: char) -> bool {
+        match (&self.dialog, letter) {
+            (
+                Some(Dialog::Unsaved(After::Editor) | Dialog::UnsavedProfile(After::Editor, _)),
+                'w' | 'd',
+            ) => true,
+            (Some(Dialog::Changed(_)), 'o') => self.pending == Some(After::Editor),
+            _ => false,
+        }
+    }
+
     /// The profile profile mode is on.
-    fn profile_name(&self) -> Option<String> {
+    pub fn profile_name(&self) -> Option<String> {
         self.profile_config
             .as_ref()
             .and_then(|screen| screen.profile.as_ref())
@@ -1508,7 +1522,7 @@ impl App {
             }
         }
         if let Some(act) = reply.act {
-            effects.extend(self.act(act));
+            effects.extend(self.send(act));
         }
         if reply.leave {
             self.stack.pop();
@@ -1525,7 +1539,7 @@ impl App {
     /// Send `act` to the daemon, unless it is known to be down (then say
     /// so, with the command that starts it, as Home does) or has not
     /// answered an action on that recording yet.
-    fn act(&mut self, act: Act) -> Option<Effect> {
+    fn send(&mut self, act: Act) -> Option<Effect> {
         if let Some(refusal) = self.refusal(&act) {
             self.status = Some(refusal);
             return None;
@@ -1564,31 +1578,61 @@ impl App {
         ))
     }
 
-    fn key(&mut self, key: KeyEvent) -> Option<Effect> {
+    /// A key press: what it means where the keys are, run by [`App::act`].
+    /// A key that means nothing there still ends the flash and stops a
+    /// sample, as any key does.
+    pub fn key(&mut self, key: KeyEvent) -> Option<Effect> {
+        if let Some(stopped) = self.lead() {
+            return stopped;
+        }
+        let action = keys::action(key, self.mode())?;
+        self.run(action)
+    }
+
+    /// Who has the keys now: the dialog, else the screen's own mode.
+    pub fn mode(&self) -> Mode {
+        if self.dialog.is_some() {
+            return Mode::Dialog;
+        }
+        match self.screen() {
+            Screen::Config | Screen::Mic => self.config.mode(),
+            Screen::Setup => self.setup.as_ref().map_or(Mode::Browse, Setup::mode),
+            Screen::Home => Mode::Browse,
+            Screen::Recordings => self.recordings.mode(),
+            Screen::History => self.history.mode(),
+            Screen::Profiles => self.profiles.mode(),
+            Screen::Profile => self
+                .profile_config
+                .as_ref()
+                .map_or(Mode::Browse, ConfigScreen::mode),
+        }
+    }
+
+    /// Run `action` as its key would: the keyboard's handler, which an
+    /// agent's input lowers into too.
+    pub fn act(&mut self, action: Action) -> Option<Effect> {
+        if let Some(stopped) = self.lead() {
+            return stopped;
+        }
+        self.run(action)
+    }
+
+    /// What every key does first: the flash ends, and a sample being said
+    /// stops, which is then all the key does (`Some`, with what stopping
+    /// it asks for).
+    pub fn lead(&mut self) -> Option<Option<Effect>> {
         self.flash = None;
-        // A sample being said stops at any key, which does nothing else.
         if self.dialog.is_none() && self.screen() == Screen::Setup {
             if let Some(reply) = self.setup.as_mut().and_then(Setup::stop_sample) {
-                return self.reply(reply);
+                return Some(self.reply(reply));
             }
         }
-        let mode = if self.dialog.is_some() {
-            Mode::Dialog
-        } else {
-            match self.screen() {
-                Screen::Config | Screen::Mic => self.config.mode(),
-                Screen::Setup => self.setup.as_ref().map_or(Mode::Browse, Setup::mode),
-                Screen::Home => Mode::Browse,
-                Screen::Recordings => self.recordings.mode(),
-                Screen::History => self.history.mode(),
-                Screen::Profiles => self.profiles.mode(),
-                Screen::Profile => self
-                    .profile_config
-                    .as_ref()
-                    .map_or(Mode::Browse, ConfigScreen::mode),
-            }
-        };
-        let action = keys::action(key, mode)?;
+        None
+    }
+
+    /// `action`, once the lead let it through.
+    fn run(&mut self, action: Action) -> Option<Effect> {
+        let mode = self.mode();
         if let Some(dialog) = self.dialog.take() {
             return self.dialog_key(dialog, action);
         }
@@ -1754,7 +1798,7 @@ impl App {
                 Action::Type('y'),
             ) => {
                 let act = act.clone();
-                self.act(act)
+                self.send(act)
             }
             // Keep is the default: anything else.
             (Dialog::DeleteRecording { act, .. }, _) => {
@@ -2233,9 +2277,32 @@ fn not_restarted_while_broken() -> Notice {
     )
 }
 
+impl Dialog {
+    /// The letters that answer it, as its keys line names them, each with
+    /// what it does. Esc answers every one too: it stays, keeps or cancels.
+    pub fn answers(&self) -> &'static [(char, &'static str)] {
+        match self {
+            Dialog::Unsaved(_) | Dialog::UnsavedProfile(..) => &[('w', "save"), ('d', "discard")],
+            Dialog::DeleteProfile { .. } | Dialog::DeleteRecording { .. } => {
+                &[('y', "delete"), ('n', "keep")]
+            }
+            Dialog::ClearHistory { .. } => &[('y', "clear"), ('n', "keep")],
+            Dialog::DeleteEntry { .. } => &[('d', "delete")],
+            Dialog::RestartAnyway => &[('y', "restart"), ('n', "no")],
+            Dialog::Changed(_) => &[('o', "overwrite"), ('l', "load it (drops your edits)")],
+            Dialog::Unwritten { .. } => &[('d', "drop them")],
+            Dialog::Bind { .. } => &[('y', "append"), ('n', "no")],
+            Dialog::DeviceChanged(_) => &[('o', "write the device over it")],
+            Dialog::SetupChanged(_) => &[('o', "write over it")],
+            Dialog::RetryRecording { .. } => &[('y', "retry"), ('n', "keep")],
+            Dialog::Help(_) => &[],
+        }
+    }
+}
+
 /// What a dialog says, `width` columns at most: the help wraps its lines,
 /// under their text.
-fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
+pub fn dialog_lines(dialog: &Dialog, ui: &Ui, width: usize) -> Vec<Line<'static>> {
     let keys = |pairs: &[(&'static str, &'static str)]| {
         let sep = format!(" {} ", ui.glyphs.separator);
         let mut spans = Vec::new();
