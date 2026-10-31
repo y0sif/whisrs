@@ -4346,7 +4346,7 @@ dependencies = [
 
 [[package]]
 name = "whisrs"
-version = "0.1.32"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "asr-dedup",
