@@ -12,6 +12,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/whisrs)](https://crates.io/crates/whisrs)
 [![docs.rs](https://img.shields.io/docsrs/whisrs)](https://docs.rs/whisrs)
+[![Listed in Awesome Voice Typing](https://img.shields.io/badge/Listed_in-Awesome_Voice_Typing-436D99?labelColor=24292F)](https://github.com/primaprashant/awesome-voice-typing)
 
 **Voice for the Linux desktop, written in Rust: dictation, read-aloud, and voice-driven LLM commands.**
 
