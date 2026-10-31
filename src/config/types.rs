@@ -1,5 +1,6 @@
 //! Configuration structs, defaults, and validation for `config.toml`.
 
+use audio_silence_gate::Vad;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -686,6 +687,41 @@ impl Default for GeneralConfig {
 pub struct AudioConfig {
     #[serde(default = "default_device")]
     pub device: String,
+    /// What decides whether anyone is speaking (auto-stop, the batch gate,
+    /// phrase splits, recording speech): `"earshot"` (default, a small
+    /// learned model) or `"rms"` (the 0.1.31 loudness test, unchanged).
+    /// Unknown values fall back to `"earshot"`; [`Config::validate`] warns.
+    /// A string, not an enum, so a typo never stops the config from loading.
+    #[serde(default = "default_vad")]
+    pub vad: String,
+}
+
+impl AudioConfig {
+    /// Parsed [`Self::vad`]; unknown values fall back to earshot.
+    pub fn vad(&self) -> Vad {
+        parse_vad(&self.vad).unwrap_or_default()
+    }
+}
+
+/// Parse a `[audio] vad` value (trimmed, case-insensitive). `None` if unknown.
+pub fn parse_vad(s: &str) -> Option<Vad> {
+    Some(match s.trim().to_ascii_lowercase().as_str() {
+        "earshot" => Vad::Earshot,
+        "rms" => Vad::Rms,
+        _ => return None,
+    })
+}
+
+/// Canonical `[audio] vad` spelling of `vad`.
+pub fn vad_name(vad: Vad) -> &'static str {
+    match vad {
+        Vad::Earshot => "earshot",
+        Vad::Rms => "rms",
+    }
+}
+
+fn default_vad() -> String {
+    vad_name(Vad::default()).to_string()
 }
 
 /// Selects which keyboard-injection backend the daemon uses to type text.
@@ -885,6 +921,7 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             device: default_device(),
+            vad: default_vad(),
         }
     }
 }
@@ -2281,9 +2318,23 @@ impl Config {
             }
         }
 
+        if parse_vad(&self.audio.vad).is_none() {
+            warnings.push(ConfigWarning {
+                message: format!(
+                    "[audio] vad = {:?} is not a known speech detector, using \"{}\". Use \
+                     earshot or rms.",
+                    self.audio.vad,
+                    vad_name(Vad::default())
+                ),
+            });
+        }
+
         if self.general.silence_timeout_ms == 0 {
             warnings.push(ConfigWarning {
-                message: "silence_timeout_ms is 0 — auto-stop is effectively disabled".to_string(),
+                message: "[general] silence_timeout_ms is 0, so auto-stop is off: dictation, \
+                          command mode, [[llm_commands]] and agent turns stop only on a second \
+                          press"
+                    .to_string(),
             });
         }
 
@@ -5140,9 +5191,60 @@ mod tests {
             overlay: None,
         };
         let warnings = config.validate().unwrap();
-        assert!(warnings
+        let zero: Vec<&str> = warnings
             .iter()
-            .any(|w| w.message.contains("silence_timeout_ms")));
+            .map(|w| w.message.as_str())
+            .filter(|m| m.contains("silence_timeout_ms"))
+            .collect();
+        // #178: 0 turns auto-stop off, and the warning says so.
+        assert_eq!(
+            zero,
+            [
+                "[general] silence_timeout_ms is 0, so auto-stop is off: dictation, command mode, \
+                 [[llm_commands]] and agent turns stop only on a second press"
+            ]
+        );
+    }
+
+    /// `[audio] vad`: earshot by default, `rms` in any case, and an unknown
+    /// value warns once and uses earshot. The key is known, so it is never
+    /// reported as unknown.
+    #[test]
+    fn audio_vad_default_rms_and_unknown() {
+        let config: Config = toml::from_str("[general]\nbackend = \"groq\"\n").unwrap();
+        assert_eq!(config.audio.vad, "earshot");
+        assert_eq!(config.audio.vad(), Vad::Earshot);
+        let rms = "[audio]\nvad = \" RMS \"\n";
+        let config: Config = toml::from_str(rms).unwrap();
+        assert_eq!(config.audio.vad(), Vad::Rms);
+        assert!(unknown_config_keys(rms).is_empty());
+
+        let vad_warnings = |config: &Config| -> Vec<String> {
+            config
+                .validate()
+                .unwrap()
+                .into_iter()
+                .map(|w| w.message)
+                .filter(|m| m.contains("[audio] vad"))
+                .collect()
+        };
+        let mut config = validatable_config("groq");
+        assert!(vad_warnings(&config).is_empty());
+        config.audio.vad = "silero".to_string();
+        assert_eq!(config.audio.vad(), Vad::Earshot);
+        let warnings = vad_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("\"silero\"") && warnings[0].contains("using \"earshot\""),
+            "{}",
+            warnings[0]
+        );
+        config.audio.vad = "rms".to_string();
+        assert!(vad_warnings(&config).is_empty());
+
+        assert_eq!(parse_vad(vad_name(Vad::Earshot)), Some(Vad::Earshot));
+        assert_eq!(parse_vad(vad_name(Vad::Rms)), Some(Vad::Rms));
+        assert_eq!(AudioConfig::default().vad(), Vad::Earshot);
     }
 
     #[test]
@@ -7839,6 +7941,8 @@ mod tests {
                 prompt: config.general.prompt.clone(),
                 keyterms: Vec::new(),
                 diarize: false,
+                vad: Default::default(),
+                soft_voices: true,
             };
             assert!(
                 request

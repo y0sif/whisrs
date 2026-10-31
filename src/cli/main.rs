@@ -2587,6 +2587,7 @@ mod tests {
                 device: "default".into(),
                 offset_ms: 0,
                 samples: 0,
+                quality: None,
             }];
             meta.summary = Some("Shipped.".into());
             std::fs::write(store::transcript_path(&dir, &id), "# Standup\n").unwrap();

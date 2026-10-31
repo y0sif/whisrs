@@ -7,12 +7,15 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use audio_silence_gate::{audio_gate_reason, AutoStopDetector, SILENCE_RMS_THRESHOLD};
+use audio_silence_gate::{
+    speech_gate, AutoStopDetector, GateReason, HeardFrame, Levels, VadConfig,
+};
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
 use whisrs::audio::feedback;
-use whisrs::history::{self, HistoryEntry};
+use whisrs::audio::quality;
+use whisrs::history::HistoryEntry;
 use whisrs::llm;
 use whisrs::replacements::Replacer;
 use whisrs::state::Action;
@@ -265,9 +268,14 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         full_text
     });
 
-    // Forward audio from capture to backend, with auto-stop detection.
-    let mut auto_stop =
-        AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout_ms, SAMPLE_RATE);
+    // Forward audio from capture to backend, with auto-stop detection
+    // (`[audio] vad`, the close profile: one user near the mic). A timeout of
+    // 0 never fires (#178).
+    let mut auto_stop = AutoStopDetector::with_vad(
+        VadConfig::close(config.vad),
+        silence_timeout_ms,
+        SAMPLE_RATE,
+    );
 
     while let Some(chunk) = audio_rx.recv().await {
         // Check for auto-stop.
@@ -302,6 +310,17 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
             break;
         }
     }
+    // Everything up to the stop: the drain below is the capture's last few
+    // chunks.
+    let stream_levels = auto_stop.levels();
+    let heard_speech = auto_stop.has_speech();
+    // A voice the level floors rejected: named as the batch gate names it.
+    let too_quiet = auto_stop.too_quiet();
+    info!(
+        "dictation audio: {}, {}",
+        describe_levels(&stream_levels),
+        heard_label(auto_stop.first_heard(), auto_stop.last_heard())
+    );
 
     // Drain remaining audio from the capture channel into the backend.
     while let Some(chunk) = audio_rx.recv().await {
@@ -412,6 +431,28 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                     &format!("Transcription failed — partial text may have been typed.\n{err_msg}"),
                 );
             }
+        }
+    }
+
+    // Nothing typed, and no error or cancel to say why: name what the audio
+    // was, as a batch skip does (a voice the level floors rejected is "too
+    // quiet", with its level). Audio the detector accepted speech in is not
+    // why, so that stays a log line.
+    if full_text.is_empty() && stream_error.is_none() && !cancelled {
+        let skip = match too_quiet {
+            Some(levels) => Some((GateReason::TooQuiet, levels)),
+            None => quality::stream_skip_reason(config.vad, &stream_levels, heard_speech)
+                .map(|reason| (reason, stream_levels)),
+        };
+        match skip {
+            Some((reason, levels)) => {
+                let message = nothing_typed_message(reason, &levels);
+                info!("{message}");
+                if notify_state {
+                    send_notification("whisrs", &message);
+                }
+            }
+            None => info!("nothing typed: the backend returned no text"),
         }
     }
 
@@ -624,10 +665,31 @@ pub(crate) enum BatchOrigin<'a> {
     Agent { name: &'a str },
 }
 
+/// `message` with the advice for `reason` after it ([`quality::skip_hint`]).
+fn with_skip_hint(message: String, reason: GateReason, levels: &Levels) -> String {
+    match quality::skip_hint(reason, levels) {
+        Some(hint) => format!("{message}. {hint}"),
+        None => message,
+    }
+}
+
+/// The toast for a streaming dictation that typed nothing because of its
+/// audio: the batch skip toast's label and advice.
+fn nothing_typed_message(reason: GateReason, levels: &Levels) -> String {
+    with_skip_hint(
+        format!(
+            "Nothing typed: the audio was {}",
+            quality::skip_label(reason, levels)
+        ),
+        reason,
+        levels,
+    )
+}
+
 impl BatchOrigin<'_> {
     /// Toast text when the audio gate rejects the audio (`label` is the
-    /// gate's reason, e.g. "too short" or "silent"). It never says
-    /// "recording": that is the recording feature's word.
+    /// gate's reason, e.g. "too short" or "silent", with its level). It
+    /// never says "recording": that is the recording feature's word.
     fn gate_skip_message(&self, label: &str) -> String {
         match self {
             BatchOrigin::Dictation | BatchOrigin::LlmCommand { .. } => {
@@ -638,6 +700,17 @@ impl BatchOrigin<'_> {
                 format!("Agent '{name}': the audio was {label}, nothing was sent")
             }
         }
+    }
+
+    /// The skip toast for `reason`: [`Self::gate_skip_message`] with the level
+    /// that explains it ([`quality::skip_label`]), and for silent audio the
+    /// advice after it.
+    fn gate_skip_toast(&self, reason: GateReason, levels: &Levels) -> String {
+        with_skip_hint(
+            self.gate_skip_message(&quality::skip_label(reason, levels)),
+            reason,
+            levels,
+        )
     }
 
     /// Progress toast shown once the gate passes. `None` for dictation, which
@@ -785,19 +858,37 @@ pub(crate) async fn transcribe_batch_audio(
     use whisrs::audio::wav::encode_wav;
 
     // Skip the API call entirely when the recording is empty, too short, or
-    // pure silence. Cloud Whisper variants (whisper-1, gpt-4o-*-transcribe)
+    // holds no speech. Cloud Whisper variants (whisper-1, gpt-4o-*-transcribe)
     // hallucinate verbatim chunks of the supplied prompt when handed audio
     // with no speech, which whisrs would then type at the cursor — for a
     // multi-hundred-character prompt that means tens of seconds of garbage
     // typing on every accidental hotkey tap. Filtering here also saves the
-    // round-trip cost.
-    if let Some(reason) = audio_gate_reason(
-        samples,
-        SAMPLE_RATE,
-        AUDIO_GATE_MIN_MS,
-        SILENCE_RMS_THRESHOLD,
-    ) {
-        let label = reason.as_str();
+    // round-trip cost. The detector is `[audio] vad` with the close profile
+    // (one user near the mic), run off the async worker: a long buffer is
+    // a few hundred ms of model time.
+    let vad = VadConfig::close(context.config.audio.vad());
+    let gate = whisrs::audio::block_off_runtime(|| {
+        speech_gate(samples, SAMPLE_RATE, AUDIO_GATE_MIN_MS, &vad)
+    });
+    // The turn's one info line with its levels: command mode,
+    // `[[llm_commands]]` and agent turns logged theirs while recording
+    // (`collect_instruction_audio`), batch dictation has only this one.
+    if opts.origin == BatchOrigin::Dictation {
+        info!(
+            "dictation audio: {}, {}",
+            describe_levels(&gate.levels),
+            heard_label(gate.first_heard, gate.last_heard)
+        );
+    } else {
+        debug!(
+            "audio gate: {}, {}",
+            describe_levels(&gate.levels),
+            heard_label(gate.first_heard, gate.last_heard)
+        );
+    }
+    if let Some(reason) = gate.reason {
+        let label = quality::skip_label(reason, &gate.levels);
+        let toast = opts.origin.gate_skip_toast(reason, &gate.levels);
         match &opts.origin {
             BatchOrigin::Dictation => {
                 info!(
@@ -805,7 +896,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_state() {
-                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
+                    send_notification("whisrs", &toast);
                 }
             }
             BatchOrigin::CommandMode => {
@@ -814,7 +905,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_error() {
-                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
+                    send_notification("whisrs", &toast);
                 }
             }
             BatchOrigin::LlmCommand { name } => {
@@ -823,7 +914,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_state() {
-                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
+                    send_notification("whisrs", &toast);
                 }
             }
             BatchOrigin::Agent { name } => {
@@ -832,7 +923,7 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_error() {
-                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
+                    send_notification("whisrs", &toast);
                 }
             }
         }
@@ -1290,6 +1381,40 @@ pub(crate) fn format_api_error(err: &anyhow::Error) -> String {
     msg
 }
 
+/// What the detector heard, the end of a turn's levels line (a diagnostic,
+/// it decides nothing): "heard at 0.35 to 8.20 s", the first and the latest
+/// frame it heard a voice in before its level floors and arming
+/// ([`AutoStopDetector::first_heard`], [`AutoStopDetector::last_heard`], or
+/// the batch gate's [`GateOutcome::first_heard`],
+/// [`GateOutcome::last_heard`]), "heard at 4.15 s" for one, or "heard
+/// nothing".
+pub(crate) fn heard_label(first: Option<HeardFrame>, last: Option<HeardFrame>) -> String {
+    let at = |frame: HeardFrame| frame.start_sample as f64 / f64::from(SAMPLE_RATE);
+    match (first, last) {
+        (Some(first), Some(last)) if last.start_sample > first.start_sample => {
+            format!("heard at {:.2} to {:.2} s", at(first), at(last))
+        }
+        (Some(first), _) => format!("heard at {:.2} s", at(first)),
+        (None, _) => "heard nothing".to_string(),
+    }
+}
+
+/// One line of a stream's measured levels, for the log.
+pub(crate) fn describe_levels(levels: &Levels) -> String {
+    let db = |v: Option<f32>| v.map_or_else(|| "none".to_string(), |v| format!("{v:.1}"));
+    format!(
+        "{:.2} s, speech {} dBFS ({:.0}% of frames), background {} dBFS, SNR {} dB, peak \
+         {:.1} dBFS, clipped {:.2}%",
+        levels.duration_ms as f64 / 1000.0,
+        db(levels.speech_dbfs),
+        levels.speech_share * 100.0,
+        db(levels.noise_dbfs),
+        db(levels.snr_db),
+        levels.peak_dbfs,
+        levels.clipped_share * 100.0
+    )
+}
+
 pub(crate) fn build_transcription_config(config: &Config, language: &str) -> TranscriptionConfig {
     TranscriptionConfig {
         language: language.to_string(),
@@ -1297,6 +1422,8 @@ pub(crate) fn build_transcription_config(config: &Config, language: &str) -> Tra
         prompt: transcription_prompt(config.general.prompt.as_deref(), &config.general.vocabulary),
         keyterms: config.general.vocabulary.clone(),
         diarize: false,
+        vad: config.audio.vad(),
+        soft_voices: true,
     }
 }
 
@@ -1321,6 +1448,8 @@ fn batch_transcription_config(
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: config.audio.vad(),
+            soft_voices: true,
         }
     }
 }
@@ -1344,9 +1473,26 @@ pub(crate) fn save_history_entry(
         language: language.to_string(),
         duration_secs,
     };
-    if let Err(e) = history::append_entry(&entry) {
+    #[cfg(not(test))]
+    if let Err(e) = whisrs::history::append_entry(&entry) {
         warn!("failed to save history entry: {e}");
     }
+    #[cfg(test)]
+    SAVED_HISTORY.with(|saved| saved.borrow_mut().push(entry.text));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the history entries this thread saved, never written to
+    /// the real history.
+    static SAVED_HISTORY: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The texts this thread saved to history since the last call.
+#[cfg(test)]
+pub(crate) fn take_saved_history() -> Vec<String> {
+    SAVED_HISTORY.with(|saved| std::mem::take(&mut *saved.borrow_mut()))
 }
 
 /// Returns `true` when the first character of `text` is a punctuation mark
@@ -1857,6 +2003,231 @@ mod tests {
         }
     }
 
+    /// A synthetic voice at an RMS of `dbfs`: a 120 Hz pulse train through
+    /// five formants of four vowels in turn, in 0.2 s syllables held at full
+    /// level between ramps. earshot hears it under close's -65 dBFS floor:
+    /// at -70 dBFS the gate calls it too quiet, its voiced frames at -68 dBFS
+    /// (too quiet from -68 to -73 dBFS, never armed). Each syllable is voiced
+    /// for 80% of it, rising and falling over 15% of that.
+    fn quiet_voice(secs: usize, dbfs: f64) -> Vec<i16> {
+        use std::f64::consts::PI;
+        const SYLLABLE_SECS: f64 = 0.2;
+        const RAMP: f64 = 0.15;
+        let rate = f64::from(SAMPLE_RATE);
+        let vowels = [
+            [700.0, 1220.0, 2600.0, 3300.0, 3750.0],
+            [300.0, 2300.0, 3000.0, 3500.0, 4200.0],
+            [500.0, 1000.0, 2500.0, 3400.0, 3900.0],
+            [400.0, 2000.0, 2600.0, 3300.0, 4000.0],
+        ];
+        let bandwidths = [80.0, 100.0, 150.0, 250.0, 300.0];
+        let mut phase = 0.0;
+        let mut state = [[0.0f64; 2]; 5];
+        let voice: Vec<f64> = (0..secs * SAMPLE_RATE as usize)
+            .map(|i| {
+                let t = i as f64 / rate;
+                let syllable = (t / SYLLABLE_SECS) as usize;
+                let within = (t % SYLLABLE_SECS) / SYLLABLE_SECS / 0.8;
+                let envelope = if within < 1.0 {
+                    (PI / 2.0 * (within.min(1.0 - within) / RAMP).min(1.0)).sin()
+                } else {
+                    0.0
+                };
+                phase += (120.0 + 15.0 * (2.0 * PI * 0.7 * t).sin()) / rate;
+                let mut y = if phase >= 1.0 {
+                    phase -= 1.0;
+                    envelope
+                } else {
+                    0.0
+                };
+                let vowel = vowels[syllable % vowels.len()];
+                for ((past, f), bandwidth) in state.iter_mut().zip(vowel).zip(bandwidths) {
+                    let r: f64 = (-PI * bandwidth / rate).exp();
+                    let v = y + 2.0 * r * (2.0 * PI * f / rate).cos() * past[0] - r * r * past[1];
+                    *past = [v, past[0]];
+                    y = v;
+                }
+                y
+            })
+            .collect();
+        let rms = (voice.iter().map(|x| x * x).sum::<f64>() / voice.len() as f64).sqrt();
+        let gain = 10f64.powf(dbfs / 20.0) * f64::from(i16::MAX) / rms;
+        voice
+            .iter()
+            .map(|x| (x * gain).round().clamp(-32768.0, 32767.0) as i16)
+            .collect()
+    }
+
+    /// A streaming backend that takes the audio and sends no text.
+    struct SilentStream;
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for SilentStream {
+        async fn transcribe(&self, _audio: &[u8], _config: &TranscriptionConfig) -> Result<String> {
+            unreachable!("a streaming session never sends a file")
+        }
+
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
+        }
+
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> Result<whisrs::transcription::Transcript> {
+            unreachable!("a streaming session never sends a file")
+        }
+
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+
+        async fn transcribe_stream(
+            &self,
+            mut audio_rx: tokio::sync::mpsc::Receiver<whisrs::audio::AudioChunk>,
+            _text_tx: tokio::sync::mpsc::Sender<String>,
+            _config: &TranscriptionConfig,
+        ) -> Result<()> {
+            while audio_rx.recv().await.is_some() {}
+            Ok(())
+        }
+    }
+
+    /// What [`streaming_run`] saw.
+    #[derive(Debug)]
+    struct StreamingRun {
+        /// The chunks sent before the session left Recording on its own, and
+        /// the state it went to.
+        stopped: Option<(usize, State)>,
+        text: String,
+        cancelled: bool,
+        /// The pipeline released its cancel slot.
+        released: bool,
+        state: State,
+        toasts: Vec<String>,
+        history: Vec<String>,
+    }
+
+    /// A streaming dictation over `samples` in 50 ms chunks, paced in
+    /// (paused) real time, on [`SilentStream`], auto-stop after 2 s. Toasts
+    /// and history are on (recorded, not shown or written, by the test
+    /// seams), the done cue and the overlay off, and nothing is typed
+    /// (`clipboard_only`). A session still recording at the end gets the
+    /// stop press.
+    async fn streaming_run(samples: &[i16]) -> StreamingRun {
+        crate::notify::take_sent_toasts();
+        take_saved_history();
+        let config: Config = toml::from_str("").unwrap();
+        let daemon_state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut ds = daemon_state.lock().await;
+            ds.state_machine.transition(Action::Toggle).unwrap();
+            ds.streaming_cancel = Some(Arc::clone(&cancel_flag));
+            ds.session_language = Some("en".into());
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let pipeline = tokio::spawn(run_streaming_pipeline(StreamingPipelineParams {
+            audio_rx: rx,
+            backend: Arc::new(SilentStream),
+            daemon_state: Arc::clone(&daemon_state),
+            window_tracker: Arc::new(whisrs::window::NoopTracker),
+            state_tx: StateBus::new(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            config: build_transcription_config(&config, "en"),
+            window_id: None,
+            language: "en".into(),
+            notify: true,
+            overlay_enabled: false,
+            silence_timeout_ms: 2000,
+            filler_enabled: false,
+            filler_words: Vec::new(),
+            replacements: Default::default(),
+            audio_feedback: false,
+            audio_feedback_volume: 0.5,
+            backend_name: "test".into(),
+            keys: KeystrokeSettings::from_config(&config.input),
+            clipboard_fallback: false,
+            clipboard_only: true,
+            terminal_classes: Vec::new(),
+            history: true,
+        }));
+        let mut stopped = None;
+        for (c, chunk) in samples.chunks(800).enumerate() {
+            tx.send(chunk.to_vec()).unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let state = daemon_state.lock().await.state_machine.state();
+            if state != State::Recording {
+                stopped = Some((c + 1, state));
+                break;
+            }
+        }
+        if stopped.is_none() {
+            daemon_state
+                .lock()
+                .await
+                .state_machine
+                .transition(Action::Toggle)
+                .unwrap();
+        }
+        // The capture's channel closes, as a stopped capture's does.
+        drop(tx);
+        let text = pipeline.await.unwrap().unwrap();
+        let ds = daemon_state.lock().await;
+        StreamingRun {
+            stopped,
+            text,
+            cancelled: cancel_flag.load(Ordering::SeqCst),
+            released: ds.streaming_cancel.is_none(),
+            state: ds.state_machine.state(),
+            toasts: crate::notify::take_sent_toasts(),
+            history: take_saved_history(),
+        }
+    }
+
+    /// A voice the level floor rejects all of (12 s of [`quiet_voice`] at
+    /// -70 dBFS) never arms auto-stop, so the session records to the stop
+    /// press; then the toast calls it too quiet with the voice's level, as
+    /// the batch gate would. The stream's own levels say only "without
+    /// speech", which a too-quiet voice outranks.
+    #[tokio::test(start_paused = true)]
+    async fn a_too_quiet_streaming_dictation_says_too_quiet() {
+        let run = streaming_run(&quiet_voice(12, -70.0)).await;
+        assert_eq!(run.stopped, None, "{run:?}");
+        assert!(!run.cancelled && run.released, "{run:?}");
+        assert_eq!(
+            run.toasts,
+            ["Nothing typed: the audio was too quiet (speech at -68 dB)"]
+        );
+        assert!(run.history.is_empty());
+        assert_eq!((run.state, run.text.as_str()), (State::Idle, ""));
+    }
+
+    /// The end of the levels line names the first and latest heard frames.
+    #[test]
+    fn heard_label_names_the_first_and_latest_heard_frames() {
+        let frame = |start_sample| HeardFrame {
+            start_sample,
+            score: 0.31,
+            dbfs: -48.6,
+            soft: true,
+        };
+        assert_eq!(heard_label(None, None), "heard nothing");
+        assert_eq!(
+            heard_label(Some(frame(3328)), Some(frame(3328))),
+            "heard at 0.21 s"
+        );
+        assert_eq!(
+            heard_label(Some(frame(3328)), Some(frame(128_000))),
+            "heard at 0.21 to 8.00 s"
+        );
+    }
+
     /// Per-origin gate-skip toast wording: command mode announces itself,
     /// dictation and llm-commands share the plain skip message.
     #[test]
@@ -1875,6 +2246,123 @@ mod tests {
         for (origin, expected) in cases {
             assert_eq!(origin.gate_skip_message("silent"), expected, "{origin:?}");
         }
+        // The speech detector's reasons read the same way on every origin.
+        use audio_silence_gate::GateReason;
+        for reason in [GateReason::TooQuiet, GateReason::NoSpeech] {
+            let label = reason.as_str();
+            for (origin, expected) in [
+                (
+                    BatchOrigin::Dictation,
+                    format!("Skipped: the audio was {label}"),
+                ),
+                (
+                    BatchOrigin::CommandMode,
+                    format!("Command mode: the audio was {label}"),
+                ),
+                (
+                    BatchOrigin::LlmCommand { name: "proofread" },
+                    format!("Skipped: the audio was {label}"),
+                ),
+                (
+                    BatchOrigin::Agent { name: "jarvis" },
+                    format!("Agent 'jarvis': the audio was {label}, nothing was sent"),
+                ),
+            ] {
+                assert_eq!(origin.gate_skip_message(label), expected, "{origin:?}");
+            }
+        }
+        assert_eq!(
+            BatchOrigin::Dictation.gate_skip_message(GateReason::NoSpeech.as_str()),
+            "Skipped: the audio was without speech"
+        );
+    }
+
+    /// The skip toast names its reason with a level, on every origin, and
+    /// silent audio asks about a muted mic after it.
+    #[test]
+    fn gate_skip_toast_names_a_level_per_reason_and_origin() {
+        use audio_silence_gate::GateReason;
+        let levels = Levels {
+            speech_dbfs: Some(-68.0),
+            noise_dbfs: Some(-48.0),
+            snr_db: Some(-20.0),
+            clipped_share: 0.0,
+            dc_offset: 0.0,
+            speech_share: 0.0,
+            peak_dbfs: -82.0,
+            duration_ms: 210,
+        };
+        let cases = [
+            (
+                GateReason::Silent,
+                "silent (peak -82 dB)",
+                ". Is the mic muted?",
+            ),
+            (GateReason::TooQuiet, "too quiet (speech at -68 dB)", ""),
+            (
+                GateReason::NoSpeech,
+                "without speech (background at -48 dB)",
+                "",
+            ),
+            (GateReason::TooShort, "too short (0.2 s)", ""),
+        ];
+        for (reason, label, hint) in cases {
+            for (origin, expected) in [
+                (
+                    BatchOrigin::Dictation,
+                    format!("Skipped: the audio was {label}{hint}"),
+                ),
+                (
+                    BatchOrigin::CommandMode,
+                    format!("Command mode: the audio was {label}{hint}"),
+                ),
+                (
+                    BatchOrigin::LlmCommand { name: "proofread" },
+                    format!("Skipped: the audio was {label}{hint}"),
+                ),
+                (
+                    BatchOrigin::Agent { name: "jarvis" },
+                    format!("Agent 'jarvis': the audio was {label}, nothing was sent{hint}"),
+                ),
+            ] {
+                assert_eq!(
+                    origin.gate_skip_toast(reason, &levels),
+                    expected,
+                    "{origin:?}"
+                );
+            }
+        }
+        // The examples the toasts were designed from.
+        assert_eq!(
+            BatchOrigin::Dictation.gate_skip_toast(GateReason::Silent, &levels),
+            "Skipped: the audio was silent (peak -82 dB). Is the mic muted?"
+        );
+        assert_eq!(
+            BatchOrigin::Agent { name: "jarvis" }.gate_skip_toast(GateReason::TooQuiet, &levels),
+            "Agent 'jarvis': the audio was too quiet (speech at -68 dB), nothing was sent"
+        );
+        // A streaming dictation that typed nothing says the same.
+        assert_eq!(
+            nothing_typed_message(GateReason::NoSpeech, &levels),
+            "Nothing typed: the audio was without speech (background at -48 dB)"
+        );
+        assert_eq!(
+            nothing_typed_message(GateReason::Silent, &levels),
+            "Nothing typed: the audio was silent (peak -82 dB). Is the mic muted?"
+        );
+        // With `vad` = rms a quiet room is silent too: no muted-mic hint.
+        let quiet_room = Levels {
+            peak_dbfs: -44.0,
+            ..levels
+        };
+        assert_eq!(
+            BatchOrigin::Dictation.gate_skip_toast(GateReason::Silent, &quiet_room),
+            "Skipped: the audio was silent (peak -44 dB)"
+        );
+        assert_eq!(
+            nothing_typed_message(GateReason::Silent, &quiet_room),
+            "Nothing typed: the audio was silent (peak -44 dB)"
+        );
     }
 
     /// Progress toast after the gate: dictation stays quiet; the command
@@ -2075,10 +2563,13 @@ mod tests {
     const VOCABULARY_SHAPED_SPEECH: &str = "Hyprland, whisrs, Wayland";
 
     /// `notify: false` keeps `send_notification` (which spawns a D-Bus thread)
-    /// out of the picture on both branches.
+    /// out of the picture on both branches. `[audio] vad = "rms"`: the test
+    /// audio is a square wave, loud but no voice, which earshot would gate.
     fn context_with_backend(backend: StubBackend) -> DaemonContext {
+        let mut config = config_with_vocabulary(&WIRING_VOCABULARY);
+        config.audio.vad = "rms".to_string();
         DaemonContext {
-            config: config_with_vocabulary(&WIRING_VOCABULARY),
+            config,
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(backend),
             notify: false,
@@ -2149,6 +2640,38 @@ mod tests {
             text.is_empty(),
             "a backend that does send the prompt must still have echoes filtered, got {text:?}"
         );
+    }
+
+    /// The gate runs `[audio] vad`: hiss at -40 dBFS reaches the backend
+    /// with the RMS test and is skipped as "without speech" with earshot.
+    #[tokio::test]
+    async fn batch_gate_runs_the_configured_vad() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let hiss: Vec<i16> = (0..2 * SAMPLE_RATE as usize)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 1141) as i16 - 570
+            })
+            .collect();
+        let mut context = context_with_backend(StubBackend {
+            text: "heard",
+            sends_prompt: false,
+        });
+        let opts = BatchOptions::dictation();
+        let sent = transcribe_batch_audio(&hiss, &context, "en", &opts).await;
+        assert_eq!(sent.unwrap(), "heard");
+        context.config.audio.vad = "earshot".to_string();
+        let gated = transcribe_batch_audio(&hiss, &context, "en", &opts).await;
+        assert_eq!(gated.unwrap(), "", "earshot heard speech in hiss");
+        let gate = speech_gate(
+            &hiss,
+            SAMPLE_RATE,
+            AUDIO_GATE_MIN_MS,
+            &VadConfig::close(context.config.audio.vad()),
+        );
+        assert_eq!(gate.reason, Some(audio_silence_gate::GateReason::NoSpeech));
     }
 
     /// `[replacements]` is wired into the batch path, not just the streaming

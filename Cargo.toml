@@ -11,7 +11,7 @@ members = [
 
 [package]
 name = "whisrs"
-version = "0.1.31"
+version = "0.1.32"
 edition = "2021"
 description = "Voice for the Linux desktop: dictation, read-aloud (TTS), and voice-driven LLM commands, with Groq, OpenAI, Deepgram, and local Whisper backends"
 license = "MIT"
@@ -72,7 +72,7 @@ hipblas = ["local-whisper", "whisper-rs?/hipblas"]
 [dependencies]
 anyhow = "1"
 asr-dedup = { path = "crates/asr-dedup", version = "0.1" }
-audio-silence-gate = { path = "crates/audio-silence-gate", version = "0.1" }
+audio-silence-gate = { path = "crates/audio-silence-gate", version = "0.2" }
 filler-remove = { path = "crates/filler-remove", version = "0.1" }
 prompt-echo = { path = "crates/prompt-echo", version = "0.1" }
 xkb-type = { path = "crates/xkb-type", version = "0.2.0", features = ["arboard", "wayland-vk", "xtest"] }

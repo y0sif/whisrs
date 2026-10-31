@@ -1422,6 +1422,7 @@ mod tests {
             },
             audio: AudioConfig {
                 device: "default".into(),
+                vad: "earshot".into(),
             },
             input: InputConfig {
                 key_delay_ms: 1,

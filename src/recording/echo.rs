@@ -34,7 +34,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context};
-use audio_silence_gate::SILENCE_RMS_THRESHOLD;
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use tracing::debug;
@@ -107,10 +106,18 @@ const NEAR_END_MARGIN_DB: f64 = 10.0;
 /// in dBFS (mean power per sample), so room noise does not count.
 const NEAR_END_FLOOR_DB: f64 = -60.0;
 
-/// A system frame quieter than this mean square is not far-end speech
+/// A system frame quieter than this mean square is not far-end audio
 /// whatever its rank, so a recording where the far side rarely talks does not
 /// learn the echo path from its noise floor (and the user's voice over it).
-const ACTIVE_POWER: f64 = SILENCE_RMS_THRESHOLD * SILENCE_RMS_THRESHOLD;
+/// It gates both the lag search and the echo-path estimate.
+///
+/// An energy floor (RMS 0.003 of full scale, about -50 dBFS), not the speech
+/// detector: the question is whether the system track carries enough
+/// energy for a lag and an echo-path estimate, and music and effects leak
+/// into the mic as echo too, so a speech detector would skip them and the
+/// canceller would learn less. A local value, so a change to the speech
+/// gate's own threshold cannot move it.
+const ACTIVE_POWER: f64 = 0.003 * 0.003;
 
 /// What [`cancel_echo`] did.
 #[derive(Debug, Clone, PartialEq)]

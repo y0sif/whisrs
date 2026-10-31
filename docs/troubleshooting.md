@@ -45,6 +45,49 @@ Verify your mic is recognized: `arecord -l`. If nothing shows up, make sure ALSA
 
 If whisrs records from the wrong microphone, set `[audio] device` to the source you want: a name from `pactl list short sources` (second column), or a description from your sound settings (on PipeWire, `wpctl status` lists them). Restart the daemon afterwards (`whisrs restart`) and check its log (`journalctl --user -u whisrs`) for the line saying which device the name resolved to. An unknown name falls back to the system default with a warning that lists the valid names. See [Choosing the microphone](configuration.md#choosing-the-microphone).
 
+## Noisy room or quiet mic
+
+whisrs measures the audio of every dictation, command and agent turn, and every recording track. Levels are in dBFS, decibels relative to full scale: 0 is the loudest a sample can be, and a normal speaking voice near the mic sits around -40.
+
+- **"Skipped: the audio was silent (peak -120 dB). Is the mic muted?"** Only digital silence reached whisrs: a muted mic or the wrong device (see [No microphone detected](#no-microphone-detected)). With `[audio] vad = "rms"`, "silent" means the whole recording stayed under about -50 dBFS, which a quiet room does too, so the muted-mic question then comes only when it was digital silence.
+- **"... the audio was too quiet (speech at -68 dB)"** A voice was heard, but too faint to send (under -65 dBFS). Move closer or raise the mic gain, for example `wpctl set-volume @DEFAULT_SOURCE@ 80%`.
+- **"... the audio was without speech (background at -48 dB)"** There was sound but no speech. If you did speak, either the background is drowning you out (try the noise filter below) or your voice was too faint or short even to count as too quiet: move closer or raise the gain.
+- **Recording warnings**, each at most once per recording:
+  - "too quiet": your speech is under -55 dBFS. Move closer or raise the gain.
+  - "clipping": the mic hit its limit. Lower the gain.
+  - "noisy": your speech is less than 10 dB above the background. Try the noise filter below.
+  - "nothing has played on the system track yet": in a call, check `[recording] system_device`.
+
+  "Too quiet" and "noisy" judge only your own speech, what the mic records while nothing plays on the system track, so the echo of a lecture on your speakers is not judged as your voice. Each track's levels are kept in `recording.json` and the transcript's front matter ([Recording](configuration.md#recording)).
+- **Your soft voice is missing from a recording while a video played on the laptop speakers.** whisrs removes the speakers' echo from the mic track, and a soft voice under that echo goes with it, as in 0.1.31. Use headphones, or speak up.
+
+A streaming dictation that typed nothing because its audio held no speech says "Nothing typed: the audio was ..." with one of the reasons above.
+
+With the overlay on (`[general] overlay`), the dictation and `[[llm_commands]]` skip notifications and "Nothing typed" do not show; command mode and agent turns always show theirs. Every skip is in the daemon log either way: `journalctl --user -u whisrs`.
+
+Each dictation, command and agent turn also logs its levels there: the speech level, the background, the SNR (signal-to-noise ratio: how far the speech is above the background, in dB), the peak and the share of clipped samples, then when the speech detector first and last heard something ("heard at 0.35 to 8.20 s", or "heard nothing"), a hint for a session that stopped or skipped unexpectedly. Speech recognition copes down to about 10 dB of SNR and gets worse below about 6 dB.
+
+If the speech detector itself misjudges your mic, `[audio] vad = "rms"` brings back the plain loudness test of whisrs 0.1.31 ([Speech detection](configuration.md#speech-detection)).
+
+### A noise filter with PipeWire
+
+whisrs does not remove noise itself. PipeWire can, with its filter-chain module (it runs audio plugins on a source) and RNNoise, a noise suppressor made for voice:
+
+1. Install the plugin. On Arch: `sudo pacman -S noise-suppression-for-voice`. It provides `librnnoise_ladspa`, a LADSPA plugin (an audio plugin format PipeWire's filter-chain can load).
+2. Copy PipeWire's example config into place:
+
+   ```bash
+   mkdir -p ~/.config/pipewire/filter-chain.conf.d
+   cp /usr/share/pipewire/filter-chain/source-rnnoise.conf ~/.config/pipewire/filter-chain.conf.d/
+   ```
+
+   It filters your default mic. To filter another one, add `target.object = "<source name>"` under `capture.props` in the copy, with a name from `pactl list short sources`.
+
+3. Start PipeWire's filter-chain service, which is what reads that folder: `systemctl --user enable --now filter-chain.service` (if it already runs, `systemctl --user restart filter-chain.service`).
+4. A new source named "Noise Canceling source" appears; `pactl list short sources` lists it as `effect_output.rnnoise`, and either name works. Set `[audio] device = "Noise Canceling source"` (a recording uses it too, unless `[recording] mic_device` is set) and run `whisrs restart`.
+
+The example's `"VAD Threshold (%)"` control (50) mutes what RNNoise does not take for voice: lower it if the starts of words get cut. Above 0 it sends exact digital silence between your words, so a long call where you mostly listen can trip the recording's muted-mic alarm ("your mic has sent only silence for 3 minutes"). If that happens, set it to 0.
+
 ## API key errors (401 Unauthorized)
 
 Double-check your key is valid and not expired. Ensure the correct environment variable is set (`WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, or `WHISRS_OPENAI_API_KEY`), or that the key in `~/.config/whisrs/config.toml` is correct. Re-run `whisrs setup` to reconfigure.

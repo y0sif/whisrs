@@ -257,6 +257,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -271,6 +273,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         let huge = vec![0u8; MAX_FILE_SIZE + 1];
         let err = backend.transcribe(&huge, &config).await.unwrap_err();
@@ -313,6 +317,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         let err = backend.transcribe_segments(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -333,6 +339,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         }
     }
 

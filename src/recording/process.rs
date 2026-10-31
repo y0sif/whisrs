@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
-use audio_silence_gate::rms_energy;
+use audio_silence_gate::{rms_energy, SpeechMask, Vad, VadConfig};
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,8 @@ use super::speech::{self, TimeMap};
 use super::split::frame_len;
 use super::store::{self, CACHE_DIR};
 use super::{llm_names, naming};
-use super::{RecordingMeta, RecordingState, Segment, TrackKind, TranscriptSegment};
+use super::{RecordingMeta, RecordingState, Segment, TrackKind, TrackQuality, TranscriptSegment};
+use crate::audio::quality::{QualityMeter, QualityReport};
 use crate::audio::wav::encode_wav;
 use crate::replacements::Replacer;
 use crate::transcription::deepgram::refused_diarization;
@@ -93,6 +94,7 @@ async fn process_with_timing(
     meta.error = None;
     fill_stored_settings(&mut meta, config);
     store::write_meta(dir, &meta)?;
+    fill_track_quality(dir, &mut meta, config.audio.vad()).await;
 
     let name = recording_backend_name(config)?;
     let backend = match dictation_backend {
@@ -120,7 +122,7 @@ async fn process_with_timing(
     let plan = speakers::plan(config, &name, meta.shared_mic.unwrap_or(false));
     let request = |kind| {
         let speakers = plan.requests_speakers(kind);
-        TrackRequest::new(&name, config, &language(kind), speakers, dir)
+        TrackRequest::new(kind, &name, config, &language(kind), speakers, dir)
     };
     let mic_request = request(TrackKind::Mic);
     let system_request = request(TrackKind::System);
@@ -157,6 +159,12 @@ async fn process_with_timing(
 
     let echo_cache = mic_request.cache.echo_cancelled();
     let cancelled_mic = echo_cancelled_mic(dir, &meta).await;
+    if let Some(echo_path_db) = cancelled_mic.as_ref().and_then(|c| c.echo_path_db) {
+        let mic = meta.tracks.iter_mut().find(|t| t.kind == TrackKind::Mic);
+        if let Some(quality) = mic.and_then(|t| t.quality.as_mut()) {
+            quality.set_echo_path(echo_path_db);
+        }
+    }
     let mut transcribed = Vec::new();
     let mut readable_tracks = 0usize;
     for track in meta.tracks.clone() {
@@ -341,6 +349,35 @@ pub(crate) fn save(dir: &Path, meta: &RecordingMeta) -> anyhow::Result<()> {
     store::write_meta(dir, meta)
 }
 
+/// Give each recorded track with no measured quality one measured from its
+/// file as recorded ([`measure_track`]): a recovered recording, whose writers
+/// never finished, one made before tracks were measured, or a track whose
+/// writer wrote nothing or failed. A warning raised live on that track
+/// (`system-silent`, [`TrackQuality::unmeasured`]) is kept. A track that
+/// cannot be read keeps what it has; transcribing it says why.
+async fn fill_track_quality(dir: &Path, meta: &mut RecordingMeta, vad: Vad) {
+    let measured =
+        |t: &&mut super::TrackMeta| t.quality.as_ref().is_some_and(TrackQuality::is_measured);
+    for track in meta.tracks.iter_mut().filter(|t| !measured(t)) {
+        let path = dir.join(&track.file);
+        if !path.exists() {
+            continue;
+        }
+        let cfg = track.kind.vad_config(vad);
+        match blocking(move || measure_track(&path, cfg)).await {
+            Ok(report) => {
+                let measured = TrackQuality::from_report(track.kind, &report);
+                track.quality = Some(measured.measured_over(track.quality.take()));
+            }
+            Err(e) => warn!(
+                "recording {}: could not measure the {} track: {e:#}",
+                meta.id,
+                track.kind.file_stem()
+            ),
+        }
+    }
+}
+
 /// Give a track with no stored language (a recording made before languages
 /// were stored) the one the config gives it ([`RecordingConfig::language_for`]),
 /// and a recording with no stored `shared_mic` or `num_speakers` the
@@ -396,7 +433,7 @@ async fn diarize_track(
     num_speakers: u32,
     cache_dir: &Path,
 ) -> anyhow::Result<Vec<Turn>> {
-    let Some(map) = speech::pack(&track.speech.regions, &[], None).pop() else {
+    let Some(map) = speech::pack(&track.speech.regions, &[], &[], None).pop() else {
         return Ok(Vec::new());
     };
     let wav = {
@@ -473,18 +510,27 @@ fn finish_track(
 }
 
 /// One track's request and the cache of its finished chunks. The two
-/// tracks' requests differ only in their language and whether they ask for
-/// speakers, which the fingerprint covers: a change to one track's leaves
-/// the other track's cached chunks valid.
+/// tracks' requests differ only in their language, whether they ask for
+/// speakers and whether soft voices count
+/// ([`TrackKind::soft_voices`]), which the fingerprint covers: a change to
+/// one track's leaves the other track's cached chunks valid.
 struct TrackRequest {
     tcfg: TranscriptionConfig,
     cache: ChunkCache,
 }
 
 impl TrackRequest {
-    fn new(name: &str, config: &Config, language: &str, diarize: bool, dir: &Path) -> Self {
+    fn new(
+        kind: TrackKind,
+        name: &str,
+        config: &Config,
+        language: &str,
+        diarize: bool,
+        dir: &Path,
+    ) -> Self {
         let mut tcfg = recording_transcription_config(name, config, language);
         tcfg.diarize = diarize;
+        tcfg.soft_voices = kind.soft_voices();
         let cache = ChunkCache {
             dir: dir.join(CACHE_DIR),
             fingerprint: cache_fingerprint(name, config, &tcfg),
@@ -498,6 +544,9 @@ struct CancelledMic {
     path: PathBuf,
     /// [`speech::FRAME`] activity from the canceller's near-end detector.
     near_end: Vec<bool>,
+    /// The echo path the canceller measured, in dB; `None` when an earlier
+    /// attempt's track was reused.
+    echo_path_db: Option<f32>,
 }
 
 /// The mic track with the speakers' echo removed ([`cancel_echo`]), or
@@ -532,6 +581,7 @@ async fn echo_cancelled_mic(dir: &Path, meta: &RecordingMeta) -> Option<Cancelle
             Some(CancelledMic {
                 path: out,
                 near_end,
+                echo_path_db: None,
             })
         }
         Ok(EchoStep::Ran(EchoOutcome::Cancelled(done))) => {
@@ -548,6 +598,7 @@ async fn echo_cancelled_mic(dir: &Path, meta: &RecordingMeta) -> Option<Cancelle
             Some(CancelledMic {
                 path: out,
                 near_end: done.near_end,
+                echo_path_db: Some(report.echo_path_db),
             })
         }
         Ok(EchoStep::Ran(EchoOutcome::Skipped(reason))) => {
@@ -689,6 +740,24 @@ pub(super) fn open_track(
     Ok(reader)
 }
 
+/// A track's quality from its file ([`QualityMeter`] on `cfg`, the track's
+/// [`TrackKind::vad_config`]), read in one-second pieces. Blocking.
+fn measure_track(path: &Path, cfg: VadConfig) -> anyhow::Result<QualityReport> {
+    let mut reader = open_track(path)?;
+    let mut meter = QualityMeter::with_config(cfg);
+    let piece = SAMPLE_RATE as usize;
+    let mut buf = Vec::with_capacity(piece);
+    for sample in reader.samples::<i16>() {
+        buf.push(sample.with_context(|| format!("failed to read {}", path.display()))?);
+        if buf.len() == piece {
+            meter.feed(&buf);
+            buf.clear();
+        }
+    }
+    meter.feed(&buf);
+    Ok(meter.report())
+}
+
 /// What one pass over a track learns, without keeping its samples: a
 /// three-hour track is ~350 MB of samples but ~1 MB of frame energies.
 #[derive(Debug, Clone, PartialEq)]
@@ -697,16 +766,23 @@ struct TrackScan {
     len: usize,
     /// RMS of every frame ([`frame_len`]), the last one partial when the
     /// track does not end on a frame: one per [`speech::FRAME`] of activity,
-    /// and what [`speech::pack`] cuts long regions by.
+    /// and what [`speech::pack`] picks the quietest cut by.
     energies: Vec<f64>,
+    /// Whether each of those frames holds speech, by `[audio] vad` with the
+    /// track's open profile ([`TrackKind::vad_config`]: any voice counts on
+    /// a recording track, and a soft one only on the mic): the activity of
+    /// every track, and where [`speech::pack`] cuts long regions.
+    speech: Vec<bool>,
 }
 
-/// Read a track once, computing its length and energies. Blocking.
-fn scan_track(path: &Path) -> anyhow::Result<TrackScan> {
+/// Read a track once, computing its length, energies and speech mask
+/// (`cfg`). Blocking.
+fn scan_track(path: &Path, cfg: VadConfig) -> anyhow::Result<TrackScan> {
     let mut reader = open_track(path)?;
     let frame = frame_len(SAMPLE_RATE as usize);
     let mut buf = Vec::with_capacity(frame);
     let mut energies = Vec::new();
+    let mut mask = SpeechMask::new(cfg, frame);
     let mut len = 0usize;
     for sample in reader.samples::<i16>() {
         let sample = sample.with_context(|| format!("failed to read {}", path.display()))?;
@@ -714,13 +790,19 @@ fn scan_track(path: &Path) -> anyhow::Result<TrackScan> {
         buf.push(sample);
         if buf.len() == frame {
             energies.push(rms_energy(&buf));
+            mask.feed(&buf);
             buf.clear();
         }
     }
     if !buf.is_empty() {
         energies.push(rms_energy(&buf));
+        mask.feed(&buf);
     }
-    Ok(TrackScan { len, energies })
+    Ok(TrackScan {
+        len,
+        energies,
+        speech: mask.finish(),
+    })
 }
 
 /// Read samples `range` of a track. Blocking.
@@ -798,29 +880,30 @@ fn read_condensed(path: &Path, map: &TimeMap) -> anyhow::Result<Vec<i16>> {
     Ok(out)
 }
 
-/// Where a track holds speech, per [`speech::FRAME`]: its frame energy at
-/// the gate's level, and for the echo-cancelled mic also its near-end mask.
-/// The mask alone passes the canceller's in-band floor, which hiss from a
-/// noisy mic can clear while the far side is quiet; the energy gate is the
-/// one every other track is held to, so the cancelled mic is held to it too.
-fn speech_activity(near_end: Option<&[bool]>, energies: &[f64], stem: &str) -> Vec<bool> {
-    let energy = speech::energy_mask(energies);
+/// Where a track holds speech, per [`speech::FRAME`]: its speech mask
+/// (`[audio] vad`, [`TrackScan::speech`]), and for the echo-cancelled mic
+/// also its near-end mask. The near-end mask alone passes the canceller's
+/// in-band floor, which hiss from a noisy mic can clear while the far side
+/// is quiet; the speech mask is the one every other track is held to, so
+/// the cancelled mic is held to it too (the detector runs on the cancelled
+/// audio).
+fn speech_activity(near_end: Option<&[bool]>, speech: &[bool], stem: &str) -> Vec<bool> {
     match near_end {
-        Some(mask) if mask.len() == energy.len() => mask
+        Some(mask) if mask.len() == speech.len() => mask
             .iter()
-            .zip(&energy)
-            .map(|(&near, &loud)| near && loud)
+            .zip(speech)
+            .map(|(&near, &voiced)| near && voiced)
             .collect(),
         Some(mask) => {
             warn!(
                 "{stem} near-end mask has {} frames for a track of {}; finding speech by \
-                 energy alone",
+                 the speech mask alone",
                 mask.len(),
-                energy.len()
+                speech.len()
             );
-            energy
+            speech.to_vec()
         }
-        None => energy,
+        None => speech.to_vec(),
     }
 }
 
@@ -855,10 +938,11 @@ async fn transcribe_track(
     let path: PathBuf = job.path.to_path_buf();
     let scan = {
         let path = path.clone();
-        blocking(move || scan_track(&path)).await?
+        let cfg = job.kind.vad_config(tcfg.vad);
+        blocking(move || scan_track(&path, cfg)).await?
     };
     let stem = job.kind.file_stem();
-    let active = speech_activity(job.near_end, &scan.energies, stem);
+    let active = speech_activity(job.near_end, &scan.speech, stem);
     let regions = speech::regions(&active, scan.len);
     if regions.is_empty() {
         debug!("{stem} track holds no speech; skipping");
@@ -871,6 +955,7 @@ async fn transcribe_track(
     let chunks = speech::pack(
         &regions,
         &scan.energies,
+        &scan.speech,
         backend
             .max_segment_chunk_secs(tcfg)
             .map(|secs| secs as usize),
@@ -1016,6 +1101,16 @@ fn cache_fingerprint(name: &str, config: &Config, tcfg: &TranscriptionConfig) ->
     });
     if tcfg.diarize {
         key["diarize_model"] = serde_json::json!(crate::transcription::deepgram::DIARIZE_MODEL);
+    }
+    // Local whisper and the phrase fallback cut a chunk into phrases by the
+    // detector, so its text depends on it. Absent for `rms`, which decides as
+    // 0.1.31 did, so a chunk cached before still matches.
+    if tcfg.vad != Vad::Rms {
+        key["vad"] = serde_json::json!(crate::vad_name(tcfg.vad));
+        // The system track's phrases go without the soft threshold.
+        if !tcfg.soft_voices {
+            key["soft_voices"] = serde_json::json!(false);
+        }
     }
     format!("{:016x}", fnv1a64(key.to_string().as_bytes()))
 }
@@ -1455,17 +1550,23 @@ mod tests {
                 device: "test".into(),
                 offset_ms: *offset_ms,
                 samples: samples.as_ref().map_or(0, |s| s.len() as u64),
+                quality: None,
             });
         }
         store::write_meta(tmp.path(), &meta).unwrap();
         (tmp, meta)
     }
 
+    /// `[audio] vad = "rms"`: the fixtures are tones and square waves, loud
+    /// but no voice, so earshot would find no speech in them, and what is
+    /// under test here is everything after the speech mask.
+    const RMS: &str = "[audio]\nvad = \"rms\"\n";
+
     fn config() -> Config {
-        toml::from_str(
-            "[general]\nbackend = \"groq\"\nremove_filler_words = true\n\
+        toml::from_str(&format!(
+            "{RMS}[general]\nbackend = \"groq\"\nremove_filler_words = true\n\
              [recording]\nuser_name = \"Tester\"\n",
-        )
+        ))
         .unwrap()
     }
 
@@ -1487,7 +1588,7 @@ mod tests {
 
     fn summary_config(url: &str, summary: bool) -> Config {
         toml::from_str(&format!(
-            "[general]\nbackend = \"groq\"\n[recording]\nuser_name = \"Tester\"\n\
+            "{RMS}[general]\nbackend = \"groq\"\n[recording]\nuser_name = \"Tester\"\n\
              summary = {summary}\n[llm]\napi_key = \"k\"\nmodel = \"m\"\napi_url = \"{url}\"\n"
         ))
         .unwrap()
@@ -1874,7 +1975,7 @@ mod tests {
             .iter()
             .map(|&(start, len)| start..start + len)
             .collect();
-        speech::pack(&regions, &[], None).remove(0)
+        speech::pack(&regions, &[], &[], None).remove(0)
     }
 
     /// A call over speakers: the mic and system tracks of
@@ -1888,10 +1989,10 @@ mod tests {
     /// speech, found by `near_end` when given, else by frame energy, packed
     /// into one condensed chunk.
     fn condensed(path: &Path, near_end: Option<&[bool]>) -> Vec<i16> {
-        let scan = scan_track(path).unwrap();
-        let active = speech_activity(near_end, &scan.energies, "test");
+        let scan = scan_track(path, TrackKind::Mic.vad_config(Vad::Rms)).unwrap();
+        let active = speech_activity(near_end, &scan.speech, "test");
         let regions = speech::regions(&active, scan.len);
-        let chunks = speech::pack(&regions, &scan.energies, None);
+        let chunks = speech::pack(&regions, &scan.energies, &scan.speech, None);
         assert_eq!(chunks.len(), 1, "{} regions", regions.len());
         read_condensed(path, &chunks[0]).unwrap()
     }
@@ -1927,7 +2028,26 @@ mod tests {
         let system_path = store::audio_path(tmp.path(), TrackKind::System);
         let recorded = fs::read(&mic_path).unwrap();
         let backend = Arc::new(RecordingBackend::default());
-        run_recording(tmp.path(), &backend).await.unwrap();
+        let meta = run_recording(tmp.path(), &backend).await.unwrap();
+
+        // The writers measured nothing here (a recording from before
+        // tracks were measured): processing measures both from their files,
+        // and the mic gets the echo path the canceller found.
+        assert_eq!(store::read_meta(tmp.path()).unwrap().tracks, meta.tracks);
+        let quality = |kind| {
+            let track = meta.tracks.iter().find(|t| t.kind == kind).unwrap();
+            track.quality.clone().expect("measured")
+        };
+        let (mic_quality, system_quality) = (quality(TrackKind::Mic), quality(TrackKind::System));
+        assert_eq!(mic_quality.vad, "rms");
+        assert!(mic_quality.echo_path_db.is_some(), "{mic_quality:?}");
+        assert!(system_quality.speech_dbfs.is_some(), "{system_quality:?}");
+        assert_eq!(system_quality.echo_path_db, None);
+        let markdown = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            markdown.contains("\naudio:\n  mic: {speech_dbfs: "),
+            "{markdown}"
+        );
 
         let sent = backend.sent.lock().unwrap();
         assert_eq!(sent.len(), 2);
@@ -1953,6 +2073,37 @@ mod tests {
         );
     }
 
+    /// A system track whose writer measured nothing but that the mic's live
+    /// check found silent ([`TrackQuality::unmeasured`]): processing measures
+    /// it from the file and keeps the warning, in `recording.json` and in
+    /// the front matter.
+    #[tokio::test]
+    async fn the_fill_keeps_a_live_system_silent_warning() {
+        let (mic, _) = speaker_call();
+        let (tmp, mut meta) = recording(&[
+            (TrackKind::Mic, 0, Some(mic)),
+            (TrackKind::System, 0, Some(vec![0; RATE])),
+        ]);
+        let mut unmeasured = TrackQuality::unmeasured();
+        unmeasured.add_warning(crate::audio::quality::Check::SystemSilent);
+        meta.tracks[1].quality = Some(unmeasured);
+        store::write_meta(tmp.path(), &meta).unwrap();
+
+        let backend = Arc::new(RecordingBackend::default());
+        let meta = run_recording(tmp.path(), &backend).await.unwrap();
+        let system = meta.tracks[1].quality.as_ref().unwrap();
+        assert!(system.is_measured(), "{system:?}");
+        assert_eq!(system.warnings, ["system-silent"]);
+        assert_eq!(store::read_meta(tmp.path()).unwrap().tracks, meta.tracks);
+        let markdown = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            markdown.contains(
+                "  - \"system: system silent (nothing played while the mic heard speech)\"\n"
+            ),
+            "{markdown}"
+        );
+    }
+
     /// No system track (`system_device = "none"`), or a silent one: the mic
     /// is sent as recorded, condensed by frame energy.
     #[tokio::test]
@@ -1961,7 +2112,10 @@ mod tests {
         let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(mic.clone()))]);
         let mic_path = store::audio_path(tmp.path(), TrackKind::Mic);
         let backend = Arc::new(RecordingBackend::default());
-        run_recording(tmp.path(), &backend).await.unwrap();
+        let meta = run_recording(tmp.path(), &backend).await.unwrap();
+        // No echo removal ran: no echo path.
+        let mic_quality = meta.tracks[0].quality.as_ref().unwrap();
+        assert_eq!(mic_quality.echo_path_db, None);
         let raw = condensed(&mic_path, None);
         assert!(
             *backend.sent.lock().unwrap() == [raw.clone()],
@@ -2182,7 +2336,7 @@ mod tests {
 
     /// Condensed length of a `len`-sample track sent by `active`.
     fn condensed_len(active: &[bool], len: usize) -> usize {
-        speech::pack(&speech::regions(active, len), &[], None)
+        speech::pack(&speech::regions(active, len), &[], &[], None)
             .iter()
             .map(TimeMap::condensed_len)
             .sum()
@@ -2427,8 +2581,8 @@ mod tests {
         };
         println!("{done:?} in {:.2?}", started.elapsed());
 
-        let scan = scan_track(&out).unwrap();
-        let active = speech_activity(Some(&done.near_end), &scan.energies, "mic");
+        let scan = scan_track(&out, TrackKind::Mic.vad_config(Vad::Earshot)).unwrap();
+        let active = speech_activity(Some(&done.near_end), &scan.speech, "mic");
         let regions = speech::regions(&active, scan.len);
         let mut words: Vec<(f64, f64)> = labels["results"]["utterances"]
             .as_array()
@@ -2459,7 +2613,7 @@ mod tests {
                 .any(|&a| a)
         };
         let detector_alone = |at: usize| padded(&done.near_end, at);
-        let with_energy = |at: usize| padded(&active, at);
+        let with_speech = |at: usize| padded(&active, at);
         let in_regions = |at: usize| regions.iter().any(|r| r.contains(&at));
         let share = |kept: &dyn Fn(usize) -> bool, want: bool| {
             let picked: Vec<usize> = (0..frames).filter(|&i| labelled[i] == want).collect();
@@ -2475,7 +2629,7 @@ mod tests {
                 "near-end mask alone, padded",
                 &detector_alone as &dyn Fn(usize) -> bool,
             ),
-            ("near-end and energy, padded", &with_energy),
+            ("near-end and speech mask, padded", &with_speech),
             ("final regions", &in_regions),
         ] {
             println!(
@@ -2486,15 +2640,15 @@ mod tests {
         }
 
         // The user over the far side: word frames where the system track,
-        // shifted by the lag, is above the gate.
-        let system_scan = scan_track(&system).unwrap();
+        // shifted by the lag, holds speech.
+        let system_scan = scan_track(&system, TrackKind::System.vad_config(Vad::Earshot)).unwrap();
         let far_active = |at: usize| {
             let at = at as i64 - done.report.lag;
             at >= 0
                 && system_scan
-                    .energies
+                    .speech
                     .get(at as usize / speech::FRAME)
-                    .is_some_and(|&e| e >= SILENCE_RMS_THRESHOLD)
+                    .is_some_and(|&s| s)
         };
         let over: Vec<usize> = (0..frames)
             .filter(|&i| labelled[i] && far_active(i * hop))
@@ -2507,13 +2661,13 @@ mod tests {
         );
 
         let secs = |samples: usize| samples as f64 / f64::from(SAMPLE_RATE);
-        let report = |name: &str, len: usize, regions: &[Range<usize>], energies: &[f64]| {
+        let report = |name: &str, len: usize, regions: &[Range<usize>], scan: &TrackScan| {
             let speech_len: usize = regions.iter().map(|r| r.len()).sum();
-            let one: usize = speech::pack(regions, energies, None)
+            let one: usize = speech::pack(regions, &scan.energies, &scan.speech, None)
                 .iter()
                 .map(TimeMap::condensed_len)
                 .sum();
-            let groq = speech::pack(regions, energies, Some(600));
+            let groq = speech::pack(regions, &scan.energies, &scan.speech, Some(600));
             println!(
                 "{name}: {:.1} s track, {} region(s), {:.1} s of speech, condensed {:.1} s \
                  ({} chunk(s) at a 600 s cap)",
@@ -2524,15 +2678,9 @@ mod tests {
                 groq.len()
             );
         };
-        report("mic", scan.len, &regions, &scan.energies);
-        let system_regions =
-            speech::regions(&speech::energy_mask(&system_scan.energies), system_scan.len);
-        report(
-            "system",
-            system_scan.len,
-            &system_regions,
-            &system_scan.energies,
-        );
+        report("mic", scan.len, &regions, &scan);
+        let system_regions = speech::regions(&system_scan.speech, system_scan.len);
+        report("system", system_scan.len, &system_regions, &system_scan);
     }
 
     /// [`FakeBackend`] with a voice label on every segment and its one
@@ -2590,7 +2738,7 @@ mod tests {
     /// lines in `[recording]`.
     fn speaker_config(extra: &str) -> Config {
         toml::from_str(&format!(
-            "[general]\nbackend = \"asr-sidecar\"\n\
+            "{RMS}[general]\nbackend = \"asr-sidecar\"\n\
              [asr-sidecar]\nurl = \"http://127.0.0.1:1/t\"\n\
              [recording]\nuser_name = \"Tester\"\n{extra}"
         ))
@@ -3350,7 +3498,7 @@ mod tests {
 
     fn deepgram_config(extra: &str) -> Config {
         toml::from_str(&format!(
-            "[general]\nbackend = \"deepgram\"\n[deepgram]\napi_key = \"k\"\n\
+            "{RMS}[general]\nbackend = \"deepgram\"\n[deepgram]\napi_key = \"k\"\n\
              [recording]\nuser_name = \"Tester\"\n{extra}"
         ))
         .unwrap()
@@ -3465,7 +3613,7 @@ mod tests {
 
     fn sidecar_config(url: &str, extra: &str) -> Config {
         toml::from_str(&format!(
-            "[general]\nbackend = \"groq\"\n[recording]\nuser_name = \"Tester\"\n\
+            "{RMS}[general]\nbackend = \"groq\"\n[recording]\nuser_name = \"Tester\"\n\
              diarization_url = \"{url}\"\n{extra}"
         ))
         .unwrap()
@@ -3686,6 +3834,41 @@ mod tests {
         );
     }
 
+    /// The system track decides speech without the soft threshold in every
+    /// pass over it: the scan behind its regions and chunk cuts, the stored
+    /// quality, and the request whose phrases a backend cuts. A drum loop is
+    /// a quarter speech on the mic's profile and none on the system's.
+    #[test]
+    fn the_system_track_goes_without_the_soft_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("drums.wav");
+        write_wav(&path, &crate::audio::test_audio::drum_loop(20, -30.0));
+        let share = |kind: TrackKind| {
+            let scan = scan_track(&path, kind.vad_config(Vad::Earshot)).unwrap();
+            let regions = speech::regions(&scan.speech, scan.len);
+            let speech = scan.speech.iter().filter(|&&s| s).count();
+            (speech as f64 / scan.speech.len() as f64, regions.len())
+        };
+        let (mic, mic_regions) = share(TrackKind::Mic);
+        let (system, system_regions) = share(TrackKind::System);
+        assert!(mic > 0.2 && mic_regions > 0, "mic {mic} in {mic_regions}");
+        assert_eq!((system, system_regions), (0.0, 0));
+
+        let speech_level =
+            |kind: TrackKind| measure_track(&path, kind.vad_config(Vad::Earshot)).unwrap();
+        assert!(speech_level(TrackKind::Mic).levels.speech_dbfs.is_some());
+        assert_eq!(speech_level(TrackKind::System).levels.speech_dbfs, None);
+
+        // The requests: the system's phrases go without it too, and the
+        // backend's open profile is the scan's.
+        let config: Config = toml::from_str("[general]\nbackend = \"groq\"\n").unwrap();
+        for kind in [TrackKind::Mic, TrackKind::System] {
+            let request = TrackRequest::new(kind, "groq", &config, "en", false, tmp.path());
+            assert_eq!(request.tcfg.soft_voices, kind == TrackKind::Mic);
+            assert_eq!(request.tcfg.open_vad(), kind.vad_config(request.tcfg.vad));
+        }
+    }
+
     fn fingerprint_of(toml_text: &str) -> String {
         let config: Config = toml::from_str(toml_text).unwrap();
         let name = recording_backend_name(&config).unwrap();
@@ -3741,6 +3924,20 @@ mod tests {
         let mut tcfg = recording_transcription_config(&name, &config, "en");
         tcfg.diarize = true;
         assert_ne!(fp, cache_fingerprint(&name, &config, &tcfg));
+
+        // So is the system track's phrase cut without the soft threshold,
+        // under earshot; the RMS test has no soft threshold to leave out.
+        let mut tcfg = recording_transcription_config(&name, &config, "en");
+        tcfg.soft_voices = false;
+        assert_ne!(fp, cache_fingerprint(&name, &config, &tcfg));
+        let rms = format!("{base}[audio]\nvad = \"rms\"\n");
+        let config: Config = toml::from_str(&rms).unwrap();
+        let mut tcfg = recording_transcription_config(&name, &config, "en");
+        tcfg.soft_voices = false;
+        assert_eq!(
+            fingerprint_of(&rms),
+            cache_fingerprint(&name, &config, &tcfg)
+        );
 
         // The sidecar URL is part of its identity.
         let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\
@@ -4034,11 +4231,18 @@ mod tests {
         samples.extend([9i16; 123]); // a partial last frame
         write_wav(&path, &samples);
 
-        let scan = scan_track(&path).unwrap();
+        let scan = scan_track(&path, TrackKind::Mic.vad_config(Vad::Rms)).unwrap();
         assert_eq!(scan.len, samples.len());
         // Every frame, the partial last one included.
         assert_eq!(scan.energies.len(), speech::frame_count(samples.len()));
         assert_eq!(scan.energies.last(), Some(&rms_energy(&[9i16; 123])));
+        // The RMS mask is 0.1.31's energy mask, bit for bit.
+        let energy_mask: Vec<bool> = scan
+            .energies
+            .iter()
+            .map(|&e| e >= SILENCE_RMS_THRESHOLD)
+            .collect();
+        assert_eq!(scan.speech, energy_mask);
         for cap in [10, 25, 60] {
             let expected = crate::recording::split::split_at_silence(
                 &samples,
@@ -4046,8 +4250,7 @@ mod tests {
                 cap,
                 SILENCE_RMS_THRESHOLD,
             );
-            let ranges =
-                split_by_energies(&scan.energies, scan.len, RATE, cap, SILENCE_RMS_THRESHOLD);
+            let ranges = split_by_energies(&scan.energies, &scan.speech, scan.len, RATE, cap);
             assert_eq!(ranges, expected, "cap {cap}");
             for r in ranges {
                 assert_eq!(read_range(&path, r.clone()).unwrap(), samples[r]);

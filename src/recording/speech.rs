@@ -3,8 +3,9 @@
 //! Whisper backends normalise their input, so a long quiet stretch (what is
 //! left of the far side after echo removal, room noise) comes back as
 //! invented sentences. A track is therefore sent as its speech only: every
-//! 100 ms frame is marked active ([`energy_mask`], or the echo canceller's
-//! near-end detector for the mic), active frames grow into padded
+//! 100 ms frame is marked active (the track's speech mask from `[audio] vad`,
+//! for the cancelled mic together with the echo canceller's near-end
+//! detector), active frames grow into padded
 //! [`regions`], and the regions are packed back to back with a second of
 //! digital silence between them into condensed chunks ([`pack`]). Each
 //! chunk keeps a [`TimeMap`] from its condensed audio to the track, which
@@ -12,8 +13,6 @@
 //! track's own timeline.
 
 use std::ops::Range;
-
-use audio_silence_gate::SILENCE_RMS_THRESHOLD;
 
 use super::split::split_by_energies;
 use super::{Segment, Word};
@@ -39,15 +38,6 @@ const MIN_SPEECH_MS: usize = 300;
 /// 900 ms there) and than Deepgram's utterance split, so both break at
 /// every join.
 pub const JOIN_GAP: usize = RATE;
-
-/// Activity from frame RMS ([`audio_silence_gate::rms_energy`] scale): a
-/// frame is active at [`SILENCE_RMS_THRESHOLD`] or above.
-pub fn energy_mask(energies: &[f64]) -> Vec<bool> {
-    energies
-        .iter()
-        .map(|&e| e >= SILENCE_RMS_THRESHOLD)
-        .collect()
-}
 
 /// Frames in a `len`-sample track, the last one possibly partial.
 pub fn frame_count(len: usize) -> usize {
@@ -108,9 +98,15 @@ pub struct TimeMap {
 /// Pack `regions` in order into condensed chunks of at most `cap_secs`
 /// each (`None`: one chunk), with [`JOIN_GAP`] of silence between regions.
 /// A region longer than the cap is first cut where [`split_by_energies`]
-/// cuts a track, in the quietest stretch before the cap, using the track's
-/// frame `energies` (one per [`FRAME`]).
-pub fn pack(regions: &[Range<usize>], energies: &[f64], cap_secs: Option<usize>) -> Vec<TimeMap> {
+/// cuts a track, in the longest stretch without speech before the cap, else
+/// at its quietest frame, using the track's frame `energies` and `speech`
+/// mask (one per [`FRAME`]).
+pub fn pack(
+    regions: &[Range<usize>],
+    energies: &[f64],
+    speech: &[bool],
+    cap_secs: Option<usize>,
+) -> Vec<TimeMap> {
     let cap = cap_secs.map(|secs| (secs * RATE).max(FRAME));
     let parts = regions.iter().flat_map(|region| -> Vec<Range<usize>> {
         match cap_secs {
@@ -119,10 +115,10 @@ pub fn pack(regions: &[Range<usize>], energies: &[f64], cap_secs: Option<usize>)
                 let from = (region.start / FRAME).min(energies.len());
                 split_by_energies(
                     &energies[from..],
+                    speech.get(from..).unwrap_or(&[]),
                     region.len(),
                     RATE,
                     secs,
-                    SILENCE_RMS_THRESHOLD,
                 )
                 .into_iter()
                 .map(|r| region.start + r.start..region.start + r.end)
@@ -484,7 +480,8 @@ mod tests {
     fn packing_keeps_gaps_and_the_cap() {
         let regions = [SEC..3 * SEC, 10 * SEC..12 * SEC, 20 * SEC..25 * SEC];
         let energies = vec![0.1; 300];
-        let one = pack(&regions, &energies, None);
+        let speech = vec![true; 300];
+        let one = pack(&regions, &energies, &speech, None);
         assert_eq!(one.len(), 1);
         assert_eq!(
             one[0].pieces,
@@ -509,7 +506,7 @@ mod tests {
         assert_eq!(one[0].condensed_len(), 11 * SEC);
 
         // A 6 s cap: the first two fit (2 + 1 + 2 s), the third starts anew.
-        let capped = pack(&regions, &energies, Some(6));
+        let capped = pack(&regions, &energies, &speech, Some(6));
         assert_eq!(capped.len(), 2);
         assert_eq!(capped[0].condensed_len(), 5 * SEC);
         assert_eq!(
@@ -525,11 +522,13 @@ mod tests {
 
     #[test]
     fn a_region_over_the_cap_is_cut_at_its_quietest_point() {
-        // 30 s of speech with one quiet frame at 7.0 s, at a 10 s cap.
+        // 30 s of speech with one quiet frame at 7.0 s, at a 10 s cap; the
+        // RMS mask (0.003) calls only that frame silent.
         let mut energies = vec![0.1; 400];
         energies[100 + 70] = 0.0;
+        let speech: Vec<bool> = energies.iter().map(|&e| e >= 0.003).collect();
         let region = 10 * SEC..40 * SEC;
-        let chunks = pack(std::slice::from_ref(&region), &energies, Some(10));
+        let chunks = pack(std::slice::from_ref(&region), &energies, &speech, Some(10));
         let cuts: Vec<usize> = chunks.iter().map(|c| c.pieces[0].original).collect();
         assert_eq!(cuts[1], 17 * SEC, "cut in the quiet frame");
         assert!(chunks
@@ -561,7 +560,7 @@ mod tests {
     /// Two regions, 0.5-2.5 s and 60-62 s of the track, condensed to 0-2 s
     /// and 3-5 s.
     fn two_pieces() -> TimeMap {
-        pack(&[SEC / 2..5 * SEC / 2, 60 * SEC..62 * SEC], &[], None).remove(0)
+        pack(&[SEC / 2..5 * SEC / 2, 60 * SEC..62 * SEC], &[], &[], None).remove(0)
     }
 
     #[test]

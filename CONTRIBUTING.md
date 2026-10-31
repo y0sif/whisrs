@@ -124,7 +124,7 @@ extracted crates:
 crates/
   xkb-type/            — uinput keyboard, XKB keymap, clipboard, wayland virtual keyboard
   asr-dedup/           — timestamp + n-gram dedup for chunked ASR
-  audio-silence-gate/  — RMS energy gate / VAD
+  audio-silence-gate/  - earshot VAD + RMS gate, auto-stop, level meter
   filler-remove/       — filler-word stripping
   prompt-echo/         — prompt-echo hallucination filter
 ```

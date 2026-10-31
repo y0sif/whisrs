@@ -74,6 +74,7 @@ fn make(
         device: "default".into(),
         offset_ms: 0,
         samples: 0,
+        quality: None,
     }];
     edit(&mut meta);
     store::write_meta(&dir, &meta).unwrap();

@@ -166,7 +166,7 @@ src/
 │   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types: every build (IPC wire);
 │   │                       #   the submodules below are feature `recording`
 │   ├── store.rs            #   Recordings folder: create, list (or list_headers: no transcript text), resolve ids, retention sweep
-│   ├── recorder.rs         #   Per-track WAV writer with periodic header flushes
+│   ├── recorder.rs         #   Per-track WAV writer (periodic header flushes), mic/system meters, live quality warnings (`LiveQuality`)
 │   ├── wav_repair.rs       #   Fix WAV headers a crash left unfinalized
 │   ├── echo.rs             #   Remove speaker echo from the mic track (system track as reference)
 │   ├── speech.rs           #   Speech regions, condensed chunks + time maps, segments mapped back
@@ -183,6 +183,7 @@ src/
 │   ├── wav.rs              # PCM-to-WAV encoding
 │   ├── playback.rs         # TTS audio playback
 │   ├── feedback.rs         # Audio cues
+│   ├── quality.rs          # Quality report: analyze (pure, open profile), verdicts, skip labels with levels
 │   └── recovery.rs         # Save/load audio on transcription failure
 ├── transcription/
 │   ├── mod.rs              # TranscriptionBackend trait, timed segments, phrase fallback
@@ -264,7 +265,7 @@ crates/
 │   ├── clipboard.rs        #   Clipboard ops (wl-copy/arboard, save/restore)
 │   └── wayland_vk.rs       #   zwp_virtual_keyboard_v1 backend
 ├── asr-dedup/              # 0.1.0 — timestamp + n-gram dedup for chunked ASR
-├── audio-silence-gate/     # 0.1.0 — RMS energy gate / VAD
+├── audio-silence-gate/     # 0.2.0 - earshot VAD + RMS gate, auto-stop, level meter
 ├── filler-remove/          # 0.1.0 — filler-word stripping
 └── prompt-echo/            # 0.1.0 — prompt-echo hallucination filter
 ```
@@ -289,6 +290,8 @@ scripts/
 ├── gen-issue55-fixture.sh  # Synthesize WAV fixtures (espeak-ng + ffmpeg)
 ├── check-issue208.sh       # Scripted segmentation "none" loop + coverage gate (large-v3-turbo)
 ├── gen-issue208-fixture.sh # Synthesize the long-dictation fixture (espeak-ng + ffmpeg)
+├── check-vad.sh            # Scripted gate for the speech detector (audio-silence-gate examples/vad_check.rs)
+├── gen-vad-fixture.sh      # Synthesize the VAD fixtures (espeak-ng + ffmpeg)
 ├── check-no-avx512.sh      # Fail if a release binary needs AVX-512 (#150, run by CI)
 └── verify-injection.sh     # Injection smoke check
 ```
@@ -296,8 +299,8 @@ scripts/
 `specs/` holds tracked per-feature design docs (e.g.
 `specs/openai-compatible-realtime/{DESIGN,README,TASKS}.md`).
 
-**Note on `docs/`:** `/docs/*` is gitignored with a five-file whitelist. Only
-`comparison.md`, `configuration.md`, `faq.md`, `troubleshooting.md` and
+**Note on `docs/`:** `/docs/*` is gitignored with a six-file whitelist. Only
+`comparison.md`, `configuration.md`, `faq.md`, `gpu-acceleration.md`, `troubleshooting.md` and
 `version-roadmap.md` are tracked. Everything else there is local-only, so "fixing the
 docs" in an untracked file changes nothing for users and shows up in no PR. Check with
 `git check-ignore -v <path>` before claiming a docs fix landed.
@@ -532,6 +535,34 @@ there until a `Stop` or `idle_loop`'s listing ends it (one `session_phases` per 
 backing off to 120 s, reset by a turn start or a row change). `TranscriptTail` (`claude_tail.rs`) sends
 `Activity` and `Interim` updates; `ProgressGate` admits interims per `feedback`.
 
+Speech detection: `[audio] vad` = `earshot` (default) | `rms` (the 0.1.31 loudness test), read through
+`AudioConfig::vad()` (an unknown value warns and uses earshot). `silence_timeout_ms = 0` turns
+auto-stop off on every path (#178). Every speech decision on both
+transcription paths goes through `audio-silence-gate`: `close` for dictation, command mode,
+`[[llm_commands]]` and agent turns (auto-stop, the batch gate, local-whisper's streaming phrase splits),
+`open` for recording tracks and cut points (`capped_phrases`, the segment fallback); on a recording's
+system track `open` goes without the soft threshold (`TrackKind::vad_config`, `TranscriptionConfig::soft_voices`:
+its mask, chunk cuts, meters and a backend's phrases), since it passes music. The `close` relative
+floor never rises above the RMS threshold (-50.5 dBFS), so a loud burst cannot bury the speech after it
+(`check-vad.sh`'s "Oh!" rows). A frame 6 dB over the background (pre-emphasized, the quietest frame of
+the last 240 ms of sound) two frames running needs only score 0.25 (`soft_threshold`), so a soft voice
+counts; such frames count half toward arming and the gate, and only within their run of speech (304 ms
+with no voiced frame forgets them, `vad::Evidence`), so separate noise onsets never add up
+(`check-vad.sh`'s noise-burst row; its real-voice rows need the local `fixtures/vad/real-soft.wav`). A skip toast names its reason with a level (`audio::quality::skip_label`:
+"silent (peak -82 dB)", "too quiet (speech at -68 dB)", "without speech (background at -48 dB)"), and
+adds "Is the mic muted?" only at a peak of digital silence (`skip_hint`); a streaming dictation whose
+audio held no speech says "Nothing typed: the audio was ..." (`notify_state`), "too quiet" with the
+voice's level when the level floors rejected it (`AutoStopDetector::too_quiet`). Each turn logs one info
+line of levels, ending in a diagnostic of what the detector heard (`pipeline::heard_label`: "heard at
+0.35 to 8.20 s", the first and the latest frame it voiced before its level floors and arming, or "heard
+nothing"), from `AutoStopDetector::first_heard`/`last_heard` (streaming dictation, and command mode,
+`[[llm_commands]]` and agents in `collect_instruction_audio`) or the batch gate's
+`GateOutcome::first_heard`/`last_heard` (batch dictation's "dictation audio" line). It decides nothing:
+a noise switching on (a fan, dishes, a knock) can show as heard too. A session in which nobody speaks
+records until the second press or a cancel, as in 0.1.31, and so does a voice too quiet to arm
+auto-stop, whose press then says "too quiet" when the floor-rejected voice still
+reached 160 ms of evidence before the floors (`unfloored_evidence`), else "without speech".
+
 Config profiles (#189): a partial config in `~/.config/whisrs/profiles/<name>.toml`, names
 `[a-z0-9_-]{1,32}` but `base`/`list`/`next`; the active name is one line in
 `$XDG_STATE_HOME/whisrs/active-profile` (none, or `base`: config.toml alone). `load_config_toml_at`
@@ -579,6 +610,22 @@ then holds the recording just to merge its fields into `recording.json` as it is
 (`summary::write_result`, stale if a name changed meanwhile) and re-render `<id>.md`
 (`process::save`); it never re-transcribes. A retry or a rename over a summary marks it
 `summary_stale`.
+Each `TrackMeta` has `quality: Option<TrackQuality>` (plain type, every build; `None` in an older
+`recording.json`): the track writer's meter on the raw chunks (`TrackStats::quality`, stored by
+`apply_outcomes`), else measured from the raw WAV by `process_recording`, plus the mic's `echo_path_db`
+when echo removal ran; `warnings` are `audio::quality::Check` codes. The front matter gets an `audio:`
+block (and `audio_warnings:` only when warned) for each track with a `quality` (an unmeasured one prints
+nulls), so an older recording, which has none, renders byte for byte as before. The mic writer's `LiveQuality` raises clipping (every 30 s once 30 s of speech
+was heard), too quiet and noisy (once 30 s of the user's own speech was) and `system-silent` (2 minutes
+of speech while `SystemSignal::heard` is false), each once per recording, through
+`MicAlarm::on_warning`; the muted-mic alarm (`on_silence`) re-arms as before. The system writer marks
+each chunk above digital silence on the shared `SystemSignal`; mic chunks taken within
+`PLAYBACK_HANGOVER` (300 ms) of one are left out of the mic's speech level, background and SNR
+(`QualityMeter::feed_marked`, live and stored; clipping and DC offset count everything), and once any
+were, a stored speech level needs 10 s of own speech (`OWN_SPEECH_FOR_LEVEL`). Too quiet, noisy, clipping, DC offset and strong
+echo are mic-only warnings (`TrackQuality::from_report(kind, ..)`); the system track's one is
+`system-silent`, stored by `apply_outcomes` on an unmeasured quality (`TrackQuality::unmeasured`) when
+its writer measured nothing, and kept when the worker measures the WAV.
 
 Environment variable overrides:
 - `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key` (also used by the `deepgram` TTS backend)
@@ -599,6 +646,8 @@ cargo clippy --all-targets --no-default-features --features tray,overlay,hooks,r
 cargo test                                     # all tests must pass
 cargo test --no-default-features --features tray,overlay,hooks   # the "built without recording" answers (CI runs it)
 cargo test -p xkb-type --all-features -- --skip us_qwerty_fr_typeable_via_uinput --skip from_localectl_returns_layout_when_available   # xkb-type (CI runs it; root `cargo test` skips it)
+cargo clippy -p audio-silence-gate --all-targets -- -D warnings   # the detector crate + vad_check example (CI runs it)
+cargo test -p audio-silence-gate                                  # the detector tests (CI runs it; root `cargo test` skips them)
 cargo build                                    # must compile
 ```
 

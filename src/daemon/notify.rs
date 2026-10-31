@@ -1,5 +1,3 @@
-use tracing::warn;
-
 /// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char
 /// boundaries. Appends "..." if truncated.
 pub(crate) fn truncate_preview(text: &str, max_bytes: usize) -> String {
@@ -21,6 +19,7 @@ pub(crate) fn send_notification(summary: &str, body: &str) {
 
 /// [`send_notification`] that stays up for `timeout_ms` (an agent's reply is
 /// longer than a progress toast).
+#[cfg(not(test))]
 pub(crate) fn send_notification_for(summary: &str, body: &str, timeout_ms: u32) {
     let summary = summary.to_string();
     let body = body.to_string();
@@ -33,9 +32,28 @@ pub(crate) fn send_notification_for(summary: &str, body: &str, timeout_ms: u32) 
             .timeout(notify_rust::Timeout::Milliseconds(timeout_ms))
             .show()
         {
-            warn!("failed to send notification: {e}");
+            tracing::warn!("failed to send notification: {e}");
         }
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for [`send_notification_for`]: the toasts this thread sent,
+    /// never shown on the desktop running the tests.
+    static SENT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test build: record the toast's body instead of showing it.
+#[cfg(test)]
+pub(crate) fn send_notification_for(_summary: &str, body: &str, _timeout_ms: u32) {
+    SENT.with(|sent| sent.borrow_mut().push(body.to_string()));
+}
+
+/// The toasts this thread sent since the last call.
+#[cfg(test)]
+pub(crate) fn take_sent_toasts() -> Vec<String> {
+    SENT.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
 }
 
 #[cfg(test)]
