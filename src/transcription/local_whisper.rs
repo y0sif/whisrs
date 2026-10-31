@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use asr_dedup::TextDedup;
 use async_trait::async_trait;
+use audio_silence_gate::{speech_gate, Vad, VadConfig};
 use prompt_echo::is_prompt_echo;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -65,10 +66,6 @@ const STEP_SAMPLES: usize = STEP_SECS * SAMPLE_RATE;
 /// Shorter initial window for faster first result.
 const INITIAL_WINDOW_SECS: usize = 4;
 const INITIAL_WINDOW_SAMPLES: usize = INITIAL_WINDOW_SECS * SAMPLE_RATE;
-
-/// Silence threshold — must match or be below the daemon's auto-stop threshold
-/// (0.003) so we never skip audio that auto-stop considers speech.
-const SILENCE_THRESHOLD: f64 = 0.003;
 
 /// whisper.cpp produces no output for buffers shorter than ~1 s of audio;
 /// short phrases are zero-padded up to this length before decoding.
@@ -177,8 +174,13 @@ impl LocalWhisperBackend {
         text_tx: mpsc::Sender<String>,
         config: &TranscriptionConfig,
     ) -> anyhow::Result<()> {
-        let mut splitter =
-            PhraseSplitter::new(SAMPLE_RATE, SILENCE_THRESHOLD, self.phrase_silence_ms);
+        // The close profile: one user near the mic, so a TV under them is
+        // not typed.
+        let mut splitter = PhraseSplitter::new(
+            SAMPLE_RATE,
+            VadConfig::close(config.vad),
+            self.phrase_silence_ms,
+        );
         let mut state = create_state(ctx)?;
 
         while let Some(chunk) = audio_rx.recv().await {
@@ -242,8 +244,8 @@ impl LocalWhisperBackend {
                 let window_start = window_end.saturating_sub(window_size);
                 let window = buffer[window_start..window_end].to_vec();
 
-                // Skip silent windows.
-                if !audio_silence_gate::is_silent(&window, SILENCE_THRESHOLD) {
+                // Skip windows without speech.
+                if holds_speech(&window, config.vad) {
                     let samples_f32 = i16_to_f32(&window);
                     let lang = config.language.clone();
                     let is_multilingual = ctx.is_multilingual();
@@ -307,8 +309,7 @@ impl LocalWhisperBackend {
             };
             let remaining = &buffer[remaining_start..];
 
-            if !remaining.is_empty() && !audio_silence_gate::is_silent(remaining, SILENCE_THRESHOLD)
-            {
+            if holds_speech(remaining, config.vad) {
                 let samples_f32 = i16_to_f32(remaining);
                 let lang = config.language.clone();
                 let is_multilingual = ctx.is_multilingual();
@@ -366,7 +367,8 @@ impl LocalWhisperBackend {
             buffer.extend_from_slice(&chunk);
         }
 
-        if buffer.is_empty() || audio_silence_gate::is_silent(&buffer, SILENCE_THRESHOLD) {
+        // A whole session: a few hundred ms of model time for minutes of it.
+        if !crate::audio::block_off_runtime(|| holds_speech(&buffer, config.vad)) {
             return Ok(());
         }
 
@@ -380,8 +382,9 @@ impl LocalWhisperBackend {
         let is_multilingual = ctx.is_multilingual();
         let prompt = config.prompt.clone().filter(|p| !p.is_empty());
         let phrase_silence_ms = self.phrase_silence_ms;
+        let vad = config.vad;
         let text = tokio::task::spawn_blocking(move || {
-            let windows = batch_windows(&buffer, phrase_silence_ms);
+            let windows = batch_windows(&buffer, phrase_silence_ms, vad);
             let mut state = create_state(&ctx)?;
             decode_batch_windows(
                 &mut state,
@@ -408,10 +411,25 @@ impl LocalWhisperBackend {
     /// `no_context(true)`: the repetition loop of #55. `phrase_silence_ms` is
     /// capped ([`super::recording_phrase_silence_ms`]), so every join between
     /// the chunk's speech regions ends a phrase. A long batch dictation is cut
-    /// the same way ([`batch_windows`]).
-    fn recording_phrases(&self, samples: &[i16]) -> Vec<super::phrase_split::Phrase> {
-        capped_phrases(samples, self.phrase_silence_ms, None)
+    /// the same way ([`batch_windows`]). `cfg` is the track's open profile
+    /// ([`TranscriptionConfig::open_vad`]).
+    fn recording_phrases(
+        &self,
+        samples: &[i16],
+        cfg: VadConfig,
+    ) -> Vec<super::phrase_split::Phrase> {
+        capped_phrases(samples, self.phrase_silence_ms, None, cfg)
     }
+}
+
+/// Whether a dictation buffer holds speech worth decoding: the whole-buffer
+/// gate on `vad` with the close profile (one user near the mic) and no
+/// minimum length. With [`Vad::Rms`] it is the 0.1.31 test: not empty, and
+/// an RMS of at least 0.003.
+fn holds_speech(samples: &[i16], vad: Vad) -> bool {
+    speech_gate(samples, SAMPLE_RATE as u32, 0, &VadConfig::close(vad))
+        .reason
+        .is_none()
 }
 
 /// The splitter behind [`LocalWhisperBackend::recording_phrases`] and
@@ -419,14 +437,19 @@ impl LocalWhisperBackend {
 /// [`super::recording_phrase_silence_ms`]), fed the whole buffer in one call
 /// or, with `feed_len`, that many samples at a time. Both give the same
 /// phrases. A free function, so a blocking task can run it.
+///
+/// Speech is decided by `cfg`, an open profile: these are cut points (a
+/// recording track may carry voices at any level), so a quiet voice must
+/// not be dropped.
 fn capped_phrases(
     samples: &[i16],
     phrase_silence_ms: u64,
     feed_len: Option<usize>,
+    cfg: VadConfig,
 ) -> Vec<super::phrase_split::Phrase> {
     let mut splitter = PhraseSplitter::new(
         SAMPLE_RATE,
-        SILENCE_THRESHOLD,
+        cfg,
         super::recording_phrase_silence_ms(phrase_silence_ms),
     );
     let mut phrases = match feed_len {
@@ -457,8 +480,13 @@ fn fits_one_decode_window(samples: usize) -> bool {
 /// it costs time with the square of its length, since each frame it drops
 /// moves the rest of the buffer. It still runs in the blocking task with
 /// the decode, not on the async thread.
-fn batch_windows(samples: &[i16], phrase_silence_ms: u64) -> Vec<DecodeWindow> {
-    let phrases = capped_phrases(samples, phrase_silence_ms, Some(SAMPLE_RATE));
+fn batch_windows(samples: &[i16], phrase_silence_ms: u64, vad: Vad) -> Vec<DecodeWindow> {
+    let phrases = capped_phrases(
+        samples,
+        phrase_silence_ms,
+        Some(SAMPLE_RATE),
+        VadConfig::open(vad),
+    );
     let windows = dictation_windows(&phrases, SAMPLE_RATE);
     debug!(
         "local whisper: {} phrase(s) in {} decode window(s) (whisper full() calls) \
@@ -968,8 +996,9 @@ impl TranscriptionBackend for LocalWhisperBackend {
         // Longer, cut into windows that each fit one 30 s mel window
         // (issue #208), in the blocking task: see `batch_windows`.
         let phrase_silence_ms = self.phrase_silence_ms;
+        let vad = config.vad;
         tokio::task::spawn_blocking(move || {
-            let windows = batch_windows(&samples_i16, phrase_silence_ms);
+            let windows = batch_windows(&samples_i16, phrase_silence_ms, vad);
             let mut state = create_state(&ctx)?;
             decode_batch_windows(
                 &mut state,
@@ -1037,7 +1066,9 @@ impl TranscriptionBackend for LocalWhisperBackend {
         })?;
 
         let samples = decode_wav_samples(audio)?;
-        let phrases = self.recording_phrases(&samples);
+        // Minutes of audio per chunk: run the detector off the async worker.
+        let phrases =
+            crate::audio::block_off_runtime(|| self.recording_phrases(&samples, config.open_vad()));
         let windows = decode_windows(&samples, &phrases, SAMPLE_RATE);
         debug!(
             "local whisper: {} phrase(s) in {} decode window(s) (whisper full() calls) \
@@ -1076,6 +1107,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         let err = backend.transcribe(&[1, 2, 3], &config).await.unwrap_err();
         let msg = err.to_string();
@@ -1181,7 +1214,7 @@ mod tests {
         for mode in ["none", "silence", "window"] {
             let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
                 .with_segmentation(mode, 400);
-            let phrases = backend.recording_phrases(&speech);
+            let phrases = backend.recording_phrases(&speech, VadConfig::open(Vad::Rms));
             assert!(phrases.len() >= 3, "{mode}: {} phrase(s)", phrases.len());
             for phrase in &phrases {
                 assert!(
@@ -1265,7 +1298,7 @@ mod tests {
         for silence_ms in [400, 900, 1000, 5000] {
             let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
                 .with_segmentation("silence", silence_ms);
-            let phrases = backend.recording_phrases(&chunk);
+            let phrases = backend.recording_phrases(&chunk, VadConfig::open(Vad::Rms));
             assert_eq!(phrases.len(), 2, "phrase_silence_ms = {silence_ms}");
             assert!(phrases[1].start_sample as usize >= region.len() + join / 2);
         }
@@ -1290,10 +1323,10 @@ mod tests {
         assert!(fits_one_decode_window(10 * SAMPLE_RATE));
         assert!(fits_one_decode_window(cap));
         assert!(!fits_one_decode_window(cap + 1));
-        assert!(!batch_windows(&audio[..cap + 1], 400).is_empty());
+        assert!(!batch_windows(&audio[..cap + 1], 400, Vad::Rms).is_empty());
 
-        let windows = batch_windows(&audio, 400);
-        let phrases = capped_phrases(&audio, 400, Some(SAMPLE_RATE));
+        let windows = batch_windows(&audio, 400, Vad::Rms);
+        let phrases = capped_phrases(&audio, 400, Some(SAMPLE_RATE), VadConfig::open(Vad::Rms));
         assert!(windows.len() >= 3, "{windows:?}");
         assert_eq!(
             windows.iter().map(|w| w.phrases).sum::<usize>(),
@@ -1335,7 +1368,7 @@ mod tests {
         }
         assert!(!fits_one_decode_window(audio.len()));
         for silence_ms in [400, 900, 1000, 2000, 5000] {
-            let windows = batch_windows(&audio, silence_ms);
+            let windows = batch_windows(&audio, silence_ms, Vad::Rms);
             assert_eq!(
                 windows.iter().map(|w| w.phrases).sum::<usize>(),
                 12,
@@ -1343,7 +1376,7 @@ mod tests {
             );
         }
         // Uncapped, 2 s of silence would run the turns together.
-        let mut uncapped = PhraseSplitter::new(SAMPLE_RATE, SILENCE_THRESHOLD, 2000);
+        let mut uncapped = PhraseSplitter::new(SAMPLE_RATE, VadConfig::open(Vad::Rms), 2000);
         let mut phrases = uncapped.feed(&audio);
         phrases.extend(uncapped.flush());
         assert!(phrases.len() < 12, "{} phrase(s)", phrases.len());
@@ -1368,9 +1401,12 @@ mod tests {
         audio.extend(room_noise(SAMPLE_RATE));
         audio.extend(voice(SAMPLE_RATE + 777));
 
-        let whole = capped_phrases(&audio, 400, None);
+        let whole = capped_phrases(&audio, 400, None, VadConfig::open(Vad::Rms));
         assert!(whole.iter().any(|p| p.continuation), "no forced cut");
-        assert_eq!(capped_phrases(&audio, 400, Some(SAMPLE_RATE)), whole);
+        assert_eq!(
+            capped_phrases(&audio, 400, Some(SAMPLE_RATE), VadConfig::open(Vad::Rms)),
+            whole
+        );
     }
 
     /// Each window reaches the decoder on its own, a short one padded with

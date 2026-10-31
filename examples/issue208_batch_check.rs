@@ -20,6 +20,7 @@
 //! Extra env knobs:
 //!   WHISRS_ISSUE208_LANG          language (default "en")
 //!   WHISRS_ISSUE208_PROMPT        the dictation prompt (default none)
+//!   WHISRS_ISSUE208_VAD           `[audio] vad`: "earshot" (default) | "rms"
 //!   WHISRS_ISSUE208_MIN_COVERAGE  if set (e.g. "0.9"), fail when less than
 //!                                 that fraction of ground-truth words
 //!                                 appears in the transcript
@@ -188,6 +189,11 @@ async fn main() -> anyhow::Result<ExitCode> {
         min_coverage.is_none() || truth_path.is_some(),
         "WHISRS_ISSUE208_MIN_COVERAGE needs a ground-truth file"
     );
+    let vad = match std::env::var("WHISRS_ISSUE208_VAD") {
+        Ok(v) => whisrs::parse_vad(&v)
+            .ok_or_else(|| anyhow::anyhow!("WHISRS_ISSUE208_VAD={v:?} is not earshot or rms"))?,
+        Err(_) => Default::default(),
+    };
 
     let samples = read_wav_samples(&wav_path)?;
     println!(
@@ -195,8 +201,10 @@ async fn main() -> anyhow::Result<ExitCode> {
          wav:    {wav_path} ({:.1}s)\n\
          model:  {model_path}\n\
          lang:   {language}\n\
-         prompt: {prompt:?}",
+         prompt: {prompt:?}\n\
+         vad:    {}",
         samples.len() as f64 / 16_000.0,
+        whisrs::vad_name(vad),
     );
 
     let backend = LocalWhisperBackend::new(model_path).with_segmentation("none", 400);
@@ -210,6 +218,8 @@ async fn main() -> anyhow::Result<ExitCode> {
         prompt,
         keyterms: Vec::new(),
         diarize: false,
+        vad,
+        soft_voices: true,
     };
 
     let wav = whisrs::audio::wav::encode_wav(&samples)?;

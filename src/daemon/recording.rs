@@ -23,12 +23,14 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use audio_silence_gate::Vad;
 use whisrs::audio::capture::AudioCaptureHandle;
 use whisrs::audio::device::default_monitor_source;
+use whisrs::audio::quality::{Check, Verdict};
 use whisrs::recording::naming::USER_NAME_LOST;
 use whisrs::recording::process::process_recording;
 use whisrs::recording::recorder::{
-    is_disk_full, spawn_mic_writer, spawn_track_writer, SilenceAlarm, TrackStats,
+    is_disk_full, spawn_mic_writer, spawn_system_writer, MicAlarm, SystemSignal, TrackStats,
     SILENCE_WARN_AFTER,
 };
 use whisrs::recording::speakers::separation_failure;
@@ -37,7 +39,7 @@ use whisrs::recording::wav_repair::repair_wav;
 use whisrs::recording::{
     store, EndReason, NetworkWait, RecordingAction, RecordingMeta, RecordingOptions,
     RecordingPhase, RecordingState, RecordingStatus, SummaryRequest, TrackKind, TrackMeta,
-    DEFAULT_OTHERS_LABEL, NETWORK_RETRY_EVERY, NETWORK_RETRY_FOR, NETWORK_RETRY_MAX,
+    TrackQuality, DEFAULT_OTHERS_LABEL, NETWORK_RETRY_EVERY, NETWORK_RETRY_FOR, NETWORK_RETRY_MAX,
 };
 use whisrs::transcription::retry::is_network_unavailable;
 use whisrs::{Config, RecordingConfig, Response};
@@ -116,7 +118,7 @@ type OpenedTracks = (Vec<TrackCapture>, Vec<TrackMeta>, Option<String>);
 
 /// [`open_tracks`], or a stand-in.
 type OpenTracksFn =
-    fn(&Path, &str, Option<Result<SystemDevice>>, SilenceAlarm) -> Result<OpenedTracks>;
+    fn(&Path, &str, Option<Result<SystemDevice>>, Vad, MicAlarm) -> Result<OpenedTracks>;
 
 /// How a start reaches the audio devices: [`resolve_system`] and
 /// [`open_tracks`], or stand-ins in tests, which must never open the host's
@@ -140,7 +142,7 @@ const DEVICES: Devices = Devices {
 #[cfg(test)]
 const DEVICES: Devices = Devices {
     resolve_system: |_| panic!("a test start looked up the system audio device"),
-    open_tracks: |_, _, _, _| panic!("a test start opened the audio devices"),
+    open_tracks: |_, _, _, _, _| panic!("a test start opened the audio devices"),
 };
 
 /// How often [`run_network_retries`] looks for a recording waiting for the
@@ -664,6 +666,7 @@ fn track_meta(kind: TrackKind, device: String) -> TrackMeta {
         device,
         offset_ms: 0,
         samples: 0,
+        quality: None,
     }
 }
 
@@ -749,16 +752,21 @@ fn resolve_system(system: SystemSource) -> Option<Result<SystemDevice>> {
     }
 }
 
-/// The alarm the mic's writer raises when the mic has sent only digital
-/// silence for [`SILENCE_WARN_AFTER`]: likely muted or the wrong device. It
-/// warns again only after real audio came back in between.
-fn muted_mic_alarm(id: &str, notify: bool) -> SilenceAlarm {
-    let id = id.to_string();
+/// The alarms the mic's writer raises. When the mic has sent only digital
+/// silence for [`SILENCE_WARN_AFTER`] (likely muted or the wrong device),
+/// and again only after real audio came back in between. And each live
+/// quality warning, at most once per recording ([`live_warning_toast`]);
+/// `system` is what the system track's writer tells the mic's.
+fn mic_alarm(id: &str, notify: bool, system: Arc<SystemSignal>) -> MicAlarm {
+    let silence_id = id.to_string();
+    let warning_id = id.to_string();
     let minutes = SILENCE_WARN_AFTER.as_secs() / 60;
-    SilenceAlarm {
-        after: SILENCE_WARN_AFTER,
+    MicAlarm {
+        silence_after: SILENCE_WARN_AFTER,
         on_silence: Box::new(move || {
-            warn!("recording {id}: the microphone has sent only silence for {minutes} minutes");
+            warn!(
+                "recording {silence_id}: the microphone has sent only silence for {minutes} minutes"
+            );
             if notify {
                 send_notification(
                     "whisrs",
@@ -769,21 +777,43 @@ fn muted_mic_alarm(id: &str, notify: bool) -> SilenceAlarm {
                 );
             }
         }),
+        on_warning: Box::new(move |verdict| {
+            warn!("recording {warning_id}: {}", verdict.message());
+            if notify {
+                send_notification("whisrs", &live_warning_toast(&verdict));
+            }
+        }),
+        system,
+    }
+}
+
+/// The toast for a live recording warning. A system track that has played
+/// nothing may be a solo memo, so that one only points at the setting.
+fn live_warning_toast(verdict: &Verdict) -> String {
+    match verdict.check {
+        Check::SystemSilent => "Recording: nothing has played on the system track yet. If this \
+                                is a call, check [recording] system_device."
+            .to_string(),
+        _ => format!("Recording: {}", verdict.message()),
     }
 }
 
 /// Open the mic (required) and the system source (best effort), each with a
 /// writer started as soon as its capture is up so the first-chunk times are
-/// not skewed by the other device's start. The mic's writer raises
-/// `silence` when the mic is muted. Blocking: runs on the blocking pool,
-/// where the runtime handle is available for the writers.
+/// not skewed by the other device's start. Both writers measure their
+/// track with `vad`; the mic's raises `alarm` when the mic is muted and for
+/// each live quality warning. Without a system track, `alarm.system` is told
+/// so here ([`SystemSignal::no_system_track`]), so no system-silent warning
+/// comes. Blocking: runs on the
+/// blocking pool, where the runtime handle is available for the writers.
 // Reached only through `DEVICES`, which test builds replace with stand-ins.
 #[cfg_attr(test, allow(dead_code))]
 fn open_tracks(
     dir: &Path,
     mic: &str,
     system: Option<Result<SystemDevice>>,
-    silence: SilenceAlarm,
+    vad: Vad,
+    alarm: MicAlarm,
 ) -> Result<OpenedTracks> {
     let mut captures = Vec::new();
     let mut metas = Vec::new();
@@ -793,16 +823,19 @@ fn open_tracks(
     let rx = handle
         .take_receiver()
         .context("mic capture has no receiver")?;
+    let system_signal = Arc::clone(&alarm.system);
     let writer = spawn_mic_writer(
         rx,
         store::audio_path(dir, TrackKind::Mic),
         FLUSH_EVERY,
-        silence,
+        vad,
+        alarm,
     );
     captures.push(TrackCapture::new(TrackKind::Mic, Some(handle), writer));
     metas.push(track_meta(TrackKind::Mic, mic.to_string()));
 
     let Some(system) = system else {
+        system_signal.no_system_track();
         return Ok((captures, metas, None));
     };
     // The strict start's errors already name the device.
@@ -824,13 +857,21 @@ fn open_tracks(
             let rx = handle
                 .take_receiver()
                 .context("system capture has no receiver")?;
-            let writer =
-                spawn_track_writer(rx, store::audio_path(dir, TrackKind::System), FLUSH_EVERY);
+            let writer = spawn_system_writer(
+                rx,
+                store::audio_path(dir, TrackKind::System),
+                FLUSH_EVERY,
+                vad,
+                system_signal,
+            );
             captures.push(TrackCapture::new(TrackKind::System, Some(handle), writer));
             metas.push(track_meta(TrackKind::System, name));
             Ok((captures, metas, None))
         }
-        Err(e) => Ok((captures, metas, Some(format!("{e:#}")))),
+        Err(e) => {
+            system_signal.no_system_track();
+            Ok((captures, metas, Some(format!("{e:#}"))))
+        }
     }
 }
 
@@ -918,9 +959,10 @@ async fn start(
 
     let started = Instant::now();
     let open_dir = dir.clone();
-    let silence = muted_mic_alarm(&id, context.notify);
+    let alarm = mic_alarm(&id, context.notify, Arc::new(SystemSignal::new()));
+    let vad = context.config.audio.vad();
     let opened = tokio::task::spawn_blocking(move || {
-        (devices.open_tracks)(&open_dir, &mic, system, silence)
+        (devices.open_tracks)(&open_dir, &mic, system, vad, alarm)
     })
     .await
     .context("audio start panicked")
@@ -1276,9 +1318,19 @@ async fn finish_tracks(
     outcomes
 }
 
-/// Fold the writers' results into the meta: sample counts, offsets, and a
-/// note for any track that did not finalize cleanly.
+/// Fold the writers' results into the meta: sample counts, offsets, each
+/// track's quality, and a note for any track that did not finalize cleanly.
+/// A `system-silent` warning the mic's writer raised goes on the system
+/// track, which it is about, even when that track measured nothing (its
+/// writer wrote nothing, or failed): then on an unmeasured quality, which
+/// the worker's measurement from the file keeps it on.
 fn apply_outcomes(meta: &mut RecordingMeta, started: Instant, outcomes: &[TrackOutcome]) {
+    let system_silent = outcomes.iter().any(|o| {
+        o.kind == TrackKind::Mic
+            && o.stats
+                .as_ref()
+                .is_ok_and(|s| s.raised.contains(&Check::SystemSilent))
+    });
     for outcome in outcomes {
         if outcome.ended_early {
             let note = format!(
@@ -1296,12 +1348,24 @@ fn apply_outcomes(meta: &mut RecordingMeta, started: Instant, outcomes: &[TrackO
             Ok(stats) => {
                 track.samples = stats.samples;
                 track.offset_ms = offset_ms(started, stats.first_chunk_at);
+                track.quality = stats
+                    .quality
+                    .as_ref()
+                    .map(|report| TrackQuality::from_report(track.kind, report));
             }
             Err(e) => {
                 let note = format!("{} track did not finalize: {e}", outcome.kind.file_stem());
                 warn!("recording {}: {note}", meta.id);
                 meta.errors.push(note);
             }
+        }
+    }
+    if system_silent {
+        if let Some(track) = meta.tracks.iter_mut().find(|t| t.kind == TrackKind::System) {
+            track
+                .quality
+                .get_or_insert_with(TrackQuality::unmeasured)
+                .add_warning(Check::SystemSilent);
         }
     }
 }
@@ -2598,6 +2662,7 @@ mod tests {
     use crate::context::{CommandModeContext, DaemonState, LlmCommandContext};
     use crate::dictation::{handle_cancel, handle_toggle};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use whisrs::recording::recorder::spawn_track_writer;
     use whisrs::recording::Segment;
     use whisrs::state::Action;
     use whisrs::transcription::{
@@ -2717,6 +2782,7 @@ mod tests {
                 stats: Ok(TrackStats {
                     samples: 32_000,
                     first_chunk_at: Some(start + Duration::from_millis(40)),
+                    ..TrackStats::default()
                 }),
                 stuck: false,
                 ended_early: false,
@@ -2739,6 +2805,114 @@ mod tests {
         assert_eq!(meta.status, RecordingState::Processing);
         assert_eq!(meta.end_reason, Some(EndReason::Stopped));
         assert!(meta.ended_at.is_some());
+    }
+
+    /// Each writer's quality report lands on its track, and the mic's live
+    /// system-silent warning on the system track.
+    #[test]
+    fn apply_outcomes_stores_each_tracks_quality() {
+        let start = Instant::now();
+        let report = |samples: &[i16]| {
+            Some(whisrs::audio::quality::analyze(
+                samples,
+                audio_silence_gate::Vad::Rms,
+            ))
+        };
+        let tone: Vec<i16> = (0..16_000)
+            .map(|i| if i % 2 == 0 { 3000 } else { -3000 })
+            .collect();
+        let outcome = |kind, stats| TrackOutcome {
+            kind,
+            stats: Ok(stats),
+            stuck: false,
+            ended_early: false,
+        };
+        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+        meta.tracks = vec![
+            track_meta(TrackKind::Mic, "mic".into()),
+            track_meta(TrackKind::System, "sys".into()),
+        ];
+        let outcomes = vec![
+            outcome(
+                TrackKind::Mic,
+                TrackStats {
+                    samples: 16_000,
+                    quality: report(&tone),
+                    raised: vec![Check::SystemSilent],
+                    ..TrackStats::default()
+                },
+            ),
+            outcome(
+                TrackKind::System,
+                TrackStats {
+                    samples: 16_000,
+                    quality: report(&[0; 16_000]),
+                    ..TrackStats::default()
+                },
+            ),
+        ];
+        apply_outcomes(&mut meta, start, &outcomes);
+        let mic = meta.tracks[0].quality.as_ref().unwrap();
+        assert_eq!(mic.vad, "rms");
+        assert!(mic.speech_dbfs.is_some());
+        assert!(mic.warnings.is_empty(), "{:?}", mic.warnings);
+        let system = meta.tracks[1].quality.as_ref().unwrap();
+        assert_eq!(system.speech_dbfs, None);
+        assert_eq!(system.warnings, ["system-silent"]);
+
+        // Into recording.json and back.
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: RecordingMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tracks, meta.tracks);
+
+        // A system writer that wrote nothing, or failed, measured nothing:
+        // the live warning is stored all the same, on an unmeasured quality.
+        let silent_mic = || {
+            outcome(
+                TrackKind::Mic,
+                TrackStats {
+                    samples: 16_000,
+                    quality: report(&tone),
+                    raised: vec![Check::SystemSilent],
+                    ..TrackStats::default()
+                },
+            )
+        };
+        let failed = TrackOutcome {
+            kind: TrackKind::System,
+            stats: Err("failed to finalize system.wav".to_string()),
+            stuck: false,
+            ended_early: false,
+        };
+        for system_outcome in [outcome(TrackKind::System, TrackStats::default()), failed] {
+            let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+            meta.tracks = vec![
+                track_meta(TrackKind::Mic, "mic".into()),
+                track_meta(TrackKind::System, "sys".into()),
+            ];
+            apply_outcomes(&mut meta, start, &[silent_mic(), system_outcome]);
+            let system = meta.tracks[1].quality.as_ref().expect("stored");
+            assert!(!system.is_measured());
+            assert_eq!(system.speech_dbfs, None);
+            assert_eq!(system.warnings, ["system-silent"]);
+        }
+        // Without the live warning nothing is stored for it.
+        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+        meta.tracks = vec![
+            track_meta(TrackKind::Mic, "mic".into()),
+            track_meta(TrackKind::System, "sys".into()),
+        ];
+        let quiet_mic = outcome(
+            TrackKind::Mic,
+            TrackStats {
+                samples: 16_000,
+                quality: report(&tone),
+                ..TrackStats::default()
+            },
+        );
+        let empty_system = outcome(TrackKind::System, TrackStats::default());
+        apply_outcomes(&mut meta, start, &[quiet_mic, empty_system]);
+        assert_eq!(meta.tracks[1].quality, None);
     }
 
     #[test]
@@ -2841,8 +3015,11 @@ mod tests {
         extra: &str,
         free_space: FreeSpaceFn,
     ) -> (Arc<DaemonContext>, mpsc::UnboundedReceiver<QueuedRecording>) {
+        // `[audio] vad = "rms"`: the test tracks are tones, loud but no voice,
+        // which earshot would find no speech in.
         let config: Config = toml::from_str(&format!(
-            "[general]\nbackend = \"groq\"\n[recording]\nuser_name = \"Tester\"\ndir = \"{}\"\n{extra}",
+            "[audio]\nvad = \"rms\"\n[general]\nbackend = \"groq\"\n[recording]\n\
+             user_name = \"Tester\"\ndir = \"{}\"\n{extra}",
             root.display()
         ))
         .unwrap();

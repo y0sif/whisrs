@@ -23,7 +23,9 @@ pub fn frame_len(sample_rate: usize) -> usize {
     (sample_rate * FRAME_MS / 1000).max(1)
 }
 
-/// Split `samples` into contiguous ranges of at most `max_chunk_secs` each.
+/// Split `samples` into contiguous ranges of at most `max_chunk_secs` each,
+/// with the RMS test deciding speech: a 100 ms frame is speech when its RMS
+/// reaches `threshold`.
 ///
 /// The ranges cover every sample exactly once, in order. When a cut is needed
 /// it goes in the middle of the longest run of 100 ms frames whose RMS is
@@ -38,25 +40,31 @@ pub fn split_at_silence(
 ) -> Vec<Range<usize>> {
     let frame = frame_len(sample_rate);
     let energies: Vec<f64> = samples.chunks_exact(frame).map(rms_energy).collect();
+    let speech: Vec<bool> = energies.iter().map(|&e| e >= threshold).collect();
     split_by_energies(
         &energies,
+        &speech,
         samples.len(),
         sample_rate,
         max_chunk_secs,
-        threshold,
     )
 }
 
-/// [`split_at_silence`] from precomputed frame energies, so a long track
-/// can be split without holding its samples: `energies[i]` is the RMS
-/// ([`rms_energy`]) of samples `i * frame_len .. (i + 1) * frame_len` for
-/// every whole frame of the `total_len`-sample track.
+/// [`split_at_silence`] from precomputed frames, so a long track can be split
+/// without holding its samples: `energies[i]` is the RMS ([`rms_energy`]) of
+/// samples `i * frame_len .. (i + 1) * frame_len` for every whole frame of
+/// the `total_len`-sample track, and `speech[i]` whether that frame holds
+/// speech (the track's speech mask, `[audio] vad`).
+///
+/// A cut goes in the middle of the longest run of frames without speech in
+/// the lookback, else at the quietest frame by energy. A frame `speech` has
+/// no flag for counts as speech.
 pub fn split_by_energies(
     energies: &[f64],
+    speech: &[bool],
     total_len: usize,
     sample_rate: usize,
     max_chunk_secs: usize,
-    threshold: f64,
 ) -> Vec<Range<usize>> {
     let frame = frame_len(sample_rate);
     let max_len = (max_chunk_secs * sample_rate).max(frame);
@@ -75,7 +83,9 @@ pub fn split_by_energies(
         let base = start / frame;
         let cap_frames = max_len / frame;
         let first = cap_frames.saturating_sub(lookback_frames).max(1);
-        let cut_frame = first + pick_cut(&energies[base + first..base + cap_frames], threshold);
+        let window = base + first..base + cap_frames;
+        let flags = speech.get(window.clone()).unwrap_or(&[]);
+        let cut_frame = first + pick_cut(&energies[window], flags);
         let cut = start + cut_frame * frame;
         ranges.push(start..cut);
         start = cut;
@@ -84,13 +94,14 @@ pub fn split_by_energies(
 }
 
 /// Index into `energies` of the frame to cut at: the middle of the longest
-/// sub-threshold run (the latest one on a tie), else the quietest frame
-/// (again the latest on a tie).
-fn pick_cut(energies: &[f64], threshold: f64) -> usize {
+/// run of frames without speech (the latest one on a tie), else the quietest
+/// frame (again the latest on a tie). `speech[i]` flags frame `i`; a frame
+/// past its end counts as speech.
+fn pick_cut(energies: &[f64], speech: &[bool]) -> usize {
     let mut best: Option<(usize, usize)> = None; // (run start, run length)
     let mut run_start = None;
-    for (i, &e) in energies.iter().enumerate() {
-        if e < threshold {
+    for i in 0..energies.len() {
+        if !speech.get(i).copied().unwrap_or(true) {
             let s = *run_start.get_or_insert(i);
             let len = i + 1 - s;
             if best.is_none_or(|(_, best_len)| len >= best_len) {
@@ -179,8 +190,36 @@ mod tests {
         );
     }
 
-    /// The implementation before frame energies were precomputed, kept as
-    /// the reference [`split_by_energies`] must match.
+    /// The 0.1.31 cut rule: the longest sub-threshold run, else the
+    /// quietest frame, the latest on a tie.
+    fn reference_pick_cut(energies: &[f64], threshold: f64) -> usize {
+        let mut best: Option<(usize, usize)> = None;
+        let mut run_start = None;
+        for (i, &e) in energies.iter().enumerate() {
+            if e < threshold {
+                let s = *run_start.get_or_insert(i);
+                let len = i + 1 - s;
+                if best.is_none_or(|(_, best_len)| len >= best_len) {
+                    best = Some((s, len));
+                }
+            } else {
+                run_start = None;
+            }
+        }
+        if let Some((s, len)) = best {
+            return s + len / 2;
+        }
+        energies
+            .iter()
+            .enumerate()
+            .rev()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(i, _)| i)
+    }
+
+    /// The implementation before frame energies were precomputed (0.1.31's
+    /// cut rule included), kept as the reference [`split_by_energies`] must
+    /// match on an RMS mask.
     fn reference_split(
         samples: &[i16],
         sample_rate: usize,
@@ -205,7 +244,7 @@ mod tests {
                     rms_energy(&samples[from..from + frame])
                 })
                 .collect();
-            let cut = start + (first + pick_cut(&energies, threshold)) * frame;
+            let cut = start + (first + reference_pick_cut(&energies, threshold)) * frame;
             ranges.push(start..cut);
             start = cut;
         }
@@ -230,11 +269,33 @@ mod tests {
                 .chunks_exact(frame_len(RATE))
                 .map(rms_energy)
                 .collect();
+            let speech: Vec<bool> = energies.iter().map(|&e| e >= 0.01).collect();
             assert_eq!(
-                split_by_energies(&energies, samples.len(), RATE, cap, 0.01),
+                split_by_energies(&energies, &speech, samples.len(), RATE, cap),
                 expected
             );
         }
+    }
+
+    #[test]
+    fn cuts_follow_the_speech_mask_and_the_energies_break_ties() {
+        // Loud throughout, at a 10 s cap (lookback 5 s: frames 50 to 99).
+        let energies = vec![0.1; 150];
+        let len = 150 * frame_len(RATE);
+        // The mask hears no speech at frames 60 to 69: the cut is in the
+        // middle of that run, whatever the level.
+        let mut speech = vec![true; 150];
+        speech[60..70].fill(false);
+        let ranges = split_by_energies(&energies, &speech, len, RATE, 10);
+        assert_eq!(ranges[0].end, 65 * frame_len(RATE));
+        // Speech throughout: the quietest frame by energy.
+        let mut quiet = energies.clone();
+        quiet[80] = 0.05;
+        let ranges = split_by_energies(&quiet, &[true; 150], len, RATE, 10);
+        assert_eq!(ranges[0].end, 80 * frame_len(RATE));
+        // Frames without a flag count as speech.
+        let ranges = split_by_energies(&quiet, &[], len, RATE, 10);
+        assert_eq!(ranges[0].end, 80 * frame_len(RATE));
     }
 
     #[test]

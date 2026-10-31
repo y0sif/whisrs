@@ -18,6 +18,8 @@
 //! Extra env knobs:
 //!   WHISRS_ISSUE55_SEGMENTATION       "silence" (default) | "window"
 //!   WHISRS_ISSUE55_PHRASE_SILENCE_MS  phrase split threshold (default 400)
+//!   WHISRS_ISSUE55_VAD                `[audio] vad`: "earshot" (default) |
+//!                                     "rms" (the 0.1.31 loudness test)
 //!   WHISRS_ISSUE55_MIN_COVERAGE       if set (e.g. "0.8"), fail when less
 //!                                     than that fraction of ground-truth
 //!                                     words appears in the transcript
@@ -222,15 +224,22 @@ async fn main() -> anyhow::Result<ExitCode> {
     let min_coverage: Option<f64> = std::env::var("WHISRS_ISSUE55_MIN_COVERAGE")
         .ok()
         .and_then(|v| v.parse().ok());
+    let vad = match std::env::var("WHISRS_ISSUE55_VAD") {
+        Ok(v) => whisrs::parse_vad(&v)
+            .ok_or_else(|| anyhow::anyhow!("WHISRS_ISSUE55_VAD={v:?} is not earshot or rms"))?,
+        Err(_) => Default::default(),
+    };
 
     let samples = read_wav_samples(&wav_path)?;
     println!(
         "== issue #55 stream check ==\n\
          wav:   {wav_path} ({:.1}s, {} samples)\n\
          model: {model_path}\n\
-         mode:  {segmentation} (phrase_silence_ms={phrase_silence_ms})",
+         mode:  {segmentation} (phrase_silence_ms={phrase_silence_ms})\n\
+         vad:   {}",
         samples.len() as f64 / 16_000.0,
         samples.len(),
+        whisrs::vad_name(vad),
     );
 
     let backend =
@@ -241,6 +250,8 @@ async fn main() -> anyhow::Result<ExitCode> {
         prompt: None,
         keyterms: Vec::new(),
         diarize: false,
+        vad,
+        soft_voices: true,
     };
 
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(256);

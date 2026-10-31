@@ -340,7 +340,7 @@ fn edit_behavior(config: &mut Config) -> Result<()> {
     println!("\n  {BOLD}Behavior{RESET}");
 
     let timeout: String = Input::new()
-        .with_prompt("Silence timeout (ms) — 0 disables auto-stop")
+        .with_prompt("Silence timeout (ms), 0 turns auto-stop off")
         .default(config.general.silence_timeout_ms.to_string())
         .interact_text()
         .context("failed to read silence timeout")?;

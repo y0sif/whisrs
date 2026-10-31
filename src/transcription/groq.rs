@@ -34,6 +34,11 @@ const MIN_CHUNK_SAMPLES: usize = 16_000 * 10;
 const SAMPLE_RATE: u32 = 16_000;
 
 /// Silence threshold for VAD-based chunk splitting (normalized RMS).
+///
+/// Left on the RMS test on purpose, outside `[audio] vad`: this chunked
+/// stream never runs, since [`TranscriptionBackend::supports_streaming`] is
+/// `false` for Groq and the daemon sends it the whole buffer once dictation
+/// stops.
 const SILENCE_THRESHOLD: f64 = 0.005;
 
 /// Minimum silence duration (in samples) to trigger a chunk split.
@@ -409,6 +414,8 @@ mod tests {
             prompt: Some("Hyprland, whisrs".to_string()),
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
 
         assert!(GroqBackend::new(String::new()).sends_prompt(&request));
@@ -486,6 +493,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -500,6 +509,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         let huge = vec![0u8; MAX_FILE_SIZE + 1];
         let err = backend.transcribe(&huge, &config).await.unwrap_err();
@@ -515,6 +526,8 @@ mod tests {
             prompt: Some("whisrs".to_string()),
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         }
     }
 
@@ -547,6 +560,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         let secs = backend.max_segment_chunk_secs(&config).unwrap() as usize;
         // 16 kHz mono i16 plus a 44-byte header.
@@ -571,6 +586,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         let wav = encode_wav(&[300i16; 16_000]).unwrap();
 
@@ -597,6 +614,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         let wav = encode_wav(&[300i16; 16_000]).unwrap();
 
@@ -625,6 +644,8 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
             diarize: false,
+            vad: Default::default(),
+            soft_voices: true,
         };
         (encode_wav(&[300i16; 16_000]).unwrap(), config)
     }

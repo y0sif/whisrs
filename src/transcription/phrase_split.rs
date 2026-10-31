@@ -7,7 +7,13 @@
 //! transcribe each phrase exactly once with no overlap and no deduplication.
 //!
 //! Rules:
-//! - RMS energy is tracked per fixed-size frame (100 ms in production).
+//! - Each fixed-size frame (100 ms in production) is speech or silence by
+//!   the configured detector (`[audio] vad`): with earshot, a frame is
+//!   speech when a 16 ms speech frame of a streaming
+//!   [`SpeechDetector`] ends inside it, so its flag is final the moment the
+//!   frame is complete; with the RMS test, when its RMS reaches the
+//!   threshold. Every frame's RMS energy is kept too, to pick the quietest
+//!   frame at a forced cut.
 //! - A phrase ends once `split_silence_frames` consecutive silent frames
 //!   follow speech.
 //! - Phrases with fewer than `min_speech_frames` frames containing speech are
@@ -17,9 +23,9 @@
 //!   continuation with zero speech frames is still discarded.
 //! - Emitted phrases include up to `pad_frames` of surrounding silence.
 //! - A phrase that reaches `max_phrase_frames` (the soft cap) without a
-//!   silence split is cut at the quietest *sub-threshold* frame in the recent
-//!   lookback window. If every recent frame is voiced, the cut is deferred —
-//!   the search re-runs each frame — until the first sub-threshold frame
+//!   silence split is cut at the quietest *silent* frame in the recent
+//!   lookback window. If every recent frame is voiced, the cut is deferred
+//!   (the search re-runs each frame) until the first silent frame
 //!   arrives or the phrase reaches `hard_max_phrase_frames` (the hard
 //!   ceiling, sized to stay inside whisper's 30 s context window), where it
 //!   is cut at the quietest recent frame even if voiced, so continuous
@@ -35,9 +41,12 @@
 //! phrase. A batch dictation longer than one window is grouped much the same
 //! way, into windows of about even length ([`dictation_windows`]).
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
-use audio_silence_gate::rms_energy;
+use audio_silence_gate::{
+    rms_energy, FrameDecision, SpeechDetector, Vad, VadConfig, VAD_FRAME, VAD_SAMPLE_RATE,
+};
 
 /// Analysis frame length in milliseconds.
 const FRAME_MS: usize = 100;
@@ -45,8 +54,8 @@ const FRAME_MS: usize = 100;
 const PAD_MS: usize = 100;
 /// Minimum speech (frames containing speech, ~ms) required to keep a phrase.
 const MIN_PHRASE_SPEECH_MS: usize = 250;
-/// Soft cap on phrase length: past this, cut at the first sub-threshold
-/// frame found in the lookback window.
+/// Soft cap on phrase length: past this, cut at the quietest silent frame
+/// found in the lookback window.
 const MAX_PHRASE_SECS: usize = 20;
 /// Hard ceiling on phrase length: past this, cut at the quietest recent
 /// frame even if it is voiced. Sized to stay inside whisper's 30 s context
@@ -218,11 +227,93 @@ fn zero_runs(samples: &[i16], min: usize) -> Vec<Range<usize>> {
     runs
 }
 
+/// What decides whether a splitter frame holds speech.
+enum SpeechSource {
+    /// The 0.1.31 rule: a frame is speech when its RMS reaches the threshold.
+    Rms(f64),
+    /// A speech detector over the stream ([`VadFrames`]).
+    Vad(Box<VadFrames>),
+    /// Flags read from a script, one per frame, then silence.
+    #[cfg(test)]
+    Script(VecDeque<bool>),
+}
+
+/// A [`SpeechDetector`]'s 16 ms decisions turned into splitter frames: a
+/// frame is speech when a 16 ms speech frame ends inside it. Each 16 ms frame
+/// counts toward exactly one splitter frame, and a frame's flag is final
+/// once its last sample is fed, so the splitter never waits on the detector.
+struct VadFrames {
+    detector: SpeechDetector,
+    /// Flags of the frames not analyzed yet, the next one first.
+    ahead: VecDeque<bool>,
+    /// Frames analyzed since the detector started or was reset.
+    analyzed: u64,
+}
+
+impl VadFrames {
+    fn new(cfg: VadConfig) -> Self {
+        Self {
+            detector: SpeechDetector::new(cfg, VAD_SAMPLE_RATE),
+            ahead: VecDeque::new(),
+            analyzed: 0,
+        }
+    }
+
+    /// Feed the stream's next samples (`frame_len`: samples per splitter
+    /// frame).
+    fn feed(&mut self, samples: &[i16], frame_len: usize) {
+        let Self {
+            detector,
+            ahead,
+            analyzed,
+        } = self;
+        detector.feed(samples, |decision| {
+            mark_frame(ahead, *analyzed, decision, frame_len);
+        });
+    }
+
+    /// The flag of the next frame, which the caller analyzes now.
+    fn next(&mut self) -> bool {
+        self.analyzed += 1;
+        self.ahead.pop_front().unwrap_or(false)
+    }
+
+    fn reset(&mut self) {
+        self.detector.reset();
+        self.ahead.clear();
+        self.analyzed = 0;
+    }
+}
+
+/// Mark the splitter frame a speech `decision` ends in, in `ahead` (the
+/// flags from frame `analyzed` on). Decisions arrive only for complete 16 ms
+/// frames, so one never lands on a frame already analyzed: that frame was
+/// complete, and its 16 ms frames decided, before it was analyzed.
+fn mark_frame(
+    ahead: &mut VecDeque<bool>,
+    analyzed: u64,
+    decision: FrameDecision,
+    frame_len: usize,
+) {
+    if !decision.speech {
+        return;
+    }
+    let last_sample = decision.start_sample + VAD_FRAME as u64 - 1;
+    let Some(at) = (last_sample / frame_len as u64).checked_sub(analyzed) else {
+        return;
+    };
+    let at = at as usize;
+    if ahead.len() <= at {
+        ahead.resize(at + 1, false);
+    }
+    ahead[at] = true;
+}
+
 /// Incremental silence-delimited phrase splitter over i16 PCM samples.
 pub struct PhraseSplitter {
     // Configuration (all in frames unless noted).
     frame_len: usize,
-    threshold: f64,
+    source: SpeechSource,
     split_silence_frames: usize,
     min_speech_frames: usize,
     max_phrase_frames: usize,
@@ -231,9 +322,11 @@ pub struct PhraseSplitter {
     hard_max_phrase_frames: usize,
 
     // Rolling state. `buffer` holds samples not yet consumed by an emitted or
-    // discarded phrase; `energies[i]` is the RMS of frame `i` of `buffer`.
+    // discarded phrase; `energies[i]` is the RMS of frame `i` of `buffer`,
+    // `speech[i]` whether it holds speech.
     buffer: Vec<i16>,
     energies: Vec<f64>,
+    speech: Vec<bool>,
     in_phrase: bool,
     /// First frame of the emitted slice (speech onset minus padding).
     emit_start_frame: usize,
@@ -253,27 +346,35 @@ pub struct PhraseSplitter {
 impl PhraseSplitter {
     /// Create a splitter with production defaults for the given sample rate.
     ///
-    /// `threshold` is a normalized RMS silence threshold (0.0–1.0);
+    /// `cfg` decides speech: [`Vad::Earshot`] at 16 kHz runs a streaming
+    /// [`SpeechDetector`]; [`Vad::Rms`], or any other rate, compares each
+    /// frame's RMS with [`VadConfig::rms_threshold`], the 0.1.31 rule.
     /// `phrase_silence_ms` is how much continuous silence ends a phrase.
-    pub fn new(sample_rate: usize, threshold: f64, phrase_silence_ms: u64) -> Self {
+    pub fn new(sample_rate: usize, cfg: VadConfig, phrase_silence_ms: u64) -> Self {
         let frame_len = (sample_rate * FRAME_MS / 1000).max(1);
-        Self::with_params(
+        let mut splitter = Self::with_params(
             frame_len,
-            threshold,
+            cfg.rms_threshold,
             (phrase_silence_ms as usize).div_ceil(FRAME_MS).max(1),
             MIN_PHRASE_SPEECH_MS.div_ceil(FRAME_MS).max(1),
             (MAX_PHRASE_SECS * 1000 / FRAME_MS).max(2),
             PAD_MS / FRAME_MS,
             (QUIET_SEARCH_MS / FRAME_MS).max(1),
             (HARD_MAX_PHRASE_SECS * 1000 / FRAME_MS).max(2),
-        )
+        );
+        if cfg.vad == Vad::Earshot && sample_rate == VAD_SAMPLE_RATE as usize {
+            splitter.source = SpeechSource::Vad(Box::new(VadFrames::new(cfg)));
+        }
+        splitter
     }
 
-    /// Create a splitter with explicit frame-level parameters (used by tests).
+    /// Create a splitter with explicit frame-level parameters (used by
+    /// tests), deciding speech with the RMS test at `threshold` (normalized,
+    /// 0.0 to 1.0).
     ///
-    /// `max_phrase_frames` is the soft cap (cut only at a sub-threshold
-    /// frame); `hard_max_phrase_frames` is the hard ceiling (cut at the
-    /// quietest recent frame regardless), clamped to at least the soft cap.
+    /// `max_phrase_frames` is the soft cap (cut only at a silent frame);
+    /// `hard_max_phrase_frames` is the hard ceiling (cut at the quietest
+    /// recent frame regardless), clamped to at least the soft cap.
     #[allow(clippy::too_many_arguments)]
     pub fn with_params(
         frame_len: usize,
@@ -288,7 +389,7 @@ impl PhraseSplitter {
         let max_phrase_frames = max_phrase_frames.max(2);
         Self {
             frame_len: frame_len.max(1),
-            threshold,
+            source: SpeechSource::Rms(threshold),
             split_silence_frames: split_silence_frames.max(1),
             min_speech_frames: min_speech_frames.max(1),
             max_phrase_frames,
@@ -297,6 +398,7 @@ impl PhraseSplitter {
             hard_max_phrase_frames: hard_max_phrase_frames.max(max_phrase_frames),
             buffer: Vec::new(),
             energies: Vec::new(),
+            speech: Vec::new(),
             in_phrase: false,
             emit_start_frame: 0,
             phrase_start_frame: 0,
@@ -310,15 +412,26 @@ impl PhraseSplitter {
     /// Feed samples; returns zero or more completed phrases in FIFO order.
     pub fn feed(&mut self, samples: &[i16]) -> Vec<Phrase> {
         self.buffer.extend_from_slice(samples);
+        let frame_len = self.frame_len;
+        if let SpeechSource::Vad(vad) = &mut self.source {
+            vad.feed(samples, frame_len);
+        }
         let mut out = Vec::new();
         // Analyze every complete frame not yet analyzed. `process_frame` may
         // drop consumed frames from the front, so recompute the index each
         // iteration.
-        while (self.energies.len() + 1) * self.frame_len <= self.buffer.len() {
+        while (self.energies.len() + 1) * frame_len <= self.buffer.len() {
             let i = self.energies.len();
-            let energy = rms_energy(&self.buffer[i * self.frame_len..(i + 1) * self.frame_len]);
+            let energy = rms_energy(&self.buffer[i * frame_len..(i + 1) * frame_len]);
+            let speech = match &mut self.source {
+                SpeechSource::Rms(threshold) => energy >= *threshold,
+                SpeechSource::Vad(vad) => vad.next(),
+                #[cfg(test)]
+                SpeechSource::Script(flags) => flags.pop_front().unwrap_or(false),
+            };
             self.energies.push(energy);
-            self.process_frame(i, energy, &mut out);
+            self.speech.push(speech);
+            self.process_frame(i, speech, &mut out);
         }
         out
     }
@@ -360,8 +473,8 @@ impl PhraseSplitter {
     }
 
     /// Process the just-analyzed frame `i` (index into `energies`).
-    fn process_frame(&mut self, i: usize, energy: f64, out: &mut Vec<Phrase>) {
-        let silent = energy < self.threshold;
+    fn process_frame(&mut self, i: usize, speech: bool, out: &mut Vec<Phrase>) {
+        let silent = !speech;
 
         if !self.in_phrase {
             if silent {
@@ -396,7 +509,7 @@ impl PhraseSplitter {
 
         // Length caps. Past the hard ceiling, cut unconditionally at the
         // quietest recent frame; past the soft cap, cut only at a genuinely
-        // sub-threshold frame, deferring (re-checked every frame) until one
+        // silent frame, deferring (re-checked every frame) until one
         // arrives.
         let phrase_len = i + 1 - self.phrase_start_frame;
         if phrase_len >= self.hard_max_phrase_frames {
@@ -452,17 +565,17 @@ impl PhraseSplitter {
         self.cut_at(split_frame, out);
     }
 
-    /// Soft-cap split: cut at the quietest *sub-threshold* frame in the
-    /// lookback window, if any. When every recent frame is voiced this does
-    /// nothing — the search re-runs on each subsequent frame, so the first
-    /// arriving sub-threshold frame becomes the cut point.
+    /// Soft-cap split: cut at the quietest *silent* frame in the lookback
+    /// window, if any. When every recent frame is voiced this does nothing:
+    /// the search re-runs on each subsequent frame, so the first arriving
+    /// silent frame becomes the cut point.
     fn try_soft_split(&mut self, i: usize, out: &mut Vec<Phrase>) {
         let search_start = self.split_search_start(i);
         let mut split_frame = None;
         let mut min_energy = f64::INFINITY;
         for j in search_start..=i {
             let e = self.energies[j];
-            if e < self.threshold && e < min_energy {
+            if !self.speech[j] && e < min_energy {
                 min_energy = e;
                 split_frame = Some(j);
             }
@@ -496,17 +609,8 @@ impl PhraseSplitter {
         self.phrase_start_frame = 0;
         self.emit_start_frame = 0;
         self.continuation = true;
-        self.speech_frames = self
-            .energies
-            .iter()
-            .filter(|&&e| e >= self.threshold)
-            .count();
-        self.trailing_silence = self
-            .energies
-            .iter()
-            .rev()
-            .take_while(|&&e| e < self.threshold)
-            .count();
+        self.speech_frames = self.speech.iter().filter(|&&s| s).count();
+        self.trailing_silence = self.speech.iter().rev().take_while(|&&s| !s).count();
     }
 
     /// Stream index of the first sample of buffered frame `frame`.
@@ -522,12 +626,19 @@ impl PhraseSplitter {
         self.consumed += (n * self.frame_len) as u64;
         self.buffer.drain(..n * self.frame_len);
         self.energies.drain(..n);
+        self.speech.drain(..n);
     }
 
     fn clear(&mut self) {
         self.consumed += self.buffer.len() as u64;
         self.buffer.clear();
         self.energies.clear();
+        self.speech.clear();
+        // The frame grid restarts at the new `consumed`, and the detector
+        // with it.
+        if let SpeechSource::Vad(vad) = &mut self.source {
+            vad.reset();
+        }
         self.in_phrase = false;
         self.emit_start_frame = 0;
         self.phrase_start_frame = 0;
@@ -921,7 +1032,7 @@ mod tests {
     }
 
     fn phrases_of(audio: &[i16]) -> Vec<Phrase> {
-        let mut splitter = PhraseSplitter::new(RATE, 0.003, 400);
+        let mut splitter = PhraseSplitter::new(RATE, VadConfig::close(Vad::Rms), 400);
         let mut phrases = splitter.feed(audio);
         phrases.extend(splitter.flush());
         phrases
@@ -1183,5 +1294,494 @@ mod tests {
         let windows = dictation_windows(&phrases, RATE);
         assert_eq!(lens(&windows), [17 * RATE, 25 * RATE / 2], "{windows:?}");
         assert_whole_phrases_in_order(&windows, &phrases);
+    }
+
+    // ── The speech source ([audio] vad) ─────────────────────────────────
+
+    /// The 0.1.31 splitter, verbatim but for its comments, as the reference
+    /// the RMS path must match.
+    mod v0_1_31 {
+        use super::super::{
+            rms_energy, Phrase, FRAME_MS, HARD_MAX_PHRASE_SECS, MAX_PHRASE_SECS,
+            MIN_PHRASE_SPEECH_MS, PAD_MS, QUIET_SEARCH_MS,
+        };
+
+        pub struct PhraseSplitter {
+            frame_len: usize,
+            threshold: f64,
+            split_silence_frames: usize,
+            min_speech_frames: usize,
+            max_phrase_frames: usize,
+            pad_frames: usize,
+            quiet_search_frames: usize,
+            hard_max_phrase_frames: usize,
+
+            buffer: Vec<i16>,
+            energies: Vec<f64>,
+            in_phrase: bool,
+            emit_start_frame: usize,
+            phrase_start_frame: usize,
+            speech_frames: usize,
+            trailing_silence: usize,
+            continuation: bool,
+            consumed: u64,
+        }
+
+        impl PhraseSplitter {
+            pub fn new(sample_rate: usize, threshold: f64, phrase_silence_ms: u64) -> Self {
+                let frame_len = (sample_rate * FRAME_MS / 1000).max(1);
+                Self::with_params(
+                    frame_len,
+                    threshold,
+                    (phrase_silence_ms as usize).div_ceil(FRAME_MS).max(1),
+                    MIN_PHRASE_SPEECH_MS.div_ceil(FRAME_MS).max(1),
+                    (MAX_PHRASE_SECS * 1000 / FRAME_MS).max(2),
+                    PAD_MS / FRAME_MS,
+                    (QUIET_SEARCH_MS / FRAME_MS).max(1),
+                    (HARD_MAX_PHRASE_SECS * 1000 / FRAME_MS).max(2),
+                )
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            pub fn with_params(
+                frame_len: usize,
+                threshold: f64,
+                split_silence_frames: usize,
+                min_speech_frames: usize,
+                max_phrase_frames: usize,
+                pad_frames: usize,
+                quiet_search_frames: usize,
+                hard_max_phrase_frames: usize,
+            ) -> Self {
+                let max_phrase_frames = max_phrase_frames.max(2);
+                Self {
+                    frame_len: frame_len.max(1),
+                    threshold,
+                    split_silence_frames: split_silence_frames.max(1),
+                    min_speech_frames: min_speech_frames.max(1),
+                    max_phrase_frames,
+                    pad_frames,
+                    quiet_search_frames: quiet_search_frames.max(1),
+                    hard_max_phrase_frames: hard_max_phrase_frames.max(max_phrase_frames),
+                    buffer: Vec::new(),
+                    energies: Vec::new(),
+                    in_phrase: false,
+                    emit_start_frame: 0,
+                    phrase_start_frame: 0,
+                    speech_frames: 0,
+                    trailing_silence: 0,
+                    continuation: false,
+                    consumed: 0,
+                }
+            }
+
+            pub fn feed(&mut self, samples: &[i16]) -> Vec<Phrase> {
+                self.buffer.extend_from_slice(samples);
+                let mut out = Vec::new();
+                while (self.energies.len() + 1) * self.frame_len <= self.buffer.len() {
+                    let i = self.energies.len();
+                    let energy =
+                        rms_energy(&self.buffer[i * self.frame_len..(i + 1) * self.frame_len]);
+                    self.energies.push(energy);
+                    self.process_frame(i, energy, &mut out);
+                }
+                out
+            }
+
+            pub fn flush(&mut self) -> Option<Phrase> {
+                if !self.in_phrase || !self.keep_phrase() {
+                    self.clear();
+                    return None;
+                }
+
+                let end_sample = if self.trailing_silence > self.pad_frames {
+                    let speech_end = self.energies.len() - self.trailing_silence;
+                    (speech_end + self.pad_frames) * self.frame_len
+                } else {
+                    self.buffer.len()
+                };
+                let phrase = Phrase {
+                    samples: self.buffer[self.emit_start_frame * self.frame_len..end_sample]
+                        .to_vec(),
+                    continuation: self.continuation,
+                    start_sample: self.stream_index(self.emit_start_frame),
+                };
+                self.clear();
+                Some(phrase)
+            }
+
+            fn keep_phrase(&self) -> bool {
+                self.speech_frames >= self.min_speech_frames
+                    || (self.continuation && self.speech_frames >= 1)
+            }
+
+            fn process_frame(&mut self, i: usize, energy: f64, out: &mut Vec<Phrase>) {
+                let silent = energy < self.threshold;
+
+                if !self.in_phrase {
+                    if silent {
+                        if self.energies.len() > self.pad_frames {
+                            let drop = self.energies.len() - self.pad_frames;
+                            self.drop_frames(drop);
+                        }
+                    } else {
+                        self.in_phrase = true;
+                        self.phrase_start_frame = i;
+                        self.emit_start_frame = i.saturating_sub(self.pad_frames);
+                        self.speech_frames = 1;
+                        self.trailing_silence = 0;
+                        self.continuation = false;
+                    }
+                    return;
+                }
+
+                if silent {
+                    self.trailing_silence += 1;
+                    if self.trailing_silence >= self.split_silence_frames {
+                        self.end_phrase(i, out);
+                        return;
+                    }
+                } else {
+                    self.speech_frames += 1;
+                    self.trailing_silence = 0;
+                }
+
+                let phrase_len = i + 1 - self.phrase_start_frame;
+                if phrase_len >= self.hard_max_phrase_frames {
+                    self.force_split(i, out);
+                } else if phrase_len >= self.max_phrase_frames {
+                    self.try_soft_split(i, out);
+                }
+            }
+
+            fn end_phrase(&mut self, i: usize, out: &mut Vec<Phrase>) {
+                let speech_end = i + 1 - self.trailing_silence;
+                let end_frame = (speech_end + self.pad_frames).min(self.energies.len());
+
+                if self.keep_phrase() {
+                    out.push(Phrase {
+                        samples: self.buffer
+                            [self.emit_start_frame * self.frame_len..end_frame * self.frame_len]
+                            .to_vec(),
+                        continuation: self.continuation,
+                        start_sample: self.stream_index(self.emit_start_frame),
+                    });
+                }
+
+                self.in_phrase = false;
+                self.continuation = false;
+                self.speech_frames = 0;
+                self.trailing_silence = 0;
+                let keep_from = self
+                    .energies
+                    .len()
+                    .saturating_sub(self.pad_frames)
+                    .max(speech_end);
+                self.drop_frames(keep_from);
+            }
+
+            fn force_split(&mut self, i: usize, out: &mut Vec<Phrase>) {
+                let search_start = self.split_search_start(i);
+                let mut split_frame = search_start;
+                let mut min_energy = f64::INFINITY;
+                for j in search_start..=i {
+                    if self.energies[j] < min_energy {
+                        min_energy = self.energies[j];
+                        split_frame = j;
+                    }
+                }
+                self.cut_at(split_frame, out);
+            }
+
+            fn try_soft_split(&mut self, i: usize, out: &mut Vec<Phrase>) {
+                let search_start = self.split_search_start(i);
+                let mut split_frame = None;
+                let mut min_energy = f64::INFINITY;
+                for j in search_start..=i {
+                    let e = self.energies[j];
+                    if e < self.threshold && e < min_energy {
+                        min_energy = e;
+                        split_frame = Some(j);
+                    }
+                }
+                if let Some(split_frame) = split_frame {
+                    self.cut_at(split_frame, out);
+                }
+            }
+
+            fn split_search_start(&self, i: usize) -> usize {
+                (i + 1)
+                    .saturating_sub(self.quiet_search_frames)
+                    .max(self.phrase_start_frame + 1)
+            }
+
+            fn cut_at(&mut self, split_frame: usize, out: &mut Vec<Phrase>) {
+                out.push(Phrase {
+                    samples: self.buffer
+                        [self.emit_start_frame * self.frame_len..split_frame * self.frame_len]
+                        .to_vec(),
+                    continuation: self.continuation,
+                    start_sample: self.stream_index(self.emit_start_frame),
+                });
+
+                self.drop_frames(split_frame);
+                self.phrase_start_frame = 0;
+                self.emit_start_frame = 0;
+                self.continuation = true;
+                self.speech_frames = self
+                    .energies
+                    .iter()
+                    .filter(|&&e| e >= self.threshold)
+                    .count();
+                self.trailing_silence = self
+                    .energies
+                    .iter()
+                    .rev()
+                    .take_while(|&&e| e < self.threshold)
+                    .count();
+            }
+
+            fn stream_index(&self, frame: usize) -> u64 {
+                self.consumed + (frame * self.frame_len) as u64
+            }
+
+            fn drop_frames(&mut self, n: usize) {
+                if n == 0 {
+                    return;
+                }
+                self.consumed += (n * self.frame_len) as u64;
+                self.buffer.drain(..n * self.frame_len);
+                self.energies.drain(..n);
+            }
+
+            fn clear(&mut self) {
+                self.consumed += self.buffer.len() as u64;
+                self.buffer.clear();
+                self.energies.clear();
+                self.in_phrase = false;
+                self.emit_start_frame = 0;
+                self.phrase_start_frame = 0;
+                self.speech_frames = 0;
+                self.trailing_silence = 0;
+                self.continuation = false;
+            }
+        }
+    }
+
+    /// Seeded audio: `runs` runs of up to `max_run` samples at one of
+    /// `levels` each (alternating sign, so the RMS is the level, with a
+    /// little jitter).
+    fn seeded(seed: u64, runs: usize, levels: &[i16], max_run: usize) -> Vec<i16> {
+        let mut state = seed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut out = Vec::new();
+        for _ in 0..runs {
+            let len = (next() % max_run as u64) as usize;
+            let level = levels[(next() % levels.len() as u64) as usize];
+            out.extend((0..len).map(|i| {
+                let s = level.saturating_add((next() % 3) as i16 - 1);
+                if i % 2 == 0 {
+                    s
+                } else {
+                    -s
+                }
+            }));
+        }
+        out
+    }
+
+    /// The two splitters under comparison.
+    trait Splits {
+        fn feed(&mut self, samples: &[i16]) -> Vec<Phrase>;
+        fn flush(&mut self) -> Option<Phrase>;
+    }
+
+    impl Splits for PhraseSplitter {
+        fn feed(&mut self, samples: &[i16]) -> Vec<Phrase> {
+            PhraseSplitter::feed(self, samples)
+        }
+        fn flush(&mut self) -> Option<Phrase> {
+            PhraseSplitter::flush(self)
+        }
+    }
+
+    impl Splits for v0_1_31::PhraseSplitter {
+        fn feed(&mut self, samples: &[i16]) -> Vec<Phrase> {
+            v0_1_31::PhraseSplitter::feed(self, samples)
+        }
+        fn flush(&mut self) -> Option<Phrase> {
+            v0_1_31::PhraseSplitter::flush(self)
+        }
+    }
+
+    /// Every phrase `splitter` emits for `audio` fed `chunk` samples at a
+    /// time, the flush included.
+    fn split_with(audio: &[i16], chunk: usize, splitter: &mut impl Splits) -> Vec<Phrase> {
+        let mut phrases: Vec<Phrase> = audio.chunks(chunk).flat_map(|c| splitter.feed(c)).collect();
+        phrases.extend(splitter.flush());
+        phrases
+    }
+
+    #[test]
+    fn rms_splits_match_0_1_31() {
+        // Production frames at 16 kHz around 0.003 (98.3 of full scale),
+        // with stretches long enough to reach both length caps.
+        let levels = [0, 4, 50, 97, 99, 300, 300, 8000, 8000, 8000];
+        let mut forced = 0;
+        for (seed, silence_ms) in [(1, 400), (2, 900), (3, 100), (4, 2000)] {
+            let audio = seeded(seed, 150, &levels, 4 * RATE);
+            for chunk in [800, 1600, 4001] {
+                let mut new = PhraseSplitter::new(RATE, VadConfig::close(Vad::Rms), silence_ms);
+                let mut old = v0_1_31::PhraseSplitter::new(
+                    RATE,
+                    audio_silence_gate::SILENCE_RMS_THRESHOLD,
+                    silence_ms,
+                );
+                let expected = split_with(&audio, chunk, &mut old);
+                let got = split_with(&audio, chunk, &mut new);
+                assert!(got == expected, "seed {seed}, chunk {chunk}");
+                forced += expected.iter().filter(|p| p.continuation).count();
+            }
+        }
+        assert!(forced > 0, "no phrase reached a cap: a weak comparison");
+        // Tiny frames and caps, so cuts of every kind happen all the time.
+        for seed in 10..30 {
+            let audio = seeded(seed, 200, &[0, 50, 300, 330, 500, 1000], 120);
+            let mut new = PhraseSplitter::with_params(FRAME, 0.01, 3, 2, 6, 1, 3, 10);
+            let mut old = v0_1_31::PhraseSplitter::with_params(FRAME, 0.01, 3, 2, 6, 1, 3, 10);
+            let expected = split_with(&audio, 37, &mut old);
+            assert_eq!(split_with(&audio, 37, &mut new), expected, "seed {seed}");
+        }
+    }
+
+    /// [`splitter`] with its speech flags read from `flags`.
+    fn scripted(flags: &[bool]) -> PhraseSplitter {
+        let mut s = splitter();
+        s.source = SpeechSource::Script(flags.iter().copied().collect());
+        s
+    }
+
+    #[test]
+    fn silence_comes_from_the_detector_not_the_level() {
+        // Loud throughout, but the detector hears speech only in frames 5 to
+        // 9: one phrase, those frames plus a pad on each side.
+        let mut flags = vec![false; 5];
+        flags.extend([true; 5]);
+        flags.extend([false; 10]);
+        let mut s = scripted(&flags);
+        let audio = frames(&[(SPEECH, 20)]);
+        let mut phrases = s.feed(&audio);
+        phrases.extend(s.flush());
+        assert_eq!(phrases.len(), 1);
+        assert_eq!(phrases[0].start_sample, (4 * FRAME) as u64);
+        assert_eq!(phrases[0].samples.len(), 7 * FRAME);
+
+        // Quiet audio the detector calls speech is a phrase all the same.
+        let mut s = scripted(&[true; 6]);
+        let mut phrases = s.feed(&frames(&[(5, 6)]));
+        phrases.extend(s.flush());
+        assert_eq!(phrases.len(), 1);
+    }
+
+    #[test]
+    fn soft_cap_cuts_at_the_quietest_silent_frame() {
+        // Soft cap 6 frames, search 3: at frame 5 the window is frames 3 to
+        // 5. Frames 3 and 4 are silent to the detector, and 4 is the quieter
+        // of them; frame 5 is quieter still but speech, so it is no cut.
+        let mut s = capped_splitter(140);
+        let flags = [true, true, true, false, false, true, true, true];
+        s.source = SpeechSource::Script(flags.into_iter().collect());
+        let audio = frames(&[
+            (SPEECH, 3),
+            (QUIET_SPEECH, 1),
+            (QUIET_SPEECH / 2, 1),
+            (5, 1),
+            (SPEECH, 2),
+        ]);
+        let phrases = s.feed(&audio);
+        assert_eq!(phrases.len(), 1, "{phrases:?}");
+        assert_eq!(phrases[0].samples.len(), 4 * FRAME);
+        let tail = s.flush().expect("the rest continues the phrase");
+        assert!(tail.continuation);
+        assert_eq!(rejoin(&[phrases[0].clone(), tail]), audio);
+    }
+
+    fn decision(start_sample: u64, speech: bool) -> FrameDecision {
+        FrameDecision {
+            start_sample,
+            speech,
+            score: if speech { 0.9 } else { 0.1 },
+            dbfs: -30.0,
+        }
+    }
+
+    #[test]
+    fn a_16_ms_frame_counts_toward_the_frame_it_ends_in() {
+        // 1600-sample frames: 16 ms frame 6 (1536..1792) ends in frame 1.
+        let mut ahead = VecDeque::new();
+        mark_frame(&mut ahead, 0, decision(5 * 256, true), 1600);
+        mark_frame(&mut ahead, 0, decision(6 * 256, true), 1600);
+        assert_eq!(ahead, [true, true]);
+        // Not speech: nothing marked.
+        let mut ahead = VecDeque::new();
+        mark_frame(&mut ahead, 0, decision(6 * 256, false), 1600);
+        assert!(ahead.is_empty());
+        // Relative to the frames analyzed so far.
+        let mut ahead = VecDeque::new();
+        mark_frame(&mut ahead, 3, decision(25 * 256, true), 1600);
+        assert_eq!(ahead, [false, true]);
+        // A decision on a frame already analyzed is dropped, never wraps.
+        let mut ahead = VecDeque::new();
+        mark_frame(&mut ahead, 3, decision(256, true), 1600);
+        assert!(ahead.is_empty());
+    }
+
+    /// Seeded Gaussian noise at about `level` normalized RMS.
+    fn noise(n: usize, seed: u64, level: f64) -> Vec<i16> {
+        let mut state = seed;
+        let mut uniform = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        (0..n)
+            .map(|_| {
+                let (u, v) = (uniform(), uniform());
+                let x = (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos();
+                (x * level * i16::MAX as f64)
+                    .round()
+                    .clamp(-32768.0, 32767.0) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn earshot_splits_no_phrase_out_of_noise() {
+        // White noise at -40 dBFS: loud enough for the RMS test to call all
+        // of it speech, never speech to earshot. Digital silence neither.
+        let hiss = noise(10 * RATE, 7, 0.01);
+        let silence = vec![0i16; 10 * RATE];
+        for cfg in [
+            VadConfig::close(Vad::Earshot),
+            VadConfig::open(Vad::Earshot),
+        ] {
+            for audio in [&hiss, &silence] {
+                let mut s = PhraseSplitter::new(RATE, cfg, 400);
+                assert!(matches!(s.source, SpeechSource::Vad(_)));
+                let phrases = split_with(audio, 800, &mut s);
+                assert!(phrases.is_empty(), "{} phrase(s)", phrases.len());
+            }
+        }
+        let mut rms = PhraseSplitter::new(RATE, VadConfig::close(Vad::Rms), 400);
+        assert_eq!(split_with(&hiss, 800, &mut rms).len(), 1);
+        // earshot runs at 16 kHz only: any other rate takes the RMS test.
+        let other = PhraseSplitter::new(8_000, VadConfig::close(Vad::Earshot), 400);
+        assert!(matches!(other.source, SpeechSource::Rms(_)));
     }
 }
