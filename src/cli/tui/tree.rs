@@ -1918,7 +1918,7 @@ mod tests {
     }
 
     /// The Deepgram key's input, a key typed into it.
-    fn secret() -> Fixture {
+    fn key_entry() -> Fixture {
         let mut fixture = mockup();
         press(&mut fixture.app, "j\nj\n");
         type_text(&mut fixture.app, "dg_typed_secret_77aa");
@@ -2182,7 +2182,7 @@ mod tests {
             ("Config", key_picker),
             ("Config", filtering),
             ("Config", typing),
-            ("Config", secret),
+            ("Config", key_entry),
             ("Config", vocabulary),
             ("Config", agents),
             ("Config", replacements),
@@ -2289,7 +2289,7 @@ mod tests {
             ("picker", picker as Make, "picker"),
             ("hotkey", hotkey, "hotkey"),
             ("input", typing, "input"),
-            ("input", secret, "input"),
+            ("input", key_entry, "input"),
         ] {
             let fixture = make();
             let nodes = nodes(&fixture.app);

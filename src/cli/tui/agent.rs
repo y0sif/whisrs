@@ -987,7 +987,7 @@ mod tests {
         fixture
     }
 
-    fn secret() -> Fixture {
+    fn key_entry() -> Fixture {
         let mut fixture = mockup();
         press(&mut fixture.app, "j\nj\n");
         type_text(&mut fixture.app, "dg_typed");
@@ -1466,7 +1466,7 @@ mod tests {
                 Some("dg_agent"),
             )
         });
-        let mut fixture = secret();
+        let mut fixture = key_entry();
         let before = fixture.app.config.typed().unwrap().input.count();
         human(&mut fixture, KEY_IS_HUMAN, |f| text(f, "abc"));
         human(&mut fixture, KEY_IS_HUMAN, |f| raw(f, "a"));
