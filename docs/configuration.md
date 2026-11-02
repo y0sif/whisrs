@@ -22,7 +22,7 @@ notify = true               # desktop notifications
 history = true              # save dictations to ~/.local/share/whisrs/history.jsonl for
                             # `whisrs log`. false stops new writes only: existing
                             # entries stay until `whisrs log --clear`
-remove_filler_words = true  # strip "um", "uh", "you know", etc.
+remove_filler_words = true  # strip "um", "uh", "you know", Russian "э-э-э", "ммм", etc.
 filler_words = []           # custom list (empty = use built-in defaults)
 audio_feedback = true       # play tones on record start/stop/done
 audio_feedback_volume = 0.5 # 0.0 to 1.0

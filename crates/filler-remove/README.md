@@ -4,19 +4,24 @@ Regex-based filler word and stutter removal from transcribed speech.
 
 ## Usage
 
-### Built-in English patterns
+### Built-in patterns
 
 ```rust
 use filler_remove::remove_filler_words;
 
 let cleaned = remove_filler_words("um, I uh went to the store", &[]);
 assert_eq!(cleaned, "I went to the store");
+
+// Russian hesitations are built in too.
+let cleaned = remove_filler_words("Э-э-э, я пошёл", &[]);
+assert_eq!(cleaned, "Я пошёл");
 ```
 
 ### Custom filler words for other languages
 
-Built-in patterns are English-only. For other languages, supply your own
-custom filler words:
+Built-in patterns cover English fillers and Russian hesitation sounds
+("э-э-э", "эм", "ммм"). For other words or languages, supply your own custom
+filler words (they replace the built-ins):
 
 ```rust
 use filler_remove::remove_filler_words;

@@ -1,23 +1,27 @@
 //! Regex-based filler word and stutter removal from transcribed speech.
 //!
 //! This crate removes common English filler words (such as "um", "uh", "like",
-//! "you know", etc.) and repeated-word stutters (e.g., "I I I went" → "I
-//! went") from text — typically output from speech-to-text engines.
+//! "you know", etc.), Russian hesitation sounds ("э-э-э", "эм", "а-а-а",
+//! "ммм") and repeated-word stutters (e.g., "I I I went" → "I went") from
+//! text — typically output from speech-to-text engines.
 //!
-//! # Built-in patterns are English-only
+//! # Built-in patterns: English fillers and Russian hesitations
 //!
-//! The default filler patterns target English speech. Construct a built-in
-//! filter via [`FillerFilter::builtin`]. For other languages, supply your own
-//! custom filler words via [`FillerFilter::new`].
+//! The default patterns target English filler words plus Russian hesitation
+//! sounds, which are Cyrillic and cannot match English text. Construct a
+//! built-in filter via [`FillerFilter::builtin`]. For other words or
+//! languages, supply your own custom filler words via [`FillerFilter::new`];
+//! they replace all built-ins.
 //!
 //! # Example
 //!
 //! ```rust
 //! use filler_remove::FillerFilter;
 //!
-//! // Built-in English patterns (no custom words).
+//! // Built-in patterns (no custom words).
 //! let filter = FillerFilter::builtin();
 //! assert_eq!(filter.apply("um, I uh went to the store"), "I went to the store");
+//! assert_eq!(filter.apply("Э-э-э, я пошёл"), "Я пошёл");
 //!
 //! // Custom words for other languages.
 //! let filter = FillerFilter::new(&["ну", "типа"]).unwrap();
@@ -54,6 +58,20 @@ static BUILTIN_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         .collect()
 });
 
+/// A whole Russian hesitation token, punctuation already stripped. Matching
+/// whole tokens (not `\b`) keeps "э-это" and "эм-м" from losing only a part.
+///
+/// Deliberately conservative: only a capital or lowercase first letter (so
+/// acronyms such as "МММ" stay); a lone "э", "м-м" (often "no") and "эу"
+/// (a greeting) stay too.
+static RU_HESITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[Ээ][эм‐–—-]+|[Аа](?:[‐–—-]а+)+|[Аа]а{2,}|[Мм]м{2,}|[Мм](?:[‐–—-]м+){2,})$")
+        .unwrap()
+});
+
+/// Sentence-ending punctuation a removed hesitation hands to the previous word.
+const SENTENCE_END: &[char] = &['.', '!', '?', '…'];
+
 /// Pre-compiled regex for collapsing multiple spaces into one.
 static SPACE_COLLAPSE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" {2,}").unwrap());
 
@@ -66,7 +84,7 @@ static SPACE_COLLAPSE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" {2,}"
 /// # Behavior
 ///
 /// - If `custom_words` is empty, the filter uses the built-in English patterns
-///   (already pre-compiled via [`LazyLock`]).
+///   and Russian hesitations (already pre-compiled via [`LazyLock`]).
 /// - If `custom_words` is non-empty, those words are compiled into custom
 ///   regexes (each wrapped with `\b...\b,?\s*`) and the built-in defaults are
 ///   **not** used — same semantics as the legacy [`remove_filler_words`].
@@ -85,7 +103,7 @@ pub struct FillerFilter {
 impl FillerFilter {
     /// Build a new filter, pre-compiling all custom-word patterns.
     ///
-    /// Pass an empty slice to use the built-in English filler list. For the
+    /// Pass an empty slice to use the built-in filler list. For the
     /// "no custom words" case, prefer [`FillerFilter::builtin`] — it doesn't
     /// require a turbofish to pin the generic parameter.
     ///
@@ -104,7 +122,7 @@ impl FillerFilter {
         Ok(Self { custom })
     }
 
-    /// Build a filter that uses only the built-in English filler patterns.
+    /// Build a filter that uses only the built-in filler patterns.
     ///
     /// This is an ergonomic shortcut for `FillerFilter::new::<&str>(&[])`
     /// that avoids the turbofish needed to pin the generic parameter when the
@@ -138,6 +156,7 @@ impl FillerFilter {
             for re in BUILTIN_PATTERNS.iter() {
                 result = re.replace_all(&result, "").to_string();
             }
+            result = remove_russian_hesitations(&result);
         } else {
             // Use pre-compiled custom-word patterns.
             for re in &self.custom {
@@ -171,10 +190,10 @@ impl Default for FillerFilter {
 ///
 /// Always removes stutters regardless of the filler list.
 ///
-/// # Built-in patterns are English-only
+/// # Built-in patterns: English fillers and Russian hesitations
 ///
-/// The default filler list targets English speech. For other languages,
-/// supply custom words.
+/// The default list targets English filler words and Russian hesitation
+/// sounds. For other words or languages, supply custom words.
 ///
 /// # Performance
 ///
@@ -191,6 +210,57 @@ pub fn remove_filler_words(text: &str, custom_words: &[String]) -> String {
     let filter = FillerFilter::new(custom_words)
         .expect("custom filler word produced an invalid regex; use FillerFilter::new for fallible construction");
     filter.apply(text)
+}
+
+/// Drop whole-token Russian hesitations, keeping the sentence intact: a
+/// sentence end on the dropped token moves to the previous word (replacing a
+/// comma there), a comma left dangling at the end goes, and the word after a
+/// dropped sentence-initial hesitation gets its capital.
+fn remove_russian_hesitations(text: &str) -> String {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let mut kept: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut capitalize_next = false;
+
+    for (i, token) in tokens.iter().enumerate() {
+        let core = token.trim_end_matches(|c: char| ",;:".contains(c) || SENTENCE_END.contains(&c));
+        if !RU_HESITATION_RE.is_match(core) {
+            let mut word = token.to_string();
+            if std::mem::take(&mut capitalize_next) {
+                word = capitalize(&word);
+            }
+            kept.push(word);
+            continue;
+        }
+
+        let sentence_end: String = token[core.len()..]
+            .chars()
+            .filter(|c| SENTENCE_END.contains(c))
+            .collect();
+        match kept.last_mut() {
+            Some(prev) => {
+                let prev_ends_sentence = prev.ends_with(SENTENCE_END);
+                if !sentence_end.is_empty() && !prev_ends_sentence {
+                    prev.truncate(prev.trim_end_matches(',').len());
+                    prev.push_str(&sentence_end);
+                } else if i == tokens.len() - 1 {
+                    prev.truncate(prev.trim_end_matches(',').len());
+                }
+                capitalize_next |= prev_ends_sentence && core.starts_with(char::is_uppercase);
+            }
+            None => capitalize_next |= core.starts_with(char::is_uppercase),
+        }
+    }
+
+    kept.join(" ")
+}
+
+/// Uppercase the first letter of `word`.
+fn capitalize(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// Remove consecutive repeated words (case-insensitive).
@@ -416,6 +486,76 @@ mod tests {
         assert_eq!(
             remove_filler_words("basically Привет, 世界 uh okay", &[]),
             "Привет, 世界 okay"
+        );
+    }
+
+    #[test]
+    fn removes_russian_hesitations() {
+        let cases = [
+            (
+                "А-а-а, работу не начинай, э-э-э, пока",
+                "Работу не начинай, пока",
+            ),
+            ("Эээм, продолжим", "Продолжим"),
+            ("эм-м, продолжим", "продолжим"),
+            ("Так, ммм, ладно", "Так, ладно"),
+            ("м-м-м, вкусно", "вкусно"),
+            ("нужна, э—э—э, какая-то", "нужна, какая-то"),
+            ("Ааа, понял", "Понял"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(remove_filler_words(input, &[]), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn russian_hesitation_keeps_sentence_punctuation() {
+        let cases = [
+            ("Э-э-э. Проверка", "Проверка"),
+            ("пока, э-э-э", "пока"),
+            ("пока, э-э-э.", "пока."),
+            ("Ладно, э-э-э. Дальше", "Ладно. Дальше"),
+            ("Ладно. Э-э-э, дальше", "Ладно. Дальше"),
+            ("Готово! Эм", "Готово!"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(remove_filler_words(input, &[]), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn keeps_russian_words_that_look_like_hesitations() {
+        let cases = [
+            "Акции МММ упали, ЭЭЭ тоже",
+            "Буква э",
+            "М-м, не надо",
+            "Эу, иди сюда",
+            "э-это мама",
+            "А папа нет, а мама эмоции и эканья-мэканья, ему и мне",
+            "покааа воообще сообщение",
+            "Э. М. Ремарк",
+            "э-книга, э-мейл, ЭМ-волны",
+            "судовая ЭУ, батарейки ААА",
+            "длинношеее животное, Оооо, как красиво!",
+        ];
+        for text in cases {
+            assert_eq!(remove_filler_words(text, &[]), text);
+        }
+    }
+
+    #[test]
+    fn russian_hesitation_removal_is_idempotent() {
+        let once = remove_filler_words("Эээм, ну, э-э-э, ладно. Ммм", &[]);
+        assert_eq!(once, "Ну, ладно.");
+        assert_eq!(remove_filler_words(&once, &[]), once);
+    }
+
+    #[test]
+    fn custom_words_skip_russian_builtins() {
+        let custom = vec!["ну".to_string()];
+        assert_eq!(
+            remove_filler_words("ну э-э-э пошёл", &custom),
+            "э-э-э пошёл"
         );
     }
 
