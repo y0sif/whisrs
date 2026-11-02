@@ -10,6 +10,7 @@
 //! the network and the sound server are only ever asked from [`worker`]
 //! threads, so none of them can freeze the screen.
 
+mod agent;
 mod app;
 mod complete;
 mod form;
@@ -23,6 +24,7 @@ mod screens;
 #[cfg(test)]
 mod testing;
 mod theme;
+mod tree;
 mod widgets;
 mod worker;
 
@@ -36,6 +38,7 @@ use anyhow::Context as _;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+use taria_ratatui::{InputStatus, LayerStats, TariaLayer};
 use whisrs::service::ServiceManager;
 
 use app::{App, Effect, Msg, Origin};
@@ -174,6 +177,15 @@ pub fn run(entry: Entry) -> anyhow::Result<()> {
     let service = ServiceManager::detect();
     let mut app = App::prepare(entry, paths, env, service).map_err(anyhow::Error::msg)?;
 
+    // Agent access: inert until a taria bridge connects, and never a reason
+    // not to open. A good bind says nothing (the socket path is in the man
+    // page); a failed one says so here, before the alternate screen and the
+    // hush, so the line stays on screen after the TUI is gone.
+    let mut layer = TariaLayer::bind_or_disabled("whisrs");
+    if let Some(line) = bind_warning(&layer) {
+        eprintln!("{line}");
+    }
+
     let glyphs = Glyphs::detect(&app.env);
     let depth = Depth::detect(&app.env);
     // Asked before raw mode and before anything reads keys, so the answer
@@ -218,9 +230,12 @@ pub fn run(entry: Entry) -> anyhow::Result<()> {
             &mut app,
             &workers,
             &rx,
-            glyphs,
-            depth,
-            ground,
+            &mut layer,
+            Looks {
+                glyphs,
+                depth,
+                ground,
+            },
         )
     });
     let stopped = wind_down(&app, &workers, &rx);
@@ -231,7 +246,60 @@ pub fn run(entry: Entry) -> anyhow::Result<()> {
     if stopped {
         println!("Stopped the model download; nothing of it is left behind.");
     }
+    for line in layer_report(&layer.stats()) {
+        eprintln!("{line}");
+    }
     result
+}
+
+/// The line a failed bind says; a good one says nothing.
+fn bind_warning(layer: &TariaLayer) -> Option<String> {
+    layer
+        .bind_error()
+        .map(|err| format!("whisrs: agent access (taria) is off: {err}"))
+}
+
+/// What the agent layer threw away or cut, a line per count that is not
+/// zero: said once the terminal is the user's again.
+fn layer_report(stats: &LayerStats) -> Vec<String> {
+    // The two cuts name where, which is what a fix needs.
+    let last = |what: Option<String>| what.map(|w| format!("; the last: {w}")).unwrap_or_default();
+    [
+        (
+            stats.dropped_inputs,
+            "agent input(s) dropped, sent faster than the TUI took them".to_string(),
+        ),
+        (
+            stats.stale_inputs,
+            "agent input(s) discarded, their bridge connection gone first".to_string(),
+        ),
+        (
+            stats.unknown_inputs,
+            "agent input(s) of a kind this build cannot read: a newer taria-mcp".to_string(),
+        ),
+        (
+            stats.dropped_acks,
+            "answer(s) to agent inputs lost, the bridge reading too slowly".to_string(),
+        ),
+        (
+            stats.truncated_snapshots,
+            format!(
+                "agent tree(s) cut to the depth limit{}",
+                last(stats.last_truncation.as_ref().map(ToString::to_string))
+            ),
+        ),
+        (
+            stats.oversized_snapshots,
+            format!(
+                "agent tree(s) trimmed to fit one line{}",
+                last(stats.last_oversize.as_ref().map(ToString::to_string))
+            ),
+        ),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, text)| format!("whisrs: {count} {text}"))
+    .collect()
 }
 
 /// Put the real stderr back first thing in a panic, then run the hooks
@@ -326,30 +394,45 @@ const TICK: Duration = Duration::from_millis(200);
 /// How long a changed value shows reversed.
 const FLASH: Duration = Duration::from_millis(150);
 
+/// What the frames are drawn with, as the terminal was found at start.
+struct Looks {
+    glyphs: Glyphs,
+    depth: Depth,
+    ground: Ground,
+}
+
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     workers: &worker::Workers,
     rx: &mpsc::Receiver<Msg>,
-    glyphs: Glyphs,
-    depth: Depth,
-    ground: Ground,
+    layer: &mut TariaLayer,
+    looks: Looks,
 ) -> anyhow::Result<()> {
     let first = app.opened();
     perform(terminal, app, workers, first)?;
     let mut redraw = true;
     let mut flash_until: Option<Instant> = None;
     loop {
+        // What an agent sent, all of it applied before the tree goes out
+        // again: the first tree after a drain is the answer to it.
+        redraw |= drain(terminal, app, workers, layer)?;
         if redraw {
             // From the config as edited, so a new `[overlay] theme` shows at
             // once.
-            let theme = Theme::new(&app.overlay(), depth, ground);
+            let theme = Theme::new(&app.overlay(), looks.depth, looks.ground);
             let ui = Ui {
                 theme: &theme,
-                glyphs: &glyphs,
+                glyphs: &looks.glyphs,
             };
             terminal.draw(|frame| app.view(frame, &ui))?;
             redraw = false;
+        }
+        // Every pass, changed or not: the layer sends nothing for a tree it
+        // has, and the same tree again, stamped, to answer an input that
+        // changed nothing. A disabled layer builds none.
+        if layer.is_enabled() {
+            layer.publish(tree::build(app));
         }
         if app.quit {
             return Ok(());
@@ -396,6 +479,38 @@ fn event_loop(
             (false, Some(_)) => flash_until = None,
             _ => {}
         }
+    }
+}
+
+/// Apply each agent input queued, its effects run before the next input as
+/// a key's are; after a quit, or an effect that failed, the rest is
+/// refused. Whether any came; the failure, kept, after the drain.
+fn drain(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    workers: &worker::Workers,
+    layer: &TariaLayer,
+) -> anyhow::Result<bool> {
+    let mut came = false;
+    let mut failed = None;
+    layer.drain(|input| {
+        came = true;
+        if app.quit || failed.is_some() {
+            return InputStatus::Ignored;
+        }
+        let mut effects = Vec::new();
+        let status = agent::apply(app, input, &mut effects);
+        for effect in effects {
+            if let Err(e) = perform(terminal, app, workers, Some(effect)) {
+                failed = Some(e);
+                break;
+            }
+        }
+        status
+    });
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(came),
     }
 }
 
@@ -807,6 +922,49 @@ mod tests {
         assert!(editor_ran("vi", Err(std::io::Error::other("no sh")))
             .unwrap_err()
             .contains("cannot run vi"));
+    }
+
+    /// A good bind says nothing and serves the tree; a failed one says one
+    /// line, and the layer is inert.
+    #[test]
+    fn a_failed_bind_says_one_line_and_a_good_one_nothing() {
+        // A folder of its own, which taria makes 0700 and vets.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("taria").join("w.sock");
+        let mut layer = TariaLayer::bind_or_disabled_at("whisrs", path);
+        assert!(layer.is_enabled(), "{:?}", layer.bind_error());
+        assert_eq!(bind_warning(&layer), None);
+        let fixture = testing::mockup();
+        layer.publish(tree::build(&fixture.app));
+        assert!(layer_report(&layer.stats()).is_empty());
+        drop(layer);
+
+        // A label that is not a file name binds nothing, and touches nothing.
+        let layer = TariaLayer::bind_or_disabled("not/a/name");
+        assert!(!layer.is_enabled());
+        let line = bind_warning(&layer).unwrap();
+        assert!(
+            line.starts_with("whisrs: agent access (taria) is off: "),
+            "{line}"
+        );
+        assert!(!line.contains('\n'));
+    }
+
+    /// Each count the layer kept, when not zero, is one line; none is
+    /// nothing.
+    #[test]
+    fn the_layer_report_says_only_what_is_not_zero() {
+        let mut stats = LayerStats::default();
+        assert!(layer_report(&stats).is_empty());
+        stats.dropped_inputs = 2;
+        stats.oversized_snapshots = 1;
+        assert_eq!(
+            layer_report(&stats),
+            [
+                "whisrs: 2 agent input(s) dropped, sent faster than the TUI took them",
+                "whisrs: 1 agent tree(s) trimmed to fit one line",
+            ]
+        );
     }
 
     #[test]

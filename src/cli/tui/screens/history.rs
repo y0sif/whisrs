@@ -73,7 +73,7 @@ pub fn read(path: &Path, now: DateTime<Local>) -> Result<Vec<Dictation>, String>
 }
 
 /// A dictation's length: `4.2s`, `1m 05s`.
-fn seconds(secs: f64) -> String {
+pub fn seconds(secs: f64) -> String {
     if secs < 60.0 {
         format!("{secs:.1}s")
     } else {
@@ -83,7 +83,7 @@ fn seconds(secs: f64) -> String {
 }
 
 /// The text on one line: its first line, spaces made one.
-fn first_line(text: &str) -> String {
+pub fn first_line(text: &str) -> String {
     text.lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or_default()
@@ -115,6 +115,8 @@ pub struct History {
     shown: Cell<(usize, usize)>,
     /// A clear was sent and the daemon has not answered yet.
     pub clearing: bool,
+    /// How many rows the list had room for as last drawn.
+    listed: Cell<Option<usize>>,
 }
 
 impl History {
@@ -141,7 +143,7 @@ impl History {
         }
     }
 
-    fn all(&self) -> &[Dictation] {
+    pub fn all(&self) -> &[Dictation] {
         match &self.entries {
             Some(Ok(entries)) => entries,
             _ => &[],
@@ -150,7 +152,7 @@ impl History {
 
     /// The dictations the filter keeps, by index: each word of it starts a
     /// word of the text, in any case, as a picker's filter does.
-    fn visible(&self) -> Vec<usize> {
+    pub fn visible(&self) -> Vec<usize> {
         self.all()
             .iter()
             .enumerate()
@@ -239,6 +241,29 @@ impl History {
         };
         self.clamp();
         Asked::Nothing
+    }
+}
+
+/// What the agent tree reads of the screen.
+impl History {
+    /// The cursor, into [`History::visible`].
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The open dictation, by its index in [`History::all`].
+    pub fn opened_at(&self) -> Option<usize> {
+        self.open.map(|(index, _)| index)
+    }
+
+    /// The filter being typed.
+    pub fn typing(&self) -> Option<&Input> {
+        self.typing.as_ref()
+    }
+
+    /// How many rows the list had room for as last drawn.
+    pub fn listed(&self) -> Option<usize> {
+        self.listed.get()
     }
 }
 
@@ -397,6 +422,7 @@ pub fn view(app: &App, f: &mut Frame, ui: &Ui) {
 fn draw_list(history: &History, visible: &[usize], f: &mut Frame, area: Rect, ui: &Ui) {
     let height = usize::from(area.height);
     let offset = scroll(visible.len(), history.cursor, height);
+    history.listed.set(Some(height));
     let all = history.all();
     // The text keeps two thirds of what is left after the date and the
     // length, at the least.

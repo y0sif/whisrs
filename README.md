@@ -301,6 +301,10 @@ While it works, a small overlay in a screen corner (`[agent_overlay]`, an orb or
 
 `whisrs agent` lists the agents and what they are doing; `whisrs agent jarvis --text "..."` sends a typed turn, and `whisrs agent jarvis --new` (or an optional `new_session_hotkey`) records one that starts a fresh session. Sessions are named `whisrs-<name>` (in `claude agents`, or OpenCode's session list; Codex's and Copilot's are known by their id, which `whisrs agent` shows), and whisrs never touches a session it did not start. Setup and details: [Agent mode](docs/configuration.md#agent-mode).
 
+### Drive the TUI with an agent
+
+`whisrs config` and `whisrs setup` publish their screens to an AI agent through [taria](https://github.com/y0sif/taria): install the bridge (`cargo install taria-mcp`), register it (for Claude Code, `claude mcp add taria -- taria-mcp --app whisrs`) and the agent reads each screen's rows, values and state, and acts on them with the keys a person presses there. Typed text goes only into an input or a picker's filter, never into the key bindings. Nothing is served until a bridge connects; the socket is `$XDG_RUNTIME_DIR/taria/whisrs.sock` (0600), or `$TARIA_SOCK`. Three things stay with the person at the keyboard: typing an API key, `e` (`$EDITOR`), and setup's sudo step for `/dev/uinput`.
+
 ---
 
 ## Supported Environments

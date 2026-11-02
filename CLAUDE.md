@@ -110,11 +110,23 @@ src/
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── cli/tui/                # whisrs config + whisrs setup TUI (ratatui; in the CLI binary only, whisrsd
 │   │                       #   never links it)
-│   ├── mod.rs              #   run(): tty refusal, load (#134 refusals), colour probe, init/restore,
-│   │                       #   the event loop, effects (save, restart, $EDITOR and sudo suspend,
-│   │                       #   a download's .part removed on the way out)
-│   ├── app.rs              #   App: screen stack, dialogs, pure update(Msg) -> Effect
+│   ├── mod.rs              #   run(): tty refusal, load (#134 refusals), the taria bind, colour probe,
+│   │                       #   init/restore, the event loop (agent drain, draw, publish), effects (save,
+│   │                       #   restart, $EDITOR and sudo suspend, a download's .part removed on the way
+│   │                       #   out), the layer's nonzero stats after restore
+│   ├── app.rs              #   App: screen stack, dialogs, pure update(Msg) -> Effect; key = mode +
+│   │                       #   keys::action + act, the one handler keys and agents share
 │   ├── keys.rs             #   key -> Action (pure)
+│   ├── tree.rs             #   the agent tree (taria, pure &App -> nodes): each screen's rows, state
+│   │                       #   and the actions its keys have; the modal gate; relayed text (titles,
+│   │                       #   transcripts, names, devices, errors), ids never built from it
+│   ├── agent.rs            #   an agent's input: act (refused unless the tree advertises it, or when
+│   │                       #   its value would not land, ConfigScreen::takes) lowered to keys through
+│   │                       #   App::act, a raw key through App::key, as a terminal delivers it (shift+y
+│   │                       #   is Y), not one whose modifier its binding ignores (alt+y, shift+Down, Y
+│   │                       #   on a dialog, shift+1), text only into an input or a picker's filter,
+│   │                       #   4096 chars at most; the person's own (a key, $EDITOR, setup's sudo)
+│   │                       #   refused with a status line
 │   ├── theme.rs            #   colour roles from the overlay theme; 16-colour map, light remap, NO_COLOR
 │   ├── glyphs.rs           #   Unicode and ASCII glyph sets (one char, one column each)
 │   ├── schema.rs           #   every config key as a row (kind, help, feature gate) + coverage tests
@@ -439,6 +451,18 @@ screen reads the profiles folder through `config::profile` on a worker, makes an
 files itself, switches through `switch-profile`, and in profile mode writes only the profile's
 file (toml_edit, `profile::write_profile`). The dialoguer wizard and its deps (`dialoguer`, `indicatif`) are gone; the daemon saves an
 `[[llm_commands]]` instruction through `config::write::write_config`.
+Agent access to the TUI is `taria-ratatui` 0.4.0 (no cargo feature, CLI only; the bridge is
+`taria-mcp --app whisrs`). `tui::run` binds `TariaLayer::bind_or_disabled("whisrs")` after
+`App::prepare` and before the alternate screen: a good bind prints nothing, a failed one one
+stderr line, and the TUI opens either way; nonzero `stats()` print after the restore. Each pass of
+`event_loop` drains the agent's input (`agent::apply`, each input's effects performed before the
+next), draws, then publishes `tree::build(app)` while the layer is enabled, every pass. The seam:
+`App::key` is `App::mode` + `keys::action` + `App::act`, and every agent input lowers into
+`App::act` (or `App::key` for a raw key), so no screen has an agent-only path: a new key or screen
+needs its nodes in `tree.rs` and, for a new node, its lowering in `agent.rs`. Recording ids and the
+open list's item ids are session serials never given twice (`Recordings::serial`,
+`ConfigScreen::item_serial`), dictation ids their times (`tree::dictation_keys`); an entry's id is
+its place, since its delete asks first in a dialog naming it.
 `whisrs agent-hook` (hidden, run by the hooks whisrs puts in the Claude sessions it starts)
 only forwards its stdin to the daemon as `agent-event`, and always exits 0 within two seconds.
 
@@ -576,7 +600,8 @@ Every other reader (the CLI's recording commands, `whisrs mcp`) stays on config.
 base-only list makes safe. A switch (`switch-profile`, `whisrs profile`, `[hotkeys] next_profile`,
 the tray's Profile radio menu) restarts through `service::restart_self`:
 `ServiceManager::restart_queued` (systemd `--no-block`, OpenRC `rc-service` detached: a waiting
-command dies with the unit's own stop) when the cgroup is `whisrs.service` (or
+command dies with the unit's own stop; a `systemctl` the stop ends anyway (SIGTERM, or exit
+143) still queued it, `service::queued`) when the cgroup is `whisrs.service` (or
 `RC_SVCNAME=whisrs`), else the SIGTERM path's `shut_down` (daemon/main.rs) and a re-exec of the
 binary `/proc/self/exe` names (` (deleted)` cut off, when a file is there), with the socket set
 aside (`service::socket_aside`); an exec that fails after the shutdown exits. The tray's Restart

@@ -14,6 +14,7 @@ use whisrs::Config;
 /// An entry of each array gives the defaults of an entry's fields.
 const DEFAULTS: &str = whisrs::config::write::SECTION_DEFAULTS;
 
+#[derive(Clone)]
 pub struct Form {
     /// The config being edited.
     table: Table,
@@ -47,6 +48,12 @@ impl Form {
     /// Whether anything changed since the load.
     pub fn is_dirty(&self) -> bool {
         self.table != self.baseline
+    }
+
+    /// How many keys changed since the load: a list or an array of tables
+    /// counts once.
+    pub fn unsaved(&self) -> usize {
+        changed(&self.table, &self.baseline)
     }
 
     /// What is edited now is what is on disk: a save that could not be read
@@ -192,6 +199,22 @@ fn to_table(config: &Config) -> Result<Table, String> {
         Ok(Value::Table(table)) => Ok(table),
         Ok(_) => Err("the config did not serialize to a table".to_string()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// How many leaves differ between `a` and `b`, a table counted by its keys.
+fn changed(a: &Table, b: &Table) -> usize {
+    let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    keys.into_iter()
+        .map(|key| changed_at(a.get(key), b.get(key)))
+        .sum()
+}
+
+fn changed_at(a: Option<&Value>, b: Option<&Value>) -> usize {
+    match (a, b) {
+        (Some(Value::Table(a)), Some(Value::Table(b))) => changed(a, b),
+        (Some(Value::Table(t)), None) | (None, Some(Value::Table(t))) => changed(t, &Table::new()),
+        (a, b) => usize::from(a != b),
     }
 }
 

@@ -214,6 +214,27 @@ the Replacements section refuse edits there. While a profile is active, plain
 Config's header says
 .B base
 and a row the profile sets says so.
+.IP
+AGENTS: an AI agent can drive this TUI and
+.B setup
+through the
+.B taria\-mcp
+bridge (for Claude Code,
+.BR "claude mcp add taria \-\- taria\-mcp \-\-app whisrs" ).
+It reads each screen's rows, values and state, and acts on them with the
+keys a person presses there; text it types goes only into an input or a
+picker's filter. Nothing is served until a bridge connects. The socket is
+.IR $XDG_RUNTIME_DIR/taria/whisrs.sock ,
+0600 in a 0700 folder, or the path
+.B TARIA_SOCK
+names; a second TUI open at the same time has none, and a socket that cannot
+be bound is said in one line before the TUI opens. Three things stay with the
+person at the keyboard, and an agent asking for one is refused with a status
+line saying so: typing an API key,
+.B e
+.RB ( $EDITOR ),
+and setup's sudo step for
+.IR /dev/uinput .
 .TP
 .B toggle
 Start or stop dictation. If idle, begins audio capture. If recording,
@@ -709,6 +730,16 @@ OpenAI API key. Overrides the value in
 Set and not empty:
 .B whisrs config
 draws without colour.
+.TP
+.B TARIA_SOCK
+The socket
+.B whisrs config
+and
+.B whisrs setup
+serve an agent on, in place of
+.IR $XDG_RUNTIME_DIR/taria/whisrs.sock .
+Set it the same for
+.BR taria\-mcp .
 .TP
 .B XDG_RUNTIME_DIR
 Directory for the Unix socket. The socket is created at

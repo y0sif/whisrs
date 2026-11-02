@@ -424,7 +424,7 @@ impl Profiles {
     }
 
     /// The rows: base, then the profiles by name.
-    fn rows(&self) -> Vec<String> {
+    pub fn rows(&self) -> Vec<String> {
         std::iter::once(BASE.to_string())
             .chain(self.items().iter().map(|item| item.name.clone()))
             .collect()
@@ -451,7 +451,8 @@ impl Profiles {
         }
     }
 
-    fn focused(&self) -> String {
+    /// The name under the cursor.
+    pub fn focused(&self) -> String {
         self.rows()
             .get(self.cursor)
             .cloned()
@@ -523,6 +524,16 @@ impl Profiles {
             }
             _ => Reply::default(),
         }
+    }
+
+    /// The cursor, into [`Profiles::rows`].
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The new profile's name, while it is typed.
+    pub fn naming(&self) -> Option<&Input> {
+        self.naming.as_ref()
     }
 
     fn moved(&mut self, to: usize) -> Reply {
@@ -599,7 +610,7 @@ impl Profiles {
 
 /// Over the list: the daemon's line when it runs on another profile than
 /// the state file names, or why the active one did not load.
-fn daemon_note(app: &App) -> Option<(String, Tone)> {
+pub fn daemon_note(app: &App) -> Option<(String, Tone)> {
     let DaemonView::Up(InfoAnswer::Info(info)) = &app.daemon else {
         return None;
     };
@@ -622,7 +633,7 @@ fn daemon_note(app: &App) -> Option<(String, Tone)> {
 }
 
 /// The pane beside the list: the focused profile's note, then its keys.
-fn pane_lines(screen: &Profiles, max: usize, ui: &Ui) -> Vec<(String, Tone)> {
+pub fn pane_lines(screen: &Profiles, max: usize, ui: &Ui) -> Vec<(String, Tone)> {
     let name = screen.focused();
     let active = screen.active().unwrap_or(BASE) == name;
     let mut lines = Vec::new();

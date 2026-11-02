@@ -3492,6 +3492,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
+name = "taria"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c59878830a5ca46cff5c3f8ebffa81094b1bdfe38132af2ba620d0b10a7e416"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "taria-ratatui"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca3df9aeb2e757def75ad3a356434a06b998df8c64eccab2ccac8e6838dc8c0b"
+dependencies = [
+ "ratatui",
+ "serde_json",
+ "taria",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "tauri-winrt-notification"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4380,6 +4401,7 @@ dependencies = [
  "serde_json",
  "smithay-client-toolkit",
  "swayipc",
+ "taria-ratatui",
  "tempfile",
  "terminal-colorsaurus",
  "thiserror 2.0.18",
