@@ -168,8 +168,8 @@ mod tests {
         let key = "a€b🔑cdé…";
         for end in key.char_indices().map(|(i, _)| i).chain([key.len()]) {
             let masked = mask_api_key(&key[..end]);
-            assert!(masked.starts_with("****"), "{masked}");
-            assert!(masked.chars().count() <= 8, "{masked}");
+            assert!(masked.starts_with("****"), "cut at byte {end}");
+            assert!(masked.chars().count() <= 8, "cut at byte {end}");
         }
     }
 
