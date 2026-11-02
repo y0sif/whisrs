@@ -4,19 +4,20 @@ use anyhow::Context;
 
 use super::capture::{CHANNELS, SAMPLE_RATE};
 
+/// The format [`encode_wav`] writes: 16 kHz mono 16-bit PCM.
+pub const WAV_SPEC: hound::WavSpec = hound::WavSpec {
+    channels: CHANNELS,
+    sample_rate: SAMPLE_RATE,
+    bits_per_sample: 16,
+    sample_format: hound::SampleFormat::Int,
+};
+
 /// Encode raw PCM samples (16kHz, mono, i16) to a WAV byte buffer.
 pub fn encode_wav(samples: &[i16]) -> anyhow::Result<Vec<u8>> {
-    let spec = hound::WavSpec {
-        channels: CHANNELS,
-        sample_rate: SAMPLE_RATE,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
     let mut cursor = std::io::Cursor::new(Vec::new());
     {
         let mut writer =
-            hound::WavWriter::new(&mut cursor, spec).context("failed to create WAV writer")?;
+            hound::WavWriter::new(&mut cursor, WAV_SPEC).context("failed to create WAV writer")?;
 
         for &sample in samples {
             writer

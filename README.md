@@ -261,6 +261,7 @@ whisrs mcp                            # Read-only MCP server (stdio) for agents:
 whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries
 whisrs log --clear  # Clear all history
+whisrs transcribe-recovery  # Transcribe the audio a failed dictation saved (newest, or a file in ~/.cache/whisrs/recovery/); prints it, copies it, removes the file
 ```
 
 ### Per-language keys

@@ -282,6 +282,25 @@ Number of entries to show. Defaults to
 Clear all history instead of showing it.
 .RE
 .TP
+\fBtranscribe\-recovery\fR [\fBlast\fR|\fIFILE\fR] [\fB\-l\fR \fICODE\fR]
+Transcribe audio that a failed dictation saved for recovery. When a batch
+dictation's transcription fails, the daemon saves its audio in
+.I ~/.cache/whisrs/recovery/
+and keeps the newest 10 files there. With no argument, or
+.BR last ,
+the newest is transcribed;
+.I FILE
+must be a file in that folder, any other is refused. The text is printed
+to standard output (and nothing else is, so it pipes cleanly), copied to
+the clipboard and saved to the history. The file is removed once it is
+transcribed, and kept when the transcription fails again.
+.RS
+.TP
+\fB\-l\fR, \fB\-\-language\fR \fICODE\fR
+Override the transcription language, as for
+.BR toggle .
+.RE
+.TP
 .B command
 Command mode: select text, speak an instruction, and the LLM rewrites it
 in place. Requires a selection. To write text where there is none, configure
@@ -777,7 +796,9 @@ No file, or
 is the base config alone.
 .TP
 .I ~/.cache/whisrs/recovery/
-Recovery directory for audio that failed transcription.
+Recovery directory for audio that failed transcription; the newest 10
+files are kept. See
+.BR transcribe\-recovery .
 .TP
 .I $XDG_DATA_HOME/whisrs/recordings/
 Recordings and their transcripts, one folder per recording (defaults to

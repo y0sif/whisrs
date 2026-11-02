@@ -508,7 +508,7 @@ pub(crate) fn discard_command_sessions(ds: &mut DaemonState, reason: &str) {
 
 /// Resolve the effective session language: the per-toggle `override_lang` when
 /// present, otherwise the configured default.
-fn resolve_language(override_lang: Option<String>, default_lang: &str) -> String {
+pub(crate) fn resolve_language(override_lang: Option<String>, default_lang: &str) -> String {
     override_lang.unwrap_or_else(|| default_lang.to_string())
 }
 
@@ -519,7 +519,7 @@ fn resolve_language(override_lang: Option<String>, default_lang: &str) -> String
 /// state transition so a bad `-l` value (e.g. `english`) is rejected up
 /// front instead of failing a whole session at transcription time. The
 /// config default (`general.language`) is deliberately not validated.
-fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, String> {
+pub(crate) fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, String> {
     match language {
         None => Ok(None),
         Some(lang) => match validate_language_override(&lang) {

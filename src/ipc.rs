@@ -106,6 +106,18 @@ pub enum Command {
         #[serde(flatten)]
         options: RecordingOptions,
     },
+    /// Transcribe audio a failed batch dictation saved for recovery
+    /// (`whisrs transcribe-recovery`): `file` is the absolute path of a file
+    /// in the recovery folder, `None` the newest one; `language` overrides
+    /// `general.language`, as `toggle`'s does. Answered with `Transcript`;
+    /// the file is removed once the backend answered.
+    #[serde(rename = "transcribe-recovery")]
+    TranscribeRecovery {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
     /// Switch the config profile (`config::profile`): a profile's name,
     /// `base`, or `None` for the next one. The daemon checks it loads, writes
     /// the active name and restarts on it; refused unless everything is idle.
@@ -156,6 +168,13 @@ pub enum Response {
         switching: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         skipped: Vec<String>,
+    },
+    /// The answer to `transcribe-recovery`: the transcript (empty when
+    /// nothing was transcribed) and the recovery file it came from, which
+    /// is removed.
+    Transcript {
+        text: String,
+        file: String,
     },
 }
 
@@ -1181,6 +1200,55 @@ mod tests {
             text: "secret reply".to_string(),
         };
         assert_eq!(speak.log_summary(), "SpeakText { 12 chars }");
+    }
+
+    /// `transcribe-recovery` leaves out what it was not given, and its
+    /// answer is a response of its own.
+    #[test]
+    fn transcribe_recovery_wire() {
+        let newest = Command::TranscribeRecovery {
+            file: None,
+            language: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&newest).unwrap(),
+            r#"{"cmd":"transcribe-recovery"}"#
+        );
+        let named = Command::TranscribeRecovery {
+            file: Some("/abs/path".to_string()),
+            language: Some("de".to_string()),
+        };
+        let json = serde_json::to_string(&named).unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"transcribe-recovery","file":"/abs/path","language":"de"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Command>(&json).unwrap(),
+            Command::TranscribeRecovery { file: Some(f), language: Some(l) }
+                if f == "/abs/path" && l == "de"
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Command>(r#"{"cmd":"transcribe-recovery"}"#).unwrap(),
+            Command::TranscribeRecovery {
+                file: None,
+                language: None
+            }
+        ));
+
+        let answer = Response::Transcript {
+            text: "hello there".to_string(),
+            file: "/c/recovery_a.wav".to_string(),
+        };
+        let json = serde_json::to_string(&answer).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"transcript","text":"hello there","file":"/c/recovery_a.wav"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Response>(&json).unwrap(),
+            Response::Transcript { text, file } if text == "hello there" && file == "/c/recovery_a.wav"
+        ));
     }
 
     #[test]

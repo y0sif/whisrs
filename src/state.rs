@@ -2,6 +2,7 @@
 //!
 //! Dictation: Idle → Recording → Transcribing → Idle.
 //! Read-aloud: Idle → Synthesizing → Speaking → Idle.
+//! Recovery retry: Idle → Transcribing → Idle (saved audio, no recording).
 //!
 //! The two flows are mutually exclusive: recording is refused while
 //! read-aloud is active, and a read-aloud request is refused while recording.
@@ -20,6 +21,9 @@ pub enum Action {
     SpeakPlaying,
     /// Read-aloud: playback finished (or synthesis produced nothing).
     SpeakDone,
+    /// `whisrs transcribe-recovery`: transcribe saved audio, with no
+    /// recording before it. Its `TranscriptionDone` returns to Idle.
+    RetryStart,
 }
 
 impl std::fmt::Display for Action {
@@ -31,6 +35,7 @@ impl std::fmt::Display for Action {
             Action::SpeakStart => write!(f, "speak_start"),
             Action::SpeakPlaying => write!(f, "speak_playing"),
             Action::SpeakDone => write!(f, "speak_done"),
+            Action::RetryStart => write!(f, "retry_start"),
         }
     }
 }
@@ -64,6 +69,7 @@ impl StateMachine {
     /// - SpeakDone:         Speaking → Idle
     /// - Cancel:            Synthesizing → Idle
     /// - Cancel:            Speaking → Idle
+    /// - RetryStart:        Idle → Transcribing
     ///
     /// Recording is intentionally refused while read-aloud is active
     /// (Toggle/CommandMode from Synthesizing/Speaking are invalid).
@@ -80,6 +86,8 @@ impl StateMachine {
             (State::Speaking, Action::SpeakDone) => State::Idle,
             (State::Synthesizing, Action::Cancel) => State::Idle,
             (State::Speaking, Action::Cancel) => State::Idle,
+            // Recovery retry.
+            (State::Idle, Action::RetryStart) => State::Transcribing,
             (from, action) => {
                 return Err(WhisrsError::InvalidTransition {
                     from,
@@ -350,6 +358,50 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // --- Recovery retry ---
+
+    /// A retry goes straight to Transcribing and back, and `cancel` cannot
+    /// cut it short: its own TranscriptionDone is the only way back.
+    #[test]
+    fn retry_full_cycle() {
+        let mut sm = StateMachine::new();
+        assert_eq!(
+            sm.transition(Action::RetryStart).unwrap(),
+            State::Transcribing
+        );
+        assert!(sm.transition(Action::Cancel).is_err());
+        assert!(sm.transition(Action::Toggle).is_err());
+        assert_eq!(sm.state(), State::Transcribing);
+        assert_eq!(
+            sm.transition(Action::TranscriptionDone).unwrap(),
+            State::Idle
+        );
+    }
+
+    /// A retry starts only from Idle.
+    #[test]
+    fn retry_refused_unless_idle() {
+        let busy: [&[Action]; 4] = [
+            &[Action::Toggle],
+            &[Action::Toggle, Action::Toggle],
+            &[Action::SpeakStart],
+            &[Action::SpeakStart, Action::SpeakPlaying],
+        ];
+        for steps in busy {
+            let mut sm = StateMachine::new();
+            for &step in steps {
+                sm.transition(step).unwrap();
+            }
+            let before = sm.state();
+            let err = sm.transition(Action::RetryStart).unwrap_err();
+            assert!(
+                matches!(err, WhisrsError::InvalidTransition { from, .. } if from == before),
+                "{steps:?}"
+            );
+            assert_eq!(sm.state(), before, "{steps:?}");
+        }
     }
 
     #[test]
