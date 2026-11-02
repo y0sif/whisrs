@@ -91,8 +91,8 @@ enum SubCmd {
     /// the history, and the file is removed
     #[command(name = "transcribe-recovery")]
     TranscribeRecovery {
-        /// `last` (the default, the newest) or a file in
-        /// ~/.cache/whisrs/recovery/
+        /// `last` (the default, the newest), a file name in
+        /// ~/.cache/whisrs/recovery/, or a path to a file there
         #[arg(value_name = "last|FILE")]
         file: Option<String>,
         /// Override the transcription language: an ISO 639-1 code (e.g.
@@ -645,8 +645,13 @@ async fn cmd_transcribe_recovery(
 ) -> anyhow::Result<()> {
     let file = recovery_file_arg(file, &std::env::current_dir()?);
     match request(Command::TranscribeRecovery { file, language }).await? {
-        Response::Transcript { text, file } => {
-            let (stdout, stderr) = recovery_output(&text, &file);
+        Response::Transcript {
+            text,
+            file,
+            copied,
+            removed,
+        } => {
+            let (stdout, stderr) = recovery_output(&text, &file, copied, removed);
             if let Some(text) = stdout {
                 println!("{text}");
             }
@@ -659,24 +664,52 @@ async fn cmd_transcribe_recovery(
 }
 
 /// The file `transcribe-recovery` sends: `None` for the newest (no
-/// argument, or `last`), else the path made absolute against `cwd`, since
-/// the daemon runs elsewhere.
+/// argument, or `last`), a bare name (no `/`) as it is, for the daemon to
+/// look up in the recovery folder, else the path made absolute against
+/// `cwd`, since the daemon runs elsewhere.
 fn recovery_file_arg(file: Option<String>, cwd: &std::path::Path) -> Option<String> {
-    file.filter(|f| f != "last")
-        .map(|f| cwd.join(f).display().to_string())
+    file.filter(|f| f != "last").map(|f| {
+        if f.contains('/') {
+            cwd.join(f).display().to_string()
+        } else {
+            f
+        }
+    })
 }
 
 /// What `transcribe-recovery` prints for its answer: the text for stdout
-/// (none when nothing was transcribed), and the line for stderr.
-fn recovery_output<'a>(text: &'a str, file: &str) -> (Option<&'a str>, String) {
+/// (none when nothing was transcribed), and the line for stderr, which says
+/// whether the copy and the removal worked.
+fn recovery_output<'a>(
+    text: &'a str,
+    file: &str,
+    copied: bool,
+    removed: bool,
+) -> (Option<&'a str>, String) {
+    const KEPT: &str = "it is still there, so `last` may pick it again";
     if text.is_empty() {
-        (None, format!("Nothing transcribed in {file}; removed it."))
-    } else {
-        (
-            Some(text),
-            format!("Copied to the clipboard; removed {file}."),
-        )
+        let line = if removed {
+            format!("Nothing transcribed in {file}; removed it.")
+        } else {
+            format!(
+                "Nothing transcribed in {file}; could not remove it (see the daemon log): {KEPT}."
+            )
+        };
+        return (None, line);
     }
+    let line = match (copied, removed) {
+        (true, true) => format!("Copied to the clipboard; removed {file}."),
+        (false, true) => {
+            format!("Could not copy to the clipboard (see the daemon log); removed {file}.")
+        }
+        (true, false) => format!(
+            "Copied to the clipboard; could not remove {file} (see the daemon log): {KEPT}."
+        ),
+        (false, false) => format!(
+            "Could not copy to the clipboard or remove {file} (see the daemon log): {KEPT}."
+        ),
+    };
+    (Some(text), line)
 }
 
 /// `whisrs status`: the state, then the profile line ([`status_lines`]).
@@ -1716,8 +1749,9 @@ mod tests {
         assert!(parse(&["a.wav", "b.wav"]).is_err());
     }
 
-    /// `last` and no argument are the newest; a path goes to the daemon
-    /// absolute.
+    /// `last` and no argument are the newest; a bare name goes to the
+    /// daemon as it is (looked up in the recovery folder), a path with a
+    /// `/` absolute.
     #[test]
     fn recovery_file_arg_makes_paths_absolute() {
         let cwd = std::path::Path::new("/home/u/somewhere");
@@ -1725,7 +1759,11 @@ mod tests {
         assert_eq!(recovery_file_arg(Some("last".into()), cwd), None);
         assert_eq!(
             recovery_file_arg(Some("recovery_a.wav".into()), cwd).as_deref(),
-            Some("/home/u/somewhere/recovery_a.wav")
+            Some("recovery_a.wav")
+        );
+        assert_eq!(
+            recovery_file_arg(Some("./recovery_a.wav".into()), cwd).as_deref(),
+            Some("/home/u/somewhere/./recovery_a.wav")
         );
         assert_eq!(
             recovery_file_arg(Some("../c/recovery_a.wav".into()), cwd).as_deref(),
@@ -1737,20 +1775,50 @@ mod tests {
         );
     }
 
+    /// The text alone on stdout; stderr says what became of the copy and
+    /// the file, as the daemon answered.
     #[test]
     fn recovery_output_keeps_stdout_for_the_text() {
+        let file = "/c/recovery_a.wav";
+        let line = |text, copied, removed| recovery_output(text, file, copied, removed);
         assert_eq!(
-            recovery_output("hello there", "/c/recovery_a.wav"),
+            line("hello there", true, true),
             (
                 Some("hello there"),
                 "Copied to the clipboard; removed /c/recovery_a.wav.".to_string()
             )
         );
         assert_eq!(
-            recovery_output("", "/c/recovery_a.wav"),
+            line("hello there", false, true).1,
+            "Could not copy to the clipboard (see the daemon log); removed /c/recovery_a.wav."
+        );
+        assert_eq!(
+            line("hello there", true, false).1,
+            "Copied to the clipboard; could not remove /c/recovery_a.wav (see the daemon log): \
+             it is still there, so `last` may pick it again."
+        );
+        assert_eq!(
+            line("hello there", false, false).1,
+            "Could not copy to the clipboard or remove /c/recovery_a.wav (see the daemon log): \
+             it is still there, so `last` may pick it again."
+        );
+        // Nothing to copy when nothing was transcribed.
+        for copied in [false, true] {
+            assert_eq!(
+                line("", copied, true),
+                (
+                    None,
+                    "Nothing transcribed in /c/recovery_a.wav; removed it.".to_string()
+                )
+            );
+        }
+        assert_eq!(
+            line("", false, false),
             (
                 None,
-                "Nothing transcribed in /c/recovery_a.wav; removed it.".to_string()
+                "Nothing transcribed in /c/recovery_a.wav; could not remove it (see the daemon \
+                 log): it is still there, so `last` may pick it again."
+                    .to_string()
             )
         );
     }

@@ -48,8 +48,9 @@ whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs transcribe-recovery [last|FILE] [-l LANG]   # transcribe audio a failed batch dictation saved in
-                 # ~/.cache/whisrs/recovery/ (newest by default, only files there; the newest 10 are
-                 # kept): text to stdout, clipboard and history, the file removed once transcribed
+                 # ~/.cache/whisrs/recovery/ (newest by default, only files there, a bare name is looked
+                 # up there; the newest 10 are kept): text to stdout, clipboard and history, the file
+                 # removed once transcribed
 whisrs config    # full-screen config editor (TUI): every key by section, w saves (comments kept),
                  # t tests a key row; Esc goes to Home, which opens Setup, Config, the Mic
                  # test (a live level meter and a quality line over the last 10 s, by [audio] vad;
@@ -179,9 +180,10 @@ src/
 │                           #   handle_command and the hotkey/tray loop) refuses every start, and
 │                           #   agent::replies_held holds replies
 ├── daemon/retry.rs         # transcribe-recovery: resolve + load the file off the runtime, Idle only
-│                           #   (RetryStart -> Transcribing), BatchOptions::recovery_retry (no second save),
-│                           #   llm_post_process, history, clipboard (injected in tests), file removed once
-│                           #   the backend answered, back to Idle on every path
+│                           #   (RetryStart -> Transcribing), BatchOptions::recovery_retry (no second save,
+│                           #   no speech gate), llm_post_process, history, clipboard (injected in tests),
+│                           #   file removed once the backend answered (the answer says whether the copy and
+│                           #   the removal worked), back to Idle on every path
 ├── recording/              # Recording feature (mic + system audio, transcribed after the stop)
 │   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types: every build (IPC wire);
 │   │                       #   the submodules below are feature `recording`
@@ -205,7 +207,8 @@ src/
 │   ├── feedback.rs         # Audio cues
 │   ├── quality.rs          # Quality report: analyze (pure, open profile), verdicts, skip labels with levels
 │   └── recovery.rs         # Recovery audio: saved when a batch dictation fails (newest RECOVERY_KEEP = 10
-│                           #   kept), resolve (newest, or a file directly in the folder), load (16 kHz mono)
+│                           #   kept, save_and_keep_newest), resolve (newest, or a file directly in the folder;
+│                           #   a bare name is joined onto it), load (16 kHz mono)
 ├── transcription/
 │   ├── mod.rs              # TranscriptionBackend trait, timed segments, phrase fallback
 │   ├── factory.rs          # Build a backend by name; model, alias and recording backend rules
@@ -406,9 +409,11 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
 {"cmd": "transcribe-recovery", "file": "/abs/path", "language": "de"}
-                                     // both optional: file = a recovery file (absolute; omitted = the
+                                     // both optional: file = a recovery file (a bare name, no `/`, is
+                                     // looked up in the recovery folder, else absolute; omitted = the
                                      // newest), language as toggle's. Refused unless Idle; answers
-                                     // {"status": "transcript", "text": "...", "file": "..."}
+                                     // {"status": "transcript", "text": "...", "file": "...",
+                                     // "copied": true, "removed": true} (each false when it failed)
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
 {"cmd": "speak-text", "text": "..."} // speak the text; its own variant so an older daemon errors
                                      // instead of reading the selection

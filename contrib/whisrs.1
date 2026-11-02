@@ -288,9 +288,11 @@ dictation's transcription fails, the daemon saves its audio in
 .I ~/.cache/whisrs/recovery/
 and keeps the newest 10 files there. With no argument, or
 .BR last ,
-the newest is transcribed;
+the newest is transcribed.
 .I FILE
-must be a file in that folder, any other is refused. The text is printed
+must be a file in that folder: a bare file name (no slash) is looked up
+there, wherever you run the command, and any other path is resolved
+against the current directory. Any other file is refused. The text is printed
 to standard output (and nothing else is, so it pipes cleanly), copied to
 the clipboard and saved to the history. The file is removed once it is
 transcribed, and kept when the transcription fails again.

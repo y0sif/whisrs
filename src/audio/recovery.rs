@@ -23,20 +23,36 @@ pub fn recovery_dir() -> PathBuf {
         .join("recovery")
 }
 
-/// Whether `name` is a recovery file's name, as [`save_recovery_audio`]
+/// Whether `name` is a recovery file's name, as [`save_and_keep_newest`]
 /// writes it (`recovery_<time>.wav`). The cleanup removes and
 /// `transcribe-recovery` reads only files named so.
 pub fn is_recovery_file_name(name: &str) -> bool {
     name.starts_with("recovery_") && name.ends_with(".wav")
 }
 
+/// Save raw PCM samples as a timestamped WAV file in `dir` (the daemon's is
+/// [`recovery_dir`]), then keep only the newest `keep` recovery files there,
+/// the new one among them. Returns the saved file's path.
+pub fn save_and_keep_newest(dir: &Path, samples: &[i16], keep: usize) -> anyhow::Result<PathBuf> {
+    let path = save_recovery_audio_to(dir, samples)?;
+    cleanup_old_recoveries_in(dir, keep);
+    Ok(path)
+}
+
 /// Save raw PCM samples as a timestamped WAV file in the recovery directory.
 ///
-/// Returns the path to the saved file on success.
+/// Returns the path to the saved file on success. The daemon saves through
+/// [`save_and_keep_newest`]; this stays for the library's users.
 pub fn save_recovery_audio(samples: &[i16]) -> anyhow::Result<PathBuf> {
     save_recovery_audio_to(&recovery_dir(), samples)
 }
 
+/// Clean up old recovery files, keeping only the most recent `keep` files.
+pub fn cleanup_old_recoveries(keep: usize) {
+    cleanup_old_recoveries_in(&recovery_dir(), keep);
+}
+
+/// Save raw PCM samples as a timestamped WAV file in `dir`.
 fn save_recovery_audio_to(dir: &Path, samples: &[i16]) -> anyhow::Result<PathBuf> {
     if samples.is_empty() {
         anyhow::bail!("no audio samples to save for recovery");
@@ -85,14 +101,10 @@ fn recovery_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files.into_iter().map(|(_, _, path)| path).collect())
 }
 
-/// Clean up old recovery files, keeping only the most recent `keep` files.
-pub fn cleanup_old_recoveries(keep: usize) {
-    cleanup_old_recoveries_in(&recovery_dir(), keep);
-}
-
-/// [`cleanup_old_recoveries`] in `dir`. Files that are no recovery file
-/// ([`is_recovery_file_name`]) are left alone.
-pub fn cleanup_old_recoveries_in(dir: &Path, keep: usize) {
+/// Remove old recovery files in `dir`, keeping only the newest `keep`.
+/// Files that are no recovery file ([`is_recovery_file_name`]) are left
+/// alone.
+fn cleanup_old_recoveries_in(dir: &Path, keep: usize) {
     let files = match recovery_files(dir) {
         Ok(files) => files,
         Err(e) if e.kind() == ErrorKind::NotFound => return,
@@ -110,18 +122,14 @@ pub fn cleanup_old_recoveries_in(dir: &Path, keep: usize) {
     }
 }
 
-/// The recovery file `whisrs transcribe-recovery` asked for: `None` is the
-/// newest, a path must name a recovery file in the recovery directory.
-pub fn resolve_recovery_file(arg: Option<&Path>) -> anyhow::Result<PathBuf> {
-    resolve_recovery_file_in(&recovery_dir(), arg)
-}
-
-/// [`resolve_recovery_file`] in `dir`. A path is refused unless it resolves
-/// (symlinks followed) to a regular file directly in `dir` with a recovery
-/// name, so a file anywhere else is never read, let alone removed. Returns
-/// the resolved path.
+/// The recovery file `whisrs transcribe-recovery` asked for, in the recovery
+/// folder `dir`: `None` is the newest, a bare name (no `/`) is looked up in
+/// `dir`, and any other path is taken as it is. A path is refused unless it
+/// resolves (symlinks followed) to a regular file directly in `dir` with a
+/// recovery name, so a file anywhere else is never read, let alone removed.
+/// Returns the resolved path.
 pub fn resolve_recovery_file_in(dir: &Path, arg: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let Some(path) = arg else {
+    let Some(arg) = arg else {
         let files = match recovery_files(dir) {
             Ok(files) => files,
             Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
@@ -132,6 +140,12 @@ pub fn resolve_recovery_file_in(dir: &Path, arg: Option<&Path>) -> anyhow::Resul
             .next_back()
             .ok_or_else(|| anyhow!("no recovery audio in {}", dir.display()));
     };
+    let bare = !arg.as_os_str().as_encoded_bytes().contains(&b'/');
+    let path = if bare {
+        dir.join(arg)
+    } else {
+        arg.to_path_buf()
+    };
     let refused = || {
         anyhow!(
             "not a recovery file: {} (recovery audio lives in {})",
@@ -139,8 +153,13 @@ pub fn resolve_recovery_file_in(dir: &Path, arg: Option<&Path>) -> anyhow::Resul
             dir.display()
         )
     };
-    let file =
-        std::fs::canonicalize(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let file = match std::fs::canonicalize(&path) {
+        Ok(file) => file,
+        Err(e) if bare && e.kind() == ErrorKind::NotFound => {
+            bail!("no recovery file {} in {}", arg.display(), dir.display())
+        }
+        Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),
+    };
     let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
         return Err(refused());
     };
@@ -212,8 +231,10 @@ mod tests {
 
     #[test]
     fn save_recovery_rejects_empty_samples() {
-        let err = save_recovery_audio(&[]).unwrap_err();
+        let dir = tempfile::tempdir().unwrap();
+        let err = save_and_keep_newest(dir.path(), &[], RECOVERY_KEEP).unwrap_err();
         assert!(err.to_string().contains("no audio samples"));
+        assert!(names(dir.path()).is_empty());
     }
 
     #[test]
@@ -295,6 +316,29 @@ mod tests {
         cleanup_old_recoveries_in(&dir.path().join("missing"), 0);
     }
 
+    /// A save keeps the newest [`RECOVERY_KEEP`]: the oldest goes, the new
+    /// file stays, and a file that is no recovery file is left alone.
+    #[test]
+    fn a_save_keeps_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..RECOVERY_KEEP {
+            recovery_file(
+                dir.path(),
+                &format!("recovery_old_{i:02}.wav"),
+                1000 - 10 * i as u64,
+            );
+        }
+        std::fs::write(dir.path().join("notes.wav"), b"mine").unwrap();
+
+        let saved = save_and_keep_newest(dir.path(), &[1, 2, 3], RECOVERY_KEEP).unwrap();
+        let files = recovery_files(dir.path()).unwrap();
+        assert_eq!(files.len(), RECOVERY_KEEP);
+        assert_eq!(files.last(), Some(&saved));
+        assert!(!dir.path().join("recovery_old_00.wav").exists());
+        assert!(dir.path().join("recovery_old_01.wav").exists());
+        assert!(dir.path().join("notes.wav").exists());
+    }
+
     #[test]
     fn no_argument_resolves_to_the_newest() {
         let dir = tempfile::tempdir().unwrap();
@@ -336,6 +380,42 @@ mod tests {
         recovery_file(dir.path(), "recovery_b.wav", 10);
         let resolved = resolve_recovery_file_in(dir.path(), Some(&path)).unwrap();
         assert_eq!(resolved, std::fs::canonicalize(&path).unwrap());
+    }
+
+    /// A bare name is looked up in the folder, wherever the caller runs.
+    #[test]
+    fn a_bare_name_resolves_in_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = recovery_file(dir.path(), "recovery_a.wav", 100);
+        recovery_file(dir.path(), "recovery_b.wav", 10);
+        let resolved =
+            resolve_recovery_file_in(dir.path(), Some(Path::new("recovery_a.wav"))).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&path).unwrap());
+
+        let err =
+            resolve_recovery_file_in(dir.path(), Some(Path::new("recovery_gone.wav"))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no recovery file recovery_gone.wav in {}",
+                dir.path().display()
+            )
+        );
+
+        // A bare name is still checked: one that is no recovery file, or one
+        // that leads out of the folder, is refused.
+        std::fs::write(dir.path().join("notes.wav"), b"mine").unwrap();
+        for name in ["notes.wav", ".."] {
+            let err = resolve_recovery_file_in(dir.path(), Some(Path::new(name))).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "not a recovery file: {} (recovery audio lives in {})",
+                    dir.path().join(name).display(),
+                    dir.path().display()
+                )
+            );
+        }
     }
 
     /// Only a recovery file directly in the folder: a file elsewhere, one

@@ -32,8 +32,9 @@ use crate::pipeline::{
 /// runtime.
 type Clipboard = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
 
-/// `transcribe-recovery`: `file` is a recovery file's absolute path, `None`
-/// the newest; `language` overrides `[general] language`.
+/// `transcribe-recovery`: `file` is a recovery file's bare name (looked up in
+/// the recovery folder) or absolute path, `None` the newest; `language`
+/// overrides `[general] language`.
 pub(crate) async fn handle_transcribe_recovery(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
@@ -130,8 +131,8 @@ async fn retry(
 /// Transcribe `samples`, the audio of the recovery file `path`, and deliver
 /// the text: `[general] llm_post_process`, history, the clipboard. The file
 /// is removed once the backend answered, and kept when it failed (nothing
-/// is saved again: [`BatchOptions::recovery_retry`]). Touches no daemon
-/// state.
+/// is saved again: [`BatchOptions::recovery_retry`]). The answer says
+/// whether the copy and the removal worked. Touches no daemon state.
 async fn transcribe(
     path: &Path,
     samples: &[i16],
@@ -156,9 +157,9 @@ async fn transcribe(
             }
         };
 
-    let text = if text.is_empty() {
+    let (text, copied) = if text.is_empty() {
         info!("transcribe-recovery: nothing transcribed in {file}");
-        text
+        (text, false)
     } else {
         // As a batch dictation does, so the retry gives what the
         // dictation would have typed.
@@ -171,23 +172,45 @@ async fn transcribe(
             samples.len() as f64 / f64::from(SAMPLE_RATE),
         );
         let copy = outcome.text.clone();
-        match tokio::task::spawn_blocking(move || clipboard(&copy)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("transcribe-recovery: failed to copy the transcript: {e:#}"),
-            Err(e) => warn!("transcribe-recovery: clipboard task failed: {e}"),
-        }
+        let copied = match tokio::task::spawn_blocking(move || clipboard(&copy)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                warn!("transcribe-recovery: failed to copy the transcript: {e:#}");
+                false
+            }
+            Err(e) => {
+                warn!("transcribe-recovery: clipboard task failed: {e}");
+                false
+            }
+        };
         info!(
             "transcribe-recovery: {} chars from {file}",
             outcome.text.len()
         );
-        outcome.text
+        (outcome.text, copied)
     };
 
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => info!("transcribe-recovery: removed {file}"),
-        Err(e) => warn!("transcribe-recovery: failed to remove {file}: {e}"),
+    let removed = match tokio::fs::remove_file(path).await {
+        Ok(()) => {
+            info!("transcribe-recovery: removed {file}");
+            true
+        }
+        // Gone already: `last` cannot pick it again either.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!("transcribe-recovery: {file} was already gone");
+            true
+        }
+        Err(e) => {
+            warn!("transcribe-recovery: failed to remove {file}: {e}");
+            false
+        }
+    };
+    Response::Transcript {
+        text,
+        file,
+        copied,
+        removed,
     }
-    Response::Transcript { text, file }
 }
 
 #[cfg(test)]
@@ -206,13 +229,34 @@ mod tests {
 
     /// A clipboard that keeps what it was given.
     fn fake_clipboard() -> (Clipboard, Arc<StdMutex<Vec<String>>>) {
+        clipboard_doing(|| Ok(()))
+    }
+
+    /// A clipboard that keeps what it was given, then runs `then` for its
+    /// answer: a failure, or a change to the folder before the removal.
+    fn clipboard_doing(
+        then: impl Fn() -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> (Clipboard, Arc<StdMutex<Vec<String>>>) {
         let copied = Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::clone(&copied);
         let clipboard: Clipboard = Arc::new(move |text: &str| {
             sink.lock().unwrap().push(text.to_string());
-            Ok(())
+            then()
         });
         (clipboard, copied)
+    }
+
+    /// The transcript answer's text, copied and removed flags.
+    fn transcript(response: Response) -> (String, bool, bool) {
+        match response {
+            Response::Transcript {
+                text,
+                copied,
+                removed,
+                ..
+            } => (text, copied, removed),
+            other => panic!("expected a transcript, got {other:?}"),
+        }
     }
 
     /// A recovery file in `dir` with audio the gate passes.
@@ -261,8 +305,14 @@ mod tests {
         take_saved_history();
 
         let response = retry(&daemon_state, &context, dir.path(), None, None, clipboard).await;
-        let Response::Transcript { text, file } = response else {
-            panic!("expected a transcript, got {response:?}");
+        let Response::Transcript {
+            text,
+            file,
+            copied: true,
+            removed: true,
+        } = response
+        else {
+            panic!("expected a copied and removed transcript, got {response:?}");
         };
         assert_eq!(text, "hello from the past");
         assert_eq!(PathBuf::from(&file), newest);
@@ -290,14 +340,76 @@ mod tests {
 
         let arg = Some(path.display().to_string());
         let response = retry(&daemon_state, &context, dir.path(), arg, None, clipboard).await;
-        assert!(
-            matches!(&response, Response::Transcript { text, .. } if text.is_empty()),
-            "{response:?}"
-        );
+        assert_eq!(transcript(response), (String::new(), false, true));
         assert!(!path.exists());
         assert!(copied.lock().unwrap().is_empty());
         assert!(take_saved_history().is_empty());
         assert_eq!(state(&daemon_state).await, State::Idle);
+    }
+
+    /// A bare name is looked up in the recovery folder; a failed copy is
+    /// answered as such, and the file still goes: the backend answered.
+    #[tokio::test]
+    async fn a_failed_copy_is_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved(dir.path(), "recovery_a.wav");
+        let context = context_with_backend(StubBackend {
+            text: "hello from the past",
+            sends_prompt: false,
+        });
+        let daemon_state = Mutex::new(DaemonState::new());
+        let (clipboard, copied) = clipboard_doing(|| anyhow::bail!("no clipboard here"));
+        take_saved_history();
+
+        let arg = Some("recovery_a.wav".to_string());
+        let response = retry(&daemon_state, &context, dir.path(), arg, None, clipboard).await;
+        assert_eq!(
+            transcript(response),
+            ("hello from the past".to_string(), false, true)
+        );
+        assert!(!path.exists());
+        assert_eq!(*copied.lock().unwrap(), ["hello from the past"]);
+        assert_eq!(take_saved_history(), ["hello from the past"]);
+        assert_eq!(state(&daemon_state).await, State::Idle);
+    }
+
+    /// A removal that fails is answered as such, and the file is left: a
+    /// folder in its place by the time it is removed. One already gone
+    /// counts as removed.
+    #[tokio::test]
+    async fn a_failed_removal_is_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved(dir.path(), "recovery_a.wav");
+        let context = context_with_backend(StubBackend {
+            text: "hello from the past",
+            sends_prompt: false,
+        });
+        let daemon_state = Mutex::new(DaemonState::new());
+        let swap = path.clone();
+        let (clipboard, _copied) = clipboard_doing(move || {
+            std::fs::remove_file(&swap)?;
+            std::fs::create_dir(&swap)?;
+            Ok(())
+        });
+
+        let response = retry(&daemon_state, &context, dir.path(), None, None, clipboard).await;
+        assert_eq!(
+            transcript(response),
+            ("hello from the past".to_string(), true, false)
+        );
+        assert!(path.is_dir());
+        assert_eq!(state(&daemon_state).await, State::Idle);
+
+        std::fs::remove_dir(&path).unwrap();
+        let path = saved(dir.path(), "recovery_b.wav");
+        let gone = path.clone();
+        let (clipboard, _copied) = clipboard_doing(move || Ok(std::fs::remove_file(&gone)?));
+        let response = retry(&daemon_state, &context, dir.path(), None, None, clipboard).await;
+        assert_eq!(
+            transcript(response),
+            ("hello from the past".to_string(), true, true)
+        );
+        assert!(!path.exists());
     }
 
     /// A backend failure keeps the file, saves no second copy, names the

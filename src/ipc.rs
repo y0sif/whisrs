@@ -107,10 +107,11 @@ pub enum Command {
         options: RecordingOptions,
     },
     /// Transcribe audio a failed batch dictation saved for recovery
-    /// (`whisrs transcribe-recovery`): `file` is the absolute path of a file
-    /// in the recovery folder, `None` the newest one; `language` overrides
-    /// `general.language`, as `toggle`'s does. Answered with `Transcript`;
-    /// the file is removed once the backend answered.
+    /// (`whisrs transcribe-recovery`): `file` is a file in the recovery
+    /// folder, by its bare name (no `/`, looked up there) or its absolute
+    /// path, `None` the newest one; `language` overrides `general.language`,
+    /// as `toggle`'s does. Answered with `Transcript`; the file is removed
+    /// once the backend answered.
     #[serde(rename = "transcribe-recovery")]
     TranscribeRecovery {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,11 +171,16 @@ pub enum Response {
         skipped: Vec<String>,
     },
     /// The answer to `transcribe-recovery`: the transcript (empty when
-    /// nothing was transcribed) and the recovery file it came from, which
-    /// is removed.
+    /// nothing was transcribed), the recovery file it came from, whether
+    /// the text was copied to the clipboard (never when empty) and whether
+    /// the file is gone (`false`: still there, the removal failed).
     Transcript {
         text: String,
         file: String,
+        #[serde(default)]
+        copied: bool,
+        #[serde(default)]
+        removed: bool,
     },
 }
 
@@ -1239,15 +1245,30 @@ mod tests {
         let answer = Response::Transcript {
             text: "hello there".to_string(),
             file: "/c/recovery_a.wav".to_string(),
+            copied: true,
+            removed: false,
         };
         let json = serde_json::to_string(&answer).unwrap();
         assert_eq!(
             json,
-            r#"{"status":"transcript","text":"hello there","file":"/c/recovery_a.wav"}"#
+            r#"{"status":"transcript","text":"hello there","file":"/c/recovery_a.wav","copied":true,"removed":false}"#
         );
         assert!(matches!(
             serde_json::from_str::<Response>(&json).unwrap(),
-            Response::Transcript { text, file } if text == "hello there" && file == "/c/recovery_a.wav"
+            Response::Transcript { text, file, copied: true, removed: false }
+                if text == "hello there" && file == "/c/recovery_a.wav"
+        ));
+        // An answer without the flags claims neither a copy nor a removal.
+        assert!(matches!(
+            serde_json::from_str::<Response>(
+                r#"{"status":"transcript","text":"","file":"/c/recovery_a.wav"}"#
+            )
+            .unwrap(),
+            Response::Transcript {
+                copied: false,
+                removed: false,
+                ..
+            }
         ));
     }
 
