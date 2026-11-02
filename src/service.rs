@@ -143,8 +143,10 @@ impl ServiceManager {
     /// ([`restart_self`]): the restart is queued, not waited for. Waiting
     /// races this process's own stop, which ends the waiting command too
     /// (`systemctl` exits 143) and reads as a failure. systemd queues the
-    /// job (`--no-block`); OpenRC has no such flag, so `rc-service` is
-    /// started in a process group of its own and not waited for.
+    /// job (`--no-block`), and even then the stop it queued can reach
+    /// `systemctl` before it has exited, so that is a restart too. OpenRC
+    /// has no such flag, so `rc-service` is started in a process group of
+    /// its own and not waited for.
     pub fn restart_queued(self) -> RestartOutcome {
         if !self.service_installed() {
             return RestartOutcome::NoService;
@@ -154,7 +156,7 @@ impl ServiceManager {
         };
         let ok = match self {
             Self::OpenRc => spawn_detached(program, args),
-            _ => run_ok(program, args),
+            _ => run_status(program, args).is_some_and(queued),
         };
         if ok {
             RestartOutcome::Restarted
@@ -377,18 +379,45 @@ fn spawn_detached(program: &str, args: &[&str]) -> bool {
     }
 }
 
+/// Whether `systemctl --no-block`, run from inside the service it restarts,
+/// queued the restart: it exited 0, or the stop it queued ended it first.
+/// It runs in the service's cgroup, and the stop's SIGTERM goes to every
+/// process there; on a loaded machine that lands before `systemctl` has
+/// exited (it dies of the signal, or exits 143). The restart is under way
+/// by then. Read as a failure, it put the old profile back in the state
+/// file as the daemon stopped: when that write landed first, the daemon
+/// came back on the old profile and said the switch had failed.
+fn queued(status: std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    if status.success() {
+        return true;
+    }
+    if status.signal() == Some(libc::SIGTERM) || status.code() == Some(128 + libc::SIGTERM) {
+        tracing::info!("systemctl was stopped with this service: the restart is under way");
+        return true;
+    }
+    tracing::warn!("systemctl: {status}");
+    false
+}
+
 /// Run a command, reporting whether it exited successfully.
 ///
 /// A missing binary is indistinguishable from a failed run here, which is what
 /// callers want: both mean "this service manager cannot do the thing".
 fn run_ok(program: &str, args: &[&str]) -> bool {
+    run_status(program, args).is_some_and(|s| s.success())
+}
+
+/// Run a command, output dropped: how it ended, or `None` if it could not
+/// run (logged).
+fn run_status(program: &str, args: &[&str]) -> Option<std::process::ExitStatus> {
     Command::new(program)
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .inspect_err(|e| tracing::debug!("cannot run {program}: {e}"))
+        .ok()
 }
 
 /// Run a command and capture stdout, or `None` if it could not run.
@@ -520,6 +549,23 @@ mod tests {
         assert!(ServiceManager::Systemd
             .restart_hint()
             .is_some_and(|hint| !hint.contains("--no-block")));
+    }
+
+    /// A queued restart's `systemctl` that the unit's own stop ended is a
+    /// restart, not a failure; any other end of it fails.
+    #[test]
+    fn a_systemctl_the_stop_ended_queued_the_restart() {
+        use std::os::unix::process::ExitStatusExt;
+        // A wait status: an exit code in the second byte, a signal in the first.
+        let exited = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        let killed = std::process::ExitStatus::from_raw;
+        assert!(queued(exited(0)));
+        assert!(queued(killed(libc::SIGTERM)));
+        assert!(queued(exited(128 + libc::SIGTERM)));
+        assert!(!queued(exited(1)));
+        assert!(!queued(exited(5)));
+        assert!(!queued(killed(libc::SIGKILL)));
+        assert!(!queued(killed(libc::SIGINT)));
     }
 
     /// A detached command starts and is not waited for.

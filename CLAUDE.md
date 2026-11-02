@@ -600,7 +600,8 @@ Every other reader (the CLI's recording commands, `whisrs mcp`) stays on config.
 base-only list makes safe. A switch (`switch-profile`, `whisrs profile`, `[hotkeys] next_profile`,
 the tray's Profile radio menu) restarts through `service::restart_self`:
 `ServiceManager::restart_queued` (systemd `--no-block`, OpenRC `rc-service` detached: a waiting
-command dies with the unit's own stop) when the cgroup is `whisrs.service` (or
+command dies with the unit's own stop; a `systemctl` the stop ends anyway (SIGTERM, or exit
+143) still queued it, `service::queued`) when the cgroup is `whisrs.service` (or
 `RC_SVCNAME=whisrs`), else the SIGTERM path's `shut_down` (daemon/main.rs) and a re-exec of the
 binary `/proc/self/exe` names (` (deleted)` cut off, when a file is there), with the socket set
 aside (`service::socket_aside`); an exec that fails after the shutdown exits. The tray's Restart
