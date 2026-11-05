@@ -71,13 +71,14 @@ pub fn setup_on(toml: Option<&str>, env: &[(&str, &str)]) -> Fixture {
     if !env.iter().any(|(key, _)| *key == "HOME") {
         env.push(("HOME", &home));
     }
-    let app = App::prepare(
+    let mut app = App::prepare(
         Entry::Setup,
         paths,
         Env::from_pairs(&env),
         ServiceManager::Systemd,
     )
     .expect("the fixture loads");
+    app.setup.as_mut().unwrap().nixos = false;
     Fixture { dir, app }
 }
 

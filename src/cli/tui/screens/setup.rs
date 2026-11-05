@@ -365,6 +365,7 @@ pub struct Setup {
     pub checks: Option<Box<Checks>>,
     /// The uinput fix ran in this session.
     fixed: bool,
+    pub(crate) nixos: bool,
     env: Env,
     models: PathBuf,
     config_path: PathBuf,
@@ -405,6 +406,7 @@ impl Setup {
             picker: None,
             checks: None,
             fixed: false,
+            nixos: whisrs::config::setup::uinput::is_nixos(),
             env,
             models,
             config_path,
@@ -1696,6 +1698,12 @@ impl Setup {
                 label: "uinput",
                 mark: Mark::Done,
                 text: "/dev/uinput can be written: whisrs can type".into(),
+                fix: None,
+            },
+            Uinput::Denied | Uinput::Other(_) if self.nixos => CheckRow {
+                label: "uinput",
+                mark: Mark::ToDo,
+                text: whisrs::config::setup::uinput::NIXOS_FIX.into(),
                 fix: None,
             },
             Uinput::Denied if self.fixed => CheckRow {
