@@ -31,6 +31,21 @@ pub fn check_at(path: &Path) -> Uinput {
     }
 }
 
+/// NixOS owns device rules and group membership through its configuration.
+pub fn is_nixos() -> bool {
+    is_nixos_at(Path::new("/etc/NIXOS"))
+}
+
+/// Probe a supplied marker so tests do not depend on the host distribution.
+pub fn is_nixos_at(marker: &Path) -> bool {
+    marker.exists()
+}
+
+/// Declarative repair shown for both missing and inaccessible devices on NixOS.
+pub const NIXOS_FIX: &str = "In your NixOS configuration, set hardware.uinput.enable = true; \
+    and users.users.<name>.extraGroups = [ \"uinput\" ]; (replace <name> with your user). \
+    Run sudo nixos-rebuild switch, then log out and back in.";
+
 /// The udev rule written when `contrib/99-whisrs.rules` is not on disk
 /// (`cargo install`): its two rules, without the comments.
 pub const UDEV_RULE: &str = "KERNEL==\"uinput\", SUBSYSTEM==\"misc\", MODE=\"0660\", GROUP=\"input\", TAG+=\"uaccess\", OPTIONS+=\"static_node=uinput\"\nKERNEL==\"uinput\", SUBSYSTEM==\"misc\", TEST==\"/usr/bin/setfacl\", RUN+=\"/usr/bin/setfacl -m g:input:rw /dev/$name\"";
@@ -39,7 +54,15 @@ pub const UDEV_RULE: &str = "KERNEL==\"uinput\", SUBSYSTEM==\"misc\", MODE=\"066
 /// and its arguments: install the udev rule (`rule` is the shipped file, or
 /// `None` to write [`UDEV_RULE`]), reload the rules and apply them, then add
 /// `user` to the input group, which takes effect at the next login.
+/// Returns no commands on NixOS; use [`NIXOS_FIX`] there.
 pub fn fix_commands(rule: Option<&Path>, user: &str) -> Vec<Vec<String>> {
+    fix_commands_for_platform(rule, user, is_nixos())
+}
+
+fn fix_commands_for_platform(rule: Option<&Path>, user: &str, nixos: bool) -> Vec<Vec<String>> {
+    if nixos {
+        return Vec::new();
+    }
     let words = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
     let install = match rule {
         Some(src) => vec![
@@ -78,6 +101,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nixos_detection_and_command_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("NIXOS");
+        assert!(!is_nixos_at(&marker));
+        std::fs::write(&marker, "").unwrap();
+        assert!(is_nixos_at(&marker));
+        assert!(fix_commands_for_platform(None, "ada", true).is_empty());
+        assert!(fix_commands_for_platform(Some(Path::new("rule")), "ada", true).is_empty());
+    }
+
+    #[test]
     fn a_writable_file_is_ok_and_a_read_only_one_denied() {
         let dir = tempfile::tempdir().unwrap();
         let open = dir.path().join("open");
@@ -100,7 +134,11 @@ mod tests {
     /// Nothing restarts systemd-udevd.
     #[test]
     fn the_fix_installs_the_rule_and_joins_the_group() {
-        let shipped = fix_commands(Some(Path::new("/src/contrib/99-whisrs.rules")), "ada");
+        let shipped = fix_commands_for_platform(
+            Some(Path::new("/src/contrib/99-whisrs.rules")),
+            "ada",
+            false,
+        );
         assert_eq!(
             shipped[0],
             [
@@ -111,7 +149,7 @@ mod tests {
             ]
         );
         assert_eq!(shipped[3], ["sudo", "usermod", "-aG", "input", "ada"]);
-        let inline = fix_commands(None, "ada");
+        let inline = fix_commands_for_platform(None, "ada", false);
         assert!(inline[0][3].contains("static_node=uinput"));
         assert!(inline[0][3].ends_with("> /etc/udev/rules.d/99-whisrs.rules"));
         for command in shipped.iter().chain(&inline) {

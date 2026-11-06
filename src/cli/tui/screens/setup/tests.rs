@@ -1897,3 +1897,35 @@ fn setup_names_what_the_active_profile_overrides() {
         Some(format!("Note: {notice}.").as_str())
     );
 }
+
+#[test]
+fn nixos_uinput_checks_require_declarative_setup() {
+    let mut fixture = setup_on(Some("[general]\n"), &[("HOME", "/home/ada")]);
+    press(&mut fixture.app, "j\n");
+    for state in [
+        Uinput::Denied,
+        Uinput::Other("missing device".into()),
+        Uinput::Ok,
+    ] {
+        let mut result = checks();
+        result.uinput = state.clone();
+        fixture.app.update(Msg::Checked(Box::new(result)));
+        setup_mut(&mut fixture).nixos = true;
+        let rows = setup(&fixture).check_rows(false);
+        assert!(rows[0].fix.is_none());
+        if state == Uinput::Ok {
+            assert_eq!(rows[0].mark, Mark::Done);
+        } else {
+            assert!(rows[0].text.contains("hardware.uinput.enable = true"));
+            assert!(rows[0].text.contains("extraGroups"));
+            assert!(rows[0].text.contains("nixos-rebuild switch"));
+            assert!(rows[0].text.contains("log out and back in"));
+        }
+        assert!(press(&mut fixture.app, " ").is_empty());
+        setup_mut(&mut fixture).nixos = false;
+        let rows = setup(&fixture).check_rows(false);
+        if state == Uinput::Denied {
+            assert_eq!(rows[0].fix, Some(Fix::Uinput));
+        }
+    }
+}
