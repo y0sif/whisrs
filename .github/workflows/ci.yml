@@ -49,12 +49,15 @@ jobs:
 
       # `cargo test` above covers only the root package, so the xkb-type tests
       # (key planning, the per-key gate) run here, with every feature so the
-      # wayland-vk and xtest code is tested too. Two tests read the host's
-      # keyboard setup and are skipped: us(qwerty-fr) is a third-party layout
-      # that xkeyboard-config does not ship, and the runner's localectl may
-      # report no X11 layout.
+      # wayland-vk and xtest code is linted and tested too. The us(qwerty-fr)
+      # test skips itself when the host lacks that layout, a third-party one
+      # xkeyboard-config does not ship. The localectl test is skipped here,
+      # since the runner's localectl may report no X11 layout.
+      - name: Clippy xkb-type
+        run: cargo clippy -p xkb-type --all-features --all-targets -- -D warnings
+
       - name: Test xkb-type
-        run: cargo test -p xkb-type --all-features -- --skip us_qwerty_fr_typeable_via_uinput --skip from_localectl_returns_layout_when_available
+        run: cargo test -p xkb-type --all-features -- --skip from_localectl_returns_layout_when_available
 
       # Likewise for audio-silence-gate: its detector tests and the vad_check
       # example (which reads fixtures only at run time, so it builds here).
@@ -63,6 +66,14 @@ jobs:
 
       - name: Test audio-silence-gate
         run: cargo test -p audio-silence-gate
+
+      # Likewise for the text filter crates, with every feature so asr-dedup's
+      # `logging` code is linted and tested too.
+      - name: Clippy filler-remove, asr-dedup, prompt-echo
+        run: cargo clippy -p filler-remove -p asr-dedup -p prompt-echo --all-features --all-targets -- -D warnings
+
+      - name: Test filler-remove, asr-dedup, prompt-echo
+        run: cargo test -p filler-remove -p asr-dedup -p prompt-echo --all-features
 
       # The "built without the recording feature" answers (CLI, daemon, config
       # warning) exist only in a build without it, and dictation must pass

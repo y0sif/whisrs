@@ -689,9 +689,12 @@ cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -
 cargo clippy --all-targets --no-default-features --features tray,overlay,hooks,recording -- -D warnings   # without mcp (CI runs it)
 cargo test                                     # all tests must pass
 cargo test --no-default-features --features tray,overlay,hooks   # the "built without recording" answers (CI runs it)
-cargo test -p xkb-type --all-features -- --skip us_qwerty_fr_typeable_via_uinput --skip from_localectl_returns_layout_when_available   # xkb-type (CI runs it; root `cargo test` skips it)
+cargo clippy -p xkb-type --all-features --all-targets -- -D warnings   # xkb-type (CI runs it)
+cargo test -p xkb-type --all-features -- --skip from_localectl_returns_layout_when_available   # xkb-type (CI runs it; root `cargo test` skips it)
 cargo clippy -p audio-silence-gate --all-targets -- -D warnings   # the detector crate + vad_check example (CI runs it)
 cargo test -p audio-silence-gate                                  # the detector tests (CI runs it; root `cargo test` skips them)
+cargo clippy -p filler-remove -p asr-dedup -p prompt-echo --all-features --all-targets -- -D warnings   # the text filter crates (CI runs it)
+cargo test -p filler-remove -p asr-dedup -p prompt-echo --all-features   # their tests (CI runs it; root `cargo test` skips them)
 cargo build                                    # must compile
 ```
 
