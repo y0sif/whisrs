@@ -205,7 +205,10 @@ The active profile's name (defaults to
 IPC socket.
 .TP
 .I ~/.cache/whisrs/recovery/
-Audio recovery files saved on transcription failure.
+Audio recovery files saved on transcription failure (the newest 10 are
+kept);
+.B whisrs transcribe\-recovery
+transcribes one.
 .TP
 .I $XDG_DATA_HOME/whisrs/recordings/
 Recordings and their transcripts, one folder per recording. Override with

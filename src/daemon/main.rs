@@ -24,6 +24,7 @@ mod pipeline;
 mod profile;
 #[cfg(feature = "recording")]
 mod recording;
+mod retry;
 mod selection;
 mod speak;
 mod startup;
@@ -586,6 +587,9 @@ async fn handle_command(
                 message: RECORDING_MISSING.to_string(),
             }
         }
+        Command::TranscribeRecovery { file, language } => {
+            crate::retry::handle_transcribe_recovery(daemon_state, context, file, language).await
+        }
         Command::SwitchProfile { name } => {
             crate::profile::handle_switch_profile(daemon_state, context, name).await
         }
@@ -836,6 +840,10 @@ mod tests {
             Command::CommandMode,
             Command::Speak,
             Command::SwitchProfile { name: None },
+            Command::TranscribeRecovery {
+                file: None,
+                language: None,
+            },
         ] {
             assert!(!is_read_only(&changes), "{}", changes.log_summary());
         }

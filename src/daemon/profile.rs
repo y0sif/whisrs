@@ -124,7 +124,8 @@ impl ProfileRuntime {
 
 /// The refusal `cmd` gets now, if any: while a switch is under way, what
 /// would start work the restart cuts off (a dictation, command mode, a
-/// read-aloud, a recording or a job on one, an agent turn). Checked where
+/// read-aloud, a recording or a job on one, an agent turn, a recovery
+/// retry). Checked where
 /// every command comes in, the socket and the hotkey and tray loop.
 pub(crate) fn switching_refusal(context: &DaemonContext, cmd: &Command) -> Option<String> {
     (context.profile.is_switching() && starts_work(cmd)).then(|| SWITCHING.to_string())
@@ -138,7 +139,8 @@ fn starts_work(cmd: &Command) -> bool {
         | Command::CommandMode
         | Command::LlmCommand { .. }
         | Command::Speak
-        | Command::SpeakText { .. } => true,
+        | Command::SpeakText { .. }
+        | Command::TranscribeRecovery { .. } => true,
         Command::Agent { action, .. } => match action {
             AgentAction::Toggle | AgentAction::Send => true,
             AgentAction::List | AgentAction::Reset | AgentAction::Stop => false,
@@ -516,6 +518,10 @@ mod tests {
             Command::LlmCommand { name: "x".into() },
             Command::Speak,
             Command::SpeakText { text: "hi".into() },
+            Command::TranscribeRecovery {
+                file: None,
+                language: None,
+            },
             agent(AgentAction::Toggle),
             agent(AgentAction::Send),
             recording(RecordingAction::Start),

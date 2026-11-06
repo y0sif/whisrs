@@ -761,6 +761,10 @@ pub(crate) struct BatchOptions<'a> {
     pub(crate) apply_filler: bool,
     /// Apply `[replacements]`. Dictation only, like `apply_filler`.
     pub(crate) apply_replacements: bool,
+    /// Skip the backend when the audio holds no speech. Off only for a
+    /// recovery retry: that audio passed the gate when it was saved, and
+    /// the file is removed only once the backend answered.
+    pub(crate) speech_gate: bool,
     /// Which flow is asking; picks the notification/log wording.
     pub(crate) origin: BatchOrigin<'a>,
 }
@@ -775,7 +779,20 @@ impl<'a> BatchOptions<'a> {
             check_prompt_echo: true,
             apply_filler: true,
             apply_replacements: true,
+            speech_gate: true,
             origin: BatchOrigin::Dictation,
+        }
+    }
+
+    /// `whisrs transcribe-recovery`: a failed dictation's saved audio,
+    /// transcribed as dictation, but never saved again (the file it came
+    /// from stays where it is when the backend fails) and never gated: it
+    /// passed the speech gate before it was saved.
+    pub(crate) fn recovery_retry() -> BatchOptions<'static> {
+        BatchOptions {
+            save_recovery: false,
+            speech_gate: false,
+            ..Self::dictation()
         }
     }
 
@@ -789,6 +806,7 @@ impl<'a> BatchOptions<'a> {
             check_prompt_echo: false,
             apply_filler: false,
             apply_replacements: false,
+            speech_gate: true,
             origin: BatchOrigin::CommandMode,
         }
     }
@@ -805,6 +823,7 @@ impl<'a> BatchOptions<'a> {
             check_prompt_echo: true,
             apply_filler: false,
             apply_replacements: false,
+            speech_gate: true,
             origin: BatchOrigin::LlmCommand { name },
         }
     }
@@ -821,6 +840,7 @@ impl<'a> BatchOptions<'a> {
             check_prompt_echo: true,
             apply_filler: false,
             apply_replacements: true,
+            speech_gate: true,
             origin: BatchOrigin::Agent { name },
         }
     }
@@ -841,8 +861,9 @@ impl<'a> BatchOptions<'a> {
     }
 }
 
-/// Shared batch transcription flow: audio gate → WAV encode → backend
-/// transcribe → prompt-echo check → filler removal.
+/// Shared batch transcription flow: audio gate (unless `opts.speech_gate`
+/// is off) → WAV encode → backend transcribe → prompt-echo check → filler
+/// removal.
 ///
 /// `Ok(String::new())` means "nothing to act on" — the recording was gated,
 /// the transcript was dropped as a prompt echo, or it came back empty — and
@@ -865,69 +886,72 @@ pub(crate) async fn transcribe_batch_audio(
     // typing on every accidental hotkey tap. Filtering here also saves the
     // round-trip cost. The detector is `[audio] vad` with the close profile
     // (one user near the mic), run off the async worker: a long buffer is
-    // a few hundred ms of model time.
-    let vad = VadConfig::close(context.config.audio.vad());
-    let gate = whisrs::audio::block_off_runtime(|| {
-        speech_gate(samples, SAMPLE_RATE, AUDIO_GATE_MIN_MS, &vad)
-    });
-    // The turn's one info line with its levels: command mode,
-    // `[[llm_commands]]` and agent turns logged theirs while recording
-    // (`collect_instruction_audio`), batch dictation has only this one.
-    if opts.origin == BatchOrigin::Dictation {
-        info!(
-            "dictation audio: {}, {}",
-            describe_levels(&gate.levels),
-            heard_label(gate.first_heard, gate.last_heard)
-        );
-    } else {
-        debug!(
-            "audio gate: {}, {}",
-            describe_levels(&gate.levels),
-            heard_label(gate.first_heard, gate.last_heard)
-        );
-    }
-    if let Some(reason) = gate.reason {
-        let label = quality::skip_label(reason, &gate.levels);
-        let toast = opts.origin.gate_skip_toast(reason, &gate.levels);
-        match &opts.origin {
-            BatchOrigin::Dictation => {
-                info!(
-                    "skipping transcription: recording was {label} ({} samples)",
-                    samples.len()
-                );
-                if context.notify_state() {
-                    send_notification("whisrs", &toast);
-                }
-            }
-            BatchOrigin::CommandMode => {
-                info!(
-                    "command mode: skipping (recording was {label}, {} samples)",
-                    samples.len()
-                );
-                if context.notify_error() {
-                    send_notification("whisrs", &toast);
-                }
-            }
-            BatchOrigin::LlmCommand { name } => {
-                info!(
-                    "llm-command '{name}': skipping (recording was {label}, {} samples)",
-                    samples.len()
-                );
-                if context.notify_state() {
-                    send_notification("whisrs", &toast);
-                }
-            }
-            BatchOrigin::Agent { name } => {
-                info!(
-                    "agent '{name}': skipping (recording was {label}, {} samples)",
-                    samples.len()
-                );
-                if context.notify_error() {
-                    send_notification("whisrs", &toast);
-                }
-            }
+    // a few hundred ms of model time. A recovery retry skips the gate: its
+    // audio passed it before it was saved (`BatchOptions::speech_gate`).
+    if opts.speech_gate {
+        let vad = VadConfig::close(context.config.audio.vad());
+        let gate = whisrs::audio::block_off_runtime(|| {
+            speech_gate(samples, SAMPLE_RATE, AUDIO_GATE_MIN_MS, &vad)
+        });
+        // The turn's one info line with its levels: command mode,
+        // `[[llm_commands]]` and agent turns logged theirs while recording
+        // (`collect_instruction_audio`), batch dictation has only this one.
+        if opts.origin == BatchOrigin::Dictation {
+            info!(
+                "dictation audio: {}, {}",
+                describe_levels(&gate.levels),
+                heard_label(gate.first_heard, gate.last_heard)
+            );
+        } else {
+            debug!(
+                "audio gate: {}, {}",
+                describe_levels(&gate.levels),
+                heard_label(gate.first_heard, gate.last_heard)
+            );
         }
-        return Ok(String::new());
+        if let Some(reason) = gate.reason {
+            let label = quality::skip_label(reason, &gate.levels);
+            let toast = opts.origin.gate_skip_toast(reason, &gate.levels);
+            match &opts.origin {
+                BatchOrigin::Dictation => {
+                    info!(
+                        "skipping transcription: recording was {label} ({} samples)",
+                        samples.len()
+                    );
+                    if context.notify_state() {
+                        send_notification("whisrs", &toast);
+                    }
+                }
+                BatchOrigin::CommandMode => {
+                    info!(
+                        "command mode: skipping (recording was {label}, {} samples)",
+                        samples.len()
+                    );
+                    if context.notify_error() {
+                        send_notification("whisrs", &toast);
+                    }
+                }
+                BatchOrigin::LlmCommand { name } => {
+                    info!(
+                        "llm-command '{name}': skipping (recording was {label}, {} samples)",
+                        samples.len()
+                    );
+                    if context.notify_state() {
+                        send_notification("whisrs", &toast);
+                    }
+                }
+                BatchOrigin::Agent { name } => {
+                    info!(
+                        "agent '{name}': skipping (recording was {label}, {} samples)",
+                        samples.len()
+                    );
+                    if context.notify_error() {
+                        send_notification("whisrs", &toast);
+                    }
+                }
+            }
+            return Ok(String::new());
+        }
     }
 
     // Progress toast for the command flows — after the gate, so a silent
@@ -958,9 +982,7 @@ pub(crate) async fn transcribe_batch_audio(
             if opts.save_recovery {
                 let friendly = format_api_error(&e);
                 error!("transcription failed: {friendly}");
-                // Save audio for recovery.
-                use whisrs::audio::recovery;
-                match recovery::save_recovery_audio(samples) {
+                match save_for_recovery(samples) {
                     Ok(path) => {
                         info!(
                             "audio saved for recovery: {} — retry with: whisrs transcribe-recovery",
@@ -1046,6 +1068,46 @@ pub(crate) async fn transcribe_batch_audio(
     }
 
     Ok(text)
+}
+
+/// Save a failed dictation's audio for `whisrs transcribe-recovery`, then
+/// keep only the newest [`recovery::RECOVERY_KEEP`] files. A test saves
+/// nothing to the real cache: its thread notes the save instead
+/// (`take_saved_recoveries`).
+///
+/// [`recovery::RECOVERY_KEEP`]: whisrs::audio::recovery::RECOVERY_KEEP
+fn save_for_recovery(samples: &[i16]) -> Result<std::path::PathBuf> {
+    #[cfg(not(test))]
+    {
+        use whisrs::audio::recovery;
+        whisrs::audio::block_off_runtime(|| {
+            recovery::save_and_keep_newest(
+                &recovery::recovery_dir(),
+                samples,
+                recovery::RECOVERY_KEEP,
+            )
+        })
+    }
+    #[cfg(test)]
+    {
+        SAVED_RECOVERIES.with(|saved| saved.borrow_mut().push(samples.len()));
+        Ok(std::path::PathBuf::from("/nonexistent/recovery_test.wav"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the length of each recovery save this thread made, never
+    /// written to the real cache.
+    static SAVED_RECOVERIES: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The recovery saves (their lengths in samples) this thread made since the
+/// last call.
+#[cfg(test)]
+pub(crate) fn take_saved_recoveries() -> Vec<usize> {
+    SAVED_RECOVERIES.with(|saved| std::mem::take(&mut *saved.borrow_mut()))
 }
 
 /// The instruction a finished transcript should be post-processed with, or
@@ -1146,7 +1208,10 @@ fn post_processed_or_raw(original: String, rewritten: Option<String>) -> Dictati
 /// Reuses `llm::rewrite_text` exactly as the llm-command path does, with the
 /// dictated text as the "selected text" and the configured instruction as the
 /// "voice instruction".
-async fn apply_llm_post_process(text: String, context: &DaemonContext) -> DictationOutcome {
+pub(crate) async fn apply_llm_post_process(
+    text: String,
+    context: &DaemonContext,
+) -> DictationOutcome {
     let Some(instruction) = llm_post_process_instruction(&context.config) else {
         return DictationOutcome::raw(text);
     };
@@ -1525,7 +1590,7 @@ fn needs_space_between(before: &str, next: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
@@ -1970,6 +2035,7 @@ mod tests {
                     check_prompt_echo: true,
                     apply_filler: true,
                     apply_replacements: true,
+                    speech_gate: true,
                     origin: BatchOrigin::Dictation,
                 },
             ),
@@ -1982,7 +2048,21 @@ mod tests {
                     check_prompt_echo: false,
                     apply_filler: false,
                     apply_replacements: false,
+                    speech_gate: true,
                     origin: BatchOrigin::CommandMode,
+                },
+            ),
+            (
+                "recovery_retry",
+                BatchOptions::recovery_retry(),
+                BatchOptions {
+                    use_prompt: true,
+                    save_recovery: false,
+                    check_prompt_echo: true,
+                    apply_filler: true,
+                    apply_replacements: true,
+                    speech_gate: false,
+                    origin: BatchOrigin::Dictation,
                 },
             ),
             (
@@ -1994,6 +2074,7 @@ mod tests {
                     check_prompt_echo: true,
                     apply_filler: false,
                     apply_replacements: false,
+                    speech_gate: true,
                     origin: BatchOrigin::LlmCommand { name: "proofread" },
                 },
             ),
@@ -2514,9 +2595,9 @@ mod tests {
 
     /// A backend that returns a fixed transcript and answers `sends_prompt()`
     /// however the test asks it to. Nothing else about the batch path cares.
-    struct StubBackend {
-        text: &'static str,
-        sends_prompt: bool,
+    pub(crate) struct StubBackend {
+        pub(crate) text: &'static str,
+        pub(crate) sends_prompt: bool,
     }
 
     #[async_trait::async_trait]
@@ -2552,6 +2633,40 @@ mod tests {
         }
     }
 
+    /// A backend that always fails, like an unreachable API.
+    pub(crate) struct FailingBackend;
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for FailingBackend {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("error sending request: connection refused")
+        }
+
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
+        }
+
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<whisrs::transcription::Transcript> {
+            unreachable!("the dictation batch path does not request segments")
+        }
+
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+    }
+
     /// Terms a user would put in `[general] vocabulary`. They are what
     /// `batch_transcription_config` turns into the prompt.
     const WIRING_VOCABULARY: [&str; 4] = ["Hyprland", "whisrs", "Wayland", "systemd"];
@@ -2565,7 +2680,9 @@ mod tests {
     /// `notify: false` keeps `send_notification` (which spawns a D-Bus thread)
     /// out of the picture on both branches. `[audio] vad = "rms"`: the test
     /// audio is a square wave, loud but no voice, which earshot would gate.
-    fn context_with_backend(backend: StubBackend) -> DaemonContext {
+    pub(crate) fn context_with_backend(
+        backend: impl TranscriptionBackend + 'static,
+    ) -> DaemonContext {
         let mut config = config_with_vocabulary(&WIRING_VOCABULARY);
         config.audio.vad = "rms".to_string();
         DaemonContext {
@@ -2589,10 +2706,54 @@ mod tests {
     /// Half a second of alternating full-ish amplitude: past `AUDIO_GATE_MIN_MS`
     /// and far above `SILENCE_RMS_THRESHOLD`, so the upstream gate lets the
     /// buffer reach the backend instead of short-circuiting to `Ok("")`.
-    fn audio_that_passes_the_gate() -> Vec<i16> {
+    pub(crate) fn audio_that_passes_the_gate() -> Vec<i16> {
         (0..SAMPLE_RATE as usize / 2)
             .map(|i| if i % 2 == 0 { 8_000 } else { -8_000 })
             .collect()
+    }
+
+    /// Audio the speech gate rejects (silence) never reaches the backend
+    /// from a dictation, but does from a recovery retry: that audio passed
+    /// the gate before it was saved, and its file goes only once the backend
+    /// answered.
+    #[tokio::test]
+    async fn a_recovery_retry_skips_the_speech_gate() {
+        let context = context_with_backend(StubBackend {
+            text: "the backend heard it",
+            sends_prompt: false,
+        });
+        let silence = vec![0i16; SAMPLE_RATE as usize];
+
+        let gated = transcribe_batch_audio(&silence, &context, "en", &BatchOptions::dictation())
+            .await
+            .unwrap();
+        assert_eq!(gated, "");
+
+        let sent =
+            transcribe_batch_audio(&silence, &context, "en", &BatchOptions::recovery_retry())
+                .await
+                .unwrap();
+        assert_eq!(sent, "the backend heard it");
+    }
+
+    /// A dictation the backend failed is saved for `whisrs
+    /// transcribe-recovery`; a retry of saved audio that fails again is not
+    /// saved a second time.
+    #[tokio::test]
+    async fn only_dictation_saves_failed_audio_for_recovery() {
+        let context = context_with_backend(FailingBackend);
+        let audio = audio_that_passes_the_gate();
+        take_saved_recoveries();
+
+        let failed =
+            transcribe_batch_audio(&audio, &context, "en", &BatchOptions::dictation()).await;
+        assert!(failed.is_err());
+        assert_eq!(take_saved_recoveries(), [audio.len()]);
+
+        let failed =
+            transcribe_batch_audio(&audio, &context, "en", &BatchOptions::recovery_retry()).await;
+        assert!(failed.is_err());
+        assert!(take_saved_recoveries().is_empty());
     }
 
     #[tokio::test]
