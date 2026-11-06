@@ -647,6 +647,22 @@ mod tests {
 
     #[test]
     fn us_qwerty_fr_typeable_via_uinput() {
+        // Skip if the host's xkeyboard-config lacks this third-party layout.
+        // Probed directly so a from_layout regression still fails here.
+        let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        let installed = xkbcommon::xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "qwerty-fr",
+            None,
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        );
+        if installed.is_none() {
+            eprintln!("skipping: us(qwerty-fr) is not installed on this host");
+            return;
+        }
         let km = XkbKeymap::from_layout(&layout("us", "qwerty-fr")).unwrap();
 
         // The real contract: on us:qwerty-fr, AltGr lives behind a
