@@ -17,10 +17,10 @@
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::speech::join_words;
 use super::{Segment, Speaker, TrackKind, Word};
 use crate::transcription::deepgram::{supports_diarization, DIARIZATION_LABEL};
 use crate::transcription::factory::canonical_backend_name;
+use crate::transcription::verbose_json::join_words;
 use crate::{Config, DiarizationMode, RecordingConfig};
 
 /// A voice with less talk time than this ...

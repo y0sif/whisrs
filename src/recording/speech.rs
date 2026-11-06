@@ -16,6 +16,7 @@ use std::ops::Range;
 
 use super::split::split_by_energies;
 use super::{Segment, Word};
+use crate::transcription::verbose_json::join_words;
 
 const RATE: usize = super::SAMPLE_RATE as usize;
 
@@ -351,27 +352,6 @@ impl TimeMap {
     }
 }
 
-/// `words` joined the way the backend's own `text` joins them: with a
-/// space, or with none where the text runs two of them together, or holds
-/// no space at all (Chinese, Japanese).
-pub(super) fn join_words<'a>(text: &str, words: impl IntoIterator<Item = &'a str>) -> String {
-    let unspaced = !text.contains(char::is_whitespace);
-    let mut out = String::new();
-    let mut previous: Option<&str> = None;
-    for word in words {
-        if let Some(previous) = previous {
-            let spaced = text.contains(&format!("{previous} {word}"));
-            let glued = !spaced && (unspaced || text.contains(&format!("{previous}{word}")));
-            if !glued {
-                out.push(' ');
-            }
-        }
-        out.push_str(word);
-        previous = Some(word);
-    }
-    out
-}
-
 /// Version of the near-end detector a cached mask came from: bump it with
 /// any change to the detector, so a retry recomputes masks an older one
 /// cached.
@@ -606,6 +586,33 @@ mod tests {
         );
         let texts: Vec<String> = map.map_segment(seg).into_iter().map(|s| s.text).collect();
         assert_eq!(texts, ["Yeah,", "so it"]);
+    }
+
+    /// A word the backend left unaligned (WhisperX's numerals) takes its
+    /// times from its neighbours, so a segment across a join still has a
+    /// word per token, and "1990." stays in its piece's text.
+    #[test]
+    fn an_unaligned_word_keeps_its_text_across_a_join() {
+        let map = two_pieces();
+        let body = r#"{"text": "We left in 1990. Bye.", "segments": [
+            {"start": 0.2, "end": 4.0, "text": "We left in 1990."},
+            {"start": 4.2, "end": 4.8, "text": "Bye."}],
+            "words": [{"word": "We", "start": 0.2, "end": 0.5},
+                      {"word": "left", "start": 0.5, "end": 0.9},
+                      {"word": "in", "start": 3.1, "end": 3.4},
+                      {"word": "1990."},
+                      {"word": "Bye.", "start": 4.2, "end": 4.8}]}"#;
+        let t = crate::transcription::verbose_json::parse_verbose_segments(body).unwrap();
+        let seg = t.segments.into_iter().next().unwrap();
+        let out = map.map_segment(seg);
+        let lines: Vec<(u64, u64, &str)> = out
+            .iter()
+            .map(|s| (s.start_ms, s.end_ms, s.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [(700, 1400, "We left"), (60_100, 61_200, "in 1990.")]
+        );
     }
 
     #[test]

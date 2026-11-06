@@ -49,6 +49,31 @@ impl Request {
         let headers = String::from_utf8_lossy(&self.body[start..data]).into_owned();
         (headers, &self.body[data..])
     }
+
+    /// The multipart text fields, in order, as `(name, value)`: every part
+    /// but a file.
+    pub fn text_fields(&self) -> Vec<(String, String)> {
+        let content_type = self
+            .header("content-type")
+            .expect("request has no content-type");
+        let boundary = content_type
+            .split_once("boundary=")
+            .expect("content-type has no multipart boundary")
+            .1
+            .trim_matches('"');
+        let body = String::from_utf8_lossy(&self.body);
+        body.split(&format!("--{boundary}"))
+            .filter_map(|part| {
+                let (headers, value) = part.split_once("\r\n\r\n")?;
+                if headers.contains("filename=") {
+                    return None;
+                }
+                let name = headers.split_once("name=\"")?.1.split('"').next()?;
+                let value = value.strip_suffix("\r\n").unwrap_or(value);
+                Some((name.to_string(), value.to_string()))
+            })
+            .collect()
+    }
 }
 
 /// Accept a single connection, read the whole request, answer `200 OK` with
