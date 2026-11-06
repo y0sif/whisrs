@@ -16,7 +16,7 @@ Multipart fields:
 
 - `file`: WAV audio
 - `model`: model identifier
-- `language`: ISO 639-1 language code, or `auto`
+- `language`: ISO 639-1 language code; left out when the language is `auto`
 - `hotwords`: optional vocabulary/context prompt
 
 Response:
@@ -62,9 +62,20 @@ loses the words around it, which costs accuracy, so a sidecar should return
 
 ## Implementations
 
+- [`moonshine`](moonshine/): Useful Sensors Moonshine in a Python server
+  (`server.py`), English only.
+- [`nemo-speech`](nemo-speech/): NVIDIA Nemotron 3.5 ASR Streaming and
+  Parakeet TDT v3 in `nemo-speech serve`, one prebuilt binary with no Python.
+- [`parakeet`](parakeet/): NVIDIA Parakeet TDT v3 through NeMo in a Python
+  server (`server.py`).
+- [`vibevoice`](vibevoice/): Microsoft VibeVoice-ASR through Transformers in a
+  Python server (`server.py`).
+
 ## Recommended choices
 
 - `moonshine`: fastest lightweight CPU/low-memory English sidecar.
+- `nemo-speech`: local CPU sidecar with no Python (Nemotron for live
+  dictation and recordings, Parakeet for batch dictation).
 - `parakeet`: recommended local GPU sidecar for high-quality multilingual
   dictation.
 - `vibevoice`: heavier long-form transcription sidecar.
@@ -72,11 +83,12 @@ loses the words around it, which costs accuracy, so a sidecar should return
 | Sidecar | Default model | Best for |
 |---|---|---|
 | `moonshine` | `UsefulSensors/moonshine-base` | Fast lightweight English dictation |
+| `nemo-speech` | the loaded model (`model = ""`) | Live and batch dictation and recordings on CPU, no Python |
 | `parakeet` | `nvidia/parakeet-tdt-0.6b-v3` | High-quality local GPU dictation |
 | `vibevoice` | `microsoft/VibeVoice-ASR-HF` | Long-form local transcription experiments |
 
-Each sidecar has its own README with installation and GPU notes, plus a
-`config.toml.example` snippet for whisrs.
+Each sidecar has its own README with installation and GPU notes and the
+whisrs config; the Python ones also ship it as a `config.toml.example`.
 
 ## AMD ROCm note
 
