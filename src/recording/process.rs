@@ -1112,6 +1112,14 @@ fn cache_fingerprint(name: &str, config: &Config, tcfg: &TranscriptionConfig) ->
             key["soft_voices"] = serde_json::json!(false);
         }
     }
+    // The ASR sidecar asks for timings and cuts them into sentences, so a
+    // chunk its phrase fallback cached before (one segment per phrase, no
+    // words) is transcribed again rather than reused. Only its key carries
+    // this: every other backend's chunks come out as before and keep
+    // matching. Bump it with a change to what the sidecar's chunks become.
+    if canonical_backend_name(name) == "asr-sidecar" {
+        key["sidecar_timings"] = serde_json::json!(1);
+    }
     format!("{:016x}", fnv1a64(key.to_string().as_bytes()))
 }
 
@@ -3950,6 +3958,61 @@ mod tests {
             fingerprint_of(sidecar),
             fingerprint_of(&sidecar.replace("\"asr-sidecar\"\n[", "\"vibevoice\"\n["))
         );
+    }
+
+    /// The fingerprint as it was before the ASR sidecar asked for timings:
+    /// [`cache_fingerprint`]'s key without `sidecar_timings`.
+    fn fingerprint_before_sidecar_timings(toml_text: &str) -> String {
+        let config: Config = toml::from_str(toml_text).unwrap();
+        let name = recording_backend_name(&config).unwrap();
+        let tcfg = recording_transcription_config(&name, &config, &config.general.language);
+        let mut key = serde_json::json!({
+            "chunking": 2,
+            "backend": canonical_backend_name(&name),
+            "identity": backend_identity(&name, &config),
+            "language": tcfg.language,
+            "model": tcfg.model,
+            "prompt": tcfg.prompt,
+            "keyterms": tcfg.keyterms,
+        });
+        if tcfg.vad != Vad::Rms {
+            key["vad"] = serde_json::json!(crate::vad_name(tcfg.vad));
+            if !tcfg.soft_voices {
+                key["soft_voices"] = serde_json::json!(false);
+            }
+        }
+        format!("{:016x}", fnv1a64(key.to_string().as_bytes()))
+    }
+
+    /// Only the ASR sidecar's chunks changed with its timings: every other
+    /// backend's fingerprint is the one it had, so the chunks it cached
+    /// still match, and the sidecar's is new, so its phrase-by-phrase
+    /// chunks are transcribed again.
+    #[test]
+    fn sidecar_timings_change_only_the_sidecar_fingerprint() {
+        for unchanged in [
+            "[general]\nbackend = \"groq\"\nlanguage = \"en\"\n",
+            "[general]\nbackend = \"deepgram\"\nvocabulary = [\"whisrs\"]\n",
+            "[general]\nbackend = \"openai\"\n[audio]\nvad = \"rms\"\n",
+            "[general]\nbackend = \"local-whisper\"\n\
+             [local-whisper]\nmodel_path = \"/m/base.en.bin\"\n",
+        ] {
+            assert_eq!(
+                fingerprint_of(unchanged),
+                fingerprint_before_sidecar_timings(unchanged),
+                "{unchanged}"
+            );
+        }
+        let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\
+                       [asr-sidecar]\nurl = \"http://127.0.0.1:1/t\"\n";
+        let vibevoice = sidecar.replace("\"asr-sidecar\"\n[", "\"vibevoice\"\n[");
+        for sidecar in [sidecar, vibevoice.as_str()] {
+            assert_ne!(
+                fingerprint_of(sidecar),
+                fingerprint_before_sidecar_timings(sidecar),
+                "{sidecar}"
+            );
+        }
     }
 
     /// A recording whose first attempt failed after one chunk, which is
