@@ -369,6 +369,8 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 #   model = "<model the endpoint serves>"
 # One divergence from OpenAI: [general] prompt rides as the `hotwords` field
 # (see prompt above), so a strict OpenAI-compatible server ignores it.
+# Recordings also ask for verbose_json word timings; a server that returns
+# only text gets each phrase sent alone (contrib/asr-sidecars/README.md).
 [asr-sidecar]
 url = "http://127.0.0.1:8765/transcribe"
 model = "microsoft/VibeVoice-ASR-HF"
@@ -690,15 +692,12 @@ at about $0.04 an hour.
 - No model is free.
 - `[general] vocabulary` and `prompt` do nothing: whisrs sends them as the
   `hotwords` field, which OpenRouter accepts and ignores.
-- Recordings take more requests. No model returns `segments` (timed lines),
-  so whisrs sends a recording's first chunk (up to 10 minutes of speech)
-  whole once, then transcribes that chunk and every later one a phrase per
-  request. That first chunk is paid twice, and a provider that bills a
-  minimum per request (Groq above: 10 seconds) bills it for every short
-  phrase. The whole-chunk request is made once per recording, or once per
-  daemon start when `[general] backend` is `asr-sidecar` too. Each phrase is
-  also transcribed without the words around it, which costs accuracy against
-  the same audio sent whole.
+- Recordings go one request per chunk (up to 10 minutes of speech): whisrs
+  asks for word timings and cuts the answer into sentences. All six models
+  above return them (checked 2026-11-06). `voxtral-mini-transcribe-3-0`
+  refuses the request for word timestamps, so whisrs asks it once more
+  without them, once per recording, or once per daemon start when
+  `[general] backend` is `asr-sidecar` too.
 
 ## Read-aloud in Arabic
 

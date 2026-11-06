@@ -19,7 +19,7 @@ talks to it as it is, with nothing to wrap. One server per model:
 Use Parakeet for batch dictation: it is the fastest local batch model here,
 and it never dropped a word in our runs, while Nemotron can drop the first
 words of a quiet voice (see Known limits). Use Nemotron for live dictation
-and for recordings. whisrs sends a recording's first chunk (up to 10 minutes
+and for recordings. whisrs sends each chunk of a recording (up to 10 minutes
 of speech) whole, and only Nemotron's memory stays bounded on that: under the
 unit's 4G memory cap, a recording with more than about 5 minutes of speech
 fails on Parakeet (nemo-speech 0.2.0), and a retry fails the same way. The numbers are below.
@@ -40,7 +40,7 @@ Both heard "whisrs" as "Wizards" or "Wizard's" and "Hyprland" as "Hyperland"
 of a quiet voice, Parakeet got the most words right but returned no
 punctuation, and Nemotron dropped the first 3.4 s of speech.
 
-Long audio, one file per request (as whisrs sends a recording's first chunk),
+Long audio, one file per request (as whisrs sends each recording chunk),
 on the same 4 cores under the units' `MemoryMax=4G` with no swap. Peak memory,
 then time:
 
@@ -236,10 +236,10 @@ model = ""
 backend = "asr-sidecar"
 ```
 
-A recording is transcribed at about real time on 4 CPU cores: the whole-chunk
-request (see Known limits) took 549 s on a 10-minute file, and the phrase
-requests come after it, so a 10-minute recording takes more than 9 minutes
-after the stop. Live dictation keeps working meanwhile, but slower: with both on
+nemo-speech answers with word times, so whisrs keeps each chunk whole and
+cuts it into sentences. A recording is transcribed at about real time on 4
+CPU cores: a chunk with 10 minutes of speech took 549 s, so a 10-minute
+recording is ready about 9 minutes after the stop. Live dictation keeps working meanwhile, but slower: with both on
 the same 4 cores, a phrase arrived about 10 s after the pause instead of 1 s, and
 the last one about 19 s after the stop.
 
@@ -266,10 +266,8 @@ the last one about 19 s after the stop.
   right after near-silence, such as a mic fading in from zero, lost its first
   words (3.4 s of a real recording), in batch and live, on 0.2.0 and 0.3.0.
   None were lost after room noise or from a loud voice; Parakeet lost none.
-- **Recordings go phrase by phrase.** No `segments` come back, so whisrs
-  discards the text of the first chunk sent whole (pure extra time) and sends
-  each phrase alone, which costs accuracy: sent alone, a phrase came back as
-  "Northern splaying, not playing a video"; sent whole, "Nothing is playing
-  and not playing a video".
+- **Nemotron's recording lines can lack periods.** On a whole chunk it
+  punctuates less than on a short clip, so a recording's lines can start
+  lowercase and break at pauses rather than at sentence ends.
 - **Parakeet has no live mode.** Parakeet TDT has no streaming endpointing,
   so it serves batch requests only.
