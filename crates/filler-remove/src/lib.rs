@@ -75,6 +75,11 @@ const SENTENCE_END: &[char] = &['.', '!', '?', '…'];
 /// Pre-compiled regex for collapsing multiple spaces into one.
 static SPACE_COLLAPSE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" {2,}").unwrap());
 
+/// A custom word ending in a word character (`\w`, what `\b` tests) gets a
+/// closing `\b`, so "um" leaves "umbrella" alone. One ending in punctuation
+/// ("you know,", "uh...") gets none: a `\b` there would need a word next.
+static ENDS_IN_WORD_CHAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w\z").unwrap());
+
 /// A reusable filler-word filter that pre-compiles its regexes once.
 ///
 /// Construct with [`FillerFilter::new`] and call [`FillerFilter::apply`]
@@ -86,7 +91,8 @@ static SPACE_COLLAPSE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" {2,}"
 /// - If `custom_words` is empty, the filter uses the built-in English patterns
 ///   and Russian hesitations (already pre-compiled via [`LazyLock`]).
 /// - If `custom_words` is non-empty, those words are compiled into custom
-///   regexes (each wrapped with `\b...\b,?\s*`) and the built-in defaults are
+///   regexes (each wrapped with `\b...\b,?\s*`, no closing `\b` after a word
+///   that ends in punctuation) and the built-in defaults are
 ///   **not** used — same semantics as the legacy [`remove_filler_words`].
 /// - Stutter removal and whitespace collapse are always applied.
 ///
@@ -116,7 +122,13 @@ impl FillerFilter {
     pub fn new<S: AsRef<str>>(custom_words: &[S]) -> Result<Self, regex::Error> {
         let mut custom = Vec::with_capacity(custom_words.len());
         for word in custom_words {
-            let pattern_str = format!(r"(?i)\b{},?\s*", regex::escape(word.as_ref()));
+            let word = word.as_ref();
+            let end = if ENDS_IN_WORD_CHAR_RE.is_match(word) {
+                r"\b"
+            } else {
+                ""
+            };
+            let pattern_str = format!(r"(?i)\b{}{end},?\s*", regex::escape(word));
             custom.push(Regex::new(&pattern_str)?);
         }
         Ok(Self { custom })
@@ -186,7 +198,8 @@ impl Default for FillerFilter {
 ///
 /// When `custom_words` is non-empty, those patterns are used instead of the
 /// built-in defaults. Each custom word is wrapped with `\b...\b,?\s*` to
-/// create a word-boundary-aware pattern.
+/// create a word-boundary-aware pattern (no closing `\b` after a word that
+/// ends in punctuation).
 ///
 /// Always removes stutters regardless of the filler list.
 ///
@@ -566,6 +579,37 @@ mod tests {
     }
 
     #[test]
+    fn custom_word_keeps_longer_words() {
+        let custom = vec!["um".to_string()];
+        assert_eq!(remove_filler_words("an umbrella", &custom), "an umbrella");
+        assert_eq!(
+            remove_filler_words("the umpire said um, okay", &custom),
+            "the umpire said okay"
+        );
+    }
+
+    #[test]
+    fn custom_cyrillic_word_keeps_longer_words() {
+        let custom = vec!["ну".to_string()];
+        assert_eq!(remove_filler_words("нужно ну да", &custom), "нужно да");
+    }
+
+    #[test]
+    fn custom_word_ending_in_comma() {
+        let custom = vec!["you know,".to_string()];
+        assert_eq!(
+            remove_filler_words("so you know, we go", &custom),
+            "so we go"
+        );
+    }
+
+    #[test]
+    fn custom_word_ending_in_dots() {
+        let custom = vec!["uh...".to_string()];
+        assert_eq!(remove_filler_words("so uh... we go", &custom), "so we go");
+    }
+
+    #[test]
     fn emoji_in_text() {
         let text = "um 😀 that was basically 🎉 great";
         assert_eq!(remove_filler_words(text, &[]), "😀 that was 🎉 great");
@@ -674,11 +718,11 @@ mod tests {
             "regex crate must reject unmatched paren as a syntax error",
         );
 
-        // Same wrapper `FillerFilter::new` uses, minus the `regex::escape`
-        // step, so the malformed character class reaches the compiler
-        // unaltered.
+        // Same wrapper `FillerFilter::new` uses for a word ending in a word
+        // character (closing `\b` included), minus the `regex::escape` step,
+        // so the malformed character class reaches the compiler unaltered.
         let unclosed_class: String = ['[', 'a', 'b', 'c'].iter().collect();
-        let wrapped = format!(r"(?i)\b{unclosed_class},?\s*");
+        let wrapped = format!(r"(?i)\b{unclosed_class}\b,?\s*");
         let bad_wrapped = Regex::new(&wrapped);
         assert!(
             matches!(bad_wrapped, Err(regex::Error::Syntax(_))),

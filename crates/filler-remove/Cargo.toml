@@ -1,6 +1,6 @@
 [package]
 name = "filler-remove"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Regex-based filler word and stutter removal from transcribed speech"
