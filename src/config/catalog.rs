@@ -360,7 +360,8 @@ pub struct WhisperModel {
 /// The whisper.cpp models setup offers to download for `local-whisper`,
 /// smallest first: each size English only (`.en`, better at English) and
 /// multilingual, then the large ones. The quantized files are left out but
-/// for large-v3-turbo's q5_0, a third of its size.
+/// for large-v3-turbo's q5_0 (a third of its size) and q8_0 (about half,
+/// with no accuracy lost in testing, for hardware short on memory).
 ///
 /// Source: https://huggingface.co/ggerganov/whisper.cpp (file names and
 /// sizes from https://huggingface.co/api/models/ggerganov/whisper.cpp/tree/main),
@@ -410,6 +411,11 @@ pub const WHISPER_MODELS: &[WhisperModel] = &[
         name: "large-v3-turbo-q5_0",
         bytes: 574_041_195,
         about: "multilingual, large-v3-turbo quantized",
+    },
+    WhisperModel {
+        name: "large-v3-turbo-q8_0",
+        bytes: 874_188_075,
+        about: "multilingual, large-v3-turbo at half the memory",
     },
     WhisperModel {
         name: "large-v3-turbo",
