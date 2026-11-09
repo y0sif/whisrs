@@ -54,7 +54,8 @@ impl OpenAiRealtimeProfile {
     }
 
     /// How the text the engine sends for this profile joins up: append
-    /// deltas are fragments, completed utterances are phrases.
+    /// deltas are fragments (the engine spaces an item's first delta from the
+    /// text before it), completed utterances are phrases.
     pub fn stream_text(self) -> StreamText {
         match self.delta_mode() {
             DeltaMode::AppendOnly => StreamText::Fragments,

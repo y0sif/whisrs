@@ -5,7 +5,7 @@ use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioChunk;
-use crate::transcription::TranscriptionConfig;
+use crate::transcription::{needs_space_between, StreamText, TranscriptionConfig};
 
 use super::profile::{
     encode_pcm_base64, resample_16k_to_24k, DeltaMode, OpenAiRealtimeProfile, TurnDetectionMode,
@@ -61,8 +61,11 @@ struct StreamState {
     // string so we do not type the same completed utterance twice.
     emitted_completed_text: HashSet<String>,
     // Append-only providers stream stable text through delta events. Keep a
-    // running copy so a later completed event cannot re-emit the same content.
+    // running copy: an item's first delta is spaced from it.
     emitted_append_text: String,
+    // The item (utterance) the last append-only delta with an item ID belonged
+    // to, so the first delta of the next one can be spaced from the text before.
+    last_append_item_id: Option<String>,
     // Set once we have forwarded at least one transcript to the downstream
     // typing channel. Used to decide whether a missing post-commit completion is
     // a graceful finalize or a genuine failure. Only flipped when text is
@@ -126,12 +129,30 @@ impl StreamState {
     ) -> DeltaAction {
         match profile.delta_mode() {
             // OpenAI-style deltas are append-only, so forwarding them downstream
-            // preserves the text stream exactly as emitted by the provider.
+            // preserves the text stream exactly as emitted by the provider,
+            // except at an item boundary: server VAD splits a dictation into
+            // several items, and an item's first delta has no leading space. It
+            // gets one by `needs_space_between` when an item ID follows a
+            // different one. A delta without an item ID never gets one and
+            // leaves the tracked item as it is, and neither does the first
+            // delta with an ID, which has no item before it to space from.
             DeltaMode::AppendOnly => {
-                self.emitted_append_text.push_str(&delta);
+                let new_item = match (self.last_append_item_id.as_deref(), item_id) {
+                    (Some(last), Some(id)) => last != id,
+                    _ => false,
+                };
+                if item_id.is_some() {
+                    self.last_append_item_id = item_id.map(str::to_string);
+                }
+                let text = if new_item && needs_space_between(&self.emitted_append_text, &delta) {
+                    format!(" {delta}")
+                } else {
+                    delta
+                };
+                self.emitted_append_text.push_str(&text);
                 self.emitted_any_text = true;
                 DeltaAction {
-                    emit_text: Some(delta),
+                    emit_text: Some(text),
                 }
             }
             DeltaMode::ReplaceableInterim => {
@@ -297,10 +318,14 @@ impl OpenAiRealtimeProtocolEngine {
         let request_clone = request.clone();
         let stream_result = self.transcribe_stream(audio_rx, text_tx, &request_clone);
 
+        // Append deltas carry their own spacing (the engine spaces one item
+        // from the next), so they join verbatim. Lemonade's completed
+        // utterances are phrases and get a space between them.
+        let spaced = self.config.profile.stream_text() == StreamText::Phrases;
         let collector = async {
             let mut full_text = String::new();
             while let Some(text) = text_rx.recv().await {
-                if !full_text.is_empty() {
+                if spaced && !full_text.is_empty() {
                     full_text.push(' ');
                 }
                 full_text.push_str(&text);
@@ -843,6 +868,52 @@ mod tests {
 
         assert_eq!(action.emit_text.as_deref(), Some("hello"));
         assert_eq!(state.emitted_append_text, "hello");
+    }
+
+    /// What an append-only delta emits.
+    fn append(state: &mut StreamState, item_id: Option<&str>, delta: &str) -> String {
+        state
+            .on_delta(OpenAiRealtimeProfile::OpenAi, item_id, delta.into())
+            .emit_text
+            .unwrap()
+    }
+
+    /// gpt-4o-transcribe sends a dictation as several items, each starting
+    /// without a space: the next item's first delta gets one, the session's
+    /// first delta and an item's continuation deltas none.
+    #[test]
+    fn append_only_delta_spaces_a_new_item_from_the_text_before() {
+        let mut state = StreamState::default();
+        assert_eq!(append(&mut state, Some("item-1"), "Сегодня"), "Сегодня");
+        assert_eq!(append(&mut state, Some("item-1"), " завтра."), " завтра.");
+        assert_eq!(append(&mut state, Some("item-2"), "П"), " П");
+        assert_eq!(append(&mut state, Some("item-2"), "отом"), "отом");
+        assert_eq!(state.emitted_append_text, "Сегодня завтра. Потом");
+    }
+
+    #[test]
+    fn append_only_new_item_already_spaced_or_punctuation_gets_no_space() {
+        let mut state = StreamState::default();
+        assert_eq!(append(&mut state, Some("item-1"), "Hello"), "Hello");
+        assert_eq!(append(&mut state, Some("item-2"), " there"), " there");
+        assert_eq!(append(&mut state, Some("item-3"), "."), ".");
+        assert_eq!(state.emitted_append_text, "Hello there.");
+    }
+
+    #[test]
+    fn append_only_delta_without_item_id_adds_no_space() {
+        let mut state = StreamState::default();
+        assert_eq!(append(&mut state, Some("item-1"), "Hel"), "Hel");
+        assert_eq!(append(&mut state, None, "lo"), "lo");
+        // Still item-1: the delta without an ID left the tracked item alone.
+        assert_eq!(append(&mut state, Some("item-1"), "ween"), "ween");
+        assert_eq!(state.emitted_append_text, "Helloween");
+
+        // The first ID after deltas without one is no boundary either.
+        let mut state = StreamState::default();
+        assert_eq!(append(&mut state, None, "Hel"), "Hel");
+        assert_eq!(append(&mut state, Some("item-1"), "lo"), "lo");
+        assert_eq!(append(&mut state, Some("item-2"), "World"), " World");
     }
 
     #[test]
@@ -1441,6 +1512,80 @@ mod stream_lifecycle_tests {
                 .contains("timed out waiting for final transcription completion"),
             "expected a timeout error when no text was emitted, got: {err}"
         );
+
+        server.await.unwrap();
+    }
+
+    // `transcribe` (command mode, agent turns) joins append deltas verbatim: a
+    // word split across deltas stays whole, and the engine's item-boundary
+    // space separates one item from the next.
+    #[tokio::test]
+    async fn openai_transcribe_joins_append_deltas_verbatim() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            assert_eq!(recv_json(&mut ws).await["type"], "session.update");
+            assert_eq!(
+                recv_json(&mut ws).await["type"],
+                "input_audio_buffer.append"
+            );
+            assert_eq!(
+                recv_json(&mut ws).await["type"],
+                "input_audio_buffer.commit"
+            );
+
+            let deltas = [
+                ("item-1", "Deep"),
+                ("item-1", "gram"),
+                ("item-1", " first"),
+                ("item-1", "."),
+                ("item-2", "Second"),
+            ];
+            for (item_id, delta) in deltas {
+                ws.send(Message::Text(
+                    serde_json::json!({
+                        "type": "conversation.item.input_audio_transcription.delta",
+                        "item_id": item_id,
+                        "delta": delta
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            }
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": "item-2",
+                    "transcript": "Second"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None => {}
+                other => panic!("expected close or end, got {other:?}"),
+            }
+        });
+
+        let engine = openai_engine_default_timeout(format!("ws://{addr}/realtime"));
+        let wav = crate::audio::wav::encode_wav(&[1; 160]).unwrap();
+        let text = timeout(
+            Duration::from_secs(5),
+            engine.transcribe(&wav, &test_request()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(text, "Deepgram first. Second");
 
         server.await.unwrap();
     }

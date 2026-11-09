@@ -383,12 +383,43 @@ pub fn open_profile(
 pub enum StreamText {
     /// Whole phrases, usually trimmed (Deepgram streaming, Groq, local
     /// whisper, Lemonade's completed utterances): the daemon puts a space
-    /// between two of them unless one already has it at the boundary or the
-    /// next one starts with closing punctuation.
+    /// between two of them by [`needs_space_between`].
     Phrases,
     /// Fragments that carry their own spacing and may split a word (OpenAI
-    /// realtime append deltas: "Deep", "gram"): appended verbatim.
+    /// realtime append deltas: "Deep", "gram"): appended verbatim, so a space
+    /// goes only where the text has one. The OpenAI engine adds one before an
+    /// utterance's first delta, which comes without it.
     Fragments,
+}
+
+/// Returns `true` when the first character of `text` is a punctuation mark
+/// that should not have a space inserted before it.
+///
+/// Covers ASCII sentence/clause terminators and closing brackets, their CJK
+/// fullwidth equivalents, the ellipsis character, and closing curly quotes.
+/// Opening brackets, opening curly quotes, and dashes are intentionally
+/// excluded — they should retain a leading space.
+fn leads_with_punct(text: &str) -> bool {
+    text.starts_with([
+        // ASCII
+        '.', ',', '!', '?', ';', ':', ')', ']', '}', // CJK fullwidth equivalents
+        '。', '，', '！', '？', '；', '：', '）', '】', '｝', // Ellipsis
+        '…',  // Closing curly quotes (U+2019, U+201D)
+        '\u{2019}', '\u{201D}',
+    ])
+}
+
+/// Whether streamed `next` needs a space to follow `before`: not when either
+/// is empty, not when the boundary already has one, and not before closing
+/// punctuation (`leads_with_punct`). The one rule for joining streamed text:
+/// two phrases, and the place a fragment stream had a gap (a batch boundary
+/// in the daemon, an utterance boundary in the OpenAI engine).
+pub fn needs_space_between(before: &str, next: &str) -> bool {
+    !(before.is_empty()
+        || next.is_empty()
+        || before.ends_with(' ')
+        || next.starts_with(' ')
+        || leads_with_punct(next))
 }
 
 /// Trait for transcription backends.
@@ -468,7 +499,8 @@ pub trait TranscriptionBackend: Send + Sync {
     /// Backends whose answer is fixed ignore the argument.
     fn sends_prompt(&self, config: &TranscriptionConfig) -> bool;
 
-    /// How the text [`Self::transcribe_stream`] sends joins up.
+    /// How the text [`Self::transcribe_stream`] sends joins up, inside a
+    /// typing batch and from one batch to the next.
     ///
     /// Required, like `sends_prompt`: a default of `Phrases` would put spaces
     /// inside the words a fragment backend splits, and treating everything as
@@ -820,5 +852,98 @@ mod tests {
         assert_eq!(secs_to_ms(1.2345), 1235);
         assert_eq!(secs_to_ms(-1.0), 0);
         assert_eq!(secs_to_ms(f64::NAN), 0);
+    }
+
+    #[test]
+    fn needs_space_between_rule() {
+        assert!(needs_space_between("a", "b"));
+        assert!(needs_space_between("a.", "(b)"));
+        assert!(!needs_space_between("", "b"), "nothing before");
+        assert!(!needs_space_between("a", ""), "nothing to separate");
+        assert!(!needs_space_between("a ", "b"));
+        assert!(!needs_space_between("a", " b"));
+        assert!(!needs_space_between("a", ", b"));
+        assert!(!needs_space_between("a", "\u{201D}"));
+    }
+
+    #[test]
+    fn leads_with_punct_ascii_terminators_and_closers() {
+        // Sentence/clause terminators and closing brackets that should not get
+        // a leading space inserted before them.
+        for p in [".", ",", "!", "?", ";", ":", ")", "]", "}"] {
+            assert!(
+                leads_with_punct(p),
+                "expected leads_with_punct({p:?}) to be true",
+            );
+        }
+    }
+
+    #[test]
+    fn leads_with_punct_ascii_followed_by_more_text() {
+        // Helper should fire based on the first char, regardless of what follows.
+        assert!(leads_with_punct(". And then"));
+        assert!(leads_with_punct(", and"));
+        assert!(leads_with_punct("?!"));
+    }
+
+    #[test]
+    fn leads_with_punct_unicode_cjk_fullwidth() {
+        // CJK fullwidth equivalents of ASCII punctuation.
+        for p in ["。", "，", "！", "？", "；", "：", "）", "】", "｝"] {
+            assert!(
+                leads_with_punct(p),
+                "expected leads_with_punct({p:?}) to be true",
+            );
+        }
+    }
+
+    #[test]
+    fn leads_with_punct_unicode_ellipsis() {
+        assert!(leads_with_punct("…"));
+        assert!(leads_with_punct("… and then"));
+    }
+
+    #[test]
+    fn leads_with_punct_unicode_closing_curly_quotes() {
+        // U+2019 RIGHT SINGLE QUOTATION MARK
+        assert!(leads_with_punct("\u{2019}"));
+        // U+201D RIGHT DOUBLE QUOTATION MARK
+        assert!(leads_with_punct("\u{201D}"));
+    }
+
+    #[test]
+    fn leads_with_punct_leading_space_is_false() {
+        // Whitespace prefix means the caller already has spacing — do not
+        // suppress an additional one based on punctuation logic.
+        assert!(!leads_with_punct(" hello"));
+        assert!(!leads_with_punct(" ."));
+    }
+
+    #[test]
+    fn leads_with_punct_non_punct_prefix_is_false() {
+        assert!(!leads_with_punct("hello"));
+        assert!(!leads_with_punct("a."));
+        assert!(!leads_with_punct("1, 2, 3"));
+    }
+
+    #[test]
+    fn leads_with_punct_empty_is_false() {
+        assert!(!leads_with_punct(""));
+    }
+
+    #[test]
+    fn leads_with_punct_opening_brackets_are_false() {
+        // Opening brackets should retain a leading space.
+        assert!(!leads_with_punct("("));
+        assert!(!leads_with_punct("["));
+        assert!(!leads_with_punct("{"));
+    }
+
+    #[test]
+    fn leads_with_punct_opening_curly_quotes_are_false() {
+        // U+2018 LEFT SINGLE QUOTATION MARK
+        assert!(!leads_with_punct("\u{2018}"));
+        // U+201C LEFT DOUBLE QUOTATION MARK
+        assert!(!leads_with_punct("\u{201C}"));
     }
 }

@@ -20,7 +20,8 @@ use whisrs::llm;
 use whisrs::replacements::Replacer;
 use whisrs::state::Action;
 use whisrs::transcription::{
-    transcription_prompt, StreamText, TranscriptionBackend, TranscriptionConfig,
+    needs_space_between, transcription_prompt, StreamText, TranscriptionBackend,
+    TranscriptionConfig,
 };
 use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
@@ -494,10 +495,12 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 ///
 /// Deltas arriving within 150ms of each other are coalesced into one batch so
 /// we don't create a new virtual keyboard per word delta. `stream_text` says
-/// how two of them join: `Phrases` by the same rule that joins a batch to the
-/// text before it ([`needs_space_between`]), `Fragments` verbatim. Phrases
-/// queue up whenever the sink is busy (a held modifier, slow typing), so they
-/// often share a batch.
+/// how pieces join, inside a batch and from a batch to the text before it.
+/// `Phrases` by [`needs_space_between`] at both: phrases queue up whenever the
+/// sink is busy (a held modifier, slow typing), so they often share a batch.
+/// `Fragments` verbatim, with a space before a batch only where the raw text
+/// had whitespace at that boundary, so a word split across two batches stays
+/// whole (issue #201).
 ///
 /// Each batch is sanitized ([`sanitize_for_injection`]) before it reaches the
 /// sink. The sink returns the text it handed on, which can differ from what
@@ -514,7 +517,8 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 ///
 /// The daemon text channel is intentionally append-only. For OpenAI realtime
 /// this still feels token-by-token because the backend emits stable append
-/// deltas (`Fragments`). For Lemonade-compatible profiles, the protocol layer
+/// deltas (`Fragments`, with a space the engine puts where one utterance
+/// follows another). For Lemonade-compatible profiles, the protocol layer
 /// only forwards completed utterances (`Phrases`), so this loop naturally
 /// types phrase-sized chunks without needing any replacement semantics.
 pub(crate) async fn run_typing_batcher<F, Fut>(
@@ -530,6 +534,8 @@ where
     Fut: std::future::Future<Output = String>,
 {
     let mut full_text = String::new();
+    // Whether the last raw batch, before any filter, ended in whitespace.
+    let mut raw_ended_in_space = false;
     let batch_delay = std::time::Duration::from_millis(150);
 
     loop {
@@ -554,6 +560,14 @@ where
         if batch.is_empty() {
             continue;
         }
+
+        // Whether this batch may get a space before it. Phrases always may.
+        // Fragments carry their own spacing, so only where the raw text had a
+        // gap at the boundary, read before filler removal trims it away.
+        let gap_allowed = stream_text == StreamText::Phrases
+            || raw_ended_in_space
+            || batch.starts_with(char::is_whitespace);
+        raw_ended_in_space = batch.ends_with(char::is_whitespace);
 
         // Apply filler word removal if enabled.
         if let Some(filter) = filler_filter.as_ref() {
@@ -581,10 +595,9 @@ where
             }
         }
 
-        // Add space separator between turns if needed.
-        // Don't insert a space before punctuation streaming deltas,
-        // as they arrive as bare tokens.
-        let text_to_type = if needs_space_between(&full_text, &batch) {
+        // Space the batch from the text already typed, unless either side has
+        // one at the boundary or the batch opens with closing punctuation.
+        let text_to_type = if gap_allowed && needs_space_between(&full_text, &batch) {
             format!(" {batch}")
         } else {
             batch
@@ -1560,35 +1573,6 @@ pub(crate) fn take_saved_history() -> Vec<String> {
     SAVED_HISTORY.with(|saved| std::mem::take(&mut *saved.borrow_mut()))
 }
 
-/// Returns `true` when the first character of `text` is a punctuation mark
-/// that should not have a space inserted before it.
-///
-/// Covers ASCII sentence/clause terminators and closing brackets, their CJK
-/// fullwidth equivalents, the ellipsis character, and closing curly quotes.
-/// Opening brackets, opening curly quotes, and dashes are intentionally
-/// excluded — they should retain a leading space.
-fn leads_with_punct(text: &str) -> bool {
-    text.starts_with([
-        // ASCII
-        '.', ',', '!', '?', ';', ':', ')', ']', '}', // CJK fullwidth equivalents
-        '。', '，', '！', '？', '；', '：', '）', '】', '｝', // Ellipsis
-        '…',  // Closing curly quotes (U+2019, U+201D)
-        '\u{2019}', '\u{201D}',
-    ])
-}
-
-/// Whether streamed `next` needs a space to follow `before`: not when either
-/// is empty, not when the boundary already has one, and not before closing
-/// punctuation ([`leads_with_punct`]). The one rule for joining a batch to
-/// the text already typed and, for `Phrases`, two deltas inside a batch.
-fn needs_space_between(before: &str, next: &str) -> bool {
-    !(before.is_empty()
-        || next.is_empty()
-        || before.ends_with(' ')
-        || next.starts_with(' ')
-        || leads_with_punct(next))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1672,87 +1656,6 @@ pub(crate) mod tests {
             built.keyterms
         );
         assert!(built.prompt.is_none());
-    }
-
-    #[test]
-    fn leads_with_punct_ascii_terminators_and_closers() {
-        // Sentence/clause terminators and closing brackets that should not get
-        // a leading space inserted before them.
-        for p in [".", ",", "!", "?", ";", ":", ")", "]", "}"] {
-            assert!(
-                leads_with_punct(p),
-                "expected leads_with_punct({p:?}) to be true",
-            );
-        }
-    }
-
-    #[test]
-    fn leads_with_punct_ascii_followed_by_more_text() {
-        // Helper should fire based on the first char, regardless of what follows.
-        assert!(leads_with_punct(". And then"));
-        assert!(leads_with_punct(", and"));
-        assert!(leads_with_punct("?!"));
-    }
-
-    #[test]
-    fn leads_with_punct_unicode_cjk_fullwidth() {
-        // CJK fullwidth equivalents of ASCII punctuation.
-        for p in ["。", "，", "！", "？", "；", "：", "）", "】", "｝"] {
-            assert!(
-                leads_with_punct(p),
-                "expected leads_with_punct({p:?}) to be true",
-            );
-        }
-    }
-
-    #[test]
-    fn leads_with_punct_unicode_ellipsis() {
-        assert!(leads_with_punct("…"));
-        assert!(leads_with_punct("… and then"));
-    }
-
-    #[test]
-    fn leads_with_punct_unicode_closing_curly_quotes() {
-        // U+2019 RIGHT SINGLE QUOTATION MARK
-        assert!(leads_with_punct("\u{2019}"));
-        // U+201D RIGHT DOUBLE QUOTATION MARK
-        assert!(leads_with_punct("\u{201D}"));
-    }
-
-    #[test]
-    fn leads_with_punct_leading_space_is_false() {
-        // Whitespace prefix means the caller already has spacing — do not
-        // suppress an additional one based on punctuation logic.
-        assert!(!leads_with_punct(" hello"));
-        assert!(!leads_with_punct(" ."));
-    }
-
-    #[test]
-    fn leads_with_punct_non_punct_prefix_is_false() {
-        assert!(!leads_with_punct("hello"));
-        assert!(!leads_with_punct("a."));
-        assert!(!leads_with_punct("1, 2, 3"));
-    }
-
-    #[test]
-    fn leads_with_punct_empty_is_false() {
-        assert!(!leads_with_punct(""));
-    }
-
-    #[test]
-    fn leads_with_punct_opening_brackets_are_false() {
-        // Opening brackets should retain a leading space.
-        assert!(!leads_with_punct("("));
-        assert!(!leads_with_punct("["));
-        assert!(!leads_with_punct("{"));
-    }
-
-    #[test]
-    fn leads_with_punct_opening_curly_quotes_are_false() {
-        // U+2018 LEFT SINGLE QUOTATION MARK
-        assert!(!leads_with_punct("\u{2018}"));
-        // U+201C LEFT DOUBLE QUOTATION MARK
-        assert!(!leads_with_punct("\u{201C}"));
     }
 
     #[test]
@@ -1916,18 +1819,6 @@ pub(crate) mod tests {
         (typed, full_text)
     }
 
-    #[test]
-    fn needs_space_between_rule() {
-        assert!(needs_space_between("a", "b"));
-        assert!(needs_space_between("a.", "(b)"));
-        assert!(!needs_space_between("", "b"), "nothing before");
-        assert!(!needs_space_between("a", ""), "nothing to separate");
-        assert!(!needs_space_between("a ", "b"));
-        assert!(!needs_space_between("a", " b"));
-        assert!(!needs_space_between("a", ", b"));
-        assert!(!needs_space_between("a", "\u{201D}"));
-    }
-
     /// Phrase backends (Deepgram streaming, Groq, local whisper) send
     /// trimmed phrases: two in one batch window used to be glued ("itcopies").
     #[tokio::test(start_paused = true)]
@@ -1961,6 +1852,81 @@ pub(crate) mod tests {
             type_in_one_batch(StreamText::Fragments, &["Deep", "gram", " is", " fast"]).await;
         assert_eq!(typed, ["Deepgram is fast"]);
         assert_eq!(full_text, "Deepgram is fast");
+    }
+
+    /// Send each of `batches` in its own batch window to a `stream_text`
+    /// batcher with `filler_filter`; return what reached the sink and the
+    /// transcript.
+    async fn type_in_batches(
+        stream_text: StreamText,
+        filler_filter: Option<FillerFilter>,
+        batches: &[&str],
+    ) -> (Vec<String>, String) {
+        let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let typed = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let sink_log = Arc::clone(&typed);
+        let batcher = tokio::spawn(run_typing_batcher(
+            text_rx,
+            stream_text,
+            Arc::new(AtomicBool::new(false)),
+            filler_filter,
+            None,
+            move |text| {
+                sink_log.lock().unwrap().push(text.clone());
+                async move { text }
+            },
+        ));
+        for batch in batches {
+            text_tx.send(batch.to_string()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        drop(text_tx);
+        let full_text = batcher.await.unwrap();
+        let typed = typed.lock().unwrap().clone();
+        (typed, full_text)
+    }
+
+    /// Issue #201: a word whose append deltas land in two batches was typed
+    /// with a space inside it ("П они ет").
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_keeps_a_word_split_across_fragment_batches_whole() {
+        let (typed, full_text) =
+            type_in_batches(StreamText::Fragments, None, &["Пон", "иет"]).await;
+        assert_eq!(typed, ["Пон", "иет"]);
+        assert_eq!(full_text, "Пониет");
+    }
+
+    /// A word gap at a batch boundary is kept, also when filler removal
+    /// trimmed the whitespace off the batch.
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_spaces_fragment_batches_at_a_word_gap() {
+        for filler in [false, true] {
+            for batches in [["Hello", " there"], ["Hello ", "there"]] {
+                let filter = filler.then(FillerFilter::builtin);
+                let (_, full_text) = type_in_batches(StreamText::Fragments, filter, &batches).await;
+                assert_eq!(full_text, "Hello there", "filler {filler}, {batches:?}");
+            }
+        }
+    }
+
+    /// The first batch gets no space, nor does a batch that opens with
+    /// closing punctuation, even where the raw text had a gap before it.
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_puts_no_space_before_a_first_or_punctuation_fragment_batch() {
+        let (typed, full_text) =
+            type_in_batches(StreamText::Fragments, None, &["Hello", "."]).await;
+        assert_eq!(typed, ["Hello", "."]);
+        assert_eq!(full_text, "Hello.");
+
+        // The filter trims " Hello" to "Hello" and " um." to ".".
+        let (typed, full_text) = type_in_batches(
+            StreamText::Fragments,
+            Some(FillerFilter::builtin()),
+            &[" Hello", " um."],
+        )
+        .await;
+        assert_eq!(typed, ["Hello", "."]);
+        assert_eq!(full_text, "Hello.");
     }
 
     /// The real trigger: phrases that arrive while the sink is still typing
