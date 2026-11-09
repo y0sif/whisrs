@@ -290,7 +290,7 @@ crates/
 │   └── wayland_vk.rs       #   zwp_virtual_keyboard_v1 backend
 ├── asr-dedup/              # 0.1.0 — timestamp + n-gram dedup for chunked ASR
 ├── audio-silence-gate/     # 0.2.0 - earshot VAD + RMS gate, auto-stop, level meter
-├── filler-remove/          # 0.1.0 — filler-word stripping
+├── filler-remove/          # 0.1.1 — filler-word stripping
 └── prompt-echo/            # 0.1.0 — prompt-echo hallucination filter
 ```
 
