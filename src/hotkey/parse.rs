@@ -63,9 +63,6 @@ pub const MODIFIER_NAMES: [&str; 4] = ["Super", "Ctrl", "Alt", "Shift"];
 /// Every key a hotkey can end in, once each, by the name a picker offers.
 /// [`parse_hotkey`] takes each one (a test holds both ways), and the other
 /// spellings it takes (`Esc`, `PgUp`) are names of keys listed here.
-///
-/// No digits: a one-character key is read as a letter, so `Super+1` does
-/// not parse, and offering it would only be refused.
 pub const KEY_NAMES: &[&str] = &[
     "A",
     "B",
@@ -93,6 +90,16 @@ pub const KEY_NAMES: &[&str] = &[
     "X",
     "Y",
     "Z",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
     "F1",
     "F2",
     "F3",
@@ -185,10 +192,11 @@ fn bare_allowed(key: Key) -> bool {
 }
 
 fn parse_key(s: &str) -> Option<Key> {
-    // Single letter keys.
+    // Single letter keys. Any other one-character key (a digit) is a named
+    // key below.
     if s.len() == 1 {
         let ch = s.to_uppercase().chars().next()?;
-        return match ch {
+        let letter = match ch {
             'A' => Some(Key::KEY_A),
             'B' => Some(Key::KEY_B),
             'C' => Some(Key::KEY_C),
@@ -217,6 +225,9 @@ fn parse_key(s: &str) -> Option<Key> {
             'Z' => Some(Key::KEY_Z),
             _ => None,
         };
+        if letter.is_some() {
+            return letter;
+        }
     }
 
     // Named keys (case-insensitive).
@@ -343,6 +354,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_every_digit_key() {
+        // Issue #219: a one-character key was read as a letter only, so the
+        // digit arms were unreachable and `Super+1` was an unknown key.
+        let expected = [
+            ("0", Key::KEY_0),
+            ("1", Key::KEY_1),
+            ("2", Key::KEY_2),
+            ("3", Key::KEY_3),
+            ("4", Key::KEY_4),
+            ("5", Key::KEY_5),
+            ("6", Key::KEY_6),
+            ("7", Key::KEY_7),
+            ("8", Key::KEY_8),
+            ("9", Key::KEY_9),
+        ];
+        for (name, key) in expected {
+            let binding = parse_hotkey(&format!("Super+{name}")).unwrap();
+            assert_eq!(binding.modifiers, vec![Key::KEY_LEFTMETA], "{name}");
+            assert_eq!(binding.trigger, key, "{name} mapped to the wrong keycode");
+        }
+    }
+
+    #[test]
+    fn parse_ctrl_alt_0() {
+        let binding = parse_hotkey("Ctrl+Alt+0").unwrap();
+        assert!(binding.modifiers.contains(&Key::KEY_LEFTCTRL));
+        assert!(binding.modifiers.contains(&Key::KEY_LEFTALT));
+        assert_eq!(binding.trigger, Key::KEY_0);
+        assert_eq!(parse_hotkey("alt+shift+5").unwrap().trigger, Key::KEY_5);
+    }
+
+    #[test]
+    fn parse_bare_digit_fails() {
+        // A digit is a key now, but one that types text: it still needs a
+        // modifier, and says so rather than calling it unknown.
+        let err = parse_hotkey("1").unwrap_err().to_string();
+        assert!(err.contains("must have at least one modifier"), "{err}");
+        assert!(!err.contains("unknown key"), "{err}");
+    }
+
+    #[test]
+    fn parse_other_single_characters_are_unknown() {
+        for hotkey in ["Super+!", "Super+-", "Super+é"] {
+            let err = parse_hotkey(hotkey).unwrap_err().to_string();
+            assert!(err.contains("unknown key"), "{hotkey}: {err}");
+        }
+    }
+
+    #[test]
     fn parse_no_modifier_fails() {
         assert!(parse_hotkey("D").is_err());
         assert!(parse_hotkey("F5").is_err());
@@ -442,9 +502,13 @@ mod tests {
                 assert!(keys.contains(&key), "{spelling} parses but is not offered");
             }
         }
-        // Each letter and function key, not just the ends listed above.
+        // Each letter, digit and function key, not just the ends listed above.
         for c in 'a'..='z' {
             assert!(keys.contains(&parse_key(&c.to_string()).unwrap()));
+        }
+        for d in 0..=9 {
+            let key = parse_key(&d.to_string()).unwrap_or_else(|| panic!("{d} does not parse"));
+            assert!(keys.contains(&key), "{d} parses but is not offered");
         }
         for n in 1..=24 {
             assert!(keys.contains(&parse_key(&format!("f{n}")).unwrap()));
@@ -471,6 +535,6 @@ mod tests {
         );
         assert_eq!(hotkey_parts("ScrollLock"), Some((vec![], "ScrollLock")));
         assert_eq!(hotkey_parts("D"), None);
-        assert_eq!(hotkey_parts("Super+1"), None);
+        assert_eq!(hotkey_parts("super+1"), Some((vec!["Super"], "1")));
     }
 }
