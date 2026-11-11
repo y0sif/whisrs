@@ -1102,6 +1102,24 @@ fn cache_fingerprint(name: &str, config: &Config, tcfg: &TranscriptionConfig) ->
     if tcfg.diarize {
         key["diarize_model"] = serde_json::json!(crate::transcription::deepgram::DIARIZE_MODEL);
     }
+    // `[deepgram]` formatting changes the words Deepgram returns, so a chunk
+    // cached under one set must not be reused under another. Only the
+    // non-default flags are keyed: a config that leaves them unset changes
+    // nothing on the wire, and every chunk it cached before this existed keeps
+    // matching.
+    if matches!(
+        canonical_backend_name(name),
+        "deepgram" | "deepgram-streaming"
+    ) {
+        let format = config.deepgram_format();
+        if !format.is_default() {
+            key["deepgram_format"] = serde_json::json!({
+                "smart_format": format.smart_format,
+                "numerals": format.numerals,
+                "paragraphs": format.paragraphs,
+            });
+        }
+    }
     // Local whisper and the phrase fallback cut a chunk into phrases by the
     // detector, so its text depends on it. Absent for `rms`, which decides as
     // 0.1.31 did, so a chunk cached before still matches.
@@ -3958,6 +3976,35 @@ mod tests {
             fingerprint_of(sidecar),
             fingerprint_of(&sidecar.replace("\"asr-sidecar\"\n[", "\"vibevoice\"\n["))
         );
+    }
+
+    /// `[deepgram]` formatting changes the words Deepgram returns, so a chunk
+    /// cached under one set must not be reused under another. The defaults are
+    /// the request every config already sent, so they key nothing: a chunk
+    /// cached before these options existed keeps matching, and a section that
+    /// spells the defaults out is the same request.
+    #[test]
+    fn deepgram_formatting_changes_the_fingerprint_only_when_set() {
+        let base = "[general]\nbackend = \"deepgram\"\nlanguage = \"en\"\n\
+                    [deepgram]\napi_key = \"k\"\nmodel = \"nova-3\"\n";
+        let fp = fingerprint_of(base);
+        assert_eq!(fp, fingerprint_of(base));
+        let spelled_out = "[general]\nbackend = \"deepgram\"\nlanguage = \"en\"\n\
+                           [deepgram]\napi_key = \"k\"\nmodel = \"nova-3\"\n\
+                           smart_format = true\nnumerals = false\nparagraphs = false\n";
+        assert_eq!(fp, fingerprint_of(spelled_out));
+        for flag in [
+            "numerals = true",
+            "paragraphs = true",
+            "smart_format = false",
+        ] {
+            let toml = format!("{base}{flag}\n");
+            assert_ne!(fp, fingerprint_of(&toml), "{flag} must key the cache");
+        }
+        // `deepgram-streaming` transcribes a recording with the REST request,
+        // so the same flags key its chunks too.
+        let streaming = base.replace("\"deepgram\"", "\"deepgram-streaming\"");
+        assert_eq!(fp, fingerprint_of(&streaming));
     }
 
     /// The fingerprint as it was before the ASR sidecar asked for timings:

@@ -179,7 +179,7 @@ pub fn create_backend_named(name: &str, config: &Config) -> Arc<dyn Transcriptio
                 warn!("no Deepgram API key configured");
             }
             info!("using Deepgram REST transcription backend");
-            Arc::new(DeepgramRestBackend::new(api_key))
+            Arc::new(DeepgramRestBackend::new(api_key, config.deepgram_format()))
         }
         "deepgram-streaming" => {
             let api_key = resolve_deepgram_api_key(config).unwrap_or_default();
@@ -187,7 +187,10 @@ pub fn create_backend_named(name: &str, config: &Config) -> Arc<dyn Transcriptio
                 warn!("no Deepgram API key configured");
             }
             info!("using Deepgram streaming transcription backend");
-            Arc::new(DeepgramStreamingBackend::new(api_key))
+            Arc::new(DeepgramStreamingBackend::new(
+                api_key,
+                config.deepgram_format(),
+            ))
         }
         "groq" => {
             let api_key = resolve_groq_api_key(config).unwrap_or_default();
@@ -886,14 +889,17 @@ mod tests {
                 RecordingCase {
                     name: "deepgram",
                     resolves_to: Some("deepgram"),
-                    backend: Box::new(DeepgramRestBackend::new(String::new())),
+                    backend: Box::new(DeepgramRestBackend::new(String::new(), Default::default())),
                     chunk_secs: Some(3600),
                 },
                 // Mapped to REST; the streaming impl agrees if it is ever asked.
                 RecordingCase {
                     name: "deepgram-streaming",
                     resolves_to: Some("deepgram"),
-                    backend: Box::new(DeepgramStreamingBackend::new(String::new())),
+                    backend: Box::new(DeepgramStreamingBackend::new(
+                        String::new(),
+                        Default::default(),
+                    )),
                     chunk_secs: Some(3600),
                 },
                 RecordingCase {

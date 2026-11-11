@@ -935,6 +935,60 @@ pub struct DeepgramConfig {
     pub api_key: String,
     #[serde(default = "default_deepgram_model")]
     pub model: String,
+    /// Deepgram `smart_format`: punctuation, capitalization and, where the
+    /// language has them, numerals.
+    ///
+    /// `true` by default because that is what every request sent before this
+    /// key existed (`build_query_params` carried a literal). Defaulting it to
+    /// `false`, Deepgram's own default, would silently strip the punctuation
+    /// from every existing config on upgrade.
+    #[serde(default = "default_true")]
+    pub smart_format: bool,
+    /// Deepgram `numerals`: numbers as digits (`900`, not `nine hundred`),
+    /// beyond the languages `smart_format` already formats.
+    ///
+    /// Off by default, as Deepgram defaults it, and left off the wire when
+    /// off, so a config that never sets it sends the request it always sent.
+    #[serde(default)]
+    pub numerals: bool,
+    /// Deepgram `paragraphs`: break the pre-recorded transcript at pauses.
+    ///
+    /// A request-side flag, not a response one: `smart_format` already makes
+    /// Deepgram return a `paragraphs` object, so what this key decides is
+    /// whether the broken text is the text whisrs types. Only the
+    /// pre-recorded path can act on it — the live socket returns one trimmed
+    /// phrase per final result, with no paragraph object and no breaks.
+    #[serde(default)]
+    pub paragraphs: bool,
+}
+
+impl DeepgramConfig {
+    /// The formatting flags this section asks for, as the request builder
+    /// takes them.
+    pub fn format(&self) -> deepgram::DeepgramFormat {
+        deepgram::DeepgramFormat {
+            smart_format: self.smart_format,
+            numerals: self.numerals,
+            paragraphs: self.paragraphs,
+        }
+    }
+}
+
+impl Default for DeepgramConfig {
+    /// The same defaults serde applies to a section that leaves a key out.
+    ///
+    /// Written out rather than derived: `smart_format` defaults to `true` (the
+    /// value every request carried before the key existed), and a derive would
+    /// quietly turn it off.
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            model: default_deepgram_model(),
+            smart_format: true,
+            numerals: false,
+            paragraphs: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2339,6 +2393,7 @@ impl Config {
         }
 
         warnings.extend(self.deepgram_keyterm_warnings(backend));
+        warnings.extend(self.deepgram_format_warnings(backend));
         warnings.extend(self.inert_prompt_warnings(backend));
         warnings.extend(self.openai_languages_warnings(backend));
 
@@ -3008,6 +3063,22 @@ impl Config {
             .unwrap_or_else(default_deepgram_model)
     }
 
+    /// The `[deepgram]` formatting flags this config will actually send.
+    ///
+    /// Serde defaults only apply when the section exists, so the absent case
+    /// needs its own answer — and it must be [`DeepgramFormat::default`], not
+    /// a literal, for the same reason [`Config::deepgram_model`] is: the
+    /// daemon and `Config::validate` would otherwise answer differently. The
+    /// default is the pre-configuration request shape, so a config with no
+    /// `[deepgram]` section keeps sending `smart_format=true` and nothing
+    /// else.
+    pub fn deepgram_format(&self) -> deepgram::DeepgramFormat {
+        self.deepgram
+            .as_ref()
+            .map(DeepgramConfig::format)
+            .unwrap_or_default()
+    }
+
     /// The OpenAI realtime model this config will actually transcribe with.
     ///
     /// Not [`default_openai_model`], on purpose. `[openai] model` is shared
@@ -3124,6 +3195,37 @@ impl Config {
                     deepgram::KEYTERM_MAX_TERMS,
                     deepgram::KEYTERM_MAX_WORDS
                 ),
+            });
+        }
+        warnings
+    }
+
+    /// Load-time warnings about `[deepgram]` formatting flags reaching nothing.
+    ///
+    /// `paragraphs` can only change a pre-recorded transcript: the streaming
+    /// endpoint answers with one trimmed phrase per final result, carrying no
+    /// `paragraphs` object and no breaks (checked against the API), so
+    /// `backend = "deepgram-streaming"` builds its request without the
+    /// parameter. The flag is not a config error — one `config.toml` is used
+    /// with both backends — but silently dropping it is exactly the kind of
+    /// no-op this file already warns about for `prompt` and `vocabulary`.
+    fn deepgram_format_warnings(&self, backend: &str) -> Vec<ConfigWarning> {
+        let mut warnings = Vec::new();
+        // The backend gate matters for the same reason it does in
+        // `deepgram_keyterm_warnings`: `[deepgram]` outlives a switch away from
+        // the backend, and a stale section must not warn on someone else's.
+        if backend != "deepgram-streaming" {
+            return warnings;
+        }
+        let paragraphs = self.deepgram.as_ref().is_some_and(|d| d.paragraphs);
+        if paragraphs {
+            warnings.push(ConfigWarning {
+                message: "[deepgram] paragraphs is ignored with backend = \"deepgram-streaming\": \
+                          the live socket returns its transcript one phrase at a time, with no \
+                          paragraph object and no breaks, so there is nothing to break there. \
+                          Use backend = \"deepgram\" for paragraph breaks, or drop the key — it is \
+                          inert here."
+                    .to_string(),
             });
         }
         warnings
@@ -4638,6 +4740,7 @@ mod tests {
                 deepgram: Some(DeepgramConfig {
                     api_key: "test-key".to_string(),
                     model: default_deepgram_model(),
+                    ..Default::default()
                 }),
                 groq: None,
                 openai: Some(OpenAiConfig {
@@ -5000,8 +5103,78 @@ mod tests {
         config.deepgram = Some(DeepgramConfig {
             api_key: "test-key".to_string(),
             model: model.to_string(),
+            ..Default::default()
         });
         config
+    }
+
+    /// The formatting a config that never mentions the keys gets: exactly the
+    /// request every config sent before they existed. `smart_format` on (it was
+    /// a literal in the request builder) and the two Deepgram defaults off, so
+    /// upgrading changes no transcript.
+    #[test]
+    fn deepgram_formatting_defaults_keep_the_request_every_config_sent() {
+        let config: Config = toml::from_str(
+            "[general]\nbackend = \"deepgram\"\n\n[deepgram]\napi_key = \"k\"\nmodel = \"nova-3\"\n",
+        )
+        .expect("a minimal deepgram config");
+        let format = config.deepgram_format();
+        assert!(format.smart_format, "smart_format was a literal true");
+        assert!(!format.numerals);
+        assert!(!format.paragraphs);
+        assert!(format.is_default());
+
+        // The section is optional, and its absence must answer the same.
+        let config: Config = toml::from_str("").expect("an empty config");
+        assert!(config.deepgram_format().is_default());
+    }
+
+    /// `paragraphs` is the one formatting flag a backend cannot honour: Deepgram
+    /// has no paragraphs on the live socket, so the streaming backend builds a
+    /// request without it. Say it once at load, the way the vocabulary drop is
+    /// said; the REST backend does send it, and a stale section on another
+    /// backend must stay quiet.
+    #[test]
+    fn config_validate_warns_paragraphs_with_the_streaming_backend() {
+        let mut config: Config = toml::from_str("").expect("an empty config");
+        config.general.backend = "deepgram-streaming".to_string();
+        config.deepgram = Some(DeepgramConfig {
+            api_key: "test-key".to_string(),
+            paragraphs: true,
+            ..Default::default()
+        });
+
+        let warnings = config.validate().expect("a keyed config is valid");
+        let warning = warnings
+            .iter()
+            .find(|w| w.message.contains("paragraphs"))
+            .unwrap_or_else(|| panic!("streaming + paragraphs must warn: {warnings:?}"));
+        assert!(
+            warning.message.contains("deepgram-streaming"),
+            "the warning must name the backend: {}",
+            warning.message
+        );
+
+        // The REST backend sends the parameter: nothing to report.
+        config.general.backend = "deepgram".to_string();
+        let warnings = config.validate().expect("a keyed config is valid");
+        assert!(
+            warnings.iter().all(|w| !w.message.contains("paragraphs")),
+            "deepgram sends paragraphs, so it must not warn: {warnings:?}"
+        );
+
+        // And the section outliving a switch to another backend is not a
+        // warning about that backend.
+        config.general.backend = "groq".to_string();
+        config.groq = Some(GroqConfig {
+            api_key: "test-key".to_string(),
+            model: default_groq_model(),
+        });
+        let warnings = config.validate().expect("a keyed config is valid");
+        assert!(
+            warnings.iter().all(|w| !w.message.contains("paragraphs")),
+            "a stale [deepgram] section must not warn on groq: {warnings:?}"
+        );
     }
 
     #[test]
@@ -5805,6 +5978,7 @@ mod tests {
             deepgram: Some(DeepgramConfig {
                 api_key: "test-key".to_string(),
                 model: default_deepgram_model(),
+                ..Default::default()
             }),
             groq: Some(GroqConfig {
                 api_key: "test-key".to_string(),
@@ -7921,12 +8095,15 @@ mod tests {
             SendsPromptCase {
                 name: "deepgram",
                 model: "nova-3",
-                backend: Box::new(DeepgramRestBackend::new(String::new())),
+                backend: Box::new(DeepgramRestBackend::new(String::new(), Default::default())),
             },
             SendsPromptCase {
                 name: "deepgram-streaming",
                 model: "nova-3",
-                backend: Box::new(DeepgramStreamingBackend::new(String::new())),
+                backend: Box::new(DeepgramStreamingBackend::new(
+                    String::new(),
+                    Default::default(),
+                )),
             },
             SendsPromptCase {
                 name: "groq",

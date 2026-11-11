@@ -275,6 +275,15 @@ model = "whisper-large-v3-turbo"
 [deepgram]
 api_key = "..."
 model = "nova-3"
+smart_format = true   # punctuation, capitalization and, where the language has them,
+                      # numerals. On unless set to false: every request used to send
+                      # smart_format=true, so a config that never had the key keeps it
+numerals = false      # numbers as digits ("900", not "nine hundred"), beyond what
+                      # smart_format formats. Off by default; not sent at all when off
+paragraphs = false    # type the transcript broken at pauses (the paragraph-broken text,
+                      # not the flat one). Pre-recorded only: the streaming socket returns
+                      # one phrase at a time with no breaks, so backend = "deepgram-streaming"
+                      # ignores it and says so at start
 
 [openai]
 api_key = "sk-..."

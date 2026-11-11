@@ -3,9 +3,9 @@
    │                                                    │
    │   Backend & keys                                   │
    │                                                    │
-   │ ▌ backend           ◂ local-whisper ▸     profile  │
-   │   deepgram api_key  set ****9f2c        base only  │
-   │   deepgram model    nova-3                   base  │
+   │ ▌ backend                ◂ local-whisp… ▸ profile  │
+   │   deepgram api_key       set ****9f2c   base only  │
+   │   deepgram model         nova-3              base  │
    │                                                    │
    │   The transcription backend. Its key or model is   │
    │   below. local-vosk and local-parakeet are not     │
