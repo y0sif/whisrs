@@ -247,7 +247,7 @@ pub const AGENT_CORNERS: &[Entry] = &[
 /// `[tts] backend`.
 pub const TTS_BACKENDS: &[Entry] = &[
     ("groq", "Orpheus on Groq"),
-    ("openai", "OpenAI speech"),
+    ("openai", "OpenAI speech, shuts down 2027-01-06"),
     ("deepgram", "Deepgram Aura-2"),
     ("tts-sidecar", "a local OpenAI-compatible server"),
 ];

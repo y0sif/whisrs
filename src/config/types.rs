@@ -975,9 +975,9 @@ pub struct TtsConfig {
     /// Whether read-selection-aloud is enabled.
     #[serde(default)]
     pub enabled: bool,
-    /// TTS backend: `"groq"` (default), `"openai"`, `"tts-sidecar"`
-    /// (alias `"openai-compat"`, for local Kokoro/Supertonic servers), or
-    /// `"deepgram"` (Aura-2).
+    /// TTS backend: `"groq"` (default), `"openai"` (stops working on
+    /// 2027-01-06), `"tts-sidecar"` (alias `"openai-compat"`, for local
+    /// Kokoro/Supertonic servers), or `"deepgram"` (Aura-2).
     #[serde(default = "default_tts_backend")]
     pub backend: String,
     /// TTS model identifier (backend-specific). When omitted, each backend
@@ -2556,6 +2556,7 @@ impl Config {
                 });
             }
         }
+        warnings.extend(self.openai_tts_shutdown_warnings());
 
         // Duplicate-binding detection across [hotkeys], llm_commands and
         // agents. The
@@ -3198,6 +3199,51 @@ impl Config {
             )
         };
         vec![ConfigWarning { message }]
+    }
+
+    /// Load-time warning that `[tts] backend = "openai"` stops working on
+    /// 2027-01-06, when OpenAI shuts down its speech models. The backend
+    /// itself goes in a later release (#220).
+    ///
+    /// Gated on `enabled`: with TTS off no backend is built (`tts_backend` in
+    /// `daemon/speak.rs` refuses, and agent replies go through it too), and
+    /// setup leaves stale sections behind, so warning a disabled one is noise.
+    /// A `model`, `voice` or `api_key` set for OpenAI would go to the new
+    /// backend as is (`tts::create_backend`, `resolve_tts_api_key`), so the
+    /// advice names the ones to unset, read as those two read them. Short
+    /// enough that the editor's three-line notice keeps all of it at 80
+    /// columns.
+    fn openai_tts_shutdown_warnings(&self) -> Vec<ConfigWarning> {
+        let Some(tts) = self
+            .tts
+            .as_ref()
+            .filter(|t| t.enabled && t.backend == "openai")
+        else {
+            return Vec::new();
+        };
+        let set = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let keys: Vec<&str> = [
+            ("model", set(&tts.model)),
+            ("voice", set(&tts.voice)),
+            (
+                "api_key",
+                tts.api_key.as_deref().is_some_and(|k| !k.is_empty()),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(key, set)| set.then_some(key))
+        .collect();
+        let unset = match keys.as_slice() {
+            [] => String::new(),
+            [key] => format!(", unset [tts] {key}"),
+            [rest @ .., last] => format!(", unset [tts] {} and {last}", rest.join(", ")),
+        };
+        vec![ConfigWarning {
+            message: format!(
+                "[tts] backend = \"openai\" stops working on 2027-01-06, when OpenAI shuts down \
+                 its speech models. Switch to groq, deepgram or tts-sidecar{unset}."
+            ),
+        }]
     }
 
     /// Load-time warnings about `[general] prompt` and `[general] vocabulary`
@@ -6031,6 +6077,84 @@ mod tests {
         config.tts = None;
         config.agents.clear();
         assert!(tts_warnings(&config).is_empty());
+    }
+
+    /// The `[tts] backend = "openai"` shutdown warnings out of `validate()`
+    /// or `validate_to_write()`.
+    fn openai_tts_shutdown_warnings_of(warnings: Vec<ConfigWarning>) -> Vec<String> {
+        warnings
+            .into_iter()
+            .map(|w| w.message)
+            .filter(|m| m.contains("stops working on 2027-01-06"))
+            .collect()
+    }
+
+    #[test]
+    fn config_validate_warns_once_for_enabled_openai_tts() {
+        let mut config = validatable_config("groq");
+        config.tts = Some(toml::from_str("enabled = true\nbackend = \"openai\"").unwrap());
+        let warnings = openai_tts_shutdown_warnings_of(config.validate().unwrap());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].ends_with("Switch to groq, deepgram or tts-sidecar."),
+            "{warnings:?}"
+        );
+
+        // The editor's save path warns too: it does not depend on MissingKey.
+        let warnings = openai_tts_shutdown_warnings_of(config.validate_to_write().unwrap());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    /// An OpenAI `model`, `voice` or `api_key` would be sent to the new
+    /// backend, so the advice names the ones set; a blank model or voice is
+    /// unset, as `create_backend` reads it.
+    #[test]
+    fn openai_tts_shutdown_warning_names_keys_to_unset() {
+        let mut config = validatable_config("groq");
+        for (case, extra, tail) in [
+            (
+                "all three",
+                "model = \"tts-1\"\nvoice = \"marin\"\napi_key = \"sk-test\"",
+                "tts-sidecar, unset [tts] model, voice and api_key.",
+            ),
+            (
+                "model, blank voice",
+                "model = \"tts-1\"\nvoice = \" \"",
+                "tts-sidecar, unset [tts] model.",
+            ),
+            (
+                "voice and key",
+                "voice = \"marin\"\napi_key = \"sk-test\"",
+                "tts-sidecar, unset [tts] voice and api_key.",
+            ),
+        ] {
+            config.tts = Some(
+                toml::from_str(&format!("enabled = true\nbackend = \"openai\"\n{extra}")).unwrap(),
+            );
+            let warnings = openai_tts_shutdown_warnings_of(config.validate().unwrap());
+            assert_eq!(warnings.len(), 1, "{case}: {warnings:?}");
+            assert!(warnings[0].ends_with(tail), "{case}: {warnings:?}");
+        }
+    }
+
+    #[test]
+    fn config_validate_silent_for_disabled_or_other_tts() {
+        // With TTS off no backend is built, so a stale section stays quiet.
+        let mut config = validatable_config("groq");
+        config.tts = Some(toml::from_str("enabled = false\nbackend = \"openai\"").unwrap());
+        let warnings = openai_tts_shutdown_warnings_of(config.validate().unwrap());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        for backend in ["groq", "deepgram", "tts-sidecar"] {
+            config.tts =
+                Some(toml::from_str(&format!("enabled = true\nbackend = \"{backend}\"")).unwrap());
+            let warnings = openai_tts_shutdown_warnings_of(config.validate().unwrap());
+            assert!(warnings.is_empty(), "{backend}: {warnings:?}");
+        }
+
+        config.tts = None;
+        let warnings = openai_tts_shutdown_warnings_of(config.validate().unwrap());
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// `[[agents]]` keys are known keys: no unknown-key warning.

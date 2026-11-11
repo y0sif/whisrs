@@ -427,6 +427,7 @@ instruction = "Translate the following text into German, using the friendly info
 [tts]
 enabled = false             # off by default
 backend = "groq"            # groq | openai | deepgram | tts-sidecar
+#                           #   openai stops working on 2027-01-06 (OpenAI shuts down its speech models)
 # model = "..."             # optional; backend default when unset.
 #                           #   groq: canopylabs/orpheus-v1-english, openai: gpt-4o-mini-tts,
 #                           #   deepgram: aura-2-thalia-en, tts-sidecar: kokoro

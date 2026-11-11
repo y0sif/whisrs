@@ -7,7 +7,8 @@
 //! - `groq` / `openai` / `tts-sidecar` share the OpenAI `/v1/audio/speech`
 //!   request shape via [`openai_compat::OpenAiCompatTts`]. The `tts-sidecar`
 //!   backend points at any local OpenAI-compatible server (Kokoro, Supertonic,
-//!   etc.) and needs no API key.
+//!   etc.) and needs no API key. `openai` stops working on 2027-01-06, when
+//!   OpenAI shuts down its speech models (#220).
 //! - `deepgram` uses Deepgram Aura-2 via [`deepgram_aura::DeepgramAuraTts`].
 //!
 //! Roadmap: native in-process local backends (Supertonic via ONNX/`ort`,
