@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::asr_sidecar::AsrSidecarBackend;
 use super::deepgram::{DeepgramRestBackend, DeepgramStreamingBackend};
@@ -23,6 +23,8 @@ use super::transcription_prompt;
 use super::TranscriptionBackend;
 #[cfg(feature = "recording")]
 use super::TranscriptionConfig;
+use crate::config::catalog;
+use crate::config::types::default_asr_sidecar_model;
 #[cfg(feature = "recording")]
 use crate::RecordingConfig;
 use crate::{Config, LocalWhisperConfig};
@@ -339,13 +341,28 @@ pub fn model_for_backend(name: &str, config: &Config) -> String {
         "local-whisper" | "local" => "base.en".to_string(),
         "local-vosk" => "small-en-us".to_string(),
         "local-parakeet" => "eou-120m".to_string(),
-        "asr-sidecar" | "asr" | "vibevoice" => config
-            .asr_sidecar
-            .as_ref()
-            .map(|v| v.model.clone())
-            .unwrap_or_else(|| "microsoft/VibeVoice-ASR-HF".to_string()),
+        "asr-sidecar" | "asr" | "vibevoice" => asr_sidecar_model(config),
         _ => "whisper-large-v3-turbo".to_string(),
     }
+}
+
+/// The model the ASR sidecar is sent: `[asr-sidecar] model`, except on
+/// OpenRouter, where the local default (a model OpenRouter does not have,
+/// so every request would be a 400) goes as OpenRouter's default, as
+/// tts-sidecar picks its default model by URL. `whisrs config` can point
+/// the URL at OpenRouter and leave the model as it was.
+fn asr_sidecar_model(config: &Config) -> String {
+    let local = default_asr_sidecar_model();
+    let model = config
+        .asr_sidecar
+        .as_ref()
+        .map_or_else(|| local.clone(), |v| v.model.clone());
+    if model == local && catalog::is_openrouter(&asr_sidecar_url(config)) {
+        let openrouter = catalog::OPENROUTER_STT_DEFAULT_MODEL;
+        debug!("OpenRouter has no {model}: sending {openrouter} instead");
+        return openrouter.to_string();
+    }
+    model
 }
 
 /// The canonical name of a backend: aliases resolve to the name they stand
@@ -626,6 +643,58 @@ mod tests {
 
         assert_eq!(backend.url(), "http://127.0.0.1:8765/transcribe");
         assert_eq!(backend.api_key(), None);
+    }
+
+    /// On OpenRouter the local default model, which OpenRouter does not
+    /// have, goes as OpenRouter's default (`whisrs config` can move the URL
+    /// and leave the model); a model named stays, and a server of your own
+    /// gets the local default. Dictation and recordings alike.
+    #[test]
+    fn asr_sidecar_model_on_openrouter_is_openrouters_default() {
+        let local = "microsoft/VibeVoice-ASR-HF";
+        for (url, model, want) in [
+            (
+                catalog::OPENROUTER_STT_URL,
+                local,
+                catalog::OPENROUTER_STT_DEFAULT_MODEL,
+            ),
+            (
+                catalog::OPENROUTER_STT_URL,
+                "qwen/qwen3-asr-1.7b",
+                "qwen/qwen3-asr-1.7b",
+            ),
+            ("http://127.0.0.1:8765/transcribe", local, local),
+        ] {
+            let mut config = config_with_sidecar_key(Some("sk-or-v1-test"));
+            let sidecar = config.asr_sidecar.as_mut().unwrap();
+            sidecar.url = url.to_string();
+            sidecar.model = model.to_string();
+            for name in ["asr-sidecar", "asr", "vibevoice"] {
+                assert_eq!(model_for_backend(name, &config), want, "{url} {model}");
+            }
+            #[cfg(feature = "recording")]
+            assert_eq!(
+                recording_transcription_config("asr-sidecar", &config, "en").model,
+                want,
+                "{url} {model}"
+            );
+        }
+
+        // An OpenRouter URL with the model left out of the file.
+        let config: Config = toml::from_str(&format!(
+            "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"{}\"\n",
+            catalog::OPENROUTER_STT_URL
+        ))
+        .unwrap();
+        assert_eq!(
+            model_for_backend("asr-sidecar", &config),
+            catalog::OPENROUTER_STT_DEFAULT_MODEL
+        );
+
+        // No section at all: the local server and its default.
+        let mut config = config_with_sidecar_key(None);
+        config.asr_sidecar = None;
+        assert_eq!(model_for_backend("asr-sidecar", &config), local);
     }
 
     #[test]

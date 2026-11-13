@@ -316,6 +316,10 @@ pub fn unset_text(path: &str, unset: &str, config: &Config) -> String {
             None => return "not used: the voice is in the model".to_string(),
         },
         "tts.url" => Some(whisrs::tts::DEFAULT_SIDECAR_URL.to_string()),
+        "asr-sidecar.model" => Some(whisrs::transcription::factory::model_for_backend(
+            "asr-sidecar",
+            config,
+        )),
         "recording.backend" => Some(config.general.backend.clone()),
         "recording.language" => Some(config.general.language.clone()),
         "recording.mic_language" | "recording.system_language" => Some(

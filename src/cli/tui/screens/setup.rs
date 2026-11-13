@@ -676,6 +676,11 @@ impl Setup {
         if !self.dictation_on_openrouter() {
             return None;
         }
+        self.sidecar_key()
+    }
+
+    /// `[asr-sidecar] api_key` in the answers, unless unset or blank.
+    fn sidecar_key(&self) -> Option<String> {
         self.editor
             .form
             .value("asr-sidecar.api_key")
@@ -683,6 +688,32 @@ impl Setup {
             .map(str::trim)
             .filter(|key| !key.is_empty())
             .map(str::to_string)
+    }
+
+    /// Dictation's OpenRouter key retyped (`was`: the key before, say a
+    /// typo fixed back on its step): command mode and read aloud on
+    /// OpenRouter that still hold the old one, a copy of it, take the new
+    /// one. A key of their own, or one cleared, stays.
+    fn follow_retyped_key(&mut self, was: Option<String>) {
+        let (Some(was), Some(key)) = (was, self.openrouter_key()) else {
+            return;
+        };
+        if was == key {
+            return;
+        }
+        let copy = |own: Option<&str>| own.map(str::trim) == Some(was.as_str());
+        let config = self.editor.form.config();
+        let llm = config
+            .llm
+            .as_ref()
+            .is_some_and(|l| catalog::is_openrouter(&l.api_url) && copy(Some(&l.api_key)));
+        let tts = self.tts_on_openrouter()
+            && copy(config.tts.as_ref().and_then(|t| t.api_key.as_deref()));
+        for (path, follows) in [("llm.api_key", llm), ("tts.api_key", tts)] {
+            if follows {
+                let _ = self.editor.form.set(path, Some(Value::from(key.as_str())));
+            }
+        }
     }
 
     /// The sidecar's model follows its URL: onto OpenRouter, the local
@@ -838,12 +869,14 @@ impl Setup {
     }
 
     /// A key the row editor takes, and what follows from a changed answer:
-    /// the test or the sample is moot, the mic follows the device, and a
-    /// row that comes or goes with a value (the sidecar's URL, recording's
-    /// key) does.
+    /// the test or the sample is moot, the mic follows the device, the
+    /// modes' copies follow dictation's OpenRouter key, and a row that
+    /// comes or goes with a value (the sidecar's URL, recording's key)
+    /// does.
     fn editor_key(&mut self, action: Action) -> Reply {
         let device = self.editor.form.config().audio.device.clone();
         let sidecar_url = self.sidecar_url();
+        let sidecar_key = self.sidecar_key();
         let on_openrouter = self.mode_on_openrouter();
         let outcome = self.editor.key(action);
         let changed = outcome.flash.is_some();
@@ -854,6 +887,7 @@ impl Setup {
             }
             if self.step == Step::Key {
                 self.follow_sidecar_url(self.sidecar_url() != sidecar_url);
+                self.follow_retyped_key(sidecar_key);
             }
             if matches!(self.step, Step::Command | Step::ReadAloud) {
                 self.follow_openrouter_key(on_openrouter);
@@ -1134,9 +1168,10 @@ impl Setup {
     /// that has a voice: its key is then there already. On OpenRouter that
     /// is tts-sidecar on OpenRouter's URL, with the key copied and a model
     /// or voice OpenRouter does not list (another backend's) cleared,
-    /// unless `[tts] url` names another server, or config.toml has
-    /// tts-sidecar on one (its own, while the URL is unset): that stays. A
-    /// `[tts] api_key` kept from the file keeps the backend it is for.
+    /// unless `[tts] url` names another server, or config.toml has read
+    /// aloud enabled on tts-sidecar at one (its own, while the URL is
+    /// unset): that stays. A `[tts] api_key` kept from the file keeps the
+    /// backend it is for.
     fn start_read_aloud(&mut self) {
         let _ = self
             .editor
@@ -1182,9 +1217,16 @@ impl Setup {
 
     /// The tts-sidecar server config.toml has read aloud on, when it is not
     /// OpenRouter: its backend name and URL (`None`, the server on this
-    /// machine).
+    /// machine). Only read aloud enabled there is a choice made; a `[tts]`
+    /// left over with it off is not.
     fn files_tts_server(&self) -> Option<(String, Option<String>)> {
-        let tts = self.existing.as_ref()?.config.tts.as_ref()?;
+        let tts = self
+            .existing
+            .as_ref()?
+            .config
+            .tts
+            .as_ref()
+            .filter(|tts| tts.enabled)?;
         if !matches!(tts.backend.as_str(), "tts-sidecar" | "openai-compat") {
             return None;
         }

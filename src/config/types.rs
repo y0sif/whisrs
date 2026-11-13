@@ -1287,7 +1287,7 @@ pub(crate) fn default_phrase_silence_ms() -> u64 {
 fn default_asr_sidecar_url() -> String {
     "http://127.0.0.1:8765/transcribe".to_string()
 }
-fn default_asr_sidecar_model() -> String {
+pub(crate) fn default_asr_sidecar_model() -> String {
     "microsoft/VibeVoice-ASR-HF".to_string()
 }
 fn default_openai_compatible_realtime_model() -> String {

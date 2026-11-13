@@ -2646,6 +2646,16 @@ fn shown(screen: &ConfigScreen, field: &Field, path: &str, env: &Env, ui: &Ui) -
         } if text.is_some_and(|text| means_unset(path, text)) => {
             Shown::muted(options::unset_text(path, unset, config))
         }
+        // The local default model on OpenRouter, which lacks it: the daemon
+        // sends OpenRouter's default instead.
+        Kind::Suggest { .. }
+            if path == "asr-sidecar.model"
+                && text.is_some_and(|text| {
+                    text != whisrs::transcription::factory::model_for_backend("asr-sidecar", config)
+                }) =>
+        {
+            Shown::muted(options::unset_text(path, "default", config))
+        }
         Kind::Suggest { unset, .. } => match text {
             Some("") => Shown::muted("empty"),
             Some(text) => Shown::plain(text),
@@ -4309,6 +4319,49 @@ mod tests {
         let own = app("[general]\nbackend = \"asr-sidecar\"\n[tts]\nbackend = \"tts-sidecar\"\n");
         assert_eq!(text(&own, "asr-sidecar.api_key"), "not set, optional");
         assert_eq!(text(&own, "tts.api_key"), "not needed");
+    }
+
+    /// The sidecar's model row says what goes: on OpenRouter the local
+    /// default model is sent as OpenRouter's default, left out of the file
+    /// or written in it; a model named there, or the local server's
+    /// default, reads as it is.
+    #[test]
+    fn the_sidecar_model_row_says_openrouters_default() {
+        use whisrs::config::catalog;
+
+        let ui_theme = crate::tui::testing::theme();
+        let glyphs = crate::tui::glyphs::Glyphs::UNICODE;
+        let ui = Ui {
+            theme: &ui_theme,
+            glyphs: &glyphs,
+        };
+        let text = |toml: &str| {
+            let fixture = app(toml);
+            let path = "asr-sidecar.model";
+            shown(
+                &fixture.app.config,
+                schema::row(path),
+                path,
+                &fixture.app.env,
+                &ui,
+            )
+            .parts
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<String>()
+        };
+        let openrouter = format!(
+            "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"{}\"\n",
+            catalog::OPENROUTER_STT_URL
+        );
+        let sends = format!("default ({})", catalog::OPENROUTER_STT_DEFAULT_MODEL);
+        assert_eq!(text(&openrouter), sends);
+        let written = format!("{openrouter}model = \"microsoft/VibeVoice-ASR-HF\"\n");
+        assert_eq!(text(&written), sends);
+        let named = format!("{openrouter}model = \"qwen/qwen3-asr-1.7b\"\n");
+        assert_eq!(text(&named), "qwen/qwen3-asr-1.7b");
+        let own = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\n";
+        assert_eq!(text(own), "microsoft/VibeVoice-ASR-HF");
     }
 
     // Saving.
