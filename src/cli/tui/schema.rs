@@ -134,10 +134,15 @@ pub enum Source {
     Languages {
         auto: bool,
     },
-    /// The models of the form's `[tts] backend`.
+    /// The models of the form's `[tts] backend` (on OpenRouter, from its
+    /// `[tts] url`).
     TtsModels,
-    /// The voices of the form's `[tts] backend`.
+    /// The voices of the form's `[tts] backend` (on OpenRouter, of its
+    /// `[tts] model`).
     TtsVoices,
+    /// The models of the form's `[asr-sidecar] url` host: OpenRouter's, or
+    /// none for a server of your own.
+    AsrSidecarModels,
     /// The chat models of the form's `[llm] api_url` host.
     LlmModels,
     /// Microphones, from the sound server, on a worker.
@@ -239,8 +244,6 @@ pub const FREE_TEXT: &[(&str, &str)] = &[
         "general.llm_instruction",
         "an instruction in your own words",
     ),
-    ("asr-sidecar.url", "where your own server listens"),
-    ("asr-sidecar.model", "named by your own server"),
     (
         "openai-compatible-realtime.url",
         "where your own server listens",
@@ -249,7 +252,6 @@ pub const FREE_TEXT: &[(&str, &str)] = &[
         "openai-compatible-realtime.model",
         "named by your own server",
     ),
-    ("tts.url", "where your own server listens"),
     ("recording.user_name", "your name"),
     (
         "recording.diarization_url",
@@ -595,20 +597,30 @@ const BACKEND: &[Field] = &[
     field(
         "asr-sidecar.url",
         "sidecar url",
-        STRING,
-        "The ASR sidecar's transcription endpoint.",
+        Kind::Suggest {
+            unset: None,
+            check: Some(check_url),
+            from: Source::List(catalog::ASR_SIDECAR_URLS),
+        },
+        "The sidecar's transcription endpoint: a server of your own, or OpenRouter.",
     ),
     field(
         "asr-sidecar.model",
         "sidecar model",
-        STRING,
-        "The model name sent to the sidecar.",
+        Kind::Suggest {
+            unset: None,
+            check: None,
+            from: Source::AsrSidecarModels,
+        },
+        "The model name sent to the sidecar. Listed for OpenRouter, with the price of an hour \
+         of audio; a server of your own names its own.",
     ),
     field(
         "asr-sidecar.api_key",
         "sidecar api_key",
         Kind::Secret,
-        "Optional bearer token for the sidecar. WHISRS_ASR_SIDECAR_API_KEY wins over it.",
+        "The sidecar's bearer token: optional for a server of your own, OpenRouter needs it. \
+         WHISRS_ASR_SIDECAR_API_KEY wins over it.",
     ),
     field(
         "openai-compatible-realtime.url",
@@ -896,7 +908,8 @@ const TTS: &[Field] = &[
         "tts.backend",
         "backend",
         Kind::Choice(catalog::TTS_BACKENDS),
-        "Who reads the text: a cloud voice, or tts-sidecar, your own OpenAI-compatible server.",
+        "Who reads the text: a cloud voice, or tts-sidecar, which asks a server of your own or \
+         OpenRouter.",
     ),
     field(
         "tts.model",
@@ -906,7 +919,8 @@ const TTS: &[Field] = &[
             check: None,
             from: Source::TtsModels,
         },
-        "The TTS model, from the backend's list. With deepgram the model is the voice.",
+        "The TTS model, from the backend's list (OpenRouter's, on its url). With deepgram the \
+         model is the voice.",
     ),
     field(
         "tts.voice",
@@ -916,23 +930,25 @@ const TTS: &[Field] = &[
             check: None,
             from: Source::TtsVoices,
         },
-        "The voice, as the backend spells it. deepgram does not use it: its voice is in the \
-         model.",
+        "The voice, as the backend spells it. On OpenRouter each model has its own. deepgram \
+         does not use it: its voice is in the model.",
     ),
     field(
         "tts.api_key",
         "api_key",
         Kind::Secret,
-        "Unset, the backend's own key is used ([groq], [openai] or [deepgram]).",
+        "Unset, the backend's own key is used ([groq], [openai] or [deepgram]). tts-sidecar \
+         sends only this one, which OpenRouter needs.",
     ),
     field(
         "tts.url",
         "url",
-        Kind::Text {
+        Kind::Suggest {
             unset: Some("not set"),
             check: Some(check_url),
+            from: Source::List(catalog::TTS_URLS),
         },
-        "The tts-sidecar endpoint (/v1/audio/speech).",
+        "The tts-sidecar endpoint (/v1/audio/speech): a server of your own, or OpenRouter.",
     ),
     field(
         "tts.response_format",

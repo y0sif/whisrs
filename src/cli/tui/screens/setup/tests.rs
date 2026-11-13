@@ -1929,3 +1929,287 @@ fn nixos_uinput_checks_require_declarative_setup() {
         }
     }
 }
+
+/// The OpenRouter key every OpenRouter test below types.
+const OR_KEY: &str = "sk-or-v1-test-4321";
+
+/// The value at `path` in setup's answers, as text.
+fn text_at(fixture: &Fixture, path: &str) -> Option<String> {
+    setup(fixture)
+        .editor
+        .form
+        .value(path)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// A fresh setup on the ASR sidecar's key step, OpenRouter picked from
+/// the URL list and its key typed.
+fn on_openrouter_key_step() -> Fixture {
+    let mut fixture = setup_on(None, &[]);
+    answer(&mut fixture, "general.backend", "asr-sidecar");
+    press(&mut fixture.app, "\n");
+    assert_eq!(setup(&fixture).step, Step::Key);
+    assert_eq!(focused(&fixture).as_deref(), Some("asr-sidecar.url"));
+    press(&mut fixture.app, " ");
+    type_text(&mut fixture.app, "openrouter");
+    press(&mut fixture.app, "\n");
+    assert_eq!(
+        text_at(&fixture, "asr-sidecar.url").as_deref(),
+        Some(catalog::OPENROUTER_STT_URL)
+    );
+    press(&mut fixture.app, "jj ");
+    type_text(&mut fixture.app, OR_KEY);
+    press(&mut fixture.app, "\n");
+    fixture
+}
+
+/// The sidecar's model follows its URL: onto OpenRouter the local default
+/// (a model OpenRouter lacks) becomes OpenRouter's default, and back off
+/// it again; a model picked stays. The step says it is OpenRouter, and
+/// that t asks about the key for free.
+#[test]
+fn the_sidecar_model_follows_the_url_onto_openrouter() {
+    let mut fixture = on_openrouter_key_step();
+    assert_eq!(
+        text_at(&fixture, "asr-sidecar.model").as_deref(),
+        Some(catalog::OPENROUTER_STT_DEFAULT_MODEL)
+    );
+    let screen = drawn(&fixture, 90, 30).join("\n");
+    assert!(screen.contains("OpenRouter"), "{screen}");
+    assert!(
+        screen.contains("t asks OpenRouter about the key, for free"),
+        "{screen}"
+    );
+
+    // Back to the local server: its own default model again.
+    press(&mut fixture.app, "kk ");
+    type_text(&mut fixture.app, "own");
+    press(&mut fixture.app, "\n");
+    assert_eq!(
+        text_at(&fixture, "asr-sidecar.url").as_deref(),
+        Some("http://127.0.0.1:8765/transcribe")
+    );
+    assert_eq!(
+        text_at(&fixture, "asr-sidecar.model").as_deref(),
+        Some("microsoft/VibeVoice-ASR-HF")
+    );
+    let screen = drawn(&fixture, 90, 30).join("\n");
+    assert!(
+        screen.contains("t sends the sidecar half a second of silence"),
+        "{screen}"
+    );
+
+    // A model picked stays, wherever the URL goes.
+    answer(&mut fixture, "asr-sidecar.model", "qwen/qwen3-asr-0.6b");
+    press(&mut fixture.app, " ");
+    type_text(&mut fixture.app, "openrouter");
+    press(&mut fixture.app, "\n");
+    assert_eq!(
+        text_at(&fixture, "asr-sidecar.model").as_deref(),
+        Some("qwen/qwen3-asr-0.6b")
+    );
+
+    // Start fresh over a file on OpenRouter keeps its URL and key, and the
+    // model follows them.
+    let file = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\n\
+                url = \"https://openrouter.ai/api/v1/audio/transcriptions\"\n\
+                api_key = \"sk-or-v1-file-1234\"\n";
+    let mut fixture = setup_on(Some(file), &[]);
+    press(&mut fixture.app, "\n");
+    answer(&mut fixture, "general.backend", "asr-sidecar");
+    press(&mut fixture.app, "\n");
+    assert_eq!(setup(&fixture).step, Step::Key);
+    assert_eq!(
+        text_at(&fixture, "asr-sidecar.model").as_deref(),
+        Some(catalog::OPENROUTER_STT_DEFAULT_MODEL)
+    );
+}
+
+/// Dictation on OpenRouter with a key: command mode set up starts on
+/// OpenRouter's chat, and read aloud on tts-sidecar at OpenRouter's URL,
+/// each with that key, so it is typed once. The review says OpenRouter,
+/// and the write carries the key in all three sections.
+#[test]
+fn openrouter_dictation_lends_its_key_to_the_modes() {
+    let mut fixture = on_openrouter_modes();
+    skip_to(&mut fixture, Step::Command);
+    press(&mut fixture.app, "\n");
+    let chat = catalog::LLM_URLS
+        .iter()
+        .map(|(url, _)| *url)
+        .find(|url| catalog::is_openrouter(url))
+        .unwrap();
+    assert_eq!(text_at(&fixture, "llm.api_url").as_deref(), Some(chat));
+    assert_eq!(
+        text_at(&fixture, "llm.model").as_deref(),
+        Some(catalog::OPENROUTER_CHAT_MODELS[0].0)
+    );
+    assert_eq!(text_at(&fixture, "llm.api_key").as_deref(), Some(OR_KEY));
+    // The key follows the URL off OpenRouter, where it would be refused,
+    // and back.
+    press(&mut fixture.app, " ");
+    type_text(&mut fixture.app, "groq");
+    press(&mut fixture.app, "\n");
+    assert_eq!(text_at(&fixture, "llm.api_key").as_deref(), Some(""));
+    press(&mut fixture.app, " ");
+    type_text(&mut fixture.app, "openrouter");
+    press(&mut fixture.app, "\n");
+    assert_eq!(text_at(&fixture, "llm.api_url").as_deref(), Some(chat));
+    assert_eq!(text_at(&fixture, "llm.api_key").as_deref(), Some(OR_KEY));
+    press(&mut fixture.app, "\n");
+
+    assert_eq!(setup(&fixture).step, Step::ReadAloud);
+    press(&mut fixture.app, "\n");
+    // Read aloud's too: off tts-sidecar and back.
+    press(&mut fixture.app, "l");
+    assert_eq!(text_at(&fixture, "tts.backend").as_deref(), Some("groq"));
+    assert_eq!(text_at(&fixture, "tts.api_key"), None);
+    press(&mut fixture.app, "h");
+    assert_eq!(
+        text_at(&fixture, "tts.backend").as_deref(),
+        Some("tts-sidecar")
+    );
+    assert_eq!(
+        text_at(&fixture, "tts.url").as_deref(),
+        Some(catalog::OPENROUTER_TTS_URL)
+    );
+    assert_eq!(text_at(&fixture, "tts.api_key").as_deref(), Some(OR_KEY));
+    assert!(shown_rows(&fixture).contains(&"tts.url".to_string()));
+    press(&mut fixture.app, "\n");
+    assert_eq!(setup(&fixture).step, Step::Jarvis);
+    skip_modes(&mut fixture);
+
+    let review = drawn(&fixture, 90, 40);
+    let has = |label: &str, value: &str| {
+        review
+            .iter()
+            .any(|r| r.contains(&format!(" {label} ")) && r.contains(value))
+    };
+    assert!(has("sidecar", "OpenRouter"), "{review:#?}");
+    assert!(has("model", catalog::OPENROUTER_STT_DEFAULT_MODEL));
+    assert!(has("key", "set ****4321"));
+    assert!(has("command mode", "openrouter.ai"));
+    assert!(has(
+        "read aloud",
+        "set up \u{b7} OpenRouter \u{b7} af_heart"
+    ));
+
+    let asked = setup(&fixture).asked();
+    for key in [
+        "asr-sidecar.api_key",
+        "llm.api_key",
+        "tts.api_key",
+        "tts.url",
+    ] {
+        assert!(asked.contains(&key.to_string()), "{key}: {asked:?}");
+    }
+    assert_eq!(write(&mut fixture), Some(Effect::Checks));
+    let text = std::fs::read_to_string(paths(fixture.dir.path()).config).unwrap();
+    let written: whisrs::Config = toml::from_str(&text).unwrap();
+    let sidecar = written.asr_sidecar.unwrap();
+    assert_eq!(sidecar.api_key.as_deref(), Some(OR_KEY), "{text}");
+    assert_eq!(sidecar.model, catalog::OPENROUTER_STT_DEFAULT_MODEL);
+    let llm = written.llm.unwrap();
+    assert_eq!(llm.api_key, OR_KEY);
+    assert_eq!(llm.api_url, chat);
+    let tts = written.tts.unwrap();
+    assert!(tts.enabled);
+    assert_eq!(tts.backend, "tts-sidecar");
+    assert_eq!(tts.url.as_deref(), Some(catalog::OPENROUTER_TTS_URL));
+    assert_eq!(tts.api_key.as_deref(), Some(OR_KEY));
+}
+
+/// On OpenRouter's key step, on to the first optional step.
+fn on_openrouter_modes() -> Fixture {
+    let mut fixture = on_openrouter_key_step();
+    press(&mut fixture.app, "\n\n\n\n\n");
+    assert!(setup(&fixture).step.optional());
+    fixture
+}
+
+/// The key goes only to OpenRouter, and never over an answer given: an
+/// LLM URL of another provider keeps it out, an LLM key or a TTS key of
+/// its own stays with what it is for, and a TTS URL of your own keeps
+/// read aloud off OpenRouter.
+#[test]
+fn openrouter_key_never_overwrites_an_answer() {
+    let mut fixture = on_openrouter_modes();
+    skip_to(&mut fixture, Step::Command);
+    let groq = "https://api.groq.com/openai/v1/chat/completions";
+    answer(&mut fixture, "llm.api_url", groq);
+    press(&mut fixture.app, "\n");
+    assert_eq!(text_at(&fixture, "llm.api_url").as_deref(), Some(groq));
+    assert_eq!(
+        text_at(&fixture, "llm.model").as_deref(),
+        Some("gpt-4o-mini")
+    );
+    assert_eq!(text_at(&fixture, "llm.api_key").as_deref(), Some(""));
+
+    let mut fixture = on_openrouter_modes();
+    skip_to(&mut fixture, Step::Command);
+    answer(&mut fixture, "llm.api_key", "sk-llm-own-1111");
+    press(&mut fixture.app, "\n");
+    assert_eq!(
+        text_at(&fixture, "llm.api_url").as_deref(),
+        Some("https://api.openai.com/v1/chat/completions")
+    );
+    assert_eq!(
+        text_at(&fixture, "llm.api_key").as_deref(),
+        Some("sk-llm-own-1111")
+    );
+
+    let mut fixture = on_openrouter_modes();
+    skip_to(&mut fixture, Step::ReadAloud);
+    let own = "http://10.0.0.2:8880/v1/audio/speech";
+    answer(&mut fixture, "tts.url", own);
+    press(&mut fixture.app, "\n");
+    assert_eq!(text_at(&fixture, "tts.url").as_deref(), Some(own));
+    assert_eq!(text_at(&fixture, "tts.api_key"), None);
+    assert_ne!(
+        text_at(&fixture, "tts.backend").as_deref(),
+        Some("tts-sidecar")
+    );
+
+    let mut fixture = on_openrouter_modes();
+    skip_to(&mut fixture, Step::ReadAloud);
+    answer(&mut fixture, "tts.backend", "openai");
+    answer(&mut fixture, "tts.api_key", "sk-tts-own-2222");
+    press(&mut fixture.app, "\n");
+    assert_eq!(text_at(&fixture, "tts.backend").as_deref(), Some("openai"));
+    assert_eq!(
+        text_at(&fixture, "tts.api_key").as_deref(),
+        Some("sk-tts-own-2222")
+    );
+    assert_eq!(text_at(&fixture, "tts.url"), None);
+}
+
+/// Read aloud on OpenRouter needs its key (tts-sidecar sends no other),
+/// and a voice its model has: the default is Kokoro's.
+#[test]
+fn read_aloud_on_openrouter_needs_its_key_and_a_voice_of_the_model() {
+    let mut fixture = on_the_modes();
+    skip_to(&mut fixture, Step::ReadAloud);
+    press(&mut fixture.app, "\n");
+    answer(&mut fixture, "tts.backend", "tts-sidecar");
+    answer(&mut fixture, "tts.url", catalog::OPENROUTER_TTS_URL);
+    press(&mut fixture.app, "\n");
+    assert_eq!(setup(&fixture).step, Step::ReadAloud);
+    assert_eq!(
+        status(&fixture),
+        "read aloud on OpenRouter needs its key: space types it on api_key, or s skips read \
+         aloud"
+    );
+    answer(&mut fixture, "tts.api_key", OR_KEY);
+    answer(&mut fixture, "tts.model", "elevenlabs/eleven-flash-v2.5");
+    press(&mut fixture.app, "\n");
+    assert_eq!(setup(&fixture).step, Step::ReadAloud);
+    assert_eq!(
+        status(&fixture),
+        "elevenlabs/eleven-flash-v2.5 has no voice af_heart: space picks one on voice, or s \
+         skips read aloud"
+    );
+    answer(&mut fixture, "tts.voice", "george");
+    press(&mut fixture.app, "\n");
+    assert_eq!(setup(&fixture).step, Step::Jarvis);
+}

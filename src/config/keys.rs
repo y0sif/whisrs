@@ -88,15 +88,18 @@ pub fn key_summary_from(config: &Config, env: impl Fn(&str) -> Option<String>) -
             if let Some(key) = env(var).filter(|key| !key.trim().is_empty()) {
                 return from_env(var, key.trim());
             }
-            return match config
-                .asr_sidecar
-                .as_ref()
+            let sidecar = config.asr_sidecar.as_ref();
+            return match sidecar
                 .and_then(|s| s.api_key.as_deref())
                 .filter(|key| !key.trim().is_empty())
             {
                 Some(key) => KeySummary::File {
                     masked: mask_api_key(key),
                 },
+                // OpenRouter refuses a request without one.
+                None if sidecar.is_some_and(|s| crate::config::catalog::is_openrouter(&s.url)) => {
+                    KeySummary::NotSet
+                }
                 None => KeySummary::Optional("API key"),
             };
         }
@@ -398,6 +401,25 @@ api_key = "tts-SECRET-gggg"
         assert_eq!(key_summary(&keyed, &[]), file_key("****5555"));
         let unknown = "[general]\nbackend = \"nope\"\n";
         assert_eq!(key_summary(unknown, &[]), KeySummary::NotSet);
+    }
+
+    /// The sidecar's key is optional, but not on OpenRouter, which refuses
+    /// a request without one.
+    #[test]
+    fn key_summary_of_the_sidecar_on_openrouter_needs_a_key() {
+        let openrouter = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\n\
+                          url = \"https://openrouter.ai/api/v1/audio/transcriptions\"\n";
+        assert_eq!(key_summary(openrouter, &[]), KeySummary::NotSet);
+        let keyed = format!("{openrouter}api_key = \"sk-or-v1-4321\"\n");
+        assert_eq!(key_summary(&keyed, &[]), file_key("****4321"));
+        let env = key_summary(
+            openrouter,
+            &[("WHISRS_ASR_SIDECAR_API_KEY", "sk-or-env-9876")],
+        );
+        assert_eq!(env, env_key("WHISRS_ASR_SIDECAR_API_KEY", "****9876"));
+        let own = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\n\
+                   url = \"http://10.0.0.2:8765/transcribe\"\n";
+        assert_eq!(key_summary(own, &[]), KeySummary::Optional("API key"));
     }
 
     /// The daemon's blank-env rules differ by backend: groq only skips an

@@ -26,7 +26,7 @@ use crate::config::catalog;
 use crate::{TtsConfig, WhisrsError};
 
 /// Default endpoint for a local OpenAI-compatible TTS sidecar (e.g. Kokoro-FastAPI).
-const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:8880/v1/audio/speech";
+pub const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:8880/v1/audio/speech";
 
 /// OpenAI's text-to-speech endpoint.
 const OPENAI_SPEECH_URL: &str = "https://api.openai.com/v1/audio/speech";

@@ -431,15 +431,19 @@ backend = "groq"            # groq | openai | deepgram | tts-sidecar
 # model = "..."             # optional; backend default when unset.
 #                           #   groq: canopylabs/orpheus-v1-english, openai: gpt-4o-mini-tts,
 #                           #   deepgram: aura-2-thalia-en, tts-sidecar: kokoro
+#                           #   (hexgrad/kokoro-82m on OpenRouter)
 #                           #   groq also speaks Saudi Arabic: see "Read-aloud in
 #                           #   Arabic" below
 # voice = "..."             # optional; backend default (groq: autumn, openai: alloy,
 #                           #   tts-sidecar: af_heart). Ignored by deepgram (voice is in the model id).
-response_format = "wav"     # audio format requested from the API
+response_format = "wav"     # wav, or pcm (raw 16-bit audio, which whisrs plays too).
+#                           #   tts-sidecar on OpenRouter asks for pcm by itself.
 # api_key = "..."           # optional; falls back to the backend's transcription key
-#                           #   ([groq]/[openai]/[deepgram]). tts-sidecar needs none.
+#                           #   ([groq]/[openai]/[deepgram]). tts-sidecar sends only
+#                           #   this one: a local server needs none, OpenRouter does.
 # url = "http://127.0.0.1:8880/v1/audio/speech"  # tts-sidecar only: local
-#                           #   OpenAI-compatible server (Kokoro, Supertonic, ...)
+#                           #   OpenAI-compatible server (Kokoro, Supertonic, ...),
+#                           #   or OpenRouter (see "ASR sidecar servers" below)
 
 # Agent mode (optional): talk to a coding agent by voice. Each entry is one
 # agent working in one directory. Its replies are spoken through [tts] above
@@ -690,15 +694,42 @@ OpenRouter picks the provider, and a request can cost more than the list price: 
 `whisper-large-v3-turbo` request that went to Groq was billed as 10 seconds
 at about $0.04 an hour.
 
-- No model is free.
+- No speech-to-text model is free.
 - `[general] vocabulary` and `prompt` do nothing: whisrs sends them as the
-  `hotwords` field, which OpenRouter accepts and ignores.
+  `hotwords` field, which OpenRouter accepts and ignores. whisrs warns when
+  either is set.
+- `whisrs setup` and `whisrs config` list the URL and every model with its
+  price (setup starts on `openai/whisper-large-v3-turbo`). `t` there asks
+  OpenRouter about the key (`GET /api/v1/key`), which is free: no audio is
+  sent.
+- With dictation on OpenRouter, `whisrs setup` offers the same key to
+  command mode (OpenRouter's chat URL) and read aloud (below), so it is
+  typed once.
 - Recordings go one request per chunk (up to 10 minutes of speech): whisrs
   asks for word timings and cuts the answer into sentences. All six models
   above return them (checked 2026-11-06). `voxtral-mini-transcribe-3-0`
   refuses the request for word timestamps, so whisrs asks it once more
   without them, once per recording, or once per daemon start when
   `[general] backend` is `asr-sidecar` too.
+
+Read aloud reaches OpenRouter's voices through `tts-sidecar`:
+
+```toml
+[tts]
+enabled = true
+backend = "tts-sidecar"
+url = "https://openrouter.ai/api/v1/audio/speech"
+api_key = "sk-or-..."   # tts-sidecar sends no other key
+# model = "hexgrad/kokoro-82m"   # the default there
+# voice = "af_heart"             # the default; Kokoro's voices
+```
+
+OpenRouter refuses `wav`, so whisrs asks it for `pcm` and plays that. Each
+model has its own voices: set `voice` with `model`, since the default,
+`af_heart`, is Kokoro's. The pickers list a few models (Kokoro, a free
+HeyGen one, Voxtral, MAI-Voice, ElevenLabs, Gemini), each with its price
+per 1,000 characters and its voices (checked 2026-11-13); any other model
+or voice can be typed.
 
 ## Read-aloud in Arabic
 
@@ -2164,7 +2195,7 @@ The following variables override the matching `api_key` in `config.toml`:
 With one of these set, the matching `api_key` line can be left out of `config.toml`
 entirely. Keep the section itself if you set `model` there.
 
-These provider keys are also used by the matching TTS backend (`groq`/`openai`/`deepgram`) unless `[tts] api_key` is set. The `tts-sidecar` backend needs no key.
+These provider keys are also used by the matching TTS backend (`groq`/`openai`/`deepgram`) unless `[tts] api_key` is set. The `tts-sidecar` backend uses `[tts] api_key` alone: a local server needs none, OpenRouter does.
 
 `RUST_LOG` controls daemon log verbosity (e.g. `RUST_LOG=debug whisrsd`).
 

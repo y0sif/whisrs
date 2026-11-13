@@ -2798,8 +2798,16 @@ fn key_from(screen: &ConfigScreen, path: &str, env: &Env) -> KeyFrom {
                 (Some(key), _) => KeyFrom::File(keys::mask_api_key(key)),
                 (None, "tts") => {
                     let tts = config.tts.as_ref().map_or("groq", |t| t.backend.as_str());
+                    let url = config.tts.as_ref().and_then(|t| t.url.as_deref());
                     match tts {
                         "groq" | "openai" | "deepgram" => KeyFrom::Uses(tts.to_string()),
+                        // tts-sidecar sends this key alone, and OpenRouter
+                        // refuses a request without one.
+                        _ if url.is_some_and(whisrs::config::catalog::is_openrouter) => {
+                            KeyFrom::NotSet {
+                                warn: config.tts.as_ref().is_some_and(|t| t.enabled),
+                            }
+                        }
                         _ => KeyFrom::NotNeeded,
                     }
                 }
@@ -4267,6 +4275,42 @@ mod tests {
         assert_eq!(text("sidecar api_key"), "not set, optional");
     }
 
+    /// On OpenRouter the sidecar's key and tts-sidecar's are needed, not
+    /// optional: it refuses a request without one. A server of your own
+    /// needs none.
+    #[test]
+    fn an_openrouter_key_is_needed() {
+        let ui_theme = crate::tui::testing::theme();
+        let glyphs = crate::tui::glyphs::Glyphs::UNICODE;
+        let ui = Ui {
+            theme: &ui_theme,
+            glyphs: &glyphs,
+        };
+        let text = |fixture: &Fixture, path: &str| {
+            let shown = shown(
+                &fixture.app.config,
+                schema::row(path),
+                path,
+                &fixture.app.env,
+                &ui,
+            );
+            shown
+                .parts
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<String>()
+        };
+        let openrouter = app("[general]\nbackend = \"asr-sidecar\"\n\
+             [asr-sidecar]\nurl = \"https://openrouter.ai/api/v1/audio/transcriptions\"\n\
+             [tts]\nenabled = true\nbackend = \"tts-sidecar\"\n\
+             url = \"https://openrouter.ai/api/v1/audio/speech\"\n");
+        assert_eq!(text(&openrouter, "asr-sidecar.api_key"), "not set");
+        assert_eq!(text(&openrouter, "tts.api_key"), "not set");
+        let own = app("[general]\nbackend = \"asr-sidecar\"\n[tts]\nbackend = \"tts-sidecar\"\n");
+        assert_eq!(text(&own, "asr-sidecar.api_key"), "not set, optional");
+        assert_eq!(text(&own, "tts.api_key"), "not needed");
+    }
+
     // Saving.
 
     /// Acceptance criterion 2: a save keeps comments, key order and unknown
@@ -4306,13 +4350,15 @@ mod tests {
     }
 
     /// An invalid config is refused, nothing is written, and every edit
-    /// stays.
+    /// stays. (A typed URL: the sidecar's is picked now, so it cannot be
+    /// emptied.)
     #[test]
     fn an_invalid_config_is_refused_with_its_edits_kept() {
-        let toml = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"http://127.0.0.1:8765/transcribe\"\n";
+        let toml = "[general]\nbackend = \"openai-compatible-realtime\"\n\
+                    [openai-compatible-realtime]\nurl = \"ws://localhost:12345/realtime\"\n";
         let mut fixture = app(toml);
         open(&mut fixture, "Backend & keys");
-        to_row(&mut fixture, "sidecar url");
+        to_row(&mut fixture, "realtime url");
         press(&mut fixture.app, "\n");
         chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         press(&mut fixture.app, "\n");
@@ -4326,7 +4372,7 @@ mod tests {
             Err(other) => panic!("refused for another reason: {other:?}"),
             Ok(_) => panic!("saved an invalid config"),
         };
-        assert!(why.contains("no sidecar URL configured"), "{why}");
+        assert!(why.contains("no WebSocket URL configured"), "{why}");
         assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), toml);
         fixture
             .app
@@ -4336,7 +4382,8 @@ mod tests {
         assert!(status.text.starts_with("not saved: "), "{}", status.text);
         assert!(fixture.app.config.form.is_dirty());
         assert!(!config(&fixture).general.notify);
-        assert_eq!(config(&fixture).asr_sidecar.as_ref().unwrap().url, "");
+        let realtime = config(&fixture).openai_compatible_realtime.clone().unwrap();
+        assert_eq!(realtime.url, "");
     }
 
     /// A sparse config, hand-commented: what the save tests below edit.

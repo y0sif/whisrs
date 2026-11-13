@@ -149,7 +149,10 @@ pub const BACKENDS: &[Entry] = &[
         "a realtime server of your own (Lemonade)",
     ),
     ("local-whisper", "whisper.cpp on this machine, offline"),
-    ("asr-sidecar", "an HTTP ASR server of your own"),
+    (
+        "asr-sidecar",
+        "an HTTP ASR server of your own, or OpenRouter",
+    ),
     ("local-vosk", "Vosk on this machine, offline"),
     ("local-parakeet", "NVIDIA Parakeet on this machine, offline"),
 ];
@@ -163,7 +166,10 @@ pub const RECORDING_BACKENDS: &[Entry] = &[
     ("groq", "Whisper on Groq"),
     ("openai", "OpenAI transcription"),
     ("deepgram", "Deepgram, with speakers told apart"),
-    ("asr-sidecar", "an HTTP ASR server of your own"),
+    (
+        "asr-sidecar",
+        "an HTTP ASR server of your own, or OpenRouter",
+    ),
     ("local-whisper", "whisper.cpp on this machine, offline"),
 ];
 
@@ -249,7 +255,10 @@ pub const TTS_BACKENDS: &[Entry] = &[
     ("groq", "Orpheus on Groq"),
     ("openai", "OpenAI speech, shuts down 2027-01-06"),
     ("deepgram", "Deepgram Aura-2"),
-    ("tts-sidecar", "a local OpenAI-compatible server"),
+    (
+        "tts-sidecar",
+        "an OpenAI-compatible server of your own, or OpenRouter",
+    ),
 ];
 
 /// `[[agents]] harness`.
@@ -351,6 +360,19 @@ pub const OPENAI_MODELS: &[Entry] = &[
     ("gpt-4o-transcribe", "both backends, removed 2027-02-26"),
     ("gpt-4o-mini-transcribe", "openai, removed 2027-02-26"),
     ("whisper-1", "openai, timestamps, removed 2027-02-26"),
+];
+
+/// `[asr-sidecar] url`: a server of your own where it listens by default,
+/// and OpenRouter. Its models: [`asr_sidecar_models`].
+///
+/// Sources: the `[asr-sidecar] url` default (src/config/types.rs), and
+/// OpenRouter's live API, checked 2026-11-13.
+pub const ASR_SIDECAR_URLS: &[Entry] = &[
+    (
+        "http://127.0.0.1:8765/transcribe",
+        "a server of your own on this machine",
+    ),
+    (OPENROUTER_STT_URL, "OpenRouter, many models, one key"),
 ];
 
 /// A whisper.cpp model whisrs setup can download: its name (the file is
@@ -650,8 +672,9 @@ pub const DEEPGRAM_TTS_MODELS: &[Entry] = &[
 /// Source: https://github.com/remsky/Kokoro-FastAPI, checked 2026-10-29.
 pub const SIDECAR_TTS_MODELS: &[Entry] = &[("kokoro", "Kokoro-82M (Kokoro-FastAPI)")];
 
-/// `[tts] voice` with `backend = "tts-sidecar"`: Kokoro's voices. Kokoro-
-/// FastAPI also takes blends (`af_bella+af_sky`), which can be typed.
+/// `[tts] voice` with `backend = "tts-sidecar"`: Kokoro's voices, which
+/// OpenRouter's `hexgrad/kokoro-82m` has too. Kokoro-FastAPI also takes
+/// blends (`af_bella+af_sky`), which can be typed.
 ///
 /// Source: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md,
 /// checked 2026-10-29.
@@ -712,23 +735,47 @@ pub const KOKORO_VOICES: &[Entry] = &[
     ("pm_santa", "Brazilian Portuguese, male"),
 ];
 
-/// The `[tts] model` list for `backend`.
-pub fn tts_models(backend: &str) -> &'static [Entry] {
+/// `[tts] url`, which only `tts-sidecar` reads: a server of your own where
+/// it listens by default, and OpenRouter.
+///
+/// Sources: `tts::DEFAULT_SIDECAR_URL`, and OpenRouter's live API, checked
+/// 2026-11-13.
+pub const TTS_URLS: &[Entry] = &[
+    (
+        crate::tts::DEFAULT_SIDECAR_URL,
+        "a server of your own on this machine (Kokoro-FastAPI)",
+    ),
+    (OPENROUTER_TTS_URL, "OpenRouter, many voices, one key"),
+];
+
+/// The `[tts] model` list for `backend`; for `tts-sidecar`, OpenRouter's
+/// when `url` (`[tts] url`) is there.
+pub fn tts_models(backend: &str, url: Option<&str>) -> &'static [Entry] {
     match backend {
         "groq" => GROQ_TTS_MODELS,
         "openai" => OPENAI_TTS_MODELS,
         "deepgram" => DEEPGRAM_TTS_MODELS,
+        "tts-sidecar" | "openai-compat" if url.is_some_and(is_openrouter) => OPENROUTER_TTS_MODELS,
         "tts-sidecar" | "openai-compat" => SIDECAR_TTS_MODELS,
         _ => &[],
     }
 }
 
 /// The `[tts] voice` list for `backend`; none for deepgram, whose voice is
-/// in the model id.
-pub fn tts_voices(backend: &str) -> &'static [Entry] {
+/// in the model id. On OpenRouter (`url`) each model has voices of its own:
+/// `model`'s, or the default model's while it is unset.
+pub fn tts_voices(backend: &str, url: Option<&str>, model: Option<&str>) -> &'static [Entry] {
     match backend {
         "groq" => GROQ_TTS_VOICES,
         "openai" => OPENAI_TTS_VOICES,
+        "tts-sidecar" | "openai-compat" if url.is_some_and(is_openrouter) => {
+            let model = model
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .or_else(|| crate::tts::default_model(backend, url))
+                .unwrap_or_default();
+            openrouter_tts_voices(model)
+        }
         "tts-sidecar" | "openai-compat" => KOKORO_VOICES,
         _ => &[],
     }
@@ -876,6 +923,422 @@ fn host_of(url: &str) -> (String, Option<&str>) {
     (name.to_ascii_lowercase(), port)
 }
 
+/// `[asr-sidecar] model` on OpenRouter: every speech-to-text model it has,
+/// the setup default first, then cheapest first, each with what an hour of
+/// audio costs (three are priced per token instead). None of them takes a
+/// prompt or vocabulary (`Config::openrouter_prompt_warnings`).
+///
+/// Source: https://openrouter.ai/api/v1/models?output_modalities=transcription,
+/// checked 2026-11-13 (`pricing.prompt` is per second of audio, but per
+/// hour for the two MAI-Transcribe models).
+pub const OPENROUTER_STT_MODELS: &[Entry] = &[
+    (
+        "openai/whisper-large-v3-turbo",
+        "Whisper Large V3 Turbo, $0.012 per hour",
+    ),
+    (
+        "nvidia/nemotron-3.5-asr-streaming-multilingual-0.6b",
+        "Nemotron 3.5 ASR Streaming Multilingual 0.6B, $0.012 per hour",
+    ),
+    ("qwen/qwen3-asr-0.6b", "Qwen3 ASR 0.6B, $0.012 per hour"),
+    (
+        "openai/whisper-large-v3",
+        "Whisper Large V3, $0.027 per hour",
+    ),
+    ("qwen/qwen3-asr-1.7b", "Qwen3 ASR 1.7B, $0.027 per hour"),
+    (
+        "mistralai/voxtral-mini-3b-2507",
+        "Voxtral Mini 3B 2507, $0.06 per hour",
+    ),
+    ("moondream/parakeet-ultra", "Parakeet Ultra, $0.06 per hour"),
+    (
+        "nvidia/nemotron-3.5-transcribe",
+        "Nemotron 3.5 Transcribe, $0.06 per hour",
+    ),
+    (
+        "nvidia/parakeet-tdt-0.6b-v3",
+        "Parakeet TDT 0.6B v3, $0.06 per hour",
+    ),
+    (
+        "microsoft/mai-transcribe-2",
+        "MAI-Transcribe 2, $0.10 per hour",
+    ),
+    ("x-ai/grok-stt-1.0", "Grok STT 1.0, $0.10 per hour"),
+    ("x-ai/grok-stt-2.0", "Grok STT 2.0, $0.10 per hour"),
+    (
+        "meta/muse-voice-transcribe-1.0",
+        "Muse Voice Transcribe 1.0, $0.18 per hour",
+    ),
+    (
+        "mistralai/voxtral-mini-transcribe",
+        "Voxtral Mini Transcribe, $0.18 per hour",
+    ),
+    (
+        "mistralai/voxtral-small-24b-2507-stt",
+        "Voxtral Small 24B 2507 STT, $0.18 per hour",
+    ),
+    (
+        "mistralai/voxtral-mini-transcribe-3-0",
+        "Voxtral Mini Transcribe 3, $0.21 per hour",
+    ),
+    ("elevenlabs/scribe-v2", "Scribe v2, $0.22 per hour"),
+    (
+        "elevenlabs/scribe-v2-medical",
+        "Scribe v2 Medical, $0.22 per hour",
+    ),
+    (
+        "mistralai/voxtral-small-transcribe-3-0",
+        "Voxtral Small Transcribe 3, $0.24 per hour",
+    ),
+    ("deepgram/nova-3", "Nova-3, $0.26 per hour"),
+    ("openai/gpt-transcribe", "GPT Transcribe, $0.27 per hour"),
+    (
+        "assemblyai/universal-3-5-pro",
+        "Universal-3.5 Pro, $0.30 per hour",
+    ),
+    (
+        "assemblyai/universal-3-6-pro",
+        "Universal-3.6 Pro, $0.30 per hour",
+    ),
+    ("fish-audio/transcribe-1", "Transcribe 1, $0.36 per hour"),
+    (
+        "fish-audio/transcribe-1-pro",
+        "Transcribe 1 Pro, $0.36 per hour",
+    ),
+    (
+        "microsoft/mai-transcribe-1.5",
+        "MAI-Transcribe 1.5, $0.36 per hour",
+    ),
+    ("openai/whisper-1", "Whisper 1, $0.36 per hour"),
+    ("google/chirp-3", "Chirp 3, $0.96 per hour"),
+    (
+        "google/gemini-3.5-transcribe",
+        "Gemini 3.5 Transcribe, priced per token",
+    ),
+    (
+        "openai/gpt-4o-mini-transcribe",
+        "GPT-4o Mini Transcribe, priced per token",
+    ),
+    (
+        "openai/gpt-4o-transcribe",
+        "GPT-4o Transcribe, priced per token",
+    ),
+];
+
+/// The `[asr-sidecar] model` setup picks when the sidecar URL becomes
+/// OpenRouter's: the daemon's own default is a local model OpenRouter does
+/// not have.
+pub const OPENROUTER_STT_DEFAULT_MODEL: &str = "openai/whisper-large-v3-turbo";
+
+/// `[tts] model` with `backend = "tts-sidecar"` on OpenRouter: a few of its
+/// speech models, Kokoro (the default there, `tts::default_model`) first,
+/// then free, then cheapest first, each with what 1,000 characters cost.
+///
+/// Source: https://openrouter.ai/api/v1/models?output_modalities=speech,
+/// checked 2026-11-13 (`pricing.prompt` is per character).
+pub const OPENROUTER_TTS_MODELS: &[Entry] = &[
+    (
+        "hexgrad/kokoro-82m",
+        "Kokoro 82M, $0.00062 per 1,000 characters",
+    ),
+    (
+        "heygen/heygen-voice-1-turbo:free",
+        "HeyGen Voice Turbo, free",
+    ),
+    (
+        "mistralai/voxtral-mini-tts-3-0",
+        "Voxtral TTS 3, $0.013 per 1,000 characters",
+    ),
+    (
+        "microsoft/mai-voice-2.1-flash",
+        "MAI-Voice-2.1-Flash, $0.015 per 1,000 characters",
+    ),
+    (
+        "elevenlabs/eleven-flash-v2.5",
+        "Eleven Flash v2.5, $0.04 per 1,000 characters",
+    ),
+    (
+        "google/gemini-3.8-flash-tts",
+        "Gemini 3.8 Flash TTS, priced per token",
+    ),
+];
+
+// The voices of each model on OpenRouter, from its `supported_voices`
+// (Kokoro's are `KOKORO_VOICES`, the same 54). A voice's line says only
+// what its id says.
+//
+// Source: https://openrouter.ai/api/v1/models?output_modalities=speech,
+// checked 2026-11-13.
+
+/// `[tts] voice` for `heygen/heygen-voice-1-turbo:free`.
+pub const HEYGEN_TTS_VOICES: &[Entry] = &[
+    ("nadine", "a HeyGen voice"),
+    ("tabitha", "a HeyGen voice"),
+    ("bram", "a HeyGen voice"),
+    ("gareth", "a HeyGen voice"),
+    ("noelle", "a HeyGen voice"),
+    ("meredith", "a HeyGen voice"),
+    ("sabrina", "a HeyGen voice"),
+    ("lucian", "a HeyGen voice"),
+    ("weston", "a HeyGen voice"),
+    ("vincent", "a HeyGen voice"),
+];
+
+/// `[tts] voice` for `mistralai/voxtral-mini-tts-3-0`: the named voices
+/// (language and mood), then the numbered ones.
+pub const VOXTRAL_TTS_VOICES: &[Entry] = &[
+    ("en_paul_neutral", "English, neutral"),
+    ("en_paul_angry", "English, angry"),
+    ("en_paul_cheerful", "English, cheerful"),
+    ("en_paul_confident", "English, confident"),
+    ("en_paul_excited", "English, excited"),
+    ("en_paul_frustrated", "English, frustrated"),
+    ("en_paul_happy", "English, happy"),
+    ("en_paul_sad", "English, sad"),
+    ("gb_jane_neutral", "British English, neutral"),
+    ("gb_jane_confident", "British English, confident"),
+    ("gb_jane_confused", "British English, confused"),
+    ("gb_jane_curious", "British English, curious"),
+    ("gb_jane_frustrated", "British English, frustrated"),
+    ("gb_jane_jealousy", "British English, jealousy"),
+    ("gb_jane_sad", "British English, sad"),
+    ("gb_jane_sarcasm", "British English, sarcasm"),
+    ("gb_jane_shameful", "British English, shameful"),
+    ("gb_oliver_neutral", "British English, neutral"),
+    ("gb_oliver_angry", "British English, angry"),
+    ("gb_oliver_cheerful", "British English, cheerful"),
+    ("gb_oliver_confident", "British English, confident"),
+    ("gb_oliver_curious", "British English, curious"),
+    ("gb_oliver_excited", "British English, excited"),
+    ("gb_oliver_sad", "British English, sad"),
+    ("fr_marie_neutral", "French, neutral"),
+    ("fr_marie_angry", "French, angry"),
+    ("fr_marie_curious", "French, curious"),
+    ("fr_marie_excited", "French, excited"),
+    ("fr_marie_happy", "French, happy"),
+    ("fr_marie_sad", "French, sad"),
+    ("voice_447", "a Voxtral voice"),
+    ("voice_478", "a Voxtral voice"),
+    ("voice_479", "a Voxtral voice"),
+    ("voice_480", "a Voxtral voice"),
+    ("voice_481", "a Voxtral voice"),
+    ("voice_482", "a Voxtral voice"),
+    ("voice_483", "a Voxtral voice"),
+    ("voice_485", "a Voxtral voice"),
+    ("voice_589", "a Voxtral voice"),
+    ("voice_590", "a Voxtral voice"),
+    ("voice_591", "a Voxtral voice"),
+    ("voice_592", "a Voxtral voice"),
+    ("voice_1786", "a Voxtral voice"),
+    ("voice_1787", "a Voxtral voice"),
+    ("voice_1788", "a Voxtral voice"),
+    ("voice_3132", "a Voxtral voice"),
+    ("voice_3133", "a Voxtral voice"),
+    ("voice_3134", "a Voxtral voice"),
+    ("voice_3135", "a Voxtral voice"),
+    ("voice_3136", "a Voxtral voice"),
+    ("voice_3137", "a Voxtral voice"),
+    ("voice_3138", "a Voxtral voice"),
+    ("voice_3139", "a Voxtral voice"),
+    ("voice_3140", "a Voxtral voice"),
+    ("voice_3141", "a Voxtral voice"),
+    ("voice_3142", "a Voxtral voice"),
+    ("voice_3143", "a Voxtral voice"),
+    ("voice_3144", "a Voxtral voice"),
+    ("voice_3145", "a Voxtral voice"),
+    ("voice_3146", "a Voxtral voice"),
+    ("voice_3147", "a Voxtral voice"),
+    ("voice_3149", "a Voxtral voice"),
+    ("voice_3150", "a Voxtral voice"),
+    ("voice_3153", "a Voxtral voice"),
+    ("voice_3154", "a Voxtral voice"),
+    ("voice_3155", "a Voxtral voice"),
+];
+
+/// `[tts] voice` for `microsoft/mai-voice-2.1-flash`, by locale.
+pub const MAI_TTS_VOICES: &[Entry] = &[
+    ("cs-CZ-Grant:MAI-Voice-2.1-Flash", "Czech"),
+    ("cs-CZ-Harper:MAI-Voice-2.1-Flash", "Czech"),
+    ("da-DK-Grant:MAI-Voice-2.1-Flash", "Danish"),
+    ("da-DK-Harper:MAI-Voice-2.1-Flash", "Danish"),
+    ("de-DE-Grant:MAI-Voice-2.1-Flash", "German"),
+    ("de-DE-Harper:MAI-Voice-2.1-Flash", "German"),
+    ("de-DE-Klaus:MAI-Voice-2.1-Flash", "German"),
+    ("de-DE-Mia:MAI-Voice-2.1-Flash", "German"),
+    ("en-AU-Isla:MAI-Voice-2.1-Flash", "English Australian"),
+    ("en-GB-Emily:MAI-Voice-2.1-Flash", "English British"),
+    ("en-GB-Harry:MAI-Voice-2.1-Flash", "English British"),
+    ("en-IN-Dhruv:MAI-Voice-2.1-Flash", "English Indian"),
+    ("en-IN-Priya:MAI-Voice-2.1-Flash", "English Indian"),
+    ("en-US-Ethan:MAI-Voice-2.1-Flash", "English US"),
+    ("en-US-Grant:MAI-Voice-2.1-Flash", "English US"),
+    ("en-US-Harper:MAI-Voice-2.1-Flash", "English US"),
+    ("en-US-Iris:MAI-Voice-2.1-Flash", "English US"),
+    ("en-US-Jasper:MAI-Voice-2.1-Flash", "English US"),
+    ("en-US-Olivia:MAI-Voice-2.1-Flash", "English US"),
+    ("en-US-Sage:MAI-Voice-2.1-Flash", "English US"),
+    ("es-ES-Marta:MAI-Voice-2.1-Flash", "Spanish Peninsular"),
+    ("es-MX-Alejo:MAI-Voice-2.1-Flash", "Spanish Mexican"),
+    ("es-MX-Grant:MAI-Voice-2.1-Flash", "Spanish Mexican"),
+    ("es-MX-Harper:MAI-Voice-2.1-Flash", "Spanish Mexican"),
+    ("es-MX-Valeria:MAI-Voice-2.1-Flash", "Spanish Mexican"),
+    ("fi-FI-Grant:MAI-Voice-2.1-Flash", "Finnish"),
+    ("fi-FI-Harper:MAI-Voice-2.1-Flash", "Finnish"),
+    ("fr-FR-Grant:MAI-Voice-2.1-Flash", "French"),
+    ("fr-FR-Harper:MAI-Voice-2.1-Flash", "French"),
+    ("fr-FR-Marc:MAI-Voice-2.1-Flash", "French"),
+    ("fr-FR-Soleil:MAI-Voice-2.1-Flash", "French"),
+    ("hi-IN-Arjun:MAI-Voice-2.1-Flash", "Hindi"),
+    ("hi-IN-Dhruv:MAI-Voice-2.1-Flash", "Hindi"),
+    ("hi-IN-Grant:MAI-Voice-2.1-Flash", "Hindi"),
+    ("hi-IN-Harper:MAI-Voice-2.1-Flash", "Hindi"),
+    ("hi-IN-Kavya:MAI-Voice-2.1-Flash", "Hindi"),
+    ("hi-IN-Priya:MAI-Voice-2.1-Flash", "Hindi"),
+    ("hu-HU-Bence:MAI-Voice-2.1-Flash", "Hungarian"),
+    ("hu-HU-Grant:MAI-Voice-2.1-Flash", "Hungarian"),
+    ("hu-HU-Harper:MAI-Voice-2.1-Flash", "Hungarian"),
+    ("hu-HU-Levente:MAI-Voice-2.1-Flash", "Hungarian"),
+    ("hu-HU-Lilla:MAI-Voice-2.1-Flash", "Hungarian"),
+    ("hu-HU-Reka:MAI-Voice-2.1-Flash", "Hungarian"),
+    ("id-ID-Grant:MAI-Voice-2.1-Flash", "Indonesian"),
+    ("id-ID-Harper:MAI-Voice-2.1-Flash", "Indonesian"),
+    ("it-IT-Grant:MAI-Voice-2.1-Flash", "Italian"),
+    ("it-IT-Harper:MAI-Voice-2.1-Flash", "Italian"),
+    ("it-IT-Luca:MAI-Voice-2.1-Flash", "Italian"),
+    ("it-IT-Rosa:MAI-Voice-2.1-Flash", "Italian"),
+    ("ko-KR-Grant:MAI-Voice-2.1-Flash", "Korean"),
+    ("ko-KR-Haena:MAI-Voice-2.1-Flash", "Korean"),
+    ("ko-KR-Harper:MAI-Voice-2.1-Flash", "Korean"),
+    ("ko-KR-Junho:MAI-Voice-2.1-Flash", "Korean"),
+    ("nb-NO-Grant:MAI-Voice-2.1-Flash", "Norwegian"),
+    ("nb-NO-Harper:MAI-Voice-2.1-Flash", "Norwegian"),
+    ("nl-NL-Grant:MAI-Voice-2.1-Flash", "Dutch"),
+    ("nl-NL-Harper:MAI-Voice-2.1-Flash", "Dutch"),
+    ("nl-NL-Sander:MAI-Voice-2.1-Flash", "Dutch"),
+    ("pl-PL-Grant:MAI-Voice-2.1-Flash", "Polish"),
+    ("pl-PL-Harper:MAI-Voice-2.1-Flash", "Polish"),
+    ("pt-BR-Caio:MAI-Voice-2.1-Flash", "Portuguese Brazilian"),
+    ("pt-BR-Grant:MAI-Voice-2.1-Flash", "Portuguese Brazilian"),
+    ("pt-BR-Harper:MAI-Voice-2.1-Flash", "Portuguese Brazilian"),
+    ("pt-BR-Luana:MAI-Voice-2.1-Flash", "Portuguese Brazilian"),
+    ("pt-BR-Pedro:MAI-Voice-2.1-Flash", "Portuguese Brazilian"),
+    ("pt-BR-Rafael:MAI-Voice-2.1-Flash", "Portuguese Brazilian"),
+    ("pt-PT-Grant:MAI-Voice-2.1-Flash", "Portuguese European"),
+    ("pt-PT-Harper:MAI-Voice-2.1-Flash", "Portuguese European"),
+    ("pt-PT-Rui:MAI-Voice-2.1-Flash", "Portuguese European"),
+    ("ro-RO-Andrei:MAI-Voice-2.1-Flash", "Romanian"),
+    ("ro-RO-Elena:MAI-Voice-2.1-Flash", "Romanian"),
+    ("ro-RO-Grant:MAI-Voice-2.1-Flash", "Romanian"),
+    ("ro-RO-Harper:MAI-Voice-2.1-Flash", "Romanian"),
+    ("ro-RO-Ioana:MAI-Voice-2.1-Flash", "Romanian"),
+    ("ro-RO-Radu:MAI-Voice-2.1-Flash", "Romanian"),
+    ("ru-RU-Grant:MAI-Voice-2.1-Flash", "Russian"),
+    ("ru-RU-Harper:MAI-Voice-2.1-Flash", "Russian"),
+    ("ru-RU-Lev:MAI-Voice-2.1-Flash", "Russian"),
+    ("ru-RU-Masha:MAI-Voice-2.1-Flash", "Russian"),
+    ("sv-SE-Grant:MAI-Voice-2.1-Flash", "Swedish"),
+    ("sv-SE-Harper:MAI-Voice-2.1-Flash", "Swedish"),
+    ("th-TH-Grant:MAI-Voice-2.1-Flash", "Thai"),
+    ("th-TH-Harper:MAI-Voice-2.1-Flash", "Thai"),
+    ("th-TH-Krit:MAI-Voice-2.1-Flash", "Thai"),
+    ("th-TH-Nattapong:MAI-Voice-2.1-Flash", "Thai"),
+    ("tr-TR-Aydin:MAI-Voice-2.1-Flash", "Turkish"),
+    ("tr-TR-Elif:MAI-Voice-2.1-Flash", "Turkish"),
+    ("tr-TR-Grant:MAI-Voice-2.1-Flash", "Turkish"),
+    ("tr-TR-Harper:MAI-Voice-2.1-Flash", "Turkish"),
+    ("vi-VN-Grant:MAI-Voice-2.1-Flash", "Vietnamese"),
+    ("vi-VN-Harper:MAI-Voice-2.1-Flash", "Vietnamese"),
+    ("zh-CN-Bo:MAI-Voice-2.1-Flash", "Mandarin"),
+    ("zh-CN-Grant:MAI-Voice-2.1-Flash", "Mandarin"),
+    ("zh-CN-Harper:MAI-Voice-2.1-Flash", "Mandarin"),
+    ("zh-CN-Lan:MAI-Voice-2.1-Flash", "Mandarin"),
+    ("zh-CN-Mei:MAI-Voice-2.1-Flash", "Mandarin"),
+    ("zh-CN-Wei:MAI-Voice-2.1-Flash", "Mandarin"),
+];
+
+/// `[tts] voice` for `elevenlabs/eleven-flash-v2.5`.
+pub const ELEVENLABS_TTS_VOICES: &[Entry] = &[
+    ("adam", "an ElevenLabs voice"),
+    ("alice", "an ElevenLabs voice"),
+    ("bella", "an ElevenLabs voice"),
+    ("bill", "an ElevenLabs voice"),
+    ("brian", "an ElevenLabs voice"),
+    ("callum", "an ElevenLabs voice"),
+    ("charlie", "an ElevenLabs voice"),
+    ("chris", "an ElevenLabs voice"),
+    ("daniel", "an ElevenLabs voice"),
+    ("eric", "an ElevenLabs voice"),
+    ("george", "an ElevenLabs voice"),
+    ("harry", "an ElevenLabs voice"),
+    ("jessica", "an ElevenLabs voice"),
+    ("laura", "an ElevenLabs voice"),
+    ("liam", "an ElevenLabs voice"),
+    ("lily", "an ElevenLabs voice"),
+    ("matilda", "an ElevenLabs voice"),
+    ("river", "an ElevenLabs voice"),
+    ("roger", "an ElevenLabs voice"),
+    ("sarah", "an ElevenLabs voice"),
+    ("will", "an ElevenLabs voice"),
+];
+
+/// `[tts] voice` for `google/gemini-3.8-flash-tts`.
+pub const GEMINI_TTS_VOICES: &[Entry] = &[
+    ("Zephyr", "a Gemini voice"),
+    ("Puck", "a Gemini voice"),
+    ("Charon", "a Gemini voice"),
+    ("Kore", "a Gemini voice"),
+    ("Fenrir", "a Gemini voice"),
+    ("Leda", "a Gemini voice"),
+    ("Orus", "a Gemini voice"),
+    ("Aoede", "a Gemini voice"),
+    ("Callirrhoe", "a Gemini voice"),
+    ("Autonoe", "a Gemini voice"),
+    ("Enceladus", "a Gemini voice"),
+    ("Iapetus", "a Gemini voice"),
+    ("Umbriel", "a Gemini voice"),
+    ("Algieba", "a Gemini voice"),
+    ("Despina", "a Gemini voice"),
+    ("Erinome", "a Gemini voice"),
+    ("Algenib", "a Gemini voice"),
+    ("Rasalgethi", "a Gemini voice"),
+    ("Laomedeia", "a Gemini voice"),
+    ("Achernar", "a Gemini voice"),
+    ("Alnilam", "a Gemini voice"),
+    ("Schedar", "a Gemini voice"),
+    ("Gacrux", "a Gemini voice"),
+    ("Pulcherrima", "a Gemini voice"),
+    ("Achird", "a Gemini voice"),
+    ("Zubenelgenubi", "a Gemini voice"),
+    ("Vindemiatrix", "a Gemini voice"),
+    ("Sadachbia", "a Gemini voice"),
+    ("Sadaltager", "a Gemini voice"),
+    ("Sulafat", "a Gemini voice"),
+];
+
+/// The `[asr-sidecar] model` list for `url`: OpenRouter's on its host, else
+/// none (a server of your own names its own).
+pub fn asr_sidecar_models(url: &str) -> &'static [Entry] {
+    if is_openrouter(url) {
+        OPENROUTER_STT_MODELS
+    } else {
+        &[]
+    }
+}
+
+/// The `[tts] voice` list of OpenRouter `model`; none for a model this does
+/// not list.
+fn openrouter_tts_voices(model: &str) -> &'static [Entry] {
+    match model {
+        "hexgrad/kokoro-82m" => KOKORO_VOICES,
+        "heygen/heygen-voice-1-turbo:free" => HEYGEN_TTS_VOICES,
+        "mistralai/voxtral-mini-tts-3-0" => VOXTRAL_TTS_VOICES,
+        "microsoft/mai-voice-2.1-flash" => MAI_TTS_VOICES,
+        "elevenlabs/eleven-flash-v2.5" => ELEVENLABS_TTS_VOICES,
+        "google/gemini-3.8-flash-tts" => GEMINI_TTS_VOICES,
+        _ => &[],
+    }
+}
+
 /// The value in `list` whose first part is `value`.
 pub fn find(list: &[Entry], value: &str) -> Option<Entry> {
     list.iter().copied().find(|(v, _)| *v == value)
@@ -926,6 +1389,15 @@ mod tests {
             OPENROUTER_CHAT_MODELS,
             GEMINI_CHAT_MODELS,
             OLLAMA_CHAT_MODELS,
+            ASR_SIDECAR_URLS,
+            TTS_URLS,
+            OPENROUTER_STT_MODELS,
+            OPENROUTER_TTS_MODELS,
+            HEYGEN_TTS_VOICES,
+            VOXTRAL_TTS_VOICES,
+            MAI_TTS_VOICES,
+            ELEVENLABS_TTS_VOICES,
+            GEMINI_TTS_VOICES,
         ] {
             let values: BTreeSet<&str> = list.iter().map(|(v, _)| *v).collect();
             assert_eq!(values.len(), list.len(), "{list:?}");
@@ -1009,19 +1481,40 @@ mod tests {
         for (backend, _) in TTS_BACKENDS {
             let model = crate::tts::default_model(backend, None).expect("a default model");
             assert!(
-                find(tts_models(backend), model).is_some(),
+                find(tts_models(backend, None), model).is_some(),
                 "{backend} {model}"
             );
             match crate::tts::default_voice(backend) {
                 Some(voice) => {
                     assert!(
-                        find(tts_voices(backend), voice).is_some(),
+                        find(tts_voices(backend, None, None), voice).is_some(),
                         "{backend} {voice}"
                     )
                 }
-                None => assert!(tts_voices(backend).is_empty(), "{backend}"),
+                None => assert!(tts_voices(backend, None, None).is_empty(), "{backend}"),
             }
         }
+        // tts-sidecar on OpenRouter: Kokoro's id there, and its voice.
+        let url = Some(OPENROUTER_TTS_URL);
+        let model = crate::tts::default_model("tts-sidecar", url).expect("a default model");
+        assert!(
+            find(tts_models("tts-sidecar", url), model).is_some(),
+            "{model}"
+        );
+        let voice = crate::tts::default_voice("tts-sidecar").expect("a default voice");
+        assert!(find(tts_voices("tts-sidecar", url, None), voice).is_some());
+        assert!(find(tts_voices("tts-sidecar", url, Some(model)), voice).is_some());
+        assert!(find(TTS_URLS, crate::tts::DEFAULT_SIDECAR_URL).is_some());
+
+        // The sidecar's URL; on OpenRouter, the model setup picks there.
+        let sidecar: crate::Config = toml::from_str("[asr-sidecar]\n").unwrap();
+        let sidecar = sidecar.asr_sidecar.expect("set above");
+        assert!(
+            find(ASR_SIDECAR_URLS, &sidecar.url).is_some(),
+            "{}",
+            sidecar.url
+        );
+        assert!(find(OPENROUTER_STT_MODELS, OPENROUTER_STT_DEFAULT_MODEL).is_some());
 
         let llm: crate::llm::LlmConfig = toml::from_str("api_key = \"k\"").unwrap();
         assert!(find(LLM_URLS, &llm.api_url).is_some(), "{}", llm.api_url);
@@ -1056,6 +1549,55 @@ mod tests {
         assert!(!llm_models("http://127.0.0.1:11434/v1/chat/completions").is_empty());
         assert!(llm_models("http://localhost:8080/v1/chat/completions").is_empty());
         assert!(llm_models("https://example.com/v1").is_empty());
+    }
+
+    /// Every sidecar URL offered has its models: OpenRouter's lists, and a
+    /// server of your own none (any name is typed). Every OpenRouter voice
+    /// model has its voices.
+    #[test]
+    fn every_sidecar_url_has_models() {
+        for (url, _) in ASR_SIDECAR_URLS {
+            assert_eq!(
+                asr_sidecar_models(url).is_empty(),
+                !is_openrouter(url),
+                "{url}"
+            );
+        }
+        assert!(asr_sidecar_models("http://10.0.0.2:8000/v1/audio/transcriptions").is_empty());
+        for (url, _) in TTS_URLS {
+            let models = tts_models("tts-sidecar", Some(url));
+            assert!(!models.is_empty(), "{url}");
+            for (model, _) in models {
+                assert!(
+                    !tts_voices("tts-sidecar", Some(url), Some(model)).is_empty(),
+                    "{url} {model}"
+                );
+            }
+        }
+        // Off OpenRouter the sidecar is Kokoro, whatever the model.
+        let own = Some("http://10.0.0.2:8880/v1/audio/speech");
+        assert_eq!(tts_models("tts-sidecar", own), SIDECAR_TTS_MODELS);
+        assert_eq!(
+            tts_voices("tts-sidecar", own, Some("elevenlabs/eleven-flash-v2.5")),
+            KOKORO_VOICES
+        );
+        // On OpenRouter, the voices follow the model; one not listed has
+        // none, and the other backends ignore the URL.
+        let openrouter = Some(OPENROUTER_TTS_URL);
+        assert_eq!(
+            tts_voices(
+                "tts-sidecar",
+                openrouter,
+                Some("elevenlabs/eleven-flash-v2.5")
+            ),
+            ELEVENLABS_TTS_VOICES
+        );
+        assert_eq!(
+            tts_voices("tts-sidecar", openrouter, Some(" ")),
+            KOKORO_VOICES
+        );
+        assert!(tts_voices("tts-sidecar", openrouter, Some("acme/new-voice")).is_empty());
+        assert_eq!(tts_models("groq", openrouter), GROQ_TTS_MODELS);
     }
 
     /// OpenRouter is known by its host, whatever the scheme, port, path or
