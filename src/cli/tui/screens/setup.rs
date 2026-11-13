@@ -2124,7 +2124,10 @@ impl Setup {
                 let voice = text("tts.voice")
                     .or_else(|| whisrs::tts::default_voice(&backend).map(str::to_string))
                     .or_else(|| text("tts.model"))
-                    .or_else(|| whisrs::tts::default_model(&backend).map(str::to_string))
+                    .or_else(|| {
+                        whisrs::tts::default_model(&backend, text("tts.url").as_deref())
+                            .map(str::to_string)
+                    })
                     .unwrap_or_default();
                 vec![backend, voice, hotkey("hotkeys.speak")]
             }

@@ -282,9 +282,14 @@ pub const DIARIZATIONS: &[Entry] = &[
     ("off", "each track is one speaker"),
 ];
 
-/// `[tts] response_format`. Playback decodes WAV only
-/// (`audio::playback::decode_wav`), so it is the one format offered.
-pub const TTS_RESPONSE_FORMATS: &[Entry] = &[("wav", "the only format whisrs plays")];
+/// `[tts] response_format`. Playback decodes WAV
+/// (`audio::playback::decode_wav`); a raw PCM answer (16-bit samples, no
+/// header) gets a WAV header put in front of it first, so it plays too.
+/// OpenRouter refuses `wav`, and whisrs asks it for `pcm` instead.
+pub const TTS_RESPONSE_FORMATS: &[Entry] = &[
+    ("wav", "WAV, which most servers send"),
+    ("pcm", "raw audio, which OpenRouter sends"),
+];
 
 // ---------------------------------------------------------------------------
 // Transcription models
@@ -827,17 +832,8 @@ pub const OLLAMA_CHAT_MODELS: &[Entry] = &[
 /// The `[llm] model` list for the host of `api_url`; none for a host this
 /// does not know.
 pub fn llm_models(api_url: &str) -> &'static [Entry] {
-    let rest = api_url
-        .trim()
-        .split_once("://")
-        .map_or(api_url.trim(), |(_, rest)| rest);
-    let authority = rest.split('/').next().unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or_default();
-    let (name, port) = match host.rsplit_once(':') {
-        Some((name, port)) => (name, Some(port)),
-        None => (host, None),
-    };
-    match name.to_ascii_lowercase().as_str() {
+    let (name, port) = host_of(api_url);
+    match name.as_str() {
         "api.openai.com" => OPENAI_CHAT_MODELS,
         "api.groq.com" => GROQ_CHAT_MODELS,
         "openrouter.ai" => OPENROUTER_CHAT_MODELS,
@@ -845,6 +841,39 @@ pub fn llm_models(api_url: &str) -> &'static [Entry] {
         "localhost" | "127.0.0.1" | "[::1]" if port == Some("11434") => OLLAMA_CHAT_MODELS,
         _ => &[],
     }
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter
+// ---------------------------------------------------------------------------
+
+/// OpenRouter's speech-to-text endpoint, for the `asr-sidecar` backend.
+/// Checked against the live API on 2026-11-13.
+pub const OPENROUTER_STT_URL: &str = "https://openrouter.ai/api/v1/audio/transcriptions";
+
+/// OpenRouter's text-to-speech endpoint, for the `tts-sidecar` backend.
+/// Checked against the live API on 2026-11-13.
+pub const OPENROUTER_TTS_URL: &str = "https://openrouter.ai/api/v1/audio/speech";
+
+/// Whether `url` points at OpenRouter, with any scheme, path, port or case.
+pub fn is_openrouter(url: &str) -> bool {
+    host_of(url).0 == "openrouter.ai"
+}
+
+/// The host name of `url`, lowercased, and its port. The scheme, user info
+/// and path are cut off, and a URL without a scheme works too.
+fn host_of(url: &str) -> (String, Option<&str>) {
+    let rest = url
+        .trim()
+        .split_once("://")
+        .map_or(url.trim(), |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let (name, port) = match host.rsplit_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    (name.to_ascii_lowercase(), port)
 }
 
 /// The value in `list` whose first part is `value`.
@@ -978,7 +1007,7 @@ mod tests {
         // Each TTS backend's own model and voice, as the backend fills
         // them in while unset.
         for (backend, _) in TTS_BACKENDS {
-            let model = crate::tts::default_model(backend).expect("a default model");
+            let model = crate::tts::default_model(backend, None).expect("a default model");
             assert!(
                 find(tts_models(backend), model).is_some(),
                 "{backend} {model}"
@@ -1027,5 +1056,33 @@ mod tests {
         assert!(!llm_models("http://127.0.0.1:11434/v1/chat/completions").is_empty());
         assert!(llm_models("http://localhost:8080/v1/chat/completions").is_empty());
         assert!(llm_models("https://example.com/v1").is_empty());
+    }
+
+    /// OpenRouter is known by its host, whatever the scheme, port, path or
+    /// case; a look-alike host is not it.
+    #[test]
+    fn is_openrouter_matches_the_host_only() {
+        for url in [
+            OPENROUTER_STT_URL,
+            OPENROUTER_TTS_URL,
+            "https://openrouter.ai/api/v1/chat/completions",
+            "  HTTPS://OpenRouter.AI:443/api/v1/audio/speech ",
+            "http://user@openrouter.ai/x",
+            "openrouter.ai/api/v1",
+            "openrouter.ai",
+        ] {
+            assert!(is_openrouter(url), "{url}");
+        }
+        for url in [
+            "",
+            "https://api.openai.com/v1/audio/speech",
+            "https://openrouter.ai.example.com/v1",
+            "https://notopenrouter.ai/v1",
+            "https://www.openrouter.ai/v1",
+            "http://127.0.0.1:8880/v1/audio/speech",
+            "https://example.com/openrouter.ai",
+        ] {
+            assert!(!is_openrouter(url), "{url}");
+        }
     }
 }

@@ -300,9 +300,10 @@ pub fn harnesses_on_path(env: &Env) -> BTreeSet<&'static str> {
 /// they come to (`[general] language (en)`).
 pub fn unset_text(path: &str, unset: &str, config: &Config) -> String {
     let tts_backend = config.tts.as_ref().map_or("groq", |t| t.backend.as_str());
+    let tts_url = config.tts.as_ref().and_then(|t| t.url.as_deref());
     let recording = config.recording.clone().unwrap_or_default();
     let value = match path {
-        "tts.model" => whisrs::tts::default_model(tts_backend).map(str::to_string),
+        "tts.model" => whisrs::tts::default_model(tts_backend, tts_url).map(str::to_string),
         "tts.voice" => match whisrs::tts::default_voice(tts_backend) {
             Some(voice) => Some(voice.to_string()),
             None => return "not used: the voice is in the model".to_string(),

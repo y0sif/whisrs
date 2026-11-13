@@ -7,6 +7,9 @@
 //! `transcription/deepgram.rs` sends it). An ASR sidecar gets half a second
 //! of silence, a local whisper model is checked for the GGML magic, and an
 //! OpenAI-compatible realtime server is not testable without a session.
+//! OpenRouter, as the ASR sidecar, the `[llm] api_url` or the tts-sidecar
+//! `[tts] url`, is asked about the key itself (`GET /api/v1/key`, Bearer),
+//! since a transcription there is billed.
 //!
 //! The key tested is the one the daemon would use: a non-empty
 //! `WHISRS_*_API_KEY` wins over config.toml. It goes into the request header
@@ -19,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 
+use crate::config::catalog::is_openrouter;
 use crate::Config;
 
 /// How long a test waits for an answer.
@@ -77,6 +81,8 @@ pub struct Endpoints {
     pub groq: String,
     pub openai: String,
     pub deepgram: String,
+    /// OpenRouter's key endpoint, which answers for any of its keys.
+    pub openrouter: String,
     pub timeout: Duration,
 }
 
@@ -86,6 +92,7 @@ impl Default for Endpoints {
             groq: "https://api.groq.com/openai/v1/models".to_string(),
             openai: "https://api.openai.com/v1/models".to_string(),
             deepgram: "https://api.deepgram.com/v1/projects".to_string(),
+            openrouter: "https://openrouter.ai/api/v1/key".to_string(),
             timeout: TIMEOUT,
         }
     }
@@ -207,7 +214,7 @@ pub fn check(
     };
     match target {
         Target::Backend(backend) => match backend.as_str() {
-            "asr-sidecar" | "asr" | "vibevoice" => sidecar(config, &env, endpoints.timeout),
+            "asr-sidecar" | "asr" | "vibevoice" => sidecar(config, &env, endpoints),
             "local-whisper" | "local" => Tested {
                 outcome: Outcome::Model(model_file(&model_path(config))),
                 source: Source::None,
@@ -223,6 +230,20 @@ pub fn check(
         },
         Target::Tts => {
             let backend = config.tts.as_ref().map_or("groq", |t| t.backend.as_str());
+            let url = config.tts.as_ref().and_then(|t| t.url.as_deref());
+            if matches!(backend, "tts-sidecar" | "openai-compat") && url.is_some_and(is_openrouter)
+            {
+                // The sidecar sends `[tts] api_key` alone, with no fallback.
+                let key = config
+                    .tts
+                    .as_ref()
+                    .and_then(|t| t.api_key.as_deref())
+                    .filter(|k| !k.is_empty());
+                return Tested {
+                    outcome: openrouter(&endpoints.openrouter, key, endpoints.timeout),
+                    source: key.map_or(Source::None, |_| Source::Config),
+                };
+            }
             let Some(provider) = Provider::of_backend(backend) else {
                 return untested("a local TTS server needs no key");
             };
@@ -245,9 +266,10 @@ pub fn check(
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
             let provider = match host.as_deref() {
-                Some("api.openai.com") => Provider::OpenAi,
-                Some("api.groq.com") => Provider::Groq,
-                _ => return untested("only OpenAI and Groq LLM keys are tested"),
+                Some("api.openai.com") => Some(Provider::OpenAi),
+                Some("api.groq.com") => Some(Provider::Groq),
+                Some("openrouter.ai") => None,
+                _ => return untested("only OpenAI, Groq and OpenRouter LLM keys are tested"),
             };
             let (key, source) = llm_key(&llm, &env);
             if key.is_empty() {
@@ -256,10 +278,13 @@ pub fn check(
                     source: Source::None,
                 };
             }
-            Tested {
-                outcome: request(endpoints.of(provider), provider, &key, endpoints.timeout),
-                source,
-            }
+            let outcome = match provider {
+                Some(provider) => {
+                    request(endpoints.of(provider), provider, &key, endpoints.timeout)
+                }
+                None => openrouter(&endpoints.openrouter, Some(&key), endpoints.timeout),
+            };
+            Tested { outcome, source }
         }
     }
 }
@@ -328,8 +353,13 @@ pub fn request(url: &str, provider: Provider, key: &str, timeout: Duration) -> O
     answer(request, timeout)
 }
 
-/// Half a second of silence to the ASR sidecar, as the backend posts audio.
-fn sidecar(config: &Config, env: &impl Fn(&str) -> Option<String>, timeout: Duration) -> Tested {
+/// Half a second of silence to the ASR sidecar, as the backend posts audio;
+/// on OpenRouter, which bills that, a question about the key instead.
+fn sidecar(
+    config: &Config,
+    env: &impl Fn(&str) -> Option<String>,
+    endpoints: &Endpoints,
+) -> Tested {
     let var = "WHISRS_ASR_SIDECAR_API_KEY";
     let file = config
         .asr_sidecar
@@ -356,15 +386,30 @@ fn sidecar(config: &Config, env: &impl Fn(&str) -> Option<String>, timeout: Dura
         .asr_sidecar
         .clone()
         .unwrap_or_else(|| toml::from_str("").expect("an empty [asr-sidecar] section parses"));
+    if is_openrouter(&sidecar.url) {
+        return Tested {
+            outcome: openrouter(&endpoints.openrouter, key.as_deref(), endpoints.timeout),
+            source,
+        };
+    }
     Tested {
         outcome: post_silence(
             &sidecar.url,
             &sidecar.model,
             &config.general.language,
             key.as_deref(),
-            timeout,
+            endpoints.timeout,
         ),
         source,
+    }
+}
+
+/// One GET to OpenRouter's key endpoint at `url`, which answers whether
+/// `key` works and bills nothing. It takes the key as OpenAI does (Bearer).
+fn openrouter(url: &str, key: Option<&str>, timeout: Duration) -> Outcome {
+    match key {
+        Some(key) => request(url, Provider::OpenAi, key, timeout),
+        None => Outcome::NoKey,
     }
 }
 
@@ -548,6 +593,7 @@ mod tests {
             groq: format!("{base}/openai/v1/models"),
             openai: format!("{base}/v1/models"),
             deepgram: format!("{base}/v1/projects"),
+            openrouter: format!("{base}/api/v1/key"),
             timeout: Duration::from_millis(800),
         }
     }
@@ -770,7 +816,7 @@ mod tests {
         );
 
         let other = config(
-            "[llm]\napi_key = \"k\"\napi_url = \"https://openrouter.ai/api/v1/chat/completions\"\n",
+            "[llm]\napi_key = \"k\"\napi_url = \"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions\"\n",
         );
         assert!(matches!(
             check(&other, &Target::Llm, no_env, &endpoints(&base)).outcome,
@@ -815,6 +861,87 @@ mod tests {
         );
         assert_eq!(tested.outcome, Outcome::Limited);
         assert_eq!(tested.source, Source::None);
+    }
+
+    /// OpenRouter is asked about the key (`GET /api/v1/key`), never sent
+    /// audio, which it bills: as the ASR sidecar, the LLM and the TTS
+    /// sidecar. 401 reads as rejected, as for the other providers.
+    #[test]
+    fn openrouter_is_asked_about_the_key_and_sent_no_audio() {
+        let sidecar = config(
+            "[asr-sidecar]\nurl = \"https://openrouter.ai/api/v1/audio/transcriptions\"\n\
+             api_key = \"sk-or-stt\"\n",
+        );
+        let llm = config(
+            "[llm]\napi_key = \"sk-or-llm\"\n\
+             api_url = \"https://openrouter.ai/api/v1/chat/completions\"\n",
+        );
+        let tts = config(
+            "[tts]\nbackend = \"tts-sidecar\"\nurl = \"https://openrouter.ai/api/v1/audio/speech\"\n\
+             api_key = \"sk-or-tts\"\n",
+        );
+        let cases = [
+            (
+                &sidecar,
+                Target::Backend("asr-sidecar".into()),
+                "Bearer sk-or-stt",
+            ),
+            (&llm, Target::Llm, "Bearer sk-or-llm"),
+            (&tts, Target::Tts, "Bearer sk-or-tts"),
+        ];
+        for (c, target, auth) in &cases {
+            let (base, asked) = serve(Meet::Status(200));
+            let tested = check(c, target, no_env, &endpoints(&base));
+            assert!(tested.outcome.passed(), "{target:?}: {:?}", tested.outcome);
+            assert_eq!(tested.source, Source::Config, "{target:?}");
+            let asked = asked.recv().unwrap();
+            assert!(
+                asked.line.starts_with("GET /api/v1/key "),
+                "{target:?}: {}",
+                asked.line
+            );
+            assert!(!asked.wav, "{target:?}: no audio goes to OpenRouter");
+            assert!(
+                asked.auth.as_deref() == Some(*auth),
+                "{target:?}: the key sent"
+            );
+
+            let (base, _asked) = serve(Meet::Status(401));
+            let tested = check(c, target, no_env, &endpoints(&base));
+            assert_eq!(tested.outcome, Outcome::Rejected, "{target:?}");
+        }
+
+        // No key: nothing to ask about, and no request.
+        let keyless = [
+            (
+                config("[asr-sidecar]\nurl = \"https://openrouter.ai/api/v1/audio/transcriptions\"\n"),
+                Target::Backend("asr".into()),
+            ),
+            (
+                config("[tts]\nbackend = \"openai-compat\"\nurl = \"https://openrouter.ai/api/v1/audio/speech\"\n"),
+                Target::Tts,
+            ),
+        ];
+        for (c, target) in &keyless {
+            let tested = check(c, target, no_env, &endpoints("http://127.0.0.1:9"));
+            assert_eq!(tested.outcome, Outcome::NoKey, "{target:?}");
+            assert_eq!(tested.source, Source::None, "{target:?}");
+        }
+        // The sidecar's env key wins there too.
+        let (base, asked) = serve(Meet::Status(200));
+        let env =
+            |var: &str| (var == "WHISRS_ASR_SIDECAR_API_KEY").then(|| "sk-or-env".to_string());
+        let tested = check(
+            &sidecar,
+            &Target::Backend("asr-sidecar".into()),
+            env,
+            &endpoints(&base),
+        );
+        assert_eq!(tested.source, Source::Env("WHISRS_ASR_SIDECAR_API_KEY"));
+        assert!(
+            asked.recv().unwrap().auth.as_deref() == Some("Bearer sk-or-env"),
+            "the env key sent"
+        );
     }
 
     #[test]

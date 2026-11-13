@@ -938,7 +938,8 @@ const TTS: &[Field] = &[
         "tts.response_format",
         "response format",
         suggest(catalog::TTS_RESPONSE_FORMATS),
-        "The audio format asked for. whisrs plays WAV only, so wav is the one that works.",
+        "The audio format asked for: wav, or pcm (raw 16-bit audio, which whisrs plays \
+         too). OpenRouter refuses wav, so whisrs asks it for pcm.",
     ),
 ];
 
