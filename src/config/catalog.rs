@@ -1337,6 +1337,19 @@ pub fn asr_sidecar_models(url: &str) -> &'static [Entry] {
     }
 }
 
+/// The voice of OpenRouter `model` while `[tts] voice` is unset
+/// (`tts::default_voice`): an American English one for MAI, whose list
+/// starts with Czech, else the first of its list (Kokoro's `af_heart`);
+/// `None` for a model this does not list.
+pub fn openrouter_default_voice(model: &str) -> Option<&'static str> {
+    match model {
+        "microsoft/mai-voice-2.1-flash" => Some("en-US-Ethan:MAI-Voice-2.1-Flash"),
+        _ => openrouter_tts_voices(model)
+            .first()
+            .map(|(voice, _)| *voice),
+    }
+}
+
 /// The `[tts] voice` list of OpenRouter `model`; none for a model this does
 /// not list.
 fn openrouter_tts_voices(model: &str) -> &'static [Entry] {
@@ -1496,7 +1509,7 @@ mod tests {
                 find(tts_models(backend, None), model).is_some(),
                 "{backend} {model}"
             );
-            match crate::tts::default_voice(backend) {
+            match crate::tts::default_voice(backend, None, None) {
                 Some(voice) => {
                     assert!(
                         find(tts_voices(backend, None, None), voice).is_some(),
@@ -1513,9 +1526,19 @@ mod tests {
             find(tts_models("tts-sidecar", url), model).is_some(),
             "{model}"
         );
-        let voice = crate::tts::default_voice("tts-sidecar").expect("a default voice");
+        let voice = crate::tts::default_voice("tts-sidecar", url, None).expect("a default voice");
         assert!(find(tts_voices("tts-sidecar", url, None), voice).is_some());
         assert!(find(tts_voices("tts-sidecar", url, Some(model)), voice).is_some());
+        // Every model listed there speaks a voice of its own list while
+        // the voice is unset.
+        for (model, _) in OPENROUTER_TTS_MODELS {
+            let voice = crate::tts::default_voice("tts-sidecar", url, Some(model))
+                .expect("a default voice");
+            assert!(
+                find(tts_voices("tts-sidecar", url, Some(model)), voice).is_some(),
+                "{model} {voice}"
+            );
+        }
         assert!(find(TTS_URLS, crate::tts::DEFAULT_SIDECAR_URL).is_some());
 
         // The sidecar's URL; on OpenRouter, the model setup picks there.

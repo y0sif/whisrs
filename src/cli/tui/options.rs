@@ -304,15 +304,8 @@ pub fn unset_text(path: &str, unset: &str, config: &Config) -> String {
     let recording = config.recording.clone().unwrap_or_default();
     let value = match path {
         "tts.model" => whisrs::tts::default_model(tts_backend, tts_url).map(str::to_string),
-        "tts.voice" => match whisrs::tts::default_voice(tts_backend) {
-            Some(voice) => {
-                // On OpenRouter, a model whose voices are not Kokoro's.
-                let voices = catalog::tts_voices(tts_backend, tts_url, tts_model);
-                if !voices.is_empty() && catalog::find(voices, voice).is_none() {
-                    return format!("{unset} ({voice}, which this model lacks)");
-                }
-                Some(voice.to_string())
-            }
+        "tts.voice" => match whisrs::tts::default_voice(tts_backend, tts_url, tts_model) {
+            Some(voice) => Some(voice.to_string()),
             None => return "not used: the voice is in the model".to_string(),
         },
         "tts.url" => Some(whisrs::tts::DEFAULT_SIDECAR_URL.to_string()),
@@ -570,11 +563,22 @@ mod tests {
         let voice = options(field("tts.voice"), "tts.voice", &eleven, &lists);
         assert!(values(&voice).contains(&"george"));
         assert!(!values(&voice).contains(&"af_heart"));
+        // The voice the daemon sends for that model while it is unset.
+        assert_eq!(voice.unset.as_deref(), Some("backend default (adam)"));
+        assert!(voice.open);
+        let voxtral = form(&format!(
+            "{openrouter}model = \"mistralai/voxtral-mini-tts-3-0\"\n"
+        ));
+        let voice = options(field("tts.voice"), "tts.voice", &voxtral, &lists);
         assert_eq!(
             voice.unset.as_deref(),
-            Some("backend default (af_heart, which this model lacks)")
+            Some("backend default (en_paul_neutral)")
         );
-        assert!(voice.open);
+        // Off OpenRouter the model does not change it.
+        let own_voxtral =
+            form("[tts]\nbackend = \"tts-sidecar\"\nmodel = \"mistralai/voxtral-mini-tts-3-0\"\n");
+        let voice = options(field("tts.voice"), "tts.voice", &own_voxtral, &lists);
+        assert_eq!(voice.unset.as_deref(), Some("backend default (af_heart)"));
     }
 
     /// The sidecar URLs offer a server of your own and OpenRouter, and the

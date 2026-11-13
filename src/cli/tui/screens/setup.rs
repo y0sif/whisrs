@@ -1391,30 +1391,12 @@ impl Setup {
                  mode"
                     .to_string()
             }),
-            Step::ReadAloud if self.tts_on_openrouter() => {
-                if !self.tts_own_key() {
-                    return Some(
-                        "read aloud on OpenRouter needs its key: space types it on api_key, or s \
-                         skips read aloud"
-                            .to_string(),
-                    );
-                }
-                // The default voice is Kokoro's, which most models there lack.
-                let tts = config.tts.as_ref();
-                let model = tts.and_then(|t| t.model.as_deref());
-                let voices =
-                    catalog::tts_voices("tts-sidecar", tts.and_then(|t| t.url.as_deref()), model);
-                let unset = tts
-                    .and_then(|t| t.voice.as_deref())
-                    .is_none_or(|v| v.trim().is_empty());
-                let voice = whisrs::tts::default_voice("tts-sidecar").unwrap_or_default();
-                (unset && !voices.is_empty() && catalog::find(voices, voice).is_none()).then(|| {
-                    format!(
-                        "{} has no voice {voice}: space picks one on voice, or s skips read aloud",
-                        model.unwrap_or_default().trim()
-                    )
-                })
-            }
+            // An unset voice is the model's own there (`tts::default_voice`).
+            Step::ReadAloud if self.tts_on_openrouter() => (!self.tts_own_key()).then(|| {
+                "read aloud on OpenRouter needs its key: space types it on api_key, or s skips \
+                 read aloud"
+                    .to_string()
+            }),
             Step::ReadAloud => {
                 let backend = self.tts_backend();
                 let sidecar = matches!(backend.as_str(), "tts-sidecar" | "openai-compat");
@@ -2462,7 +2444,14 @@ impl Setup {
             Step::ReadAloud => {
                 let backend = self.tts_backend();
                 let voice = text("tts.voice")
-                    .or_else(|| whisrs::tts::default_voice(&backend).map(str::to_string))
+                    .or_else(|| {
+                        whisrs::tts::default_voice(
+                            &backend,
+                            text("tts.url").as_deref(),
+                            text("tts.model").as_deref(),
+                        )
+                        .map(str::to_string)
+                    })
                     .or_else(|| text("tts.model"))
                     .or_else(|| {
                         whisrs::tts::default_model(&backend, text("tts.url").as_deref())

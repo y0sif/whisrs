@@ -2210,9 +2210,9 @@ fn openrouter_key_never_overwrites_an_answer() {
 }
 
 /// Read aloud on OpenRouter needs its key (tts-sidecar sends no other),
-/// and a voice its model has: the default is Kokoro's.
+/// but no voice: unset, it is the model's own, which the review names.
 #[test]
-fn read_aloud_on_openrouter_needs_its_key_and_a_voice_of_the_model() {
+fn read_aloud_on_openrouter_needs_its_key_not_a_voice() {
     let mut fixture = on_the_modes();
     skip_to(&mut fixture, Step::ReadAloud);
     press(&mut fixture.app, "\n");
@@ -2228,15 +2228,17 @@ fn read_aloud_on_openrouter_needs_its_key_and_a_voice_of_the_model() {
     answer(&mut fixture, "tts.api_key", OR_KEY);
     answer(&mut fixture, "tts.model", "elevenlabs/eleven-flash-v2.5");
     press(&mut fixture.app, "\n");
-    assert_eq!(setup(&fixture).step, Step::ReadAloud);
-    assert_eq!(
-        status(&fixture),
-        "elevenlabs/eleven-flash-v2.5 has no voice af_heart: space picks one on voice, or s \
-         skips read aloud"
-    );
-    answer(&mut fixture, "tts.voice", "george");
-    press(&mut fixture.app, "\n");
     assert_eq!(setup(&fixture).step, Step::Jarvis);
+    assert_eq!(text_at(&fixture, "tts.voice"), None);
+    skip_modes(&mut fixture);
+    let review = drawn(&fixture, 90, 40);
+    assert!(
+        review
+            .iter()
+            .any(|r| r.contains(" read aloud ")
+                && r.contains("set up \u{b7} OpenRouter \u{b7} adam")),
+        "{review:#?}"
+    );
 }
 
 /// An LLM key in the environment is command mode's already: set up, it

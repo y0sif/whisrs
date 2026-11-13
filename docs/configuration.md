@@ -435,7 +435,8 @@ backend = "groq"            # groq | openai | deepgram | tts-sidecar
 #                           #   groq also speaks Saudi Arabic: see "Read-aloud in
 #                           #   Arabic" below
 # voice = "..."             # optional; backend default (groq: autumn, openai: alloy,
-#                           #   tts-sidecar: af_heart). Ignored by deepgram (voice is in the model id).
+#                           #   tts-sidecar: af_heart; on OpenRouter, the model's own).
+#                           #   Ignored by deepgram (voice is in the model id).
 response_format = "wav"     # wav, or pcm (raw 16-bit audio, which whisrs plays too).
 #                           #   tts-sidecar on OpenRouter asks for pcm by itself.
 # api_key = "..."           # optional; falls back to the backend's transcription key
@@ -722,12 +723,14 @@ backend = "tts-sidecar"
 url = "https://openrouter.ai/api/v1/audio/speech"
 api_key = "sk-or-..."   # tts-sidecar sends no other key
 # model = "hexgrad/kokoro-82m"   # the default there
-# voice = "af_heart"             # the default; Kokoro's voices
+# voice = "af_heart"             # the default for Kokoro; Kokoro's voices
 ```
 
 OpenRouter refuses `wav`, so whisrs asks it for `pcm` and plays that. Each
-model has its own voices: set `voice` with `model`, since the default,
-`af_heart`, is Kokoro's. The pickers list a few models (Kokoro, a free
+model has its own voices, and while `voice` is unset whisrs sends the
+model's own: the first of its list (`en_paul_neutral` for Voxtral),
+`en-US-Ethan:MAI-Voice-2.1-Flash` for MAI-Voice, and Kokoro's `af_heart`
+for a model it does not list. The pickers list a few models (Kokoro, a free
 HeyGen one, Voxtral, MAI-Voice, ElevenLabs, Gemini), each with its voices
 and its price: per 1,000 characters, except Gemini, priced per token, and
 HeyGen's, which is free (checked 2026-11-13). Any other model or voice can

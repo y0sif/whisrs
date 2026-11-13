@@ -68,14 +68,35 @@ fn sidecar_default_model(url: Option<&str>) -> &'static str {
 }
 
 /// The voice `backend` uses while `[tts] voice` is unset; `None` for
-/// deepgram, whose voice is part of the model id.
-pub fn default_voice(backend: &str) -> Option<&'static str> {
+/// deepgram, whose voice is part of the model id. `url` and `model` are
+/// `[tts] url` and `[tts] model`, which only `tts-sidecar` reads: on
+/// OpenRouter the voice follows the model, as the model follows the URL.
+pub fn default_voice(
+    backend: &str,
+    url: Option<&str>,
+    model: Option<&str>,
+) -> Option<&'static str> {
     match backend {
         "groq" => Some(GROQ_DEFAULT_VOICE),
         "openai" => Some(OPENAI_DEFAULT_VOICE),
-        "tts-sidecar" | "openai-compat" => Some(SIDECAR_DEFAULT_VOICE),
+        "tts-sidecar" | "openai-compat" => Some(sidecar_default_voice(url, model)),
         _ => None,
     }
+}
+
+/// The `tts-sidecar` voice while `[tts] voice` is unset: on OpenRouter, the
+/// one of `model` (the default model's while it is unset), since most
+/// models there lack Kokoro's voices; `af_heart` for any other server and
+/// for a model the catalog does not list.
+fn sidecar_default_voice(url: Option<&str>, model: Option<&str>) -> &'static str {
+    if !url.is_some_and(catalog::is_openrouter) {
+        return SIDECAR_DEFAULT_VOICE;
+    }
+    let model = model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(OPENROUTER_DEFAULT_MODEL);
+    catalog::openrouter_default_voice(model).unwrap_or(SIDECAR_DEFAULT_VOICE)
 }
 
 /// Trait for text-to-speech backends.
@@ -385,6 +406,10 @@ fn sidecar_backend(config: &TtsConfig, api_key: Option<String>) -> openai_compat
         config.model.as_deref(),
         sidecar_default_model(Some(&base_url)),
     );
+    let voice = set_or(
+        config.voice.as_deref(),
+        sidecar_default_voice(Some(&base_url), Some(&model)),
+    );
     // `stream: true` asks the sidecar for a chunked body. Pocket TTS OpenAI
     // wrappers default to returning the whole clip at once; Kokoro-FastAPI
     // already streams by default.
@@ -392,7 +417,7 @@ fn sidecar_backend(config: &TtsConfig, api_key: Option<String>) -> openai_compat
         base_url,
         api_key, // optional: sidecars usually need none
         model,
-        set_or(config.voice.as_deref(), SIDECAR_DEFAULT_VOICE),
+        voice,
         response_format,
     )
     .with_stream_flag()
@@ -846,5 +871,102 @@ mod tests {
         let local = body(DEFAULT_SIDECAR_URL, None, "wav");
         assert_eq!(local["response_format"], "wav");
         assert_eq!(local["model"], "kokoro");
+    }
+
+    /// Voxtral on OpenRouter with no voice set asks for a voice of its own,
+    /// not Kokoro's `af_heart` (which OpenRouter answers with a 400).
+    #[tokio::test]
+    async fn openrouter_voxtral_without_a_voice_sends_its_own_voice() {
+        use test_server::*;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, body) = accept_request(&listener).await;
+            write_chunked_head_as(&mut stream, "audio/pcm;rate=24000;channels=1").await;
+            write_chunk(&mut stream, &[0, 0, 0, 0]).await;
+            finish_chunked(&mut stream).await;
+            body
+        });
+
+        let config = TtsConfig {
+            url: Some(catalog::OPENROUTER_TTS_URL.to_string()),
+            model: Some("mistralai/voxtral-mini-tts-3-0".to_string()),
+            ..cfg("tts-sidecar")
+        };
+        let backend = sidecar_backend(&config, Some("k".to_string()))
+            .posting_to(format!("http://{addr}/api/v1/audio/speech"));
+        let mut audio = match backend.synthesize("hi").await {
+            Ok(audio) => audio,
+            Err(e) => panic!("expected a 200 response: {e}"),
+        };
+        while audio.next_chunk().await.unwrap().is_some() {}
+
+        let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+        assert_eq!(body["model"], "mistralai/voxtral-mini-tts-3-0", "{body}");
+        assert_eq!(body["voice"], "en_paul_neutral", "{body}");
+    }
+
+    /// The unset voice follows the model on OpenRouter only: Kokoro there
+    /// (set or by default), a model the catalog does not list, and any model
+    /// on another server keep `af_heart`; a voice that is set always wins.
+    #[test]
+    fn the_default_voice_follows_the_model_on_openrouter() {
+        let voice = |url: &str, model: Option<&str>, voice: Option<&str>| {
+            let config = TtsConfig {
+                url: Some(url.to_string()),
+                model: model.map(str::to_string),
+                voice: voice.map(str::to_string),
+                ..cfg("tts-sidecar")
+            };
+            sidecar_backend(&config, None).wire_body("hi")["voice"].clone()
+        };
+        let openrouter = catalog::OPENROUTER_TTS_URL;
+        for (model, expected) in [
+            (None, "af_heart"),
+            (Some("hexgrad/kokoro-82m"), "af_heart"),
+            (Some(" mistralai/voxtral-mini-tts-3-0 "), "en_paul_neutral"),
+            (Some("heygen/heygen-voice-1-turbo:free"), "nadine"),
+            (
+                Some("microsoft/mai-voice-2.1-flash"),
+                "en-US-Ethan:MAI-Voice-2.1-Flash",
+            ),
+            (Some("elevenlabs/eleven-flash-v2.5"), "adam"),
+            (Some("google/gemini-3.8-flash-tts"), "Zephyr"),
+            (Some("someone/unlisted-tts"), "af_heart"),
+        ] {
+            assert_eq!(voice(openrouter, model, None), expected, "{model:?}");
+            assert_eq!(
+                default_voice("tts-sidecar", Some(openrouter), model),
+                Some(expected),
+                "{model:?}"
+            );
+        }
+        // Another server: Kokoro's voice, whatever the model.
+        for model in [None, Some("kokoro"), Some("mistralai/voxtral-mini-tts-3-0")] {
+            assert_eq!(voice(DEFAULT_SIDECAR_URL, model, None), "af_heart");
+            assert_eq!(
+                default_voice("tts-sidecar", Some(DEFAULT_SIDECAR_URL), model),
+                Some("af_heart")
+            );
+            assert_eq!(
+                default_voice("openai-compat", None, model),
+                Some("af_heart")
+            );
+        }
+        // A voice that is set wins, on OpenRouter and off it.
+        let voxtral = Some("mistralai/voxtral-mini-tts-3-0");
+        assert_eq!(
+            voice(openrouter, voxtral, Some("gb_jane_sad")),
+            "gb_jane_sad"
+        );
+        assert_eq!(voice(openrouter, None, Some("bf_emma")), "bf_emma");
+        assert_eq!(voice(DEFAULT_SIDECAR_URL, voxtral, Some("x")), "x");
+        // The URL and the model change nothing for the other backends.
+        assert_eq!(
+            default_voice("groq", Some(openrouter), voxtral),
+            Some(GROQ_DEFAULT_VOICE)
+        );
+        assert_eq!(default_voice("deepgram", Some(openrouter), voxtral), None);
     }
 }
