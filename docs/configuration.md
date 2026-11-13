@@ -697,7 +697,7 @@ at about $0.04 an hour.
 - No speech-to-text model is free.
 - `[general] vocabulary` and `prompt` do nothing: whisrs sends them as the
   `hotwords` field, which OpenRouter accepts and ignores. whisrs warns when
-  either is set.
+  one it would send is set (recordings send only the vocabulary).
 - `whisrs setup` and `whisrs config` list the URL and every model with its
   price (setup starts on `openai/whisper-large-v3-turbo`). `t` there asks
   OpenRouter about the key (`GET /api/v1/key`), which is free: no audio is
@@ -727,9 +727,10 @@ api_key = "sk-or-..."   # tts-sidecar sends no other key
 OpenRouter refuses `wav`, so whisrs asks it for `pcm` and plays that. Each
 model has its own voices: set `voice` with `model`, since the default,
 `af_heart`, is Kokoro's. The pickers list a few models (Kokoro, a free
-HeyGen one, Voxtral, MAI-Voice, ElevenLabs, Gemini), each with its price
-per 1,000 characters and its voices (checked 2026-11-13); any other model
-or voice can be typed.
+HeyGen one, Voxtral, MAI-Voice, ElevenLabs, Gemini), each with its voices
+and its price: per 1,000 characters, except Gemini, priced per token, and
+HeyGen's, which is free (checked 2026-11-13). Any other model or voice can
+be typed.
 
 ## Read-aloud in Arabic
 

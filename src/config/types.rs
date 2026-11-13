@@ -3211,7 +3211,9 @@ impl Config {
     /// of its speech-to-text models, so nothing at run time says they are
     /// lost. Said once, when dictation (`[general] backend`) or recordings
     /// (`[recording] backend`) use the asr-sidecar backend on an OpenRouter
-    /// `[asr-sidecar] url`. Blank is absent, as in
+    /// `[asr-sidecar] url`, naming only what those paths send: dictation
+    /// both, recordings only the vocabulary (`recording_transcription_config`
+    /// sends no prompt). Blank is absent, as in
     /// [`Config::inert_prompt_warnings`].
     fn openrouter_prompt_warnings(&self) -> Vec<ConfigWarning> {
         let sidecar = |backend: &str| matches!(backend.trim(), "asr-sidecar" | "asr" | "vibevoice");
@@ -3221,18 +3223,20 @@ impl Config {
                 .as_ref()
                 .and_then(|r| r.backend.as_deref())
                 .is_some_and(sidecar);
+        let dictation = sidecar(&self.general.backend);
         let on_openrouter = self
             .asr_sidecar
             .as_ref()
             .is_some_and(|a| crate::config::catalog::is_openrouter(&a.url));
-        if !on_openrouter || !(sidecar(&self.general.backend) || recording) {
+        if !on_openrouter || !(dictation || recording) {
             return Vec::new();
         }
-        let has_prompt = self
-            .general
-            .prompt
-            .as_deref()
-            .is_some_and(|p| !p.trim().is_empty());
+        let has_prompt = dictation
+            && self
+                .general
+                .prompt
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty());
         let has_terms = self
             .general
             .vocabulary
@@ -3247,8 +3251,8 @@ impl Config {
         vec![ConfigWarning {
             message: format!(
                 "{ignored} ignored on OpenRouter ([asr-sidecar] url): none of its \
-                 speech-to-text models takes a prompt or vocabulary (checked 2026-11-13). \
-                 [replacements] still fixes words after transcription."
+                 speech-to-text models takes a prompt or vocabulary. [replacements] still \
+                 fixes words after transcription."
             ),
         }]
     }
@@ -6474,16 +6478,19 @@ mod tests {
         assert!(unused.is_empty(), "{unused:?}");
     }
 
-    /// Recordings on OpenRouter warn too, once with dictation there as well.
+    /// Recordings on OpenRouter warn too, once with dictation there as well,
+    /// naming only what the paths in use send: a recording sends the
+    /// vocabulary and never `[general] prompt`, so a prompt alone is lost
+    /// only to dictation there.
     #[cfg(feature = "recording")]
     #[test]
     fn openrouter_warning_covers_recordings() {
-        for general in ["groq", "asr-sidecar"] {
-            let warnings = openrouter_warnings(&format!(
+        let config = |general: &str, hints: &str| {
+            format!(
                 r#"
                 [general]
                 backend = "{general}"
-                prompt = "Arch Linux"
+                {hints}
 
                 [groq]
                 api_key = "k"
@@ -6494,8 +6501,33 @@ mod tests {
                 [recording]
                 backend = "asr-sidecar"
                 "#
-            ));
-            assert_eq!(warnings.len(), 1, "{general}: {warnings:?}");
+            )
+        };
+        let both = "prompt = \"Arch Linux\"\nvocabulary = [\"PKGBUILD\"]";
+        for (general, hints, want) in [
+            ("groq", both, Some("[general] vocabulary is ignored")),
+            ("groq", "prompt = \"Arch Linux\"", None),
+            (
+                "asr-sidecar",
+                both,
+                Some("[general] prompt and vocabulary are"),
+            ),
+            (
+                "asr-sidecar",
+                "prompt = \"Arch Linux\"",
+                Some("[general] prompt is"),
+            ),
+        ] {
+            let warnings = openrouter_warnings(&config(general, hints));
+            match want {
+                Some(start) => {
+                    assert_eq!(warnings.len(), 1, "{general}: {warnings:?}");
+                    assert!(warnings[0].starts_with(start), "{general}: {warnings:?}");
+                    // A date in the message would only age.
+                    assert!(!warnings[0].contains("checked"), "{warnings:?}");
+                }
+                None => assert!(warnings.is_empty(), "{general}: {warnings:?}"),
+            }
         }
     }
 

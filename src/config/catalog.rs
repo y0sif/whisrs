@@ -902,13 +902,25 @@ pub const OPENROUTER_STT_URL: &str = "https://openrouter.ai/api/v1/audio/transcr
 /// Checked against the live API on 2026-11-13.
 pub const OPENROUTER_TTS_URL: &str = "https://openrouter.ai/api/v1/audio/speech";
 
-/// Whether `url` points at OpenRouter, with any scheme, path, port or case.
+/// Whether `url` points at OpenRouter: its host, as reqwest parses it (the
+/// one a request goes to, the key with it), is `openrouter.ai`, in any
+/// case, on any port or path. A URL reqwest cannot parse (one without a
+/// scheme) goes nowhere, so it is not OpenRouter either; nor is a
+/// look-alike whose `@openrouter.ai` sits in the query or the fragment.
 pub fn is_openrouter(url: &str) -> bool {
-    host_of(url).0 == "openrouter.ai"
+    reqwest::Url::parse(url.trim())
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.eq_ignore_ascii_case("openrouter.ai"))
+        })
+        .unwrap_or(false)
 }
 
 /// The host name of `url`, lowercased, and its port. The scheme, user info
-/// and path are cut off, and a URL without a scheme works too.
+/// and path are cut off, and a URL without a scheme works too. Only picks
+/// a list ([`llm_models`]); [`is_openrouter`], which decides where a key
+/// goes, parses as reqwest does.
 fn host_of(url: &str) -> (String, Option<&str>) {
     let rest = url
         .trim()
@@ -1600,8 +1612,10 @@ mod tests {
         assert_eq!(tts_models("groq", openrouter), GROQ_TTS_MODELS);
     }
 
-    /// OpenRouter is known by its host, whatever the scheme, port, path or
-    /// case; a look-alike host is not it.
+    /// OpenRouter is known by its host as reqwest parses it, whatever the
+    /// scheme, port, path or case; a look-alike host is not it, nor a URL
+    /// whose `@openrouter.ai` is in the query or fragment (reqwest sends
+    /// those to the host before them), nor one reqwest cannot parse.
     #[test]
     fn is_openrouter_matches_the_host_only() {
         for url in [
@@ -1610,8 +1624,7 @@ mod tests {
             "https://openrouter.ai/api/v1/chat/completions",
             "  HTTPS://OpenRouter.AI:443/api/v1/audio/speech ",
             "http://user@openrouter.ai/x",
-            "openrouter.ai/api/v1",
-            "openrouter.ai",
+            "https://openrouter.ai",
         ] {
             assert!(is_openrouter(url), "{url}");
         }
@@ -1623,8 +1636,18 @@ mod tests {
             "https://www.openrouter.ai/v1",
             "http://127.0.0.1:8880/v1/audio/speech",
             "https://example.com/openrouter.ai",
+            "https://evil.com#@openrouter.ai/",
+            "https://evil.com?@openrouter.ai/",
+            "https://evil.com/x#@openrouter.ai/api/v1/audio/speech",
+            "openrouter.ai/api/v1",
+            "openrouter.ai",
         ] {
             assert!(!is_openrouter(url), "{url}");
         }
+        // The list a URL picks is as it was: the host before any `@`.
+        assert_eq!(
+            llm_models("https://openrouter.ai/api/v1/chat/completions"),
+            OPENROUTER_CHAT_MODELS
+        );
     }
 }

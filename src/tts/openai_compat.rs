@@ -456,4 +456,29 @@ mod tests {
         // Not RIFF, but nothing said it is PCM: as it is.
         assert_eq!(answer("wav", "audio/wav", pcm.clone()).await, pcm);
     }
+
+    /// Asked for pcm, an answer that says it is another format is that
+    /// format and passes through untouched (an MP3 given a WAV header would
+    /// play as noise, or not at all); one with no Content-Type is the PCM
+    /// asked for, and is wrapped.
+    #[tokio::test]
+    async fn asked_pcm_wraps_only_an_answer_that_names_no_other_type() {
+        // An MP3 frame header, then bytes: not RIFF, so only its type tells.
+        let mp3: Vec<u8> = [0xff, 0xfb, 0x90, 0x64]
+            .into_iter()
+            .chain((0..200u8).map(|i| i.wrapping_mul(31)))
+            .collect();
+        assert_eq!(answer("pcm", "audio/mpeg", mp3.clone()).await, mp3);
+        assert_eq!(answer("pcm", "audio/ogg", mp3.clone()).await, mp3);
+
+        let pcm: Vec<u8> = (0..400u16).flat_map(|i| (i * 97).to_le_bytes()).collect();
+        let out = answer("pcm", "", pcm.clone()).await;
+        assert_eq!(&out[..4], b"RIFF");
+        assert_eq!(&out[44..], &pcm[..]);
+        let decoded = crate::audio::playback::decode_wav(&out).unwrap();
+        assert_eq!((decoded.sample_rate, decoded.channels), (24_000, 1));
+        assert_eq!(decoded.samples.len(), 400);
+        // Asked for wav and sent with no type: as it is.
+        assert_eq!(answer("wav", "", pcm.clone()).await, pcm);
+    }
 }

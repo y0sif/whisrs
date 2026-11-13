@@ -126,10 +126,10 @@ impl HttpAudioStream {
         }
     }
 
-    /// Like [`Self::new`], for an answer that may be raw PCM: asked for with
-    /// `response_format = "pcm"`, or sent as `audio/pcm`. Such a body gets a
-    /// WAV header put in front of it, unless it starts with `RIFF` (a WAV
-    /// after all), so playback, which reads WAV, plays it.
+    /// Like [`Self::new`], for an answer that may be raw PCM
+    /// (`reads_as_pcm`). Such a body gets a WAV header put in front of it,
+    /// unless it starts with `RIFF` (a WAV after all), so playback, which
+    /// reads WAV, plays it.
     pub(crate) fn wrapping_pcm(
         response: reqwest::Response,
         label: &'static str,
@@ -140,15 +140,14 @@ impl HttpAudioStream {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        let pcm = (response_format.trim().eq_ignore_ascii_case("pcm") || is_pcm_type(content_type))
-            .then(|| {
-                let (rate, channels) = pcm_format(content_type);
-                debug!(
-                    "TTS answer may be raw PCM (content type {content_type:?}): \
-                     read as {rate} Hz, {channels} ch, 16-bit"
-                );
-                PcmToWav::new(rate, channels)
-            });
+        let pcm = reads_as_pcm(response_format, content_type).then(|| {
+            let (rate, channels) = pcm_format(content_type);
+            debug!(
+                "TTS answer may be raw PCM (content type {content_type:?}): \
+                 read as {rate} Hz, {channels} ch, 16-bit"
+            );
+            PcmToWav::new(rate, channels)
+        });
         Self {
             response,
             label,
@@ -185,13 +184,28 @@ impl TtsAudioStream for HttpAudioStream {
 /// (OpenRouter's Kokoro and ElevenLabs voices send 24 kHz).
 const PCM_DEFAULT_RATE: u32 = 24_000;
 
-/// Whether `content_type` is `audio/pcm`, in any case, with or without
-/// parameters.
+/// The media type of `content_type`, without its parameters.
+fn mime_of(content_type: &str) -> &str {
+    content_type.split(';').next().unwrap_or_default().trim()
+}
+
+/// Whether `content_type` is raw PCM: `audio/pcm` or `audio/L16`, in any
+/// case, with or without parameters. `audio/L16` is read little-endian as
+/// `audio/pcm` is, as Gemini's voices send it (RFC 2586's is big-endian).
 fn is_pcm_type(content_type: &str) -> bool {
-    content_type
-        .split(';')
-        .next()
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("audio/pcm"))
+    let mime = mime_of(content_type);
+    mime.eq_ignore_ascii_case("audio/pcm") || mime.eq_ignore_ascii_case("audio/l16")
+}
+
+/// Whether an answer of `content_type` to a request for `response_format`
+/// is read as raw PCM: sent as PCM, or asked for as `pcm` and sent with no
+/// type, or as `application/octet-stream`, which says nothing. Any other
+/// type (`audio/mpeg`, `audio/wav`, `audio/ogg`) is what it says, whatever
+/// was asked, and is handed over as it is.
+fn reads_as_pcm(response_format: &str, content_type: &str) -> bool {
+    let mime = mime_of(content_type);
+    let untyped = mime.is_empty() || mime.eq_ignore_ascii_case("application/octet-stream");
+    is_pcm_type(content_type) || (response_format.trim().eq_ignore_ascii_case("pcm") && untyped)
 }
 
 /// The sample rate and channel count of a raw PCM body: the Content-Type's
@@ -437,11 +451,15 @@ pub(crate) mod test_server {
         write_chunked_head_as(stream, "audio/wav").await;
     }
 
-    /// Start a `200 OK` response of `content_type` with a chunked body.
+    /// Start a `200 OK` response of `content_type` with a chunked body; an
+    /// empty `content_type` sends no Content-Type at all.
     pub(crate) async fn write_chunked_head_as(stream: &mut TcpStream, content_type: &str) {
-        let head = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\n\r\n"
-        );
+        let typed = if content_type.is_empty() {
+            String::new()
+        } else {
+            format!("content-type: {content_type}\r\n")
+        };
+        let head = format!("HTTP/1.1 200 OK\r\n{typed}transfer-encoding: chunked\r\n\r\n");
         stream.write_all(head.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
     }
@@ -677,7 +695,7 @@ mod tests {
     }
 
     /// A Content-Type that names no rate or channels, or names them wrong,
-    /// is 24 kHz mono; only `audio/pcm` itself is raw PCM.
+    /// is 24 kHz mono; only `audio/pcm` and `audio/L16` are raw PCM.
     #[test]
     fn pcm_format_defaults_to_24_khz_mono() {
         for content_type in [
@@ -694,6 +712,8 @@ mod tests {
         assert_eq!(pcm_format("audio/pcm;channels=2"), (24_000, 2));
         assert!(is_pcm_type("AUDIO/PCM"));
         assert!(is_pcm_type(" audio/pcm ;rate=24000"));
+        assert!(is_pcm_type("audio/L16;codec=pcm;rate=24000"));
+        assert_eq!(pcm_format("audio/L16;codec=pcm;rate=24000"), (24_000, 1));
         for content_type in [
             "audio/wav",
             "audio/mpeg",
@@ -702,6 +722,47 @@ mod tests {
             "text/audio/pcm",
         ] {
             assert!(!is_pcm_type(content_type), "{content_type:?}");
+        }
+    }
+
+    /// A body is read as PCM when its type says so, or when pcm was asked
+    /// for and its type says nothing (none, or `application/octet-stream`).
+    /// A type that names another format is what it says, whatever was
+    /// asked: an MP3 is never given a WAV header.
+    #[test]
+    fn only_a_pcm_or_untyped_answer_reads_as_pcm() {
+        for format in ["pcm", "wav", "mp3", ""] {
+            for content_type in ["audio/pcm", "AUDIO/PCM;rate=44100", "audio/l16;rate=24000"] {
+                assert!(
+                    reads_as_pcm(format, content_type),
+                    "{format} {content_type}"
+                );
+            }
+            for content_type in [
+                "audio/mpeg",
+                "audio/wav",
+                "audio/x-wav",
+                "audio/ogg; codecs=opus",
+                "audio/flac",
+                "audio/aac",
+                "text/plain",
+            ] {
+                assert!(
+                    !reads_as_pcm(format, content_type),
+                    "{format} {content_type}"
+                );
+            }
+        }
+        for content_type in [
+            "",
+            "  ",
+            "application/octet-stream",
+            "Application/Octet-Stream; x=1",
+        ] {
+            assert!(reads_as_pcm("pcm", content_type), "{content_type:?}");
+            assert!(reads_as_pcm(" PCM ", content_type), "{content_type:?}");
+            assert!(!reads_as_pcm("wav", content_type), "{content_type:?}");
+            assert!(!reads_as_pcm("mp3", content_type), "{content_type:?}");
         }
     }
 

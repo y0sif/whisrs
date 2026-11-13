@@ -714,25 +714,46 @@ impl Setup {
         }
     }
 
+    /// Whether this step's mode points at OpenRouter: command mode's
+    /// `[llm] api_url`, read aloud's tts-sidecar URL.
+    fn mode_on_openrouter(&self) -> bool {
+        match self.step {
+            Step::Command => self
+                .editor
+                .form
+                .config()
+                .llm
+                .as_ref()
+                .is_some_and(|l| catalog::is_openrouter(&l.api_url)),
+            Step::ReadAloud => self.tts_on_openrouter(),
+            _ => false,
+        }
+    }
+
     /// Dictation's OpenRouter key follows command mode and read aloud on
-    /// and off OpenRouter: copied while the key there is empty, taken out
-    /// once they point elsewhere, where it would be refused. Another key
-    /// stays.
-    fn follow_openrouter_key(&mut self) {
+    /// and off OpenRouter (`was_on`: the mode was on it before the key):
+    /// copied as the mode moves onto it while the key there is empty, taken
+    /// out as it moves elsewhere, where it would be refused. Only a move
+    /// does either, so a key cleared on OpenRouter stays cleared. Another
+    /// key stays.
+    fn follow_openrouter_key(&mut self, was_on: bool) {
         let Some(key) = self.openrouter_key() else {
             return;
         };
+        let on_openrouter = self.mode_on_openrouter();
+        if on_openrouter == was_on {
+            return;
+        }
         let config = self.editor.form.config();
-        let (path, own, on_openrouter) = match self.step {
-            Step::Command => {
-                let llm = config.llm.clone().unwrap_or_default();
-                let on = catalog::is_openrouter(&llm.api_url);
-                ("llm.api_key", Some(llm.api_key), on)
-            }
-            Step::ReadAloud => {
-                let own = config.tts.as_ref().and_then(|t| t.api_key.clone());
-                ("tts.api_key", own, self.tts_on_openrouter())
-            }
+        let (path, own) = match self.step {
+            Step::Command => (
+                "llm.api_key",
+                config.llm.as_ref().map(|l| l.api_key.clone()),
+            ),
+            Step::ReadAloud => (
+                "tts.api_key",
+                config.tts.as_ref().and_then(|t| t.api_key.clone()),
+            ),
             _ => return,
         };
         let own = own.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
@@ -823,6 +844,7 @@ impl Setup {
     fn editor_key(&mut self, action: Action) -> Reply {
         let device = self.editor.form.config().audio.device.clone();
         let sidecar_url = self.sidecar_url();
+        let on_openrouter = self.mode_on_openrouter();
         let outcome = self.editor.key(action);
         let changed = outcome.flash.is_some();
         let mut reply = Reply::from_outcome(outcome);
@@ -834,7 +856,7 @@ impl Setup {
                 self.follow_sidecar_url(self.sidecar_url() != sidecar_url);
             }
             if matches!(self.step, Step::Command | Step::ReadAloud) {
-                self.follow_openrouter_key();
+                self.follow_openrouter_key(on_openrouter);
             }
             if self.step == Step::ReadAloud {
                 self.sample = None;
@@ -1068,17 +1090,19 @@ impl Setup {
     }
 
     /// Command mode on OpenRouter's chat when dictation is on OpenRouter
-    /// with a key and `[llm]` has none: that key, so it is typed once. A
+    /// with a key and no LLM key resolves yet (`[llm] api_key`, or one in
+    /// `WHISRS_OPENAI_API_KEY` or `WHISRS_GROQ_API_KEY`, which would go to
+    /// OpenAI's or Groq's URL as it is): that key, so it is typed once. A
     /// URL or model the answers have stays, and the key goes only to
     /// OpenRouter.
     fn start_command(&mut self) {
         let Some(key) = self.openrouter_key() else {
             return;
         };
-        let llm = self.editor.form.config().llm.clone().unwrap_or_default();
-        if !llm.api_key.trim().is_empty() {
+        if self.llm_key_resolves() {
             return;
         }
+        let llm = self.editor.form.config().llm.clone().unwrap_or_default();
         let default = whisrs::llm::LlmConfig::default();
         let openrouter = catalog::LLM_URLS
             .iter()
@@ -1108,9 +1132,11 @@ impl Setup {
 
     /// Read aloud on, its backend the dictation backend's provider when
     /// that has a voice: its key is then there already. On OpenRouter that
-    /// is tts-sidecar on OpenRouter's URL, with the key copied, unless
-    /// `[tts] url` names another server. A `[tts] api_key` kept from the
-    /// file keeps the backend it is for.
+    /// is tts-sidecar on OpenRouter's URL, with the key copied and a model
+    /// or voice OpenRouter does not list (another backend's) cleared,
+    /// unless `[tts] url` names another server, or config.toml has
+    /// tts-sidecar on one (its own, while the URL is unset): that stays. A
+    /// `[tts] api_key` kept from the file keeps the backend it is for.
     fn start_read_aloud(&mut self) {
         let _ = self
             .editor
@@ -1120,6 +1146,14 @@ impl Setup {
             return;
         }
         if let Some(key) = self.openrouter_key() {
+            if let Some((backend, url)) = self.files_tts_server() {
+                let form = &mut self.editor.form;
+                let _ = form.set("tts.backend", Some(Value::from(backend)));
+                if let Some(url) = url {
+                    let _ = form.set("tts.url", Some(Value::from(url)));
+                }
+                return;
+            }
             let url = self.tts_url();
             if url.is_none() || url.as_deref().is_some_and(catalog::is_openrouter) {
                 let form = &mut self.editor.form;
@@ -1128,6 +1162,7 @@ impl Setup {
                     let _ = form.set("tts.url", Some(Value::from(catalog::OPENROUTER_TTS_URL)));
                 }
                 let _ = form.set("tts.api_key", Some(Value::from(key)));
+                self.keep_openrouter_voice(url.as_deref().unwrap_or(catalog::OPENROUTER_TTS_URL));
                 return;
             }
         }
@@ -1142,6 +1177,52 @@ impl Setup {
                 .editor
                 .form
                 .set("tts.backend", Some(Value::from(provider)));
+        }
+    }
+
+    /// The tts-sidecar server config.toml has read aloud on, when it is not
+    /// OpenRouter: its backend name and URL (`None`, the server on this
+    /// machine).
+    fn files_tts_server(&self) -> Option<(String, Option<String>)> {
+        let tts = self.existing.as_ref()?.config.tts.as_ref()?;
+        if !matches!(tts.backend.as_str(), "tts-sidecar" | "openai-compat") {
+            return None;
+        }
+        let url = tts
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty());
+        (!url.is_some_and(catalog::is_openrouter))
+            .then(|| (tts.backend.clone(), url.map(str::to_string)))
+    }
+
+    /// Clear a `[tts] model` or `voice` OpenRouter (`url`) does not list,
+    /// such as another backend's (Groq's `troy`), so it is not sent there:
+    /// the defaults go instead. A voice is checked against the model left.
+    fn keep_openrouter_voice(&mut self, url: &str) {
+        let given = |value: Option<&String>| {
+            value
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let tts = self.editor.form.config().tts.clone();
+        let mut model = given(tts.as_ref().and_then(|t| t.model.as_ref()));
+        let voice = given(tts.as_ref().and_then(|t| t.voice.as_ref()));
+        let models = catalog::tts_models("tts-sidecar", Some(url));
+        if model
+            .as_deref()
+            .is_some_and(|m| catalog::find(models, m).is_none())
+        {
+            model = None;
+            let _ = self.editor.form.set("tts.model", None);
+        }
+        let voices = catalog::tts_voices("tts-sidecar", Some(url), model.as_deref());
+        if voice
+            .as_deref()
+            .is_some_and(|v| catalog::find(voices, v).is_none())
+        {
+            let _ = self.editor.form.set("tts.voice", None);
         }
     }
 
