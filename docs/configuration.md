@@ -684,11 +684,11 @@ Some picks, each checked on 2026-10-31 with the request whisrs sends:
 | `microsoft/mai-transcribe-2` | $0.10 | 60 languages |
 | `elevenlabs/scribe-v2` | $0.22 | |
 | `mistralai/voxtral-mini-transcribe-3-0` | $0.21 | compact |
-| `nvidia/nemotron-3.5-transcribe` | $0.12 | open-weight |
+| `nvidia/nemotron-3.5-transcribe` | $0.06 | open-weight |
 | `qwen/qwen3-asr-1.7b` | $0.027 | 30 languages |
 | `openai/whisper-large-v3-turbo` | $0.012 | cheapest here |
 
-Prices are OpenRouter's list prices
+Prices are OpenRouter's list prices on 2026-11-13
 (`https://openrouter.ai/api/v1/models?output_modalities=transcription`).
 OpenRouter picks the provider, and a request can cost more than the list price: an 8-second
 `whisper-large-v3-turbo` request that went to Groq was billed as 10 seconds
