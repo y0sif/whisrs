@@ -989,7 +989,10 @@ pub struct TtsConfig {
     /// voice is used.
     #[serde(default)]
     pub voice: Option<String>,
-    /// Audio response format requested from the API (we decode WAV).
+    /// Audio response format requested from the API: `"wav"` (default), or
+    /// `"pcm"` (raw 16-bit samples, which get a WAV header before playback).
+    /// On OpenRouter, which refuses `"wav"`, the `tts-sidecar` backend asks
+    /// for `"pcm"` instead.
     #[serde(default = "default_tts_response_format")]
     pub response_format: String,
     /// Optional dedicated API key; falls back to the backend's key when absent.
@@ -1284,7 +1287,7 @@ pub(crate) fn default_phrase_silence_ms() -> u64 {
 fn default_asr_sidecar_url() -> String {
     "http://127.0.0.1:8765/transcribe".to_string()
 }
-fn default_asr_sidecar_model() -> String {
+pub(crate) fn default_asr_sidecar_model() -> String {
     "microsoft/VibeVoice-ASR-HF".to_string()
 }
 fn default_openai_compatible_realtime_model() -> String {
@@ -2340,6 +2343,7 @@ impl Config {
 
         warnings.extend(self.deepgram_keyterm_warnings(backend));
         warnings.extend(self.inert_prompt_warnings(backend));
+        warnings.extend(self.openrouter_prompt_warnings());
         warnings.extend(self.openai_languages_warnings(backend));
 
         // Streaming backends (including local-whisper, unless its
@@ -3199,6 +3203,58 @@ impl Config {
             )
         };
         vec![ConfigWarning { message }]
+    }
+
+    /// Load-time warning that OpenRouter drops `[general] prompt` and
+    /// `[general] vocabulary` (#230). The asr-sidecar backend sends them (as
+    /// `hotwords`), and OpenRouter takes the field and ignores it on every one
+    /// of its speech-to-text models, so nothing at run time says they are
+    /// lost. Said once, when dictation (`[general] backend`) or recordings
+    /// (`[recording] backend`) use the asr-sidecar backend on an OpenRouter
+    /// `[asr-sidecar] url`, naming only what those paths send: dictation
+    /// both, recordings only the vocabulary (`recording_transcription_config`
+    /// sends no prompt). Blank is absent, as in
+    /// [`Config::inert_prompt_warnings`].
+    fn openrouter_prompt_warnings(&self) -> Vec<ConfigWarning> {
+        let sidecar = |backend: &str| matches!(backend.trim(), "asr-sidecar" | "asr" | "vibevoice");
+        let recording = cfg!(feature = "recording")
+            && self
+                .recording
+                .as_ref()
+                .and_then(|r| r.backend.as_deref())
+                .is_some_and(sidecar);
+        let dictation = sidecar(&self.general.backend);
+        let on_openrouter = self
+            .asr_sidecar
+            .as_ref()
+            .is_some_and(|a| crate::config::catalog::is_openrouter(&a.url));
+        if !on_openrouter || !(dictation || recording) {
+            return Vec::new();
+        }
+        let has_prompt = dictation
+            && self
+                .general
+                .prompt
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty());
+        let has_terms = self
+            .general
+            .vocabulary
+            .iter()
+            .any(|term| !term.trim().is_empty());
+        let ignored = match (has_prompt, has_terms) {
+            (false, false) => return Vec::new(),
+            (true, false) => "[general] prompt is",
+            (false, true) => "[general] vocabulary is",
+            (true, true) => "[general] prompt and vocabulary are",
+        };
+        vec![ConfigWarning {
+            message: format!(
+                "{ignored} ignored on OpenRouter ([asr-sidecar] url): none of its \
+                 speech-to-text models takes a prompt or vocabulary. [replacements] still \
+                 fixes words after transcription."
+            ),
+        }]
     }
 
     /// Load-time warning that `[tts] backend = "openai"` stops working on
@@ -6314,6 +6370,165 @@ mod tests {
         assert!(feedback[0].contains("'chatty'") && feedback[0].contains("uses brief"));
         // The entry is kept: no "skipped" warning.
         assert!(matching(&config, "is skipped").is_empty());
+    }
+
+    /// The OpenRouter warnings `validate` gives `toml`.
+    fn openrouter_warnings(toml: &str) -> Vec<String> {
+        let config: Config = toml::from_str(toml).unwrap();
+        config
+            .validate()
+            .expect("config validates")
+            .into_iter()
+            .map(|w| w.message)
+            .filter(|m| m.contains("OpenRouter"))
+            .collect()
+    }
+
+    /// The asr-sidecar backend on OpenRouter, which ignores the prompt and
+    /// the vocabulary: one warning naming what is set.
+    #[test]
+    fn openrouter_ignores_the_prompt_and_vocabulary() {
+        let warnings = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr-sidecar"
+            prompt = "Arch Linux"
+            vocabulary = ["PKGBUILD"]
+
+            [asr-sidecar]
+            url = "https://openrouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("[general] prompt and vocabulary are ignored on OpenRouter"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].contains(['\u{2013}', '\u{2014}']));
+
+        // The alias, with only a prompt; then only a term among blanks.
+        let warnings = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr"
+            prompt = "Arch Linux"
+
+            [asr-sidecar]
+            url = "HTTPS://OpenRouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("[general] prompt is ignored"));
+        let warnings = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr-sidecar"
+            vocabulary = ["  ", "PKGBUILD"]
+
+            [asr-sidecar]
+            url = "https://openrouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("[general] vocabulary is ignored"));
+    }
+
+    /// A sidecar elsewhere sends both, and with nothing set there is
+    /// nothing to lose.
+    #[test]
+    fn openrouter_warning_needs_openrouter_and_a_hint() {
+        let elsewhere = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr-sidecar"
+            prompt = "Arch Linux"
+            vocabulary = ["PKGBUILD"]
+
+            [asr-sidecar]
+            url = "http://127.0.0.1:8765/transcribe"
+            "#,
+        );
+        assert!(elsewhere.is_empty(), "{elsewhere:?}");
+        let blank = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr-sidecar"
+            prompt = "   "
+            vocabulary = ["", " "]
+
+            [asr-sidecar]
+            url = "https://openrouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert!(blank.is_empty(), "{blank:?}");
+        // An OpenRouter [asr-sidecar] url no backend uses.
+        let unused = openrouter_warnings(
+            r#"
+            [general]
+            backend = "groq"
+            prompt = "Arch Linux"
+
+            [groq]
+            api_key = "k"
+
+            [asr-sidecar]
+            url = "https://openrouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert!(unused.is_empty(), "{unused:?}");
+    }
+
+    /// Recordings on OpenRouter warn too, once with dictation there as well,
+    /// naming only what the paths in use send: a recording sends the
+    /// vocabulary and never `[general] prompt`, so a prompt alone is lost
+    /// only to dictation there.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn openrouter_warning_covers_recordings() {
+        let config = |general: &str, hints: &str| {
+            format!(
+                r#"
+                [general]
+                backend = "{general}"
+                {hints}
+
+                [groq]
+                api_key = "k"
+
+                [asr-sidecar]
+                url = "https://openrouter.ai/api/v1/audio/transcriptions"
+
+                [recording]
+                backend = "asr-sidecar"
+                "#
+            )
+        };
+        let both = "prompt = \"Arch Linux\"\nvocabulary = [\"PKGBUILD\"]";
+        for (general, hints, want) in [
+            ("groq", both, Some("[general] vocabulary is ignored")),
+            ("groq", "prompt = \"Arch Linux\"", None),
+            (
+                "asr-sidecar",
+                both,
+                Some("[general] prompt and vocabulary are"),
+            ),
+            (
+                "asr-sidecar",
+                "prompt = \"Arch Linux\"",
+                Some("[general] prompt is"),
+            ),
+        ] {
+            let warnings = openrouter_warnings(&config(general, hints));
+            match want {
+                Some(start) => {
+                    assert_eq!(warnings.len(), 1, "{general}: {warnings:?}");
+                    assert!(warnings[0].starts_with(start), "{general}: {warnings:?}");
+                    // A date in the message would only age.
+                    assert!(!warnings[0].contains("checked"), "{warnings:?}");
+                }
+                None => assert!(warnings.is_empty(), "{general}: {warnings:?}"),
+            }
+        }
     }
 
     /// The recording checks, in a build with the feature.

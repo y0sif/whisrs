@@ -254,9 +254,12 @@ impl AsrSidecarBackend {
 
         if !status.is_success() {
             let code = status.as_u16();
-            let message = match serde_json::from_str::<AsrSidecarErrorResponse>(&body) {
-                Ok(err_resp) => format!("ASR sidecar error ({code}): {}", err_resp.message()),
-                Err(_) => format!("ASR sidecar error ({code}): {body}"),
+            let message = match serde_json::from_str::<AsrSidecarErrorResponse>(&body)
+                .ok()
+                .and_then(|err_resp| err_resp.message())
+            {
+                Some(message) => format!("ASR sidecar error ({code}): {message}"),
+                None => format!("ASR sidecar error ({code}): {body}"),
             };
             // FastAPI answers a field it does not take with 422, others
             // with 400.
@@ -472,20 +475,32 @@ pub struct AsrSidecarResponse {
 
 #[derive(Debug, Deserialize)]
 struct AsrSidecarErrorResponse {
-    error: Option<String>,
+    /// `"..."`, or `{"message": "...", "code": 400}` as OpenRouter (and
+    /// OpenAI) send it.
+    error: Option<serde_json::Value>,
     detail: Option<serde_json::Value>,
 }
 
 impl AsrSidecarErrorResponse {
-    fn message(&self) -> String {
-        if let Some(error) = &self.error {
-            return error.clone();
+    /// What the body says, or `None` for an `error` of another shape (the
+    /// caller shows the body as it is).
+    fn message(&self) -> Option<String> {
+        match &self.error {
+            Some(serde_json::Value::String(error)) => return Some(error.clone()),
+            Some(serde_json::Value::Object(error)) => {
+                return error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            Some(_) => return None,
+            None => {}
         }
-        match &self.detail {
+        Some(match &self.detail {
             Some(serde_json::Value::String(detail)) => detail.clone(),
             Some(detail) => detail.to_string(),
             None => "unknown sidecar error".to_string(),
-        }
+        })
     }
 }
 
@@ -803,14 +818,61 @@ mod tests {
     fn parse_asr_sidecar_error() {
         let body = r#"{"error": "model failed to load"}"#;
         let parsed: AsrSidecarErrorResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.message(), "model failed to load");
+        assert_eq!(parsed.message().as_deref(), Some("model failed to load"));
     }
 
     #[test]
     fn parse_fastapi_error_detail() {
         let body = r#"{"detail": "request asked for wrong model"}"#;
         let parsed: AsrSidecarErrorResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.message(), "request asked for wrong model");
+        assert_eq!(
+            parsed.message().as_deref(),
+            Some("request asked for wrong model")
+        );
+    }
+
+    /// OpenRouter nests its message in an object; another `error` shape
+    /// leaves the message to the raw body.
+    #[test]
+    fn parse_openrouter_error_object() {
+        let body = r#"{"error":{"message":"The selected model does not support keyterms.","code":400},"user_id":"u"}"#;
+        let parsed: AsrSidecarErrorResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed.message().as_deref(),
+            Some("The selected model does not support keyterms.")
+        );
+        for body in [r#"{"error":{"code":400}}"#, r#"{"error": 5}"#] {
+            let parsed: AsrSidecarErrorResponse = serde_json::from_str(body).unwrap();
+            assert_eq!(parsed.message(), None, "{body}");
+        }
+    }
+
+    /// The error a request fails with names OpenRouter's message, not its
+    /// JSON; a body that is no JSON is shown as it is.
+    #[tokio::test]
+    async fn an_openrouter_error_carries_its_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![
+                (
+                    400,
+                    r#"{"error":{"message":"The selected model does not support keyterms. Remove the field","code":400},"user_id":"u"}"#,
+                ),
+                (400, "Bad Request"),
+            ],
+        ));
+        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
+        let err = backend.transcribe(&wav, &test_config()).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ASR sidecar error (400): The selected model does not support keyterms. Remove the field"
+        );
+        let err = backend.transcribe(&wav, &test_config()).await.unwrap_err();
+        assert_eq!(err.to_string(), "ASR sidecar error (400): Bad Request");
+        server.await.unwrap();
     }
 
     #[test]

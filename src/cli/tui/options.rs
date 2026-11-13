@@ -1,7 +1,8 @@
 //! What a row offers: the values of its picker and of its `h`/`l` steps,
 //! each with what it is, what applies while it is unset, and why a value
 //! cannot be picked here. Built from the schema, the form as edited (the
-//! TTS voices follow `[tts] backend`) and the lists the workers found.
+//! TTS voices follow `[tts] backend`, and on OpenRouter its model) and the
+//! lists the workers found.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -299,14 +300,19 @@ pub fn harnesses_on_path(env: &Env) -> BTreeSet<&'static str> {
 /// What applies while `path` is unset: its `unset` words, with the value
 /// they come to (`[general] language (en)`).
 pub fn unset_text(path: &str, unset: &str, config: &Config) -> String {
-    let tts_backend = config.tts.as_ref().map_or("groq", |t| t.backend.as_str());
+    let (tts_backend, tts_url, tts_model) = tts_of(config);
     let recording = config.recording.clone().unwrap_or_default();
     let value = match path {
-        "tts.model" => whisrs::tts::default_model(tts_backend).map(str::to_string),
-        "tts.voice" => match whisrs::tts::default_voice(tts_backend) {
+        "tts.model" => whisrs::tts::default_model(tts_backend, tts_url).map(str::to_string),
+        "tts.voice" => match whisrs::tts::default_voice(tts_backend, tts_url, tts_model) {
             Some(voice) => Some(voice.to_string()),
             None => return "not used: the voice is in the model".to_string(),
         },
+        "tts.url" => Some(whisrs::tts::DEFAULT_SIDECAR_URL.to_string()),
+        "asr-sidecar.model" => Some(whisrs::transcription::factory::model_for_backend(
+            "asr-sidecar",
+            config,
+        )),
         "recording.backend" => Some(config.general.backend.clone()),
         "recording.language" => Some(config.general.language.clone()),
         "recording.mic_language" | "recording.system_language" => Some(
@@ -324,10 +330,20 @@ pub fn unset_text(path: &str, unset: &str, config: &Config) -> String {
     }
 }
 
+/// `[tts]` backend, url and model, as the TTS lists read them.
+fn tts_of(config: &Config) -> (&str, Option<&str>, Option<&str>) {
+    let tts = config.tts.as_ref();
+    (
+        tts.map_or("groq", |t| t.backend.as_str()),
+        tts.and_then(|t| t.url.as_deref()),
+        tts.and_then(|t| t.model.as_deref()),
+    )
+}
+
 /// A source's picks, and whether its list is still coming.
 fn source_picks(from: Source, config: &Config, lists: &Lists) -> (Vec<Pick>, Loading) {
     let list = |opts: &[Opt]| opts.iter().copied().map(Pick::of).collect::<Vec<_>>();
-    let tts_backend = config.tts.as_ref().map_or("groq", |t| t.backend.as_str());
+    let (tts_backend, tts_url, tts_model) = tts_of(config);
     match from {
         Source::List(opts) => (list(opts), Loading::Done),
         Source::Languages { auto } => {
@@ -338,8 +354,21 @@ fn source_picks(from: Source, config: &Config, lists: &Lists) -> (Vec<Pick>, Loa
             picks.extend(list(catalog::LANGUAGES));
             (picks, Loading::Done)
         }
-        Source::TtsModels => (list(catalog::tts_models(tts_backend)), Loading::Done),
-        Source::TtsVoices => (list(catalog::tts_voices(tts_backend)), Loading::Done),
+        Source::TtsModels => (
+            list(catalog::tts_models(tts_backend, tts_url)),
+            Loading::Done,
+        ),
+        Source::TtsVoices => (
+            list(catalog::tts_voices(tts_backend, tts_url, tts_model)),
+            Loading::Done,
+        ),
+        Source::AsrSidecarModels => {
+            let models = config
+                .asr_sidecar
+                .as_ref()
+                .map_or(&[][..], |s| catalog::asr_sidecar_models(&s.url));
+            (list(models), Loading::Done)
+        }
         Source::LlmModels => {
             let url = config
                 .llm
@@ -509,6 +538,102 @@ mod tests {
         assert_eq!(
             voice.unset.as_deref(),
             Some("not used: the voice is in the model")
+        );
+
+        // tts-sidecar: Kokoro on a server of your own, OpenRouter's models
+        // on its URL, each with its own voices.
+        let own = form("[tts]\nbackend = \"tts-sidecar\"\n");
+        let model = options(field("tts.model"), "tts.model", &own, &lists);
+        assert_eq!(values(&model), ["kokoro"]);
+        let openrouter = "[tts]\nbackend = \"tts-sidecar\"\n\
+                          url = \"https://openrouter.ai/api/v1/audio/speech\"\n";
+        let model = options(field("tts.model"), "tts.model", &form(openrouter), &lists);
+        assert_eq!(values(&model)[0], "hexgrad/kokoro-82m");
+        assert!(values(&model).contains(&"heygen/heygen-voice-1-turbo:free"));
+        assert_eq!(
+            model.unset.as_deref(),
+            Some("backend default (hexgrad/kokoro-82m)")
+        );
+        let voice = options(field("tts.voice"), "tts.voice", &form(openrouter), &lists);
+        assert_eq!(voice.picks.len(), catalog::KOKORO_VOICES.len());
+        assert_eq!(voice.unset.as_deref(), Some("backend default (af_heart)"));
+        let eleven = form(&format!(
+            "{openrouter}model = \"elevenlabs/eleven-flash-v2.5\"\n"
+        ));
+        let voice = options(field("tts.voice"), "tts.voice", &eleven, &lists);
+        assert!(values(&voice).contains(&"george"));
+        assert!(!values(&voice).contains(&"af_heart"));
+        // The voice the daemon sends for that model while it is unset.
+        assert_eq!(voice.unset.as_deref(), Some("backend default (adam)"));
+        assert!(voice.open);
+        let voxtral = form(&format!(
+            "{openrouter}model = \"mistralai/voxtral-mini-tts-3-0\"\n"
+        ));
+        let voice = options(field("tts.voice"), "tts.voice", &voxtral, &lists);
+        assert_eq!(
+            voice.unset.as_deref(),
+            Some("backend default (en_paul_neutral)")
+        );
+        // Off OpenRouter the model does not change it.
+        let own_voxtral =
+            form("[tts]\nbackend = \"tts-sidecar\"\nmodel = \"mistralai/voxtral-mini-tts-3-0\"\n");
+        let voice = options(field("tts.voice"), "tts.voice", &own_voxtral, &lists);
+        assert_eq!(voice.unset.as_deref(), Some("backend default (af_heart)"));
+    }
+
+    /// The sidecar URLs offer a server of your own and OpenRouter, and the
+    /// models follow the URL's host: OpenRouter's, else none to pick (any
+    /// name is typed).
+    #[test]
+    fn sidecar_urls_and_models_follow_the_host() {
+        let lists = Lists::default();
+        let own = form("[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\n");
+        let url = options(field("asr-sidecar.url"), "asr-sidecar.url", &own, &lists);
+        assert_eq!(
+            values(&url),
+            [
+                "http://127.0.0.1:8765/transcribe",
+                catalog::OPENROUTER_STT_URL
+            ]
+        );
+        assert!(url.open && url.unset.is_none());
+        let models = options(
+            field("asr-sidecar.model"),
+            "asr-sidecar.model",
+            &own,
+            &lists,
+        );
+        assert!(models.picks.is_empty() && models.open);
+
+        let openrouter = form(
+            "[general]\nbackend = \"asr-sidecar\"\n\
+             [asr-sidecar]\nurl = \"https://openrouter.ai/api/v1/audio/transcriptions\"\n",
+        );
+        let models = options(
+            field("asr-sidecar.model"),
+            "asr-sidecar.model",
+            &openrouter,
+            &lists,
+        );
+        assert_eq!(values(&models)[0], "openai/whisper-large-v3-turbo");
+        assert_eq!(models.picks.len(), catalog::OPENROUTER_STT_MODELS.len());
+        assert_eq!(
+            models.picks[0].about,
+            "Whisper Large V3 Turbo, $0.012 per hour"
+        );
+
+        // [tts] url: unset is the local default, which is listed too.
+        let url = options(field("tts.url"), "tts.url", &form(""), &lists);
+        assert_eq!(
+            values(&url),
+            [
+                whisrs::tts::DEFAULT_SIDECAR_URL,
+                catalog::OPENROUTER_TTS_URL
+            ]
+        );
+        assert_eq!(
+            url.unset.as_deref(),
+            Some("not set (http://127.0.0.1:8880/v1/audio/speech)")
         );
     }
 

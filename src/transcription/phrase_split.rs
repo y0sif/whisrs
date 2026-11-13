@@ -556,10 +556,10 @@ impl PhraseSplitter {
         let search_start = self.split_search_start(i);
         let mut split_frame = search_start;
         let mut min_energy = f64::INFINITY;
-        for j in search_start..=i {
-            if self.energies[j] < min_energy {
-                min_energy = self.energies[j];
-                split_frame = j;
+        for (k, &e) in self.energies[search_start..=i].iter().enumerate() {
+            if e < min_energy {
+                min_energy = e;
+                split_frame = search_start + k;
             }
         }
         self.cut_at(split_frame, out);
@@ -1484,10 +1484,10 @@ mod tests {
                 let search_start = self.split_search_start(i);
                 let mut split_frame = search_start;
                 let mut min_energy = f64::INFINITY;
-                for j in search_start..=i {
-                    if self.energies[j] < min_energy {
-                        min_energy = self.energies[j];
-                        split_frame = j;
+                for (k, &e) in self.energies[search_start..=i].iter().enumerate() {
+                    if e < min_energy {
+                        min_energy = e;
+                        split_frame = search_start + k;
                     }
                 }
                 self.cut_at(split_frame, out);
