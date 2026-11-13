@@ -700,7 +700,8 @@ at about $0.04 an hour.
   one it would send is set (recordings send only the vocabulary).
 - `whisrs setup` and `whisrs config` list the URL and every model with its
   price (setup starts on `openai/whisper-large-v3-turbo`, which is also what
-  goes while `model` is left out). `t` there asks OpenRouter about the key
+  goes while `model` is left out or names the local default,
+  `microsoft/VibeVoice-ASR-HF`). `t` there asks OpenRouter about the key
   (`GET /api/v1/key`), which is free: no audio is sent.
 - With dictation on OpenRouter, `whisrs setup` offers the same key to
   command mode (OpenRouter's chat URL) and read aloud (below), so it is

@@ -1037,9 +1037,9 @@ pub const OPENROUTER_STT_MODELS: &[Entry] = &[
     ),
 ];
 
-/// The `[asr-sidecar] model` setup picks when the sidecar URL becomes
-/// OpenRouter's: the daemon's own default is a local model OpenRouter does
-/// not have.
+/// The `[asr-sidecar] model` on OpenRouter: setup picks it when the sidecar
+/// URL becomes OpenRouter's, and the daemon sends it in place of the local
+/// default model, which OpenRouter does not have.
 pub const OPENROUTER_STT_DEFAULT_MODEL: &str = "openai/whisper-large-v3-turbo";
 
 /// `[tts] model` with `backend = "tts-sidecar"` on OpenRouter: a few of its
