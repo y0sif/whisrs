@@ -3,11 +3,11 @@
    │                                                    │
    │   Backend & keys                                   │
    │                                                    │
-   │   backend           deepgram-streaming             │
-   │ ▌ deepgram api_key  set ****9f2c                   │
-   │   deepgram model    nova-3                         │
-   │   groq api_key      WHISRS_GROQ_API_KEY (this sh…  │
-   │   groq model        whisper-large-v3-turbo         │
+   │   backend                deepgram-streaming        │
+   │ ▌ deepgram api_key       set ****9f2c              │
+   │   deepgram model         nova-3                    │
+   │   deepgram smart_format  on                        │
+   │   deepgram numerals      off                       │
    │                                                    │
    │   API key for the deepgram backends.               │
    │   WHISRS_DEEPGRAM_API_KEY wins over it.            │

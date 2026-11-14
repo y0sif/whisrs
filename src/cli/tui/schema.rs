@@ -527,6 +527,28 @@ const BACKEND: &[Field] = &[
          none of it.",
     ),
     field(
+        "deepgram.smart_format",
+        "deepgram smart_format",
+        Kind::Bool,
+        "Deepgram's smart formatting: punctuation, capitalization and, where the language has \
+         them, numerals. On whether or not the key is written; turn it off for raw, \
+         unpunctuated text.",
+    ),
+    field(
+        "deepgram.numerals",
+        "deepgram numerals",
+        Kind::Bool,
+        "Numbers as digits (\"900\", not \"nine hundred\"), beyond the languages smart \
+         formatting already formats. Off by default, Deepgram's own default.",
+    ),
+    field(
+        "deepgram.paragraphs",
+        "deepgram paragraphs",
+        Kind::Bool,
+        "Break the pre-recorded transcript at pauses. The streaming socket has no paragraphs, \
+         so backend = \"deepgram-streaming\" ignores it (and says so at load).",
+    ),
+    field(
         "groq.api_key",
         "groq api_key",
         Kind::Secret,
@@ -1463,6 +1485,7 @@ mod tests {
             deepgram: Some(DeepgramConfig {
                 api_key: "k".into(),
                 model: "m".into(),
+                ..Default::default()
             }),
             groq: Some(GroqConfig {
                 api_key: "k".into(),
