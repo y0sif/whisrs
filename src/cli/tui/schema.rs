@@ -463,7 +463,9 @@ const GENERAL: &[Field] = &[
             unit: "ms",
             named: &[(0, "off")],
         }),
-        "Stop dictating after this much silence. off never stops on its own.",
+        "Stop after this much silence once you spoke: streaming dictation, command mode, LLM \
+         commands and agent turns. Batch dictation stops on a second press. At 0 (off), every \
+         session waits for the second press.",
     ),
     field(
         "general.notify",
@@ -500,7 +502,8 @@ const GENERAL: &[Field] = &[
         "general.tray",
         "tray icon",
         Kind::Bool,
-        "Show the tray icon.",
+        "Show the tray icon. It needs a StatusNotifierItem tray host, such as waybar's tray \
+         module, KDE Plasma, or GNOME with the AppIndicator extension.",
         Gate::Tray,
     ),
 ];
@@ -511,7 +514,7 @@ const BACKEND: &[Field] = &[
         "backend",
         Kind::Choice(BACKENDS),
         "The transcription backend. Its key or model is below. local-vosk and local-parakeet \
-         are not implemented yet; e edits their sections in config.toml.",
+         are not implemented yet; set their model_path in config.toml.",
     ),
     field(
         "deepgram.api_key",
@@ -548,8 +551,9 @@ const BACKEND: &[Field] = &[
         "openai.model",
         "openai model",
         suggest(catalog::OPENAI_MODELS),
-        "The model of both openai backends. A recording on openai sends gpt-transcribe in \
-         place of a realtime-only one.",
+        "The model of both openai backends. With no [openai] section, openai-realtime uses \
+         gpt-realtime-whisper. A recording on openai sends gpt-transcribe in place of a \
+         realtime-only one.",
     ),
     field(
         "openai.languages",
@@ -569,8 +573,9 @@ const BACKEND: &[Field] = &[
             tilde: false,
             from: Some(Source::ModelFiles),
         },
-        "The ggml model file. Those in the models folder are listed; any other path can be \
-         typed, tab completes it. whisrs setup downloads one.",
+        "The ggml model file, as a full path. config.toml does not expand ~; whisrs config \
+         expands it when it saves. whisrs setup downloads models into the models folder, and \
+         whisrs config lists those.",
         Gate::LocalWhisper,
     ),
     gated(
@@ -584,7 +589,8 @@ const BACKEND: &[Field] = &[
         "local-whisper.phrase_silence_ms",
         "phrase silence",
         ms(0, 10_000, 50, 250),
-        "The silence that ends a phrase with silence segmentation.",
+        "The silence that ends a phrase with silence segmentation. Shorter types sooner, in \
+         smaller pieces; longer keeps a phrase together and types it later.",
         Gate::LocalWhisper,
     ),
     gated(
@@ -613,7 +619,8 @@ const BACKEND: &[Field] = &[
             from: Source::AsrSidecarModels,
         },
         "The model name sent to the sidecar. Listed for OpenRouter, with the price of an hour \
-         of audio; a server of your own names its own.",
+         of audio; a server of your own names its own. Left at the default on OpenRouter, \
+         openai/whisper-large-v3-turbo is sent.",
     ),
     field(
         "asr-sidecar.api_key",
@@ -638,7 +645,7 @@ const BACKEND: &[Field] = &[
         "openai-compatible-realtime.profile",
         "realtime profile",
         Kind::Choice(catalog::REALTIME_PROFILES),
-        "Which server dialect to speak.",
+        "Which server dialect to speak. Only lemonade works so far.",
     ),
     field(
         "openai-compatible-realtime.turn_detection",
@@ -663,7 +670,7 @@ const AUDIO: &[Field] = &[
             check: None,
             from: Source::Inputs,
         },
-        "The microphone: default, or a source the sound server lists. Monitors, last, record \
+        "The microphone: default, or a source the sound server lists. A monitor source records \
          what the speakers play.",
     ),
     field(
@@ -671,8 +678,8 @@ const AUDIO: &[Field] = &[
         "speech detector",
         Kind::Choice(catalog::VADS),
         "What decides a sound is speech, for auto-stop, the skips and recordings: earshot, a \
-         small learned model that holds up in background noise, or rms, the loudness test of \
-         0.1.31. The Mic test's quality line uses it too.",
+         small learned model that holds up in background noise, or rms, a plain loudness test. \
+         The Mic test's quality line uses it too.",
     ),
 ];
 
@@ -735,14 +742,15 @@ const TYPING: &[Field] = &[
             unit: "ms",
             named: &[(0, "no wait")],
         }),
-        "How long to wait for held Super, Alt, Ctrl or Shift before each key; still held, \
-         the rest goes to the clipboard. no wait sends it there at once.",
+        "How long to wait for held Super, Alt, Ctrl or Shift before each key; if one is \
+         still held, the rest goes to the clipboard. At 0 (no wait), it goes there at once.",
     ),
     field(
         "input.paste",
         "paste",
         Kind::Bool,
-        "Paste with Ctrl+V instead of typing (batch backends and command mode).",
+        "Paste with Ctrl+V instead of typing (batch backends, command mode and LLM \
+         commands).",
     ),
     field(
         "input.clipboard_fallback",
@@ -822,14 +830,16 @@ const OVERLAY: &[Field] = &[
         "general.overlay",
         "overlay",
         Kind::Bool,
-        "Show the recording pill on screen.",
+        "Show a small pill on screen while you dictate or hear text read aloud. Recordings \
+         show none.",
         Gate::Overlay,
     ),
     field(
         "overlay.theme",
         "theme",
         Kind::Choice(catalog::OVERLAY_THEMES),
-        "Colours the pill and this screen. custom takes the colors below.",
+        "Colours the pill and whisrs config. custom takes the [overlay.colors] values, and \
+         ember's colours for those left unset.",
     ),
     field(
         "overlay.position",
@@ -843,7 +853,7 @@ const OVERLAY: &[Field] = &[
         "overlay.colors.recording",
         "recording color",
         Kind::Color,
-        "The custom theme's recording colour, and this screen's accent.",
+        "The custom theme's recording colour, and whisrs config's accent.",
     ),
     field(
         "overlay.colors.transcribing",
@@ -964,8 +974,9 @@ const LLM: &[Field] = &[
         "llm.api_key",
         "api_key",
         Kind::Secret,
-        "API key for the LLM provider, for command mode, LLM commands and recording \
-         summaries.",
+        "API key for the LLM provider: command mode, LLM commands, post-processing, recording \
+         summaries and speaker names. Unset, WHISRS_OPENAI_API_KEY is used, else \
+         WHISRS_GROQ_API_KEY. A local server that needs no key still needs a placeholder here.",
     ),
     field(
         "llm.model",
@@ -992,7 +1003,8 @@ const LLM: &[Field] = &[
         "general.llm_post_process",
         "post-process",
         Kind::Bool,
-        "Run every dictation through the LLM with the instruction below. Batch backends only.",
+        "Run every dictation through the LLM with llm_instruction before it is typed. Batch \
+         backends only.",
     ),
     field(
         "general.llm_instruction",
@@ -1132,7 +1144,7 @@ const RECORDING: &[Field] = &[
     field(
         "recording.user_name",
         "your name",
-        text("your login name"),
+        text("your account's name"),
         "Your name in transcripts.",
     ),
     field(
@@ -1235,7 +1247,7 @@ const RECORDING: &[Field] = &[
             unit: "",
             named: &[(0, "auto")],
         }),
-        "How many voices the sidecar should find. auto lets it decide.",
+        "How many voices the sidecar should find. At 0 (auto), the sidecar decides.",
     ),
     field(
         "recording.shared_mic",
@@ -1268,21 +1280,23 @@ const HOOKS: &[Field] = &[
         "hooks.media_auto_pause",
         "pause media",
         Kind::Bool,
-        "Pause the media that is playing while you dictate, and resume exactly that after.",
+        "Pause the media that is playing while whisrs listens to you, and resume exactly that \
+         after. Recordings pause nothing.",
         Gate::Hooks,
     ),
     gated(
         "hooks.on_record_start",
         "on start",
         text("not set"),
-        "A shell command run when dictation starts.",
+        "A shell command run when whisrs starts listening to you: dictation, command mode, LLM \
+         commands and agent voice turns. Recordings run none.",
         Gate::Hooks,
     ),
     gated(
         "hooks.on_record_stop",
         "on stop",
         text("not set"),
-        "A shell command run when dictation stops.",
+        "A shell command run when whisrs stops listening to you. Recordings run none.",
         Gate::Hooks,
     ),
 ];

@@ -9,6 +9,13 @@
 //! restart, `$EDITOR`, setup's sudo step) and owns the terminal. The daemon,
 //! the network and the sound server are only ever asked from [`worker`]
 //! threads, so none of them can freeze the screen.
+//!
+//! Agents reach it through a taria layer that `run` binds before the
+//! alternate screen (`TariaLayer::bind_or_disabled("whisrs")`): a failed
+//! bind prints one line and the TUI opens anyway. Each pass of `event_loop`
+//! applies the agent input queued (`agent::apply`, each input's effects run
+//! before the next), draws only when `redraw` is set, then publishes
+//! `tree::build` while the layer is enabled.
 
 mod agent;
 mod app;
@@ -17,6 +24,8 @@ mod form;
 mod glyphs;
 mod keys;
 mod options;
+#[cfg(test)]
+mod reference;
 #[cfg(test)]
 mod render_tests;
 mod schema;
@@ -372,7 +381,7 @@ fn drain_early_input() -> std::io::Result<()> {
 fn terminal_refusal(entry: Entry, env: &Env, tty: bool, config: &Path) -> Option<String> {
     (!tty || env.get("TERM") == Some("dumb")).then(|| {
         format!(
-            "{} needs an interactive terminal. Edit {} (reference: docs/configuration.md), then \
+            "{} needs an interactive terminal. Edit {} (reference: docs/config-reference.md), then \
              run whisrs restart.",
             entry.command(),
             tilde(config, env.get("HOME")).display()
@@ -976,7 +985,7 @@ mod tests {
             terminal_refusal(Entry::Config, &env, false, config).as_deref(),
             Some(
                 "whisrs config needs an interactive terminal. Edit \
-                 ~/.config/whisrs/config.toml (reference: docs/configuration.md), then run \
+                 ~/.config/whisrs/config.toml (reference: docs/config-reference.md), then run \
                  whisrs restart."
             )
         );
