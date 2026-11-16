@@ -1,5 +1,7 @@
 # Troubleshooting
 
+This page lists common whisrs problems by symptom, with the cause and the fix.
+
 ## /dev/uinput permission denied
 
 Copy the udev rule and add yourself to the `input` group:
@@ -14,28 +16,25 @@ Log out and back in for the group change to take effect.
 
 If you are already in the `input` group and still get permission denied, the
 `uinput` module is probably not loaded (`ls /sys/class/misc/uinput` fails). The
-kernel only autoloads it when `/dev/uinput` is opened, and the node is
-`root:root 0600` until then, so a non-root open never gets that far. The rule's
-`static_node=uinput` option fixes the node's permissions at boot. To fix it
-without rebooting:
+rule's `static_node=uinput` option fixes that from the next boot. To fix it
+now:
 
 ```bash
 sudo modprobe uinput
 ```
 
 The rule also grants the `input` group an ACL on `/dev/uinput`, which matters when
-another rule (e.g. brltty) sets one; ACLs override plain group permissions. That
-line is written against the FHS path `/usr/bin/setfacl` and is skipped when the
-path does not exist, so on distributions that put `setfacl` elsewhere (NixOS,
-Guix) rewrite it after copying:
+another rule (e.g. brltty) sets one. That line calls `/usr/bin/setfacl` and is
+skipped when the path does not exist, so on distributions that put `setfacl`
+elsewhere (NixOS, Guix) rewrite it after copying:
 
 ```bash
 command -v setfacl >/dev/null && sudo sed -i "s|/usr/bin/setfacl|$(command -v setfacl)|g" /etc/udev/rules.d/99-whisrs.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-The `command -v` guard matters: with `setfacl` not installed the substitution would
-rewrite the rule to `TEST==""`, which stays dead even after you install `acl`.
+Keep the `command -v` guard: without `setfacl` installed, the substitution
+breaks that line for good, even after you install `acl`.
 
 The Nix package does this substitution at build time.
 
@@ -43,7 +42,7 @@ The Nix package does this substitution at build time.
 
 Verify your mic is recognized: `arecord -l`. If nothing shows up, make sure ALSA or PulseAudio/PipeWire is installed and your mic is not muted. On PipeWire systems, install `pipewire-alsa` for ALSA compatibility.
 
-If whisrs records from the wrong microphone, set `[audio] device` to the source you want: a name from `pactl list short sources` (second column), or a description from your sound settings (on PipeWire, `wpctl status` lists them). Restart the daemon afterwards (`whisrs restart`) and check its log (`journalctl --user -u whisrs`) for the line saying which device the name resolved to. An unknown name falls back to the system default with a warning that lists the valid names. See [Choosing the microphone](configuration.md#choosing-the-microphone).
+If whisrs records from the wrong microphone, set `[audio] device` as [Choosing the microphone](configuration.md#choosing-the-microphone) describes, then run `whisrs restart`.
 
 ## Noisy room or quiet mic
 
@@ -52,22 +51,20 @@ whisrs measures the audio of every dictation, command and agent turn, and every 
 - **"Skipped: the audio was silent (peak -120 dB). Is the mic muted?"** Only digital silence reached whisrs: a muted mic or the wrong device (see [No microphone detected](#no-microphone-detected)). With `[audio] vad = "rms"`, "silent" means the whole recording stayed under about -50 dBFS, which a quiet room does too, so the muted-mic question then comes only when it was digital silence.
 - **"... the audio was too quiet (speech at -68 dB)"** A voice was heard, but too faint to send (under -65 dBFS). Move closer or raise the mic gain, for example `wpctl set-volume @DEFAULT_SOURCE@ 80%`.
 - **"... the audio was without speech (background at -48 dB)"** There was sound but no speech. If you did speak, either the background is drowning you out (try the noise filter below) or your voice was too faint or short even to count as too quiet: move closer or raise the gain.
-- **Recording warnings**, each at most once per recording:
+- **Recording warnings**, each at most once per recording, once your mic has heard 30 seconds of speech:
   - "too quiet": your speech is under -55 dBFS. Move closer or raise the gain.
   - "clipping": the mic hit its limit. Lower the gain.
   - "noisy": your speech is less than 10 dB above the background. Try the noise filter below.
-  - "nothing has played on the system track yet": in a call, check `[recording] system_device`.
+  - "nothing has played on the system track yet", after 2 minutes of your speech: in a call, check `[recording] system_device`.
 
-  "Too quiet" and "noisy" judge only your own speech, what the mic records while nothing plays on the system track, so the echo of a lecture on your speakers is not judged as your voice. Each track's levels are kept in `recording.json` and the transcript's front matter ([Recording](configuration.md#recording)).
-- **Your soft voice is missing from a recording while a video played on the laptop speakers.** whisrs removes the speakers' echo from the mic track, and a soft voice under that echo goes with it, as in 0.1.31. Use headphones, or speak up.
+  "Too quiet" and "noisy" judge only your own speech, what the mic records while nothing plays on the system track, so the echo of a lecture on your speakers is not judged as your voice. The transcript's front matter keeps each track's levels and warnings ([Recording](recording.md)).
+- **Your soft voice is missing from a recording while a video played on the laptop speakers.** whisrs removes the speakers' echo from the mic track, and a soft voice under that echo goes with it. Use headphones, or speak up.
 
-A streaming dictation that typed nothing because its audio held no speech says "Nothing typed: the audio was ..." with one of the reasons above.
+A streaming dictation that typed nothing because its audio held no speech says "Nothing typed: the audio was ..." with one of the reasons above. With the overlay on (`[general] overlay`), the dictation and `[[llm_commands]]` skip notifications and "Nothing typed" do not show; command mode and agent turns always show theirs.
 
-With the overlay on (`[general] overlay`), the dictation and `[[llm_commands]]` skip notifications and "Nothing typed" do not show; command mode and agent turns always show theirs. Every skip is in the daemon log either way: `journalctl --user -u whisrs`.
+Every skip is in the daemon log either way (`journalctl --user -u whisrs`). Each dictation, command and agent turn also logs its levels there (speech, background, SNR, peak and clipping) and when the speech detector heard something ("heard at 0.35 to 8.20 s", or "heard nothing"). SNR, the signal-to-noise ratio, is how far the speech is above the background in dB: speech recognition copes down to about 10 dB and gets worse below about 6 dB.
 
-Each dictation, command and agent turn also logs its levels there: the speech level, the background, the SNR (signal-to-noise ratio: how far the speech is above the background, in dB), the peak and the share of clipped samples, then when the speech detector first and last heard something ("heard at 0.35 to 8.20 s", or "heard nothing"), a hint for a session that stopped or skipped unexpectedly. Speech recognition copes down to about 10 dB of SNR and gets worse below about 6 dB.
-
-If the speech detector itself misjudges your mic, `[audio] vad = "rms"` brings back the plain loudness test of whisrs 0.1.31 ([Speech detection](configuration.md#speech-detection)).
+If the speech detector itself misjudges your mic, `[audio] vad = "rms"` switches to a plain loudness test ([Speech detection](configuration.md#speech-detection)).
 
 ### A noise filter with PipeWire
 
@@ -90,7 +87,7 @@ The example's `"VAD Threshold (%)"` control (50) mutes what RNNoise does not tak
 
 ## API key errors (401 Unauthorized)
 
-Double-check your key is valid and not expired. Ensure the correct environment variable is set (`WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, or `WHISRS_OPENAI_API_KEY`), or that the key in `~/.config/whisrs/config.toml` is correct. Re-run `whisrs setup` to reconfigure.
+Check that the key is valid and not expired. A key variable in the daemon's environment (`WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, `WHISRS_OPENAI_API_KEY` or `WHISRS_ASR_SIDECAR_API_KEY`) wins over the key in `~/.config/whisrs/config.toml`, so a stale one hides a correct file ([Environment variables](configuration.md#environment-variables)). In `whisrs config`, `t` on a key row tests the key with one request; `whisrs setup` sets it again.
 
 ## Config file fails to load
 
@@ -115,35 +112,30 @@ chmod 600 ~/.config/whisrs/config.toml
 
 ## Text goes to the wrong window
 
-whisrs captures the focused window when recording starts and restores focus before typing. This requires compositor support. See the [Supported Environments](../README.md#supported-environments) table. On GNOME Wayland, the `window-calls` extension is required.
+On GNOME and KDE whisrs cannot focus the window you started in again ([Terminal detection](configuration.md#terminal-detection) says why), so keep the target window focused until the text appears.
 
 ## TUI drops characters while whisrs types
 
-Some Node/Ink-based terminal UIs (e.g. Claude Code in raw mode) can drop characters when whisrs injects text quickly. Raise the inter-key delay in `~/.config/whisrs/config.toml`:
-
-```toml
-[input]
-key_delay_ms = 6   # default is 2; try 4–10 if characters get dropped
-```
-
-Restart the daemon for the change to take effect.
+Some terminal UIs drop characters when whisrs types fast: raise `[input] key_delay_ms` as [Typing](configuration.md#typing) describes, then run `whisrs restart`.
 
 ## Daemon not running
 
-Start the daemon manually (`whisrsd`) or via your service manager.
-
-systemd:
+Start the daemon by hand (`whisrsd`) or through your service manager. `whisrs setup` installs the user service; to install it yourself under systemd, point `ExecStart` at the installed `whisrsd`, since systemd ignores your shell's `PATH` and the shipped unit names a bare `whisrsd`:
 
 ```bash
-systemctl --user start whisrs.service
+install -Dm644 contrib/whisrs.service ~/.config/systemd/user/whisrs.service
+sed -i "s|^ExecStart=.*|ExecStart=$(command -v whisrsd)|" ~/.config/systemd/user/whisrs.service
+systemctl --user enable --now whisrs.service
 systemctl --user status whisrs.service
 ```
 
-OpenRC:
+OpenRC user services need OpenRC 0.55 or newer:
 
 ```bash
+install -Dm755 contrib/openrc/whisrs.initd ~/.config/rc/init.d/whisrs
+install -Dm644 contrib/openrc/whisrs.confd ~/.config/rc/conf.d/whisrs
+rc-update --user add whisrs default
 rc-service --user whisrs start
-rc-service --user whisrs status
 ```
 
 If it fails, check the logs: `journalctl --user -u whisrs.service` under systemd,
@@ -179,20 +171,15 @@ Place it in `~/.local/share/whisrs/models/` and update `model_path` in your conf
 
 ## Garbled output / wrong characters on non-US layouts
 
-whisrs auto-detects your XKB layout via the active compositor (Hyprland / Sway), then `setxkbmap` (X11), then `localectl` (systemd), then the `XKB_DEFAULT_LAYOUT` / `XKB_DEFAULT_VARIANT` env vars, in that order. If none succeed, it falls back to US/QWERTY, and on a non-US layout that produces garbled output (e.g. `"this"` typed as `"èCDU"` on `fr(bepo)`).
+The uinput backend types each character with the key that makes it in your XKB layout, so it needs to know that layout. whisrs takes it from Hyprland's keyboard, else `setxkbmap -query` (an X11 session), else `localectl status` (systemd). Only when none of those gives one does it read the `XKB_DEFAULT_LAYOUT` and `XKB_DEFAULT_VARIANT` variables, and with none at all it types as US/QWERTY, which garbles a non-US layout (e.g. `"this"` typed as `"èCDU"` on `fr(bepo)`). The Wayland virtual keyboard, which `[input] backend = "auto"` picks when the compositor has it, and `[input] paste = true` do not depend on the layout.
 
-To diagnose, run the daemon in the foreground with debug logging and look for the detected layout:
+whisrs reads the layout when the daemon starts and does not log it, so run those commands yourself. Fix the first source that answers, then run `whisrs restart`:
 
-```bash
-RUST_LOG=debug whisrsd
-```
+1. On Hyprland, set `kb_layout` and `kb_variant` in its `input` section. On X11, `setxkbmap` with your layout.
+2. Elsewhere, make `localectl status` report the right `X11 Layout` and `X11 Variant` (`localectl set-x11-keymap`). It needs no session variables.
+3. When none of those answers (no `localectl` on an OpenRC system, say), set the variables on the service. They cannot override a layout found above.
 
-If the layout is missing or wrong, fix it one of two ways:
-
-1. Make sure `localectl status` reports the right `X11 Layout` and `X11 Variant`. This is the system source-of-truth and works without any X session env vars.
-2. Force the layout via env vars on the service.
-
-   systemd (`systemctl --user edit whisrs.service`):
+   systemd (`systemctl --user edit whisrs.service`), then `systemctl --user restart whisrs.service`:
 
    ```ini
    [Service]
@@ -200,16 +187,14 @@ If the layout is missing or wrong, fix it one of two ways:
    Environment=XKB_DEFAULT_VARIANT=bepo
    ```
 
-   Then `systemctl --user restart whisrs.service`.
-
-   OpenRC (add to `~/.config/rc/conf.d/whisrs`):
+   OpenRC (`~/.config/rc/conf.d/whisrs`), then `rc-service --user whisrs restart`:
 
    ```sh
    XKB_DEFAULT_LAYOUT="fr"
    XKB_DEFAULT_VARIANT="bepo"
    ```
 
-   Then `rc-service --user whisrs restart`.
+Typing also garbles when the focused window's active layout is not the one whisrs found, even when detection is right: per-window layouts on KDE (`SwitchMode=WinClass`, and KWin has no Wayland virtual keyboard), or a layout switched since the daemon started. `[input] paste = true` avoids it for batch dictation and command mode.
 
 ## Hotkey keys are physical positions, not layout characters
 

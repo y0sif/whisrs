@@ -60,9 +60,9 @@ and watch whisper.cpp report the device it picked up:
 RUST_LOG=debug whisrsd
 ```
 
-A working Vulkan build names your GPU at load time (for example
-`ggml_vulkan: Found 1 Vulkan devices: Radeon RX 9070 XT (RADV GFX1201)`) and
-loads the model onto it.
+A working Vulkan build names your GPU at load time (a line starting
+`ggml_vulkan: Found 1 Vulkan devices:` with its name) and loads the model onto
+it.
 
 ## CUDA tuning
 
@@ -116,8 +116,8 @@ flash_attn = true
 ```
 
 When it took effect, whisper.cpp's init lines in the daemon log show
-`flash attn = 1`. Leave it off on Vulkan and CPU builds: it was slower there,
-and on an Intel iGPU under Vulkan it also hung the GPU.
+`flash attn = 1`. Leave it off on Vulkan and CPU builds, where it can be
+slower and can hang some GPUs.
 
 ## Upgrading over a distro package or tarball install
 

@@ -7,7 +7,7 @@ Detect Whisper prompt-regurgitation hallucination on silent audio.
 Whisper-family models (OpenAI `whisper-1`, `gpt-4o-*-transcribe`, and most
 Whisper-derived APIs) condition decoding on an optional **prompt** parameter.
 When the audio carries no speech, the model has nothing to anchor decoding
-to and falls back to its strongest prior — the prompt itself — emitting it
+to and falls back to its strongest prior (the prompt itself), emitting it
 verbatim (or in long contiguous chunks) as the "transcription."
 
 Without filtering, those echoes are typed at the cursor, which for a
@@ -25,7 +25,7 @@ Two conservative heuristics, neither of which false-positives on real speech:
    the response.
 
 Short responses (fewer than 8 normalised characters or 6 words) are never
-flagged — they could plausibly be a real utterance that happens to overlap
+flagged: they could plausibly be a real utterance that happens to overlap
 the prompt's vocabulary.
 
 ## Example
@@ -35,7 +35,7 @@ use prompt_echo::is_prompt_echo;
 
 let prompt = "John Doe speaking. Professional, culinary register.";
 
-// Echo detected — the model regurgitated the prompt on silence:
+// Echo detected (the model regurgitated the prompt on silence):
 assert!(is_prompt_echo("John Doe speaking. Professional, culinary register.", prompt));
 
 // Real speech not flagged:

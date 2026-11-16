@@ -11,7 +11,7 @@
 #   ./install.sh
 #
 # Environment:
-#   WHISRS_VERSION=v0.1.11   Pin to a specific tag (default: latest)
+#   WHISRS_VERSION=v0.2.1    Pin to a specific tag (default: latest)
 #   WHISRS_MINIMAL=1         Use the minimal build (cloud-only, no whisper.cpp;
 #                            still includes the tray icon, overlay, recordings and
 #                            MCP server)
@@ -132,7 +132,7 @@ else
 
     if [ -z "$TAG" ] || [ "$TAG" = "latest" ]; then
         error "Could not resolve the latest release tag."
-        echo "  Set WHISRS_VERSION=v0.1.11 (or similar) and re-run."
+        echo "  Set WHISRS_VERSION=v0.2.1 (or similar) and re-run."
         exit 1
     fi
     info "Latest:" "$TAG"

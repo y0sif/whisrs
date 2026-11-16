@@ -32,12 +32,13 @@ What actually happened.
 - **Distro:** (e.g., Arch Linux, Ubuntu 24.04)
 - **Audio backend:** (PipeWire / PulseAudio / ALSA)
 - **Keyboard layout:** (QWERTY / Dvorak / AZERTY / other)
-- **Transcription backend:** (Groq / OpenAI Realtime / OpenAI REST / local)
+- **Transcription backend:** (groq / deepgram / deepgram-streaming / openai / openai-realtime / openai-compatible-realtime / local-whisper / asr-sidecar)
 - **whisrs version:** (`whisrs --version`)
 
 ## Daemon Logs
 
-Run with `RUST_LOG=debug whisrsd` and paste the relevant logs:
+Paste the relevant lines of `journalctl --user -u whisrs` (under systemd), or run
+`RUST_LOG=debug whisrsd` in a terminal and paste its output:
 
 ```
 (paste logs here)

@@ -1,6 +1,6 @@
 [Unit]
 Description=whisrs dictation daemon
-Documentation=https://github.com/whisrs/whisrs
+Documentation=https://github.com/y0sif/whisrs
 After=graphical-session.target
 
 [Service]
