@@ -1,15 +1,42 @@
+# Build output
 /target
-/fixtures/
 crates/*/target/
 crates/*/Cargo.lock
+
+# Local test data
+/fixtures/
+
+# Docs: only these pages are tracked
 /docs/*
+!/docs/agents.md
 !/docs/comparison.md
+!/docs/config-reference.md
 !/docs/configuration.md
 !/docs/faq.md
 !/docs/gpu-acceleration.md
+!/docs/recording.md
 !/docs/troubleshooting.md
-!/docs/version-roadmap.md
-.worktrees/
-.deepseek/
+
+# Internal: specs and agent tooling
+/specs/
 .claude/
+.deepseek/
+.worktrees/
 graphify-out/
+CLAUDE.local.md
+
+# Internal working files, in any directory
+NOTES.md
+notes.md
+PLAN.md
+BENCHMARKS.md
+BENCH.md
+HANDOFF.md
+TESTING-QUEUE.md
+MEMORY.md
+next-session*.md
+
+# Internal working folders, at the root only
+/bench/
+/results/
+/memory/

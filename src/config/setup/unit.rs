@@ -150,7 +150,7 @@ pub fn write(
 /// script; what to say about it.
 ///
 /// The init script defaults every value it reads, so a missing conf.d is not a
-/// failure, but README and docs/troubleshooting.md both point users at
+/// failure, but docs/troubleshooting.md points users at
 /// `~/.config/rc/conf.d/whisrs`, so it should exist for them to edit. Never
 /// overwrites: the file holds user settings and may hold API keys.
 fn install_openrc_confd(dir: &Path, contrib: &impl Fn(&str) -> Option<PathBuf>) -> Option<String> {
@@ -167,7 +167,7 @@ fn install_openrc_confd(dir: &Path, contrib: &impl Fn(&str) -> Option<PathBuf>) 
     Some(match fs::copy(&src, &dest) {
         Ok(_) => {
             // May hold API keys, so keep it owner-only rather than the 0644
-            // the README suggests for a bare tunables file.
+            // of the manual install in docs/troubleshooting.md.
             let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o600));
             format!("installed tunables to {}", dest.display())
         }
@@ -573,10 +573,10 @@ mod tests {
     /// actually get, so a change to the packaged unit is covered too.
     #[test]
     fn exec_start_rewrite_touches_nothing_else_in_the_shipped_unit() {
-        // Not an early return: `Cargo.toml` sets no `include`/`exclude`, so
-        // `contrib/` ships with the crate and is on disk wherever this test
-        // runs. A `return` here would let the whole assertion go vacuous the
-        // day that stops being true.
+        // Not an early return: `contrib/whisrs.service` is in `Cargo.toml`'s
+        // `include`, so it ships with the crate and is on disk wherever this
+        // test runs. A `return` here would let the whole assertion go vacuous
+        // the day that stops being true.
         let src = find_contrib_file("whisrs.service").expect("contrib/whisrs.service is on disk");
         let original = std::fs::read_to_string(&src).expect("contrib unit is readable");
         let rewritten = rewrite_exec_start(&original, "/opt/bin/whisrsd");

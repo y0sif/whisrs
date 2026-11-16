@@ -243,7 +243,7 @@ cursor in the previously focused window.
 .RS
 .TP
 \fB\-l\fR, \fB\-\-language\fR \fICODE\fR
-Override the transcription language for this session only \(em no config
+Override the transcription language for this session only, with no config
 edit or daemon restart.
 .I CODE
 is an ISO 639\-1 code (e.g.
@@ -309,10 +309,9 @@ in place. Requires a selection. To write text where there is none, configure
 an
 .B [[llm_commands]]
 entry with a generic \(lqtreat the following text as a request and output
-only what is asked\(rq instruction \(em that path never reads the selection.
-See
-.I https://github.com/y0sif/whisrs/blob/main/docs/configuration.md
-for the recipe.
+only what is asked\(rq instruction: that path never reads the selection.
+The recipe is under \(lqGenerate text with no selection\(rq in
+.IR https://github.com/y0sif/whisrs/blob/main/docs/configuration.md .
 .TP
 \fBllm\-command\fR \fINAME\fR
 Toggle a named custom LLM command (see
@@ -325,7 +324,7 @@ typed at the cursor. Press again to stop recording, same as
 .TP
 \fBllm\-command\-set\fR \fINAME\fR
 Reprogram a named LLM command from the current selection: highlight the
-new instruction text, then run this \(em it is saved to
+new instruction text, then run this; it is saved to
 .I config.toml
 and applied live. Pairs with an entry's
 .BR set_hotkey .
@@ -700,7 +699,7 @@ Applies to
 .B command
 and to every
 .B [[llm_commands]]
-entry \(em both type the model's reply at the cursor.
+entry: both type the model's reply at the cursor.
 .PP
 A reply wrapped entirely in a Markdown code fence is unwrapped before it is
 typed; a fence is never what you wanted at the cursor. A reply that contains
@@ -708,7 +707,7 @@ several fenced blocks is prose about code, not a wrapper, and is left alone.
 Stripping has no opt-out, so an entry whose instruction asks for a fenced
 block cannot produce one.
 .PP
-A reply spanning several lines is typed normally \(em translating a paragraph
+A reply spanning several lines is typed normally: translating a paragraph
 or drafting an email is exactly what these commands are for. The one exception
 is a terminal: there a line break is an Enter that runs a command you have not
 read, so a multi-line reply aimed at a terminal is refused rather than typed.
@@ -732,11 +731,9 @@ set, there is no refusal: whisrs types and pastes nothing, so the reply is
 copied to the clipboard like any other result. Pasting it into a shell yourself
 carries the same caveat about bracketed paste.
 .PP
-Terminal detection needs
-.BR WindowTracker::get_focused_window_class ,
-which Hyprland, Niri, Sway and X11 implement. On GNOME and KDE it reports
-nothing, so a terminal there is treated as an ordinary target and multi-line
-replies are typed.
+Terminal detection needs the focused window's class, which whisrs reads on
+Hyprland, Niri, Sway and X11. GNOME and KDE do not report it, so a terminal
+there is treated as an ordinary target and multi\-line replies are typed.
 .SH ENVIRONMENT
 .TP
 .B WHISRS_GROQ_API_KEY
@@ -745,6 +742,16 @@ Groq API key. Overrides the value in
 .TP
 .B WHISRS_OPENAI_API_KEY
 OpenAI API key. Overrides the value in
+.IR config.toml .
+.TP
+.B WHISRS_DEEPGRAM_API_KEY
+Deepgram API key. Overrides the value in
+.IR config.toml .
+.TP
+.B WHISRS_ASR_SIDECAR_API_KEY
+Bearer token for an
+.B asr\-sidecar
+server that needs one (OpenRouter, for example). Overrides the value in
 .IR config.toml .
 .TP
 .B NO_COLOR

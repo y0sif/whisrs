@@ -32,19 +32,5 @@ the `gnome-extensions enable` command again.
 
 ## Updating the extension
 
-On Wayland, GNOME Shell caches extension bytecode and there is no in-session
-reload. After changing any file, clear the cache and log out:
-
-```bash
-rm -rf ~/.cache/gnome-shell/extensions/whisrs-overlay@eresende.github
-```
-
-Then log out and back in. For already-installed extensions where only
-`stylesheet.css` changed, a disable/enable cycle is sometimes enough:
-
-```bash
-gnome-extensions disable whisrs-overlay@eresende.github
-gnome-extensions enable whisrs-overlay@eresende.github
-```
-
-But for `extension.js` changes a full session restart is required.
+Copy the new version over the old one, delete `~/.cache/gnome-shell/extensions/whisrs-overlay@eresende.github`,
+and log out and back in: GNOME Shell on Wayland cannot reload an extension within a session.

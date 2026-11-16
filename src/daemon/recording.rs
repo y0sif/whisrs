@@ -8,6 +8,18 @@
 //! recording finishes as usual. Status goes out on a separate watch channel
 //! that only the tray reads, so a recording never animates the overlay or
 //! fires the dictation hooks.
+//!
+//! Every processing job goes through one queue and one worker: a [`Job`] is
+//! a transcription or a summary, claimed with `reserve` (which refuses a
+//! recording already queued, processed or held) and handed over with
+//! `dispatch`. Waiting transcriptions run before waiting summaries
+//! ([`next_job`]), but a running summary delays the next transcription. A
+//! short rewrite that is no job (`recording name`, the retention sweep)
+//! takes a `hold` instead, which a transcription blocks and a summary job
+//! does not; a delete's hold is refused by both. A summary job reads a snapshot and calls
+//! the LLM unheld, then holds the recording only to merge its result in
+//! ([`summarize_one`]); it never transcribes again. Its `summary_pending`
+//! mark brings an interrupted one back at the next start ([`resume_summaries`]).
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;

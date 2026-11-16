@@ -1,3 +1,25 @@
+//! The two transcription paths. [`run_streaming_pipeline`] types text while
+//! the user talks (a backend that `supports_streaming`); [`transcribe_batch_audio`]
+//! sends one recorded buffer: batch dictation, command mode, `[[llm_commands]]`,
+//! agent voice turns and recovery retries, told apart by [`BatchOrigin`] and
+//! [`BatchOptions`]. A dictation feature belongs on both paths.
+//!
+//! Every speech decision goes through `audio-silence-gate` with `[audio] vad`:
+//!
+//! - The close profile (one user near the mic) for dictation, command mode,
+//!   `[[llm_commands]]` and agent turns: auto-stop while recording (here, and
+//!   `collect_instruction_audio` for the instruction flows), the speech gate
+//!   that skips the backend on a batch buffer with no speech (not on a
+//!   recovery retry), and local whisper's streaming phrase splits.
+//!   `silence_timeout_ms = 0` turns auto-stop off on every path.
+//! - The open profile (any voice counts) for recording tracks and their chunk
+//!   cuts (`TrackKind::vad_config`, `TranscriptionConfig::open_vad`). The
+//!   system track goes without the soft threshold, since it carries music.
+//!
+//! A skipped turn's toast names its reason with a level
+//! (`quality::skip_label`). Each turn logs one line of levels ending in
+//! [`heard_label`], a diagnostic that decides nothing.
+
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

@@ -5,10 +5,8 @@
 small Python environment that `uv` builds on first run. Two ONNX models do
 the work: pyannote segmentation-3.0 finds the speech and where the speaker
 changes, and 3D-Speaker's ERes2Net (trained on English VoxCeleb) tells the
-voices apart. In the laptop measurements below it gave more of the speech
-the right voice than the [Nemotron recipe](../nemotron/), but it is 3.5
-times slower than Nemotron on a CPU, and it counts the voices right only
-thanks to its threshold and merge step.
+voices apart. [The sidecars index](../README.md) compares it with the
+Nemotron recipe.
 
 - sherpa-onnx: Apache-2.0.
 - pyannote segmentation-3.0, converted to ONNX by sherpa-onnx: MIT (the
@@ -18,65 +16,35 @@ thanks to its threshold and merge step.
 - No account, token or GPU needed. Avoid the `sherpa-onnx-reverb-diarization-v1`
   model that sits next to these downloads: its licence is non-commercial.
 
-## Measured on a laptop
+The environment takes about 100 MB (sherpa-onnx bundles onnxruntime) and the
+two models 32 MB. The Python packages are pinned in `server.py`; another
+sherpa-onnx version may need a new `--threshold`.
 
-Intel Core Ultra 9 185H, 4 CPU threads, three 15-minute AMI meetings scored
-against the AMI reference, plus two real recordings.
+Reading an upload takes about 3 times its size in memory on top of the
+diarization, about 1 GB more for a 3-hour track. `--max-upload-mb` (default
+400, a little over 3.5 hours of speech) refuses anything larger. It diarizes
+one recording at a time, and whisrs waits and tries again while it is busy.
 
-| | |
-|---|---|
-| Time for 15 minutes of audio | about 2.5 to 2.8 minutes (0.16 to 0.19 x real time) |
-| Peak memory | 575 MB for 15 minutes sent over HTTP; 660 MB for a 28-minute call (run with `--input`) |
-| Error rate (0.25 s collar, overlapping speech included) | 11.8 % |
-| Voices found, after the merge | 4, 4 and 3 for the meetings (4 in each, but the fourth person of the third meeting says 2 s); 1 for a one-teacher lesson video; 2 for a two-person call |
-| Voices found, before the merge | 8, 8 and 8; 1; 9 |
+## Tuning
 
-The environment takes about 100 MB (sherpa-onnx bundles onnxruntime), and the
-two models 32 MB. The Python packages are pinned in `server.py` to the
-versions measured here (sherpa-onnx 1.13.8, numpy 2.5.4, soundfile 0.14.0):
-the threshold below was tuned on sherpa-onnx 1.13.8, and another version may
-need it tuned again.
+Without a speaker count, the voices are grouped by distance, then small groups
+are merged:
 
-Reading an upload takes about 3 times its size in memory (it is read once
-and decoded where it lies), on top of the diarization itself: about 1 GB more
-for a 3-hour track (345 MB of WAV). `--max-upload-mb` (default 400, a little
-over 3.5 hours of speech) refuses anything larger with HTTP 413. One
-recording is diarized at a time: a request that comes meanwhile is answered
-HTTP 503 with `Retry-After: 30` (whisrs waits and tries again) and its body
-is never kept. That answer takes under a second, except during sherpa-onnx's
-first pass over the audio (the first 35 s or so for 15 minutes of audio),
-which holds Python's interpreter lock until it ends.
-
-## Why the threshold matters
-
-Without a speaker count, sherpa-onnx groups the voices by a distance
-threshold. Its usual default, 0.5, found 60 voices in a 15-minute meeting of
-four people. On a separate AMI meeting used only for tuning, 1.1 found the
-voices best; 1.2 already merged four people into two. So `--threshold 1.1` is
-the default here, set for this embedding model on meetings: another
-embedding model needs its own value.
-
-Even at 1.1, a long recording keeps a few small clusters: a cough, two people
-at once, one voice split in pieces. Unmerged, each would show up in the
-transcript as one more "Speaker N" with a line or two. So every cluster
-holding under 5 % of the speech (`--min-share`), smallest first, is merged
-into the voice it sounds closest to (the cosine similarity of their mean
-embeddings). Only a small cluster with 10 s of speech or more
-(`--keep-seconds`) that sounds unlike every other voice (similarity under
-0.6, `--min-similarity`) stays a voice of its own: someone who says little.
-That guard kept two people of the third meeting apart, who talk for 35 and
-11 s there; merging every small cluster left that meeting with one voice
-(and a worse error rate, 13.0 % against 11.8 % over the three meetings).
+- `--threshold` (default 1.1, set for this embedding model on meetings): lower
+  finds more voices, higher merges different people.
+- `--min-share` (default 0.05): a voice with less of the speech than this is
+  merged into the one it sounds closest to.
+- `--keep-seconds` (default 10) and `--min-similarity` (default 0.6): a small
+  voice with that much speech that sounds unlike every other stays apart.
 
 With `num_speakers` (whisrs' `num_speakers` or `--num-speakers N`),
 sherpa-onnx groups the speech into that many voices (one can come back empty
-on a short clip) and nothing is merged. In the measurements the true count
-did worse than the threshold and merge (13.5 % against 11.8 %), so leave it
-at 0 unless you know.
+on a short clip) and nothing is merged. The threshold and merge usually do
+better, so leave it at 0.
 
 ## Install
 
-The models, with the checksums of the files measured here:
+The models, with their checksums:
 
 ```sh
 mkdir -p ~/.local/share/sherpa-onnx && cd ~/.local/share/sherpa-onnx
@@ -130,5 +98,4 @@ diarization_url = "http://127.0.0.1:8770/diarize"
 ```
 
 `diarization = "auto"`, the default, uses the sidecar once `diarization_url`
-is set. whisrs waits at least 10 minutes, and twice the length of the speech
-it sends, which leaves room at 0.19 x real time.
+is set.

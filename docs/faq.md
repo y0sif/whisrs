@@ -1,22 +1,19 @@
 # FAQ
 
-**Does whisrs work on Wayland?**
-Yes. whisrs has native support for Wayland compositors including Hyprland, Sway, GNOME, and KDE. It uses compositor-specific protocols for window tracking and the Wayland virtual keyboard (or uinput) for keyboard injection, so it does not depend on X11 tools like xdotool.
+These answers add to the [FAQ in the README](../README.md#faq).
 
-**Can whisrs work offline?**
-Yes. The local whisper.cpp backend runs transcription entirely on your machine. No API key, no internet connection, and no audio data leaves your device. Run `whisrs setup` and select the local backend to get started.
+## Which speech recognition backends does whisrs support?
 
-**What speech recognition backends does whisrs support?**
-Six backends: Groq (cloud, free tier), Deepgram Nova REST and Streaming (cloud, 60+ languages, $200 free credit on signup), OpenAI REST (cloud), OpenAI Realtime (cloud, true streaming over WebSocket), and local whisper.cpp (offline, CPU/GPU). More local backends (Vosk, Parakeet) are planned.
+whisrs supports eight backends: `groq`, `deepgram`, `deepgram-streaming`, `openai`, `openai-realtime`, `openai-compatible-realtime`, `local-whisper` and `asr-sidecar`. `asr-sidecar` reaches any OpenAI-compatible transcription server, your own (Parakeet, Nemotron, Moonshine) or hosted, such as [OpenRouter](configuration.md#openrouter). [Batch and streaming backends](configuration.md#batch-and-streaming-backends) says which of them type while you speak.
 
-**How does whisrs type text into applications?**
-whisrs sends keystrokes through the Wayland virtual-keyboard protocol or a virtual keyboard created with Linux's uinput subsystem (on X11 you can opt into the XTEST extension instead with `[input] backend = "xtest"`), and performs XKB reverse lookups to find the correct keycode and modifier combination for each character. This means it respects your keyboard layout and works in any application, including terminals, editors, and browsers.
+## How does whisrs type text into applications?
 
-**Can whisrs read text back to me?**
-Yes. Select some text, then run `whisrs speak` (alias `read`, or bind `[hotkeys] speak`) and whisrs reads the selection aloud. Press the speak hotkey again or run `whisrs cancel` to stop playback. Supported backends are Groq, OpenAI, Deepgram, and a local OpenAI-compatible `tts-sidecar` (Kokoro, Supertonic, etc.). It is off by default; enable it with `[tts] enabled = true`.
+whisrs types keystrokes through a virtual keyboard that follows your layout, so the text lands in any app, terminals included. [Typing](configuration.md#typing) covers the backends and paste.
 
-**Is whisrs a replacement for Wispr Flow or Superwhisper on Linux?**
-Yes. Wispr Flow ships clients for macOS and Windows; Superwhisper is macOS-only. Neither has a Linux client. whisrs brings the same workflow to Linux: press a hotkey, speak, and text appears at your cursor. It supports both cloud and local transcription backends.
+## Can whisrs read text aloud?
 
-**What Linux distributions does whisrs support?**
-whisrs works on any Linux distribution with the required system dependencies (alsa-lib, libxkbcommon, clang, cmake). It has been primarily tested on Arch Linux but also supports Debian/Ubuntu, Fedora, NixOS, and others. Install methods include AUR, cargo, Nix flake, and a universal install script.
+whisrs reads the selected text aloud with `whisrs speak` (alias `read`) once `[tts] enabled = true`, through Groq, Deepgram, or a local or OpenRouter speech server ([Read aloud](configuration.md#read-aloud)).
+
+## Which Linux distributions does whisrs support?
+
+whisrs runs on any Linux distribution with ALSA and libxkbcommon, on x86_64 and aarch64, under systemd or OpenRC. Install it with the install script, a prebuilt tarball, the AUR, `cargo install whisrs --locked` or the Nix flake ([Installation](../README.md#installation)). Building from source also needs clang and cmake for the bundled whisper.cpp.

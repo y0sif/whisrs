@@ -1578,7 +1578,7 @@ pub(crate) async fn handle_agent(
     if !rt.is_enabled() {
         return error(
             "no agents are configured: add an [[agents]] entry to config.toml \
-             (see docs/configuration.md)",
+             (see docs/agents.md)",
         );
     }
     let Some(name) = name.filter(|n| !n.trim().is_empty()) else {

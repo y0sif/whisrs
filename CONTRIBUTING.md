@@ -1,43 +1,26 @@
 # Contributing to whisrs
 
-Thanks for considering a contribution to whisrs. This document covers the basics.
+Thanks for considering a contribution to whisrs.
 
 ## Ways to Contribute
 
-### Testing on your setup
+### Desktop and distro reports
 
-The most impactful thing you can do right now is test whisrs on your compositor and distro, then report what works and what doesn't.
-
-**Compositors that need testing:**
-- Sway / i3
-- KDE Plasma (Wayland)
-- GNOME (Wayland and X11)
-- Any X11 window manager
-
-**Distros that need testing:**
-- Fedora, Ubuntu, Debian, NixOS, Void, Gentoo, etc.
-
-When reporting, include:
-- Compositor + version
-- Distro + version
-- Audio backend (PipeWire / PulseAudio / ALSA)
-- What worked, what didn't
-- Daemon logs (`RUST_LOG=debug whisrsd`)
+When something works differently on your desktop or distro than
+[Supported Environments](README.md#supported-environments) says, open an issue with the
+Compositor / Distro Test Report template. Run the daemon as `RUST_LOG=debug whisrsd` for the logs.
 
 ### Bug reports
 
-Open an issue using the bug report template. Include:
-- Steps to reproduce
-- Expected vs actual behavior
-- Daemon logs
-- Your environment (compositor, distro, audio backend)
+Open an issue with the bug report template: it asks for the steps, your environment and the
+daemon logs.
 
 ### Code contributions
 
 1. Fork the repo
 2. Create a feature branch (`git checkout -b feature/my-thing`)
 3. Make your changes
-4. Run the checks: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
+4. Run the [checks](#checks)
 5. Commit with a clear message
 6. Open a PR using the template
 
@@ -64,17 +47,7 @@ cargo build --no-default-features --features tray,overlay,hooks,recording,mcp
 ```
 
 That is the minimal release build. Dropping `recording,mcp` too leaves out the recording
-feature and `whisrs mcp` (which needs it). CI lints that build and the one without `mcp`, and
-runs the tests of the one without `recording`.
-
-### Build and test
-
-```bash
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
-```
+feature and `whisrs mcp` (which needs it).
 
 The `whisrs config` TUI's render tests compare each screen with a snapshot of its
 rows in `src/cli/tui/snapshots/`. After a change to a screen that is meant, rewrite them
@@ -94,53 +67,50 @@ cargo run --bin whisrs -- cancel
 
 ### Project structure
 
-```
-src/
-  cli/main.rs          — thin CLI client
-  daemon/main.rs       — daemon (the real application)
-  lib.rs               — shared types, config, IPC protocol
-  state.rs             — state machine
-  audio/               — cpal capture, WAV encoding, playback
-  transcription/       — backend trait + Groq, OpenAI, local implementations
-  tts/                 — text-to-speech backends (read selection aloud)
-  window/              — compositor-specific window tracking
-  hotkey/              — evdev hotkey listener + spec parsing
-  tray/, overlay/      — tray icon and recording overlay (feature-gated)
+The directory map is in [AGENTS.md](AGENTS.md#layout). The five crates under `crates/` are
+published to crates.io on their own: their version rule is in [AGENTS.md](AGENTS.md#workspace-crates).
+
+## Checks
+
+CI runs every command below on each pull request. Run them before you push:
+
+```bash
+scripts/check-docs.sh
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+
+# Builds without `recording` and without `mcp`
+cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -- -D warnings
+cargo clippy --all-targets --no-default-features --features tray,overlay,hooks,recording -- -D warnings
+cargo test --no-default-features --features tray,overlay,hooks
+
+# The workspace crates (root `cargo test` skips their tests)
+cargo clippy -p xkb-type --all-features --all-targets -- -D warnings
+cargo test -p xkb-type --all-features -- --skip from_localectl_returns_layout_when_available
+cargo clippy -p audio-silence-gate --all-targets -- -D warnings
+cargo test -p audio-silence-gate
+cargo clippy -p filler-remove -p asr-dedup -p prompt-echo --all-features --all-targets -- -D warnings
+cargo test -p filler-remove -p asr-dedup -p prompt-echo --all-features
+
+# The GPU features still resolve (nothing is compiled)
+for feature in vulkan cuda hipblas; do
+  cargo metadata --locked --format-version 1 --features "$feature" > /dev/null
+done
+
+# Release builds, full and minimal, with no AVX-512 in the binaries
+GGML_NATIVE=OFF cargo build --release
+scripts/check-no-avx512.sh
+GGML_NATIVE=OFF cargo build --release --no-default-features --features tray,overlay,hooks,recording,mcp
+scripts/check-no-avx512.sh
 ```
 
-`src/config/` holds the config types and their validation, the load and format-preserving
-write, and `src/config/setup/`: the side effects of `whisrs setup` (uinput, the service,
-the keybinding, the GNOME extension, the model download, the microphone probe, the API key
-test) as plain functions that neither print nor ask, their programs and network injected
-in tests. The `whisrs config` and `whisrs setup` TUI is in `src/cli/tui/`, in the CLI binary
-so whisrsd never links ratatui: screens (Home, Config, the setup wizard, Mic), widgets, and
-the schema of every config key. It reads and writes config.toml through `src/config/`.
-
-Injection policy stays in the daemon (`inject_text` and friends in `src/daemon/main.rs`),
-but the primitives it calls live in the `xkb-type` workspace crate, alongside four other
-extracted crates:
-
-```
-crates/
-  xkb-type/            — uinput keyboard, XKB keymap, clipboard, wayland virtual keyboard
-  asr-dedup/           — timestamp + n-gram dedup for chunked ASR
-  audio-silence-gate/  - earshot VAD + RMS gate, auto-stop, level meter
-  filler-remove/       — filler-word stripping
-  prompt-echo/         — prompt-echo hallucination filter
-```
-
-These are published to crates.io independently. A change to one needs a version bump in
-its own `Cargo.toml`. The root `Cargo.toml` dependency line only needs editing when the
-new version falls outside its existing requirement: all five are caret requirements, so
-any 0.1.x bump is absorbed and only a 0.2.0 would force a root edit.
+`cargo fmt` fixes what the first check reports.
 
 ## Code Style
 
-- Use `thiserror` for library error types, `anyhow` for binary error handling
-- Use `tracing` for all logging (not `println!` or `log`)
-- Run `cargo fmt` before committing
-- No warnings from `cargo clippy --all-targets -- -D warnings`
-- Keep dependencies minimal — don't add a crate for something you can write in 20 lines
+Follow the coding conventions in [AGENTS.md](AGENTS.md). Keep dependencies minimal: don't add a
+crate for something you can write in 20 lines.
 
 ## Commit Messages
 
