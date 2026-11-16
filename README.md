@@ -16,9 +16,9 @@
 
 **Voice for the Linux desktop: dictation, read-aloud, meeting transcription, voice-driven LLM commands and coding agents, with Groq, Deepgram, OpenAI or offline whisper.cpp.**
 
-Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app. Speech recognition runs in the cloud (Groq, Deepgram, OpenAI) or fully offline through whisper.cpp.
+Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app. Speech recognition runs in the cloud (Groq, Deepgram, OpenAI, OpenRouter), on your own speech server, or fully offline through whisper.cpp.
 
-Other hotkeys read selected text aloud, rewrite it with an LLM, or hand a task to a coding agent (Claude Code, OpenCode, Codex, GitHub Copilot) that answers out loud. Meeting transcription turns your mic and the system audio into one timestamped Markdown transcript with speaker names. One Rust daemon and a small CLI, open source under MIT.
+Other hotkeys read selected text aloud, rewrite it with an LLM, or hand a task to a coding agent (Claude Code, OpenCode, Codex, GitHub Copilot) that answers out loud. Meeting transcription turns your mic and the system audio into one timestamped Markdown transcript with speaker names. A voice-to-text daemon written in Rust and a small CLI, open source under MIT.
 
 ![whisrs demo: dictation, read aloud, and command mode](assets/demo.gif)
 
@@ -30,26 +30,21 @@ Other hotkeys read selected text aloud, rewrite it with an LLM, or hand a task t
 - **Voice + LLM**: rewrite the selection with a spoken instruction, give named instructions their own hotkeys, or clean up every dictation, with any OpenAI-compatible endpoint, local ones included. [LLM commands](docs/configuration.md#llm-commands)
 - **Voice + coding agents**: give Claude Code, OpenCode, Codex or GitHub Copilot a hotkey; it works in its project, answers in a short reply spoken through `[tts]`, and an optional overlay shows what it is doing. [Agent mode](docs/agents.md)
 - **Meeting transcription**: record your mic and the system audio, then get a timestamped Markdown transcript with [speaker names](docs/recording.md#speaker-names), an optional [summary](docs/recording.md#summaries), and a read-only [MCP server](docs/recording.md#mcp-server) so an agent can search your recordings. [Recording](docs/recording.md)
-- **Setup and config**: a full-screen setup wizard, a config editor (`whisrs config`) that an AI agent can drive too (`cargo install taria-mcp`, then `man whisrs`), and [profiles](docs/configuration.md#profiles) that switch the backend and other settings (offline, work) with one command.
+- **Setup and config**: a setup wizard, a full-screen [config editor](#configuration) that an AI agent can drive too (through `taria-mcp`, see `man whisrs`), and [profiles](docs/configuration.md#profiles) that switch the backend and other settings (offline, work) with one command.
 - **Extras**: tray icon, on-screen overlay, [word replacements](docs/configuration.md#word-replacements), a [vocabulary file](docs/configuration.md#the-vocabulary-file), dictation history, and a failed dictation's audio kept for `whisrs transcribe-recovery`.
 
 What changed in each release: [GitHub Releases](https://github.com/y0sif/whisrs/releases).
 
 ## Installation
 
-### Quick install
-
 ```bash
 curl -sSf https://y0sif.github.io/whisrs/install.sh | bash
 ```
 
-For x86_64 and aarch64. The script installs the runtime libraries, puts the latest `whisrs` and `whisrsd` in `/usr/local/bin`, and runs `whisrs setup`. Run it again to upgrade. Pin a release with `WHISRS_VERSION`, or take the minimal build (cloud backends only, no whisper.cpp) with `WHISRS_MINIMAL=1`:
+The script installs the latest release for x86_64 or aarch64 in `/usr/local/bin`, with its runtime libraries, then runs `whisrs setup`. Run it again to upgrade. Put `WHISRS_VERSION=v0.2.1` before `bash` to pin a release, or `WHISRS_MINIMAL=1` for the build without whisper.cpp (cloud backends only).
 
-```bash
-curl -sSf https://y0sif.github.io/whisrs/install.sh | WHISRS_VERSION=v0.2.1 bash
-```
-
-### Arch Linux (AUR)
+<details>
+<summary>Arch Linux (AUR)</summary>
 
 ```bash
 yay -S whisrs-bin
@@ -59,45 +54,46 @@ yay -S whisrs-bin
 - `whisrs`, `whisrs-cuda`, `whisrs-vulkan`: the tagged release compiled from source, for the CPU, CUDA or Vulkan (community-maintained).
 - `whisrs-git`: builds `main` when you install it; reinstall it to update.
 
-### Cargo
+</details>
+
+<details>
+<summary>Cargo (build from source)</summary>
 
 ```bash
 cargo install whisrs --locked
 ```
 
-It compiles whisper.cpp, so it needs a C++ toolchain and a few system packages first; [CONTRIBUTING.md](CONTRIBUTING.md) lists them per distro. Add `--features vulkan` (or `cuda`, `hipblas`) for a [GPU build](docs/gpu-acceleration.md).
+It compiles whisper.cpp, so it needs a C++ toolchain, clang and cmake first; [CONTRIBUTING.md](CONTRIBUTING.md#prerequisites) lists the packages per distro. Add `--features vulkan` (or `cuda`, `hipblas`) for a [GPU build](docs/gpu-acceleration.md). Then run `whisrs setup`.
 
-### Nix
+</details>
+
+<details>
+<summary>Nix</summary>
 
 ```bash
 nix profile install github:y0sif/whisrs
 ```
 
-Or add it to your flake inputs: `inputs.whisrs.url = "github:y0sif/whisrs";`
+Or add `inputs.whisrs.url = "github:y0sif/whisrs";` to your flake. Then run `whisrs setup`.
 
-### Prebuilt tarball
+</details>
 
-[GitHub Releases](https://github.com/y0sif/whisrs/releases/latest) has `whisrs-linux-x86_64.tar.gz` and `whisrs-linux-aarch64.tar.gz`, plus `-minimal` versions without whisper.cpp. Each holds `whisrs`, `whisrsd`, the man pages, the udev rule and the service files. Copy the two binaries onto your `PATH`.
+<details>
+<summary>Prebuilt tarball</summary>
+
+[GitHub Releases](https://github.com/y0sif/whisrs/releases/latest) has `whisrs-linux-x86_64.tar.gz` and `whisrs-linux-aarch64.tar.gz`, plus `-minimal` builds without whisper.cpp. Each holds `whisrs`, `whisrsd`, the man pages, the udev rule and the service files. Copy the two binaries onto your `PATH`, then run `whisrs setup`.
+
+</details>
 
 ### First run
 
-```bash
-whisrs setup
-```
+`whisrs setup`, a full-screen wizard that needs a terminal, picks a backend and tests its API key or downloads a whisper.cpp model, sets the language and microphone, and offers recording, command mode, read-aloud and a coding agent. Then it checks `/dev/uinput` access (for typing), the user service and a hotkey, fixing each with a keypress.
 
-The wizard, which the quick install already ran, picks a backend and tests its API key, or downloads a whisper.cpp model, then checks your microphone, `/dev/uinput` access (for typing), the user service and a hotkey, fixing each with a keypress. It needs a terminal. Then press your hotkey, speak, and press it again: the text appears at your cursor. If something does not work, see [troubleshooting](docs/troubleshooting.md).
+Press your hotkey, speak, and press it again: the text appears at your cursor. If something does not work, see [troubleshooting](docs/troubleshooting.md).
 
 ## Usage
 
-Bind `whisrs toggle` to a key. `whisrs setup` writes the binding on Hyprland and Sway. On Sway it is `bindsym $mod+w exec whisrs toggle`; on Hyprland it looks like this:
-
-```
-# ~/.config/hypr/hyprland.conf
-bind = $mainMod, W, exec, whisrs toggle
-bind = $mainMod SHIFT, W, exec, whisrs toggle -l de   # a second key that dictates in German
-```
-
-On other desktops, bind it in the keyboard shortcut settings, or set `[hotkeys]` in config.toml, which whisrs reads from the keyboard itself on any desktop ([keys are physical positions](docs/troubleshooting.md#hotkey-keys-are-physical-positions-not-layout-characters)).
+Bind `whisrs toggle` to a key; `whisrs setup` writes the binding on Hyprland (`bind = $mainMod, W, exec, whisrs toggle`) and Sway (`bindsym $mod+w exec whisrs toggle`). Bind `whisrs toggle -l de` to a second key to dictate in German. On other desktops, bind it in the keyboard shortcut settings, or set `[hotkeys]` in config.toml, which whisrs reads from the keyboard itself on any desktop ([keys are physical positions](docs/troubleshooting.md#hotkey-keys-are-physical-positions-not-layout-characters)).
 
 | Command | What it does |
 |---|---|
@@ -110,7 +106,7 @@ On other desktops, bind it in the keyboard shortcut settings, or set `[hotkeys]`
 | `whisrs recording toggle` | Start or stop recording your mic and the system audio |
 | `whisrs recording show last` | Print a transcript; also `list`, `copy`, `name`, `summarize`, `retry`, `delete` |
 | `whisrs profile [NAME]` | List config profiles, or switch to one (`next`, `base`) |
-| `whisrs config` | Edit the config in a full-screen editor |
+| `whisrs config` | Change settings, test the mic, and browse recordings, profiles and history |
 | `whisrs log` | Show recent dictations |
 | `whisrs transcribe-recovery` | Transcribe the audio a failed dictation saved |
 | `whisrs status`, `whisrs restart` | Show the daemon's state, or restart it |
@@ -120,7 +116,7 @@ Full reference: `whisrs <command> --help` and `man whisrs` ([contrib/whisrs.1](c
 
 ## Transcription Backends
 
-whisrs works with eight speech recognition backends, set with `[general] backend`:
+Pick a speech recognition backend in `whisrs setup` or `whisrs config`, or set `[general] backend`:
 
 | Backend | Text is typed | Runs on | Cost |
 |---|---|---|---|
@@ -129,26 +125,26 @@ whisrs works with eight speech recognition backends, set with `[general] backend
 | `deepgram` | When you stop | Cloud | Paid, free credit on signup |
 | `openai-realtime` | While you talk | Cloud | Paid |
 | `openai` | When you stop | Cloud | Paid |
+| OpenRouter (`asr-sidecar`) | When you stop | Cloud, many models behind one key | Paid |
+| `asr-sidecar` | When you stop | Your server (Parakeet, Nemotron, Moonshine, VibeVoice) | Free |
 | `openai-compatible-realtime` | While you talk | Your server (Lemonade or similar) | Free |
 | `local-whisper` | While you talk, phrase by phrase | Your machine (whisper.cpp) | Free |
-| `asr-sidecar` | When you stop | Your server (Parakeet, Nemotron, Moonshine and more), or OpenRouter | Free on your server; OpenRouter is paid |
 
-For offline use, pick `local-whisper` in `whisrs setup` and it downloads a model (`base.en` to start). Local server recipes are in [contrib/asr-sidecars/](contrib/asr-sidecars/). More: [batch and streaming backends](docs/configuration.md#batch-and-streaming-backends), [ASR sidecar servers](docs/configuration.md#asr-sidecar-servers), [OpenRouter](docs/configuration.md#openrouter).
+For OpenRouter, pick `asr-sidecar` and OpenRouter as its server in `whisrs setup` or `whisrs config`, which list each model with its price; by hand it is `[asr-sidecar] url = "https://openrouter.ai/api/v1/audio/transcriptions"` ([OpenRouter](docs/configuration.md#openrouter)). For offline use, pick `local-whisper` and setup downloads a model (`base.en` to start). Local server recipes are in [contrib/asr-sidecars/](contrib/asr-sidecars/). More: [batch and streaming backends](docs/configuration.md#batch-and-streaming-backends), [ASR sidecar servers](docs/configuration.md#asr-sidecar-servers).
 
 ## Supported Environments
 
-whisrs runs on Wayland and X11 desktops alike: it types through the Wayland virtual keyboard, uinput or XTEST, and hotkeys work on every desktop.
+whisrs runs on every Wayland compositor and on X11. Typing, hotkeys, read-aloud, recording and agent mode work on all of them; the desktop decides only window tracking and the overlays.
 
-| Desktop | Status |
-|---|---|
-| Hyprland | Tested |
-| Niri | Tested |
-| X11 | Tested |
-| GNOME (Wayland) | Tested, no window tracking; the overlay needs the bundled [Shell extension](docs/configuration.md#gnome-overlay) |
-| Sway | Implemented |
-| KDE Plasma (Wayland) | Untested, no window tracking |
+| Desktop | Window tracking | Overlay |
+|---|---|---|
+| Hyprland, Niri, Sway | Yes | Yes |
+| X11, any desktop | Yes | Yes |
+| KDE Plasma (Wayland) | No | Yes |
+| GNOME (Wayland) | No | Recording pill through the bundled [Shell extension](docs/configuration.md#gnome-overlay); no agent overlay |
+| Other Wayland compositors | No | Where the compositor has layer-shell |
 
-Without window tracking, whisrs cannot return focus to the window you started in, or tell a terminal from other windows ([terminal detection](docs/configuration.md#terminal-detection)). Audio comes from the ALSA default input, which follows your PipeWire or PulseAudio default source through `pipewire-alsa` or `pulseaudio-alsa`, or from the source set in `[audio] device`. Reports from Sway, i3 and KDE are welcome: [open an issue](https://github.com/y0sif/whisrs/issues).
+whisrs types through the Wayland virtual keyboard where the compositor offers it and through uinput everywhere else; on X11, XTEST is an option ([Typing](docs/configuration.md#typing)). Window tracking returns focus to the window you started in before typing, and tells a terminal from other windows ([terminal detection](docs/configuration.md#terminal-detection)); without it, text goes to the window focused when it is typed. Audio comes from the default input (your PipeWire or PulseAudio default source, through ALSA) or the one `[audio] device` names.
 
 ## How whisrs Compares
 
@@ -157,19 +153,19 @@ whisrs is a background daemon and a CLI you bind to any hotkey, not a GUI app. I
 ## FAQ
 
 **Is there a Wispr Flow or Superwhisper alternative for Linux?**
-Yes: whisrs is an open-source Linux dictation tool, an alternative to Wispr Flow and Superwhisper. Press a hotkey, speak, and the text is typed at your cursor in any app, on Wayland or X11, with cloud or offline speech recognition. See [how it compares](docs/comparison.md).
+whisrs is an open-source Linux dictation tool and an alternative to Wispr Flow and Superwhisper. Press a hotkey, speak, and the text is typed at your cursor in any app, on Wayland or X11, with cloud or offline speech recognition. See [how it compares](docs/comparison.md).
 
 **Does whisrs work offline?**
-whisrs works fully offline with the `local-whisper` backend, which runs whisper.cpp on your machine: no API key, and no audio leaves it. `whisrs setup` downloads the model for you. Read-aloud and LLM commands can use local servers too.
+whisrs works fully offline with the `local-whisper` backend, which runs whisper.cpp on your machine: no API key, and no audio leaves it. `whisrs setup` downloads the model for you. Read-aloud and LLM commands can run on local servers too.
 
 **Does whisrs work on Wayland and GNOME?**
-whisrs works on Wayland, GNOME included, and on X11. It types through the Wayland virtual keyboard or uinput on Wayland, and through uinput or XTEST on X11. On GNOME the overlay needs the bundled Shell extension. See [Supported Environments](#supported-environments).
+whisrs works on every Wayland compositor, GNOME and KDE included, and on X11. On GNOME and KDE Wayland sessions everything works except window tracking; GNOME shows the recording pill through the bundled Shell extension and has no agent overlay. See [Supported Environments](#supported-environments).
 
 **Which transcription backend should I pick?**
-Groq is the default and the easiest start: it has a free tier and needs only an API key. For text typed while you talk, pick `deepgram-streaming` or `openai-realtime`; for no cloud at all, `local-whisper`. See [Transcription Backends](#transcription-backends).
+Groq, the default backend, is the easiest start: it has a free tier and needs only an API key. For text typed while you talk, pick `deepgram-streaming` or `openai-realtime`; for many hosted models behind one key, OpenRouter; for no cloud at all, `local-whisper`. See [Transcription Backends](#transcription-backends).
 
 **Can I talk to Claude Code by voice?**
-whisrs gives Claude Code, OpenCode, Codex or GitHub Copilot its own hotkey through an `[[agents]]` entry. Press it, say what you want, and the agent works in its project; when the turn ends, whisrs speaks a short reply through `[tts]` (a notification while it is off). See [agent mode](docs/agents.md).
+whisrs gives Claude Code, OpenCode, Codex or GitHub Copilot its own hotkey through an `[[agents]]` entry. Press it, say what you want, and the agent works in its project; when the turn ends, whisrs speaks a short reply through `[tts]` and shows it as a notification. See [agent mode](docs/agents.md).
 
 **Can whisrs transcribe meetings?**
 whisrs records your microphone and the system audio with `whisrs recording`, then writes one timestamped Markdown transcript with speaker names. It records what your computer plays, so it works with any call app, and it can add an LLM summary. See [recording](docs/recording.md).
@@ -178,8 +174,7 @@ More answers: [docs/faq.md](docs/faq.md).
 
 ## Configuration
 
-whisrs reads `~/.config/whisrs/config.toml`, which `whisrs setup` writes and `whisrs config` edits.
-How the features fit together is in [docs/configuration.md](docs/configuration.md), and every key in [docs/config-reference.md](docs/config-reference.md).
+`whisrs config` is the easy way to change any setting: a full-screen editor with pickers for backends, models, languages, voices and microphones, a key test, and screens for the mic test, recordings, profiles and history. It saves `~/.config/whisrs/config.toml` and restarts the daemon. You can also edit that file by hand: [the guide](docs/configuration.md), [every key](docs/config-reference.md).
 
 ## Troubleshooting
 

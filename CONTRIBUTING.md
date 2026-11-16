@@ -4,12 +4,11 @@ Thanks for considering a contribution to whisrs.
 
 ## Ways to Contribute
 
-### Testing on your setup
+### Desktop and distro reports
 
-The most useful thing you can do is test whisrs on a desktop that
-[Supported Environments](README.md#supported-environments) does not mark Tested (Sway, KDE
-Plasma), on i3, or on your distro, and report what works and what doesn't with the Compositor / Distro
-Test Report issue template. Run the daemon as `RUST_LOG=debug whisrsd` for the logs.
+When something works differently on your desktop or distro than
+[Supported Environments](README.md#supported-environments) says, open an issue with the
+Compositor / Distro Test Report template. Run the daemon as `RUST_LOG=debug whisrsd` for the logs.
 
 ### Bug reports
 
