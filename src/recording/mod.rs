@@ -9,6 +9,12 @@
 //! (`Command::Recording`, [`RecordingStatus`]) and `recording.json`, so a CLI
 //! and a daemon built with and without the `recording` feature still talk.
 //! The submodules are the feature itself and exist only with it.
+//!
+//! A track's [`TrackQuality`] comes from its writer's meter on the raw chunks
+//! (`recorder`), else the processing worker measures it from the WAV; echo
+//! removal adds the mic's echo path. The transcript's front matter gets an
+//! `audio:` block only for a track that has one, so an older `recording.json`
+//! without it renders unchanged.
 
 #[cfg(feature = "recording")]
 pub mod diarize;

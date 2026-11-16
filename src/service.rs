@@ -1,13 +1,14 @@
 //! Init-system abstraction for controlling the whisrs user service.
 //!
 //! whisrs is a per-session daemon, so it is managed by whatever runs the
-//! user's *session* services. That was originally assumed to be systemd, which
-//! left users on OpenRC distros (Gentoo, Artix, Alpine, Devuan) being told to
-//! run `systemctl` commands that do not exist on their machine.
+//! user's *session* services: systemd or OpenRC, both supported.
 //!
 //! Everything init-specific lives here: detection, the control commands, and
 //! the command strings shown in help text. Callers ask the detected
-//! [`ServiceManager`] what to do rather than hardcoding a command.
+//! [`ServiceManager`] what to do rather than hardcoding a command. The daemon
+//! restarts itself (a profile switch, the tray's Restart Daemon) only through
+//! [`restart_self`]: its service manager when it runs under its service, else
+//! a re-exec of its own binary.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

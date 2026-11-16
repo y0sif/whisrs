@@ -1,8 +1,21 @@
-//! Config profiles (#189): a profile is a partial `config.toml` in
+//! Config profiles: a profile is a partial `config.toml` in
 //! `profiles/<name>.toml` beside it, holding only what differs. The daemon
-//! merges the active one over the base config at startup; the active name is
-//! one line in `$XDG_STATE_HOME/whisrs/active-profile` (no file, or `base`:
-//! the base config alone).
+//! merges the active one over the base config at startup
+//! (`daemon/startup.rs` has the load order); the active name is one line in
+//! `$XDG_STATE_HOME/whisrs/active-profile` (no file, or `base`: the base
+//! config alone). There is no hot reload: a switch restarts the daemon.
+//!
+//! The merge ([`effective`]): both files read with the aliases renamed
+//! ([`ALIASES`]), the profile's [`BASE_ONLY`] keys dropped with a warning
+//! each, tables merged key by key and any other value replacing the base's,
+//! then deserialized and validated. A profile that fails in any way leaves
+//! the base in use, with [`Effective::error`] saying why. Every other reader
+//! of config.toml (the CLI's recording commands, `whisrs mcp`) ignores
+//! profiles, which [`BASE_ONLY`] makes safe.
+//!
+//! The daemon's check decides a switch ([`Check::Daemon`]); a client's only
+//! predicts it ([`Check::Client`]), since a missing API key can live in the
+//! daemon's environment alone.
 
 use std::collections::BTreeSet;
 use std::io;

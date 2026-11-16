@@ -3,6 +3,16 @@
 //! and restarts the daemon on it. While a switch is under way, whatever would
 //! start work the restart cuts off is refused ([`switching_refusal`]) and
 //! agent replies wait.
+//!
+//! A switch, in order: resolve the target (`next` passes over a profile that
+//! does not load); answer without a restart when the daemon already runs on
+//! it; refuse while anything is busy ([`busy`], the checks `info` makes) or
+//! while the target does not load; mark the switch, write the state file,
+//! notify and answer. After [`REPLY_GRACE`] it checks busy again: a start
+//! that slipped in before the mark rolls the switch back (the old name
+//! written back, no restart), else it restarts through
+//! `whisrs::service::restart_self`. A restart that fails rolls back the same
+//! way.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

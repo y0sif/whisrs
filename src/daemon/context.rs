@@ -1,3 +1,12 @@
+//! What every daemon task shares. [`DaemonState`] sits behind the dictation
+//! lock: the state machine and what the session in progress holds (its
+//! capture, the focused window, its language, the command-mode, LLM-command
+//! or agent context, the read-aloud stop flag). [`DaemonContext`] holds what
+//! lives outside that lock: the config, the transcription backend, the window
+//! tracker, the recording and agent runtimes (each behind a lock of its own),
+//! the profile runtime and the state broadcast ([`StateBus`]), which only
+//! [`StateBus::publish`] sends, with the dictation lock held.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 

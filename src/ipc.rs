@@ -30,6 +30,10 @@ pub enum Command {
     Status,
     /// What the daemon is and does ([`DaemonInfo`]). Newer than `status`, so
     /// a client falls back to `status` when an older daemon hangs up on it.
+    ///
+    /// Never waits on a lock, so it is safe to poll: with the dictation lock
+    /// held, `state` is the last one published and `busy` is set
+    /// ([`DaemonInfo::busy`]).
     Info,
     /// Retrieve recent transcription history.
     Log {
