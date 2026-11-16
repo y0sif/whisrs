@@ -208,6 +208,67 @@ struct LemonadeTurnDetectionConfig {
     detection_type: String,
 }
 
+/// Client message: session.update for the llama.cpp realtime endpoint.
+///
+/// llama.cpp defaults the input rate to the loaded model's native rate and
+/// resamples the client's audio *from* that. It learns a different client rate
+/// only from `audio.input.format.rate`, so the flat Lemonade shape - which
+/// carries no rate - would make the server read our 16 kHz audio as if it were
+/// already at the model's rate. That is correct only when the model's native
+/// rate is 16 kHz (Voxtral), and garbles the audio for anything else. Declaring
+/// the rate makes the profile correct for a model of any native rate.
+#[derive(Debug, Serialize)]
+pub(crate) struct LlamaCppSessionUpdate {
+    #[serde(rename = "type")]
+    msg_type: String,
+    session: LlamaCppSessionConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct LlamaCppSessionConfig {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_detection: Option<LemonadeTurnDetectionConfig>,
+    audio: LlamaCppAudioConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct LlamaCppAudioConfig {
+    input: LlamaCppInputConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct LlamaCppInputConfig {
+    format: AudioInputFormatConfig,
+}
+
+impl LlamaCppSessionUpdate {
+    pub(crate) fn new(model: &str, turn_detection: TurnDetectionMode, sample_rate: u32) -> Self {
+        let turn_detection = match turn_detection {
+            TurnDetectionMode::ServerVad => Some(LemonadeTurnDetectionConfig {
+                detection_type: "server_vad".to_string(),
+            }),
+            TurnDetectionMode::ManualCommit => None,
+        };
+
+        Self {
+            msg_type: "session.update".to_string(),
+            session: LlamaCppSessionConfig {
+                model: model.to_string(),
+                turn_detection,
+                audio: LlamaCppAudioConfig {
+                    input: LlamaCppInputConfig {
+                        format: AudioInputFormatConfig {
+                            format_type: "audio/pcm".to_string(),
+                            rate: sample_rate,
+                        },
+                    },
+                },
+            },
+        }
+    }
+}
+
 impl LemonadeSessionUpdate {
     pub(crate) fn new(model: &str, turn_detection: TurnDetectionMode) -> Self {
         // Lemonade exposes a flatter session shape than OpenAI. We keep that

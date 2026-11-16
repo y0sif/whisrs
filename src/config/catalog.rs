@@ -146,7 +146,7 @@ pub const BACKENDS: &[Entry] = &[
     ("openai", "OpenAI, sent when you stop"),
     (
         "openai-compatible-realtime",
-        "a realtime server of your own (Lemonade)",
+        "a realtime server of your own (Lemonade, llama.cpp)",
     ),
     ("local-whisper", "whisper.cpp on this machine, offline"),
     (
@@ -192,6 +192,10 @@ pub const SEGMENTATIONS: &[Entry] = &[
 /// `[openai-compatible-realtime] profile`: the server's dialect.
 pub const REALTIME_PROFILES: &[Entry] = &[
     ("lemonade", "Lemonade: 16 kHz, interim text replaced"),
+    (
+        "llamacpp",
+        "llama.cpp realtime: 16 kHz, words typed as they arrive",
+    ),
     ("openai", "OpenAI's wire: 24 kHz, text appended"),
 ];
 

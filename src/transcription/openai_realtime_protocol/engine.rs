@@ -651,14 +651,16 @@ impl OpenAiRealtimeProtocolEngine {
                         }
                         "input_audio_buffer.cleared" => {
                             debug!("audio buffer event: {}", server_msg.msg_type);
-                            // Lemonade may clear the committed buffer without
-                            // emitting a second completed item when the last
-                            // utterance already finalized before stop. In that
-                            // case, treat buffer-cleared as the terminal post-
-                            // commit flush signal instead of waiting until the
-                            // timeout fires.
-                            if profile == OpenAiRealtimeProfile::Lemonade
-                                && state.awaiting_post_commit_completion()
+                            // The flat-session servers (Lemonade, llama.cpp) may
+                            // clear the committed buffer without emitting a
+                            // second completed item when the last utterance
+                            // already finalized before stop. In that case, treat
+                            // buffer-cleared as the terminal post-commit flush
+                            // signal instead of waiting until the timeout fires.
+                            if matches!(
+                                profile,
+                                OpenAiRealtimeProfile::Lemonade | OpenAiRealtimeProfile::LlamaCpp
+                            ) && state.awaiting_post_commit_completion()
                             {
                                 debug!("post-commit buffer cleared observed; finalizing stream");
                                 state.final_completion_seen = true;
@@ -1120,6 +1122,35 @@ mod tests {
         assert!(second.emit_text.is_none());
         assert!(third.emit_text.is_none());
         assert_eq!(completed.emit_text.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn llamacpp_deltas_are_typed_live_and_not_repeated_on_completed() {
+        // The llama.cpp realtime endpoint sends append-only word fragments: the
+        // concatenation of its deltas equals the final completed transcript.
+        // They must reach the typing channel as they arrive, and the completed
+        // event must not type the same text a second time.
+        let mut state = StreamState::default();
+
+        let first = state.on_delta(
+            OpenAiRealtimeProfile::LlamaCpp,
+            Some("item-1"),
+            " Well".to_string(),
+        );
+        let second = state.on_delta(
+            OpenAiRealtimeProfile::LlamaCpp,
+            Some("item-1"),
+            ", hello".to_string(),
+        );
+        let completed = state.on_completed(
+            OpenAiRealtimeProfile::LlamaCpp,
+            Some("item-1"),
+            Some(" Well, hello".to_string()),
+        );
+
+        assert_eq!(first.emit_text.as_deref(), Some(" Well"));
+        assert_eq!(second.emit_text.as_deref(), Some(", hello"));
+        assert!(completed.emit_text.is_none());
     }
 
     #[tokio::test]

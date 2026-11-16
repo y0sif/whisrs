@@ -19,6 +19,7 @@ pub struct OpenAiCompatibleRealtimeBackend {
     url: String,
     endpoint_display: String,
     auth_bearer: Option<String>,
+    profile: OpenAiRealtimeProfile,
     turn_detection: TurnDetectionMode,
     model: String,
     final_completion_timeout: Option<std::time::Duration>,
@@ -55,9 +56,12 @@ impl OpenAiCompatibleRealtimeBackend {
         }
 
         let profile = OpenAiRealtimeProfile::parse(profile.trim())?;
-        if profile != OpenAiRealtimeProfile::Lemonade {
+        if !matches!(
+            profile,
+            OpenAiRealtimeProfile::Lemonade | OpenAiRealtimeProfile::LlamaCpp
+        ) {
             anyhow::bail!(
-                "openai-compatible realtime backend currently supports only profile 'lemonade'"
+                "openai-compatible realtime backend supports only the 'lemonade' and 'llamacpp' profiles"
             );
         }
 
@@ -70,6 +74,7 @@ impl OpenAiCompatibleRealtimeBackend {
             endpoint_display: sanitize_endpoint_display(&parsed_url),
             url,
             auth_bearer,
+            profile,
             turn_detection,
             model,
             final_completion_timeout: None,
@@ -92,7 +97,7 @@ impl OpenAiCompatibleRealtimeBackend {
             endpoint_display: self.endpoint_display.clone(),
             auth_bearer: self.auth_bearer.clone(),
             host_header: None,
-            profile: OpenAiRealtimeProfile::Lemonade,
+            profile: self.profile,
             turn_detection: self.turn_detection,
             languages: Vec::new(),
             final_completion_timeout: self.final_completion_timeout,
@@ -142,22 +147,21 @@ impl TranscriptionBackend for OpenAiCompatibleRealtimeBackend {
         true
     }
 
-    // Statically false, exactly like Deepgram (issue #133). `new` rejects
-    // every profile but `lemonade` and `engine` hardcodes
-    // `OpenAiRealtimeProfile::Lemonade`, whose `session_update` arm calls
-    // `LemonadeSessionUpdate::new(model, turn_detection)` — a constructor that
-    // takes no prompt argument at all. The engine passes `request.prompt`
-    // down, but the Lemonade wire format drops it on the floor, so a
-    // non-empty `[general] vocabulary` here would otherwise get real
+    // Statically false for both profiles this backend accepts. Neither wire
+    // format carries a prompt: `session_update` routes `Lemonade` and
+    // `LlamaCpp` to `LemonadeSessionUpdate::new(model, turn_detection)`, a
+    // constructor that takes no prompt argument at all. The engine passes
+    // `request.prompt` down, but the flat session shape drops it on the floor,
+    // so a non-empty `[general] vocabulary` here would otherwise get real
     // transcripts discarded as echoes of a prompt that was never sent.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
     }
 
-    // The profile `engine` always uses (`new` accepts no other): completed
-    // utterances.
+    // Whatever the configured profile's delta mode implies: `lemonade` sends
+    // completed utterances, `llamacpp` sends append-only fragments.
     fn stream_text(&self) -> StreamText {
-        OpenAiRealtimeProfile::Lemonade.stream_text()
+        self.profile.stream_text()
     }
 
     // Live-only: a recording needs a batch backend.
@@ -240,7 +244,24 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains("currently supports only profile 'lemonade'"));
+            .contains("supports only the 'lemonade' and 'llamacpp' profiles"));
+    }
+
+    #[test]
+    fn accepts_llamacpp_profile() {
+        let backend = OpenAiCompatibleRealtimeBackend::new(
+            "ws://localhost:8080/v1/realtime".to_string(),
+            "Voxtral-Mini-4B-Realtime".to_string(),
+            "llamacpp".to_string(),
+            "server-vad".to_string(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(backend.profile, OpenAiRealtimeProfile::LlamaCpp);
+        // Append-only deltas reach the typing channel as they arrive, so the
+        // user sees words during the dictation rather than one blob at the stop.
+        assert_eq!(backend.stream_text(), StreamText::Fragments);
     }
 
     #[test]

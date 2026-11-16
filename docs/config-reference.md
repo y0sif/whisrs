@@ -79,7 +79,7 @@ Guide: [Realtime servers](configuration.md#realtime-servers).
 |---|---|---|---|---|
 | `url` | string | unset | text | WebSocket endpoint of the OpenAI-compatible realtime server. |
 | `model` | string | `Whisper-Tiny` | text | The model the realtime server loads. |
-| `profile` | string | `lemonade` | `lemonade`, `openai` | Which server dialect to speak. Only lemonade works so far. |
+| `profile` | string | `lemonade` | `lemonade`, `llamacpp`, `openai` | Which server dialect to speak. lemonade and llamacpp work here; openai does not. |
 | `turn_detection` | string | `server-vad` | `server-vad`, `manual-commit` | Who decides where a turn ends. |
 | `api_key` | API key | unset | your key | Optional bearer token for the realtime server. |
 

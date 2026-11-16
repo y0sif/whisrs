@@ -2264,9 +2264,9 @@ impl Config {
                         "OpenAI-compatible realtime profile is invalid: {e}"
                     ))
                 })?;
-                if config.profile.trim() != "lemonade" {
+                if !matches!(config.profile.trim(), "lemonade" | "llamacpp") {
                     return Err(WhisrsError::Config(
-                        "OpenAI-compatible realtime backend currently supports only profile 'lemonade'."
+                        "OpenAI-compatible realtime backend supports only the 'lemonade' and 'llamacpp' profiles."
                             .to_string(),
                     ));
                 }

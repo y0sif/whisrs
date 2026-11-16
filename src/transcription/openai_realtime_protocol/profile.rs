@@ -1,7 +1,7 @@
 use base64::Engine;
 use tracing::warn;
 
-use super::wire::{LemonadeSessionUpdate, OpenAiSessionUpdate};
+use super::wire::{LemonadeSessionUpdate, LlamaCppSessionUpdate, OpenAiSessionUpdate};
 use crate::transcription::StreamText;
 
 /// OpenAI Realtime API rejects transcription prompts longer than this.
@@ -12,6 +12,9 @@ pub const PROMPT_MAX_CHARS: usize = 1024;
 pub enum OpenAiRealtimeProfile {
     OpenAi,
     Lemonade,
+    /// The llama.cpp realtime endpoint (Voxtral and friends): the flat Lemonade
+    /// session shape and 16 kHz input, but append-only word deltas.
+    LlamaCpp,
 }
 
 /// Transcript delta semantics for a profile.
@@ -33,8 +36,9 @@ impl OpenAiRealtimeProfile {
         match value {
             "openai" => Ok(Self::OpenAi),
             "lemonade" => Ok(Self::Lemonade),
+            "llamacpp" => Ok(Self::LlamaCpp),
             other => anyhow::bail!(
-                "unsupported OpenAI-compatible realtime profile '{other}' (supported: openai, lemonade)"
+                "unsupported OpenAI-compatible realtime profile '{other}' (supported: openai, lemonade, llamacpp)"
             ),
         }
     }
@@ -42,13 +46,13 @@ impl OpenAiRealtimeProfile {
     pub fn input_sample_rate(self) -> u32 {
         match self {
             Self::OpenAi => 24_000,
-            Self::Lemonade => 16_000,
+            Self::Lemonade | Self::LlamaCpp => 16_000,
         }
     }
 
     pub fn delta_mode(self) -> DeltaMode {
         match self {
-            Self::OpenAi => DeltaMode::AppendOnly,
+            Self::OpenAi | Self::LlamaCpp => DeltaMode::AppendOnly,
             Self::Lemonade => DeltaMode::ReplaceableInterim,
         }
     }
@@ -82,6 +86,11 @@ impl OpenAiRealtimeProfile {
             Self::Lemonade => {
                 serde_json::to_value(LemonadeSessionUpdate::new(model, turn_detection))?
             }
+            Self::LlamaCpp => serde_json::to_value(LlamaCppSessionUpdate::new(
+                model,
+                turn_detection,
+                self.input_sample_rate(),
+            ))?,
         };
         Ok(value)
     }
@@ -223,6 +232,7 @@ mod tests {
     fn profile_sample_rates_and_delta_modes() {
         assert_eq!(OpenAiRealtimeProfile::OpenAi.input_sample_rate(), 24_000);
         assert_eq!(OpenAiRealtimeProfile::Lemonade.input_sample_rate(), 16_000);
+        assert_eq!(OpenAiRealtimeProfile::LlamaCpp.input_sample_rate(), 16_000);
         assert_eq!(
             OpenAiRealtimeProfile::OpenAi.delta_mode(),
             DeltaMode::AppendOnly
@@ -230,6 +240,10 @@ mod tests {
         assert_eq!(
             OpenAiRealtimeProfile::Lemonade.delta_mode(),
             DeltaMode::ReplaceableInterim
+        );
+        assert_eq!(
+            OpenAiRealtimeProfile::LlamaCpp.delta_mode(),
+            DeltaMode::AppendOnly
         );
     }
 
@@ -243,6 +257,68 @@ mod tests {
             OpenAiRealtimeProfile::Lemonade.stream_text(),
             StreamText::Phrases
         );
+        assert_eq!(
+            OpenAiRealtimeProfile::LlamaCpp.stream_text(),
+            StreamText::Fragments
+        );
+    }
+
+    #[test]
+    fn llamacpp_session_update_uses_the_flat_shape() {
+        let json = OpenAiRealtimeProfile::LlamaCpp
+            .session_update(
+                "Voxtral-Mini-4B-Realtime",
+                "auto",
+                &[],
+                Some("ignored"),
+                TurnDetectionMode::ServerVad,
+            )
+            .unwrap();
+
+        assert_eq!(json["type"], "session.update");
+        assert_eq!(json["session"]["model"], "Voxtral-Mini-4B-Realtime");
+        assert_eq!(json["session"]["turn_detection"]["type"], "server_vad");
+        assert!(json["session"].get("language").is_none());
+        assert!(json["session"].get("prompt").is_none());
+    }
+
+    #[test]
+    fn llamacpp_session_update_declares_the_input_rate() {
+        // llama.cpp defaults the input rate to the model's own rate and
+        // resamples the client audio from it, so a profile that sends 16 kHz
+        // without saying so is read at the model's rate. The rate must be on
+        // the wire for the profile to hold for a model of any native rate.
+        let json = OpenAiRealtimeProfile::LlamaCpp
+            .session_update(
+                "Voxtral-Mini-4B-Realtime",
+                "auto",
+                &[],
+                None,
+                TurnDetectionMode::ServerVad,
+            )
+            .unwrap();
+
+        assert_eq!(
+            json["session"]["audio"]["input"]["format"]["type"],
+            "audio/pcm"
+        );
+        assert_eq!(json["session"]["audio"]["input"]["format"]["rate"], 16000);
+    }
+
+    #[test]
+    fn lemonade_session_update_still_carries_no_rate() {
+        // The Lemonade server is not llama.cpp; leave its wire format alone.
+        let json = OpenAiRealtimeProfile::Lemonade
+            .session_update(
+                "Whisper-Tiny",
+                "auto",
+                &[],
+                None,
+                TurnDetectionMode::ServerVad,
+            )
+            .unwrap();
+
+        assert!(json["session"].get("audio").is_none());
     }
 
     #[test]
