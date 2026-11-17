@@ -83,6 +83,8 @@ the GPU ones (`vulkan`, `cuda`, `hipblas`), which CI only checks resolve. Rules:
 - Injection policy (what gets typed or pasted) lives in `src/daemon/injection.rs`; the
   primitives live in `crates/xkb-type`.
 - A new config key needs a row in `src/cli/tui/schema.rs`; a test fails without one.
+- Tests follow [CONTRIBUTING.md#tests](CONTRIBUTING.md#tests): extend the covering test before
+  adding one.
 
 ## IPC
 
