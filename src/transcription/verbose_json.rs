@@ -790,7 +790,8 @@ mod tests {
             .all(|s| s.speaker.as_deref() == Some("SPEAKER_01")));
     }
 
-    /// `null` reads as a missing key, at the top and in a segment.
+    /// `null` reads as a missing key, at the top and in a segment. A segment
+    /// whose text is null or blank is dropped.
     #[test]
     fn nulls_read_as_missing_keys() {
         let t =
@@ -798,7 +799,8 @@ mod tests {
         assert!(t.segments.is_empty());
         let body = r#"{"text": "yes", "words": null, "segments": [
             {"start": 0.0, "end": 1.0, "text": null},
-            {"start": 1.0, "end": 2.0, "text": " yes"}]}"#;
+            {"start": 1.0, "end": 2.0, "text": " yes"},
+            {"start": 2.0, "end": 2.5, "text": "  "}]}"#;
         let t = parse_verbose_segments(body).unwrap();
         assert_eq!(lines(&t.segments), [(1000, 2000, "yes")]);
         assert!(t.segments[0].words.is_none());
