@@ -212,8 +212,8 @@ struct LemonadeTurnDetectionConfig {
 ///
 /// llama.cpp defaults the input rate to the loaded model's native rate and
 /// resamples the client's audio *from* that. It learns a different client rate
-/// only from `audio.input.format.rate`, so the flat Lemonade shape - which
-/// carries no rate - would make the server read our 16 kHz audio as if it were
+/// only from `audio.input.format.rate`. The flat Lemonade shape carries no
+/// rate, so it would make the server read our 16 kHz audio as if it were
 /// already at the model's rate. That is correct only when the model's native
 /// rate is 16 kHz (Voxtral), and garbles the audio for anything else. Declaring
 /// the rate makes the profile correct for a model of any native rate.

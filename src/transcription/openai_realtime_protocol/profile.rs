@@ -263,8 +263,11 @@ mod tests {
         );
     }
 
+    /// llama.cpp reads the client audio at the model's own rate unless
+    /// `audio.input.format.rate` says otherwise, so the 16 kHz rate must be on
+    /// the wire for the profile to hold for a model of any native rate.
     #[test]
-    fn llamacpp_session_update_uses_the_flat_shape() {
+    fn llamacpp_session_update_uses_the_flat_shape_and_declares_the_input_rate() {
         let json = OpenAiRealtimeProfile::LlamaCpp
             .session_update(
                 "Voxtral-Mini-4B-Realtime",
@@ -280,45 +283,11 @@ mod tests {
         assert_eq!(json["session"]["turn_detection"]["type"], "server_vad");
         assert!(json["session"].get("language").is_none());
         assert!(json["session"].get("prompt").is_none());
-    }
-
-    #[test]
-    fn llamacpp_session_update_declares_the_input_rate() {
-        // llama.cpp defaults the input rate to the model's own rate and
-        // resamples the client audio from it, so a profile that sends 16 kHz
-        // without saying so is read at the model's rate. The rate must be on
-        // the wire for the profile to hold for a model of any native rate.
-        let json = OpenAiRealtimeProfile::LlamaCpp
-            .session_update(
-                "Voxtral-Mini-4B-Realtime",
-                "auto",
-                &[],
-                None,
-                TurnDetectionMode::ServerVad,
-            )
-            .unwrap();
-
         assert_eq!(
             json["session"]["audio"]["input"]["format"]["type"],
             "audio/pcm"
         );
         assert_eq!(json["session"]["audio"]["input"]["format"]["rate"], 16000);
-    }
-
-    #[test]
-    fn lemonade_session_update_still_carries_no_rate() {
-        // The Lemonade server is not llama.cpp; leave its wire format alone.
-        let json = OpenAiRealtimeProfile::Lemonade
-            .session_update(
-                "Whisper-Tiny",
-                "auto",
-                &[],
-                None,
-                TurnDetectionMode::ServerVad,
-            )
-            .unwrap();
-
-        assert!(json["session"].get("audio").is_none());
     }
 
     #[test]
@@ -372,6 +341,7 @@ mod tests {
         assert_eq!(json["session"]["turn_detection"]["type"], "server_vad");
         assert!(json["session"].get("language").is_none());
         assert!(json["session"].get("prompt").is_none());
+        assert!(json["session"].get("audio").is_none());
     }
 
     #[test]

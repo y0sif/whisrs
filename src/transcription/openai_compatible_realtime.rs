@@ -147,13 +147,14 @@ impl TranscriptionBackend for OpenAiCompatibleRealtimeBackend {
         true
     }
 
-    // Statically false for both profiles this backend accepts. Neither wire
-    // format carries a prompt: `session_update` routes `Lemonade` and
-    // `LlamaCpp` to `LemonadeSessionUpdate::new(model, turn_detection)`, a
-    // constructor that takes no prompt argument at all. The engine passes
-    // `request.prompt` down, but the flat session shape drops it on the floor,
-    // so a non-empty `[general] vocabulary` here would otherwise get real
-    // transcripts discarded as echoes of a prompt that was never sent.
+    // Statically false for both profiles this backend accepts, exactly like
+    // Deepgram. Neither wire format carries a prompt: `session_update` builds
+    // `LemonadeSessionUpdate::new(model, turn_detection)` for `Lemonade`, and
+    // `LlamaCppSessionUpdate::new`, which carries only the model, the turn
+    // detection and the input rate, for `LlamaCpp`. The engine passes
+    // `request.prompt` down, but both drop it on the floor, so a non-empty
+    // `[general] vocabulary` here would otherwise get real transcripts
+    // discarded as echoes of a prompt that was never sent.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
     }
@@ -185,7 +186,6 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use serde_json::Value;
     use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
     use tokio::time::{sleep, timeout, Duration};
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -247,21 +247,39 @@ mod tests {
             .contains("supports only the 'lemonade' and 'llamacpp' profiles"));
     }
 
+    /// `lemonade` forwards completed utterances, so queued ones need a space
+    /// between them; `llamacpp` forwards append deltas as they arrive. Neither
+    /// wire format has a prompt field, so the echo filter stays off for both.
     #[test]
-    fn accepts_llamacpp_profile() {
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            "ws://localhost:8080/v1/realtime".to_string(),
-            "Voxtral-Mini-4B-Realtime".to_string(),
-            "llamacpp".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap();
+    fn accepted_profiles_pick_stream_text_and_send_no_prompt() {
+        for (profile, expected, stream_text) in [
+            (
+                "lemonade",
+                OpenAiRealtimeProfile::Lemonade,
+                StreamText::Phrases,
+            ),
+            (
+                "llamacpp",
+                OpenAiRealtimeProfile::LlamaCpp,
+                StreamText::Fragments,
+            ),
+        ] {
+            let backend = OpenAiCompatibleRealtimeBackend::new(
+                "ws://localhost:1234/realtime".to_string(),
+                "Whisper-Tiny".to_string(),
+                profile.to_string(),
+                "server-vad".to_string(),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{profile}: {e}"));
 
-        assert_eq!(backend.profile, OpenAiRealtimeProfile::LlamaCpp);
-        // Append-only deltas reach the typing channel as they arrive, so the
-        // user sees words during the dictation rather than one blob at the stop.
-        assert_eq!(backend.stream_text(), StreamText::Fragments);
+            assert_eq!(backend.profile, expected, "{profile}: profile");
+            assert_eq!(backend.stream_text(), stream_text, "{profile}: stream text");
+            assert!(
+                !backend.sends_prompt(&test_request()),
+                "{profile}: sends no prompt"
+            );
+        }
     }
 
     #[test]
@@ -334,40 +352,6 @@ mod tests {
         assert!(backend.supports_streaming());
     }
 
-    /// The Lemonade wire format has no prompt field, so the echo filter must
-    /// stay off here (#133). Pinned because `engine()` hardcodes the Lemonade
-    /// profile: wiring the OpenAI profile in without revisiting this would
-    /// silently make the answer wrong again.
-    #[test]
-    fn lemonade_never_sends_the_prompt() {
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            "ws://localhost:1234/realtime".to_string(),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap();
-
-        assert!(!backend.sends_prompt(&test_request()));
-    }
-
-    /// Lemonade forwards only completed utterances, so queued ones need a
-    /// space between them. Pinned for the same reason as the prompt answer.
-    #[test]
-    fn lemonade_stream_text_is_phrases() {
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            "ws://localhost:1234/realtime".to_string(),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(backend.stream_text(), StreamText::Phrases);
-    }
-
     #[test]
     fn accepts_manual_commit_turn_detection() {
         let backend = OpenAiCompatibleRealtimeBackend::new(
@@ -404,163 +388,162 @@ mod tests {
         serde_json::from_str(&text).unwrap()
     }
 
+    fn delta(item_id: &str, delta: &str) -> Value {
+        serde_json::json!({
+            "type": "conversation.item.input_audio_transcription.delta",
+            "item_id": item_id,
+            "delta": delta
+        })
+    }
+
+    fn completed(item_id: &str, transcript: &str) -> Value {
+        serde_json::json!({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": item_id,
+            "transcript": transcript
+        })
+    }
+
+    struct StreamCase {
+        profile: &'static str,
+        /// Server events sent while the audio is still streaming.
+        live: Vec<Value>,
+        typed_live: &'static [&'static str],
+        /// Server events sent in reply to the end-of-stream commit.
+        after_commit: Vec<Value>,
+        /// The server closes the socket after those events, as llama.cpp does.
+        closes: bool,
+        typed_tail: &'static [&'static str],
+        session_rate: Option<u32>,
+    }
+
     #[tokio::test]
-    async fn mock_ws_happy_path_emits_completed_phrases_and_commit() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (delta_one_sent_tx, delta_one_sent_rx) = oneshot::channel::<()>();
-        let (allow_first_completed_tx, allow_first_completed_rx) = oneshot::channel::<()>();
-        let (delta_two_sent_tx, delta_two_sent_rx) = oneshot::channel::<()>();
-        let (allow_second_completed_tx, allow_second_completed_rx) = oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_async(stream).await.unwrap();
+    async fn mock_ws_happy_path_types_live_text_and_the_tail_after_commit() {
+        let cases = [
+            // Interim deltas are never typed, completed phrases are.
+            StreamCase {
+                profile: "lemonade",
+                live: vec![
+                    delta("item-1", "hel"),
+                    completed("item-1", "hello world"),
+                    delta("item-2", "good"),
+                    completed("item-2", "good morning"),
+                ],
+                typed_live: &["hello world", "good morning"],
+                after_commit: vec![completed("item-3", "tail flush")],
+                closes: false,
+                typed_tail: &["tail flush"],
+                session_rate: None,
+            },
+            // Deltas are typed as they arrive. The commit is acknowledged, the
+            // word the model still held at the stop arrives as one more delta
+            // of the same item, and its completed adds nothing.
+            StreamCase {
+                profile: "llamacpp",
+                live: vec![delta("item_1", " Hello"), delta("item_1", " there")],
+                typed_live: &[" Hello", " there"],
+                after_commit: vec![
+                    serde_json::json!({
+                        "type": "input_audio_buffer.committed",
+                        "item_id": "item_1"
+                    }),
+                    delta("item_1", " friend"),
+                    completed("item_1", " Hello there friend"),
+                ],
+                closes: true,
+                typed_tail: &[" friend"],
+                session_rate: Some(16_000),
+            },
+        ];
 
-            let session = recv_json(&mut ws).await;
-            assert_eq!(session["type"], "session.update");
-            assert_eq!(session["session"]["model"], "Whisper-Tiny");
-            assert_eq!(session["session"]["turn_detection"]["type"], "server_vad");
+        for case in cases {
+            let name = case.profile;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (live, after_commit, closes) = (case.live, case.after_commit, case.closes);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(stream).await.unwrap();
 
-            let append_one = recv_json(&mut ws).await;
-            assert_eq!(append_one["type"], "input_audio_buffer.append");
-            assert!(append_one["audio"].as_str().is_some_and(|s| !s.is_empty()));
+                let session = recv_json(&mut ws).await;
+                let append = recv_json(&mut ws).await;
+                assert_eq!(append["type"], "input_audio_buffer.append", "{name}");
+                for event in live {
+                    ws.send(Message::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                }
 
-            ws.send(Message::Text(
-                serde_json::json!({
-                    "type": "conversation.item.input_audio_transcription.delta",
-                    "item_id": "item-1",
-                    "delta": "hel"
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
+                let commit = recv_json(&mut ws).await;
+                for event in after_commit {
+                    ws.send(Message::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                if closes {
+                    ws.send(Message::Close(None)).await.unwrap();
+                }
+                match ws.next().await {
+                    Some(Ok(Message::Close(_))) | None => {}
+                    other => panic!("{name}: expected the client's close, got {other:?}"),
+                }
+                (session, commit)
+            });
+
+            let backend = OpenAiCompatibleRealtimeBackend::new(
+                format!("ws://{addr}/realtime"),
+                "Whisper-Tiny".to_string(),
+                name.to_string(),
+                "server-vad".to_string(),
+                None,
+            )
             .unwrap();
-            delta_one_sent_tx.send(()).ok();
-            allow_first_completed_rx.await.ok();
+            let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(8);
+            let (text_tx, mut text_rx) = mpsc::channel::<String>(8);
+            let backend_task = tokio::spawn(async move {
+                backend
+                    .transcribe_stream(audio_rx, text_tx, &test_request())
+                    .await
+            });
 
-            let append_two = recv_json(&mut ws).await;
-            assert_eq!(append_two["type"], "input_audio_buffer.append");
-            assert!(append_two["audio"].as_str().is_some_and(|s| !s.is_empty()));
-
-            ws.send(Message::Text(
-                serde_json::json!({
-                    "type": "conversation.item.input_audio_transcription.delta",
-                    "item_id": "item-2",
-                    "delta": "good"
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-            delta_two_sent_tx.send(()).ok();
-            allow_second_completed_rx.await.ok();
-
-            ws.send(Message::Text(
-                serde_json::json!({
-                    "type": "conversation.item.input_audio_transcription.completed",
-                    "item_id": "item-1",
-                    "transcript": "hello world"
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-
-            ws.send(Message::Text(
-                serde_json::json!({
-                    "type": "conversation.item.input_audio_transcription.completed",
-                    "item_id": "item-2",
-                    "transcript": "good morning"
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-
-            let commit = recv_json(&mut ws).await;
-            assert_eq!(commit["type"], "input_audio_buffer.commit");
-
-            ws.send(Message::Text(
-                serde_json::json!({
-                    "type": "conversation.item.input_audio_transcription.completed",
-                    "item_id": "item-3",
-                    "transcript": "tail flush"
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-
-            match ws.next().await.unwrap().unwrap() {
-                Message::Close(_) => {}
-                other => panic!("expected close frame, got {other:?}"),
+            audio_tx.send(vec![1; 160]).await.unwrap();
+            for expected in case.typed_live {
+                let typed = timeout(Duration::from_secs(1), text_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("{name}: {expected:?} not typed while streaming"));
+                assert_eq!(typed.as_deref(), Some(*expected), "{name}: while streaming");
             }
-        });
 
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            format!("ws://{addr}/realtime"),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap();
-        let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(8);
-        let (text_tx, mut text_rx) = mpsc::channel::<String>(8);
-
-        let backend_task = tokio::spawn(async move {
-            backend
-                .transcribe_stream(audio_rx, text_tx, &test_request())
+            drop(audio_tx);
+            let mut tail = Vec::new();
+            while let Some(text) = timeout(Duration::from_secs(5), text_rx.recv())
                 .await
-        });
+                .unwrap_or_else(|_| panic!("{name}: the stream did not end"))
+            {
+                tail.push(text);
+            }
+            assert_eq!(tail, case.typed_tail, "{name}: typed after the stop");
+            let result = backend_task.await.unwrap();
+            assert!(result.is_ok(), "{name}: {result:?}");
 
-        audio_tx.send(vec![1; 160]).await.unwrap();
-        delta_one_sent_rx.await.unwrap();
-        assert!(
-            timeout(Duration::from_millis(100), text_rx.recv())
-                .await
-                .is_err(),
-            "replaceable interim delta unexpectedly reached text channel early"
-        );
-        allow_first_completed_tx.send(()).ok();
-
-        audio_tx.send(vec![2; 160]).await.unwrap();
-        delta_two_sent_rx.await.unwrap();
-        assert!(
-            timeout(Duration::from_millis(100), text_rx.recv())
-                .await
-                .is_err(),
-            "replaceable interim delta unexpectedly reached text channel early"
-        );
-        allow_second_completed_tx.send(()).ok();
-
-        let first = timeout(Duration::from_secs(1), text_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first, "hello world");
-
-        let second = timeout(Duration::from_secs(1), text_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(second, "good morning");
-
-        drop(audio_tx);
-
-        let third = timeout(Duration::from_secs(1), text_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(third, "tail flush");
-
-        assert!(backend_task.await.unwrap().is_ok());
-        server.await.unwrap();
+            let (session, commit) = server.await.unwrap();
+            assert_eq!(session["type"], "session.update", "{name}");
+            assert_eq!(session["session"]["model"], "Whisper-Tiny", "{name}");
+            assert_eq!(
+                session["session"]["turn_detection"]["type"], "server_vad",
+                "{name}"
+            );
+            assert_eq!(
+                session["session"]["audio"]["input"]["format"].get("rate"),
+                case.session_rate.map(Value::from).as_ref(),
+                "{name}: session input rate"
+            );
+            assert_eq!(
+                commit,
+                serde_json::json!({ "type": "input_audio_buffer.commit" }),
+                "{name}: the end-of-stream commit"
+            );
+        }
     }
 
     #[tokio::test]
