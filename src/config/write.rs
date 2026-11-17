@@ -1275,6 +1275,15 @@ model = "whisper-large-v3-turbo"
         let reparsed: Config = toml::from_str(&out).unwrap();
         assert_eq!(reparsed.general.backend, "openai");
         assert_eq!(reparsed.llm_commands[0].instruction, "Translate to French.");
+
+        // Writing the identical Config again (a set_hotkey press that changes
+        // nothing) must not perturb a single byte.
+        write_config_to(&config, &path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            out,
+            "second write of an identical Config must be byte-identical"
+        );
     }
 
     /// An entry added to an array of tables goes right after the file's
@@ -1534,86 +1543,52 @@ args = ["--model", "haiku"]
         assert_eq!(reparsed.llm_commands.len(), 2);
     }
 
+    /// A file that is not TOML, or TOML that does not deserialize into
+    /// `Config`, cannot be merged into: it is regenerated from the struct, and
+    /// the file it replaces survives byte for byte as a private backup beside
+    /// it, the only copy of the user's hand edits and keys. The second kind is
+    /// the one a merge would ruin: `toml_edit` reads it, and a merge against an
+    /// empty preserve set deletes every section the struct does not carry.
     #[test]
-    fn unparseable_existing_file_is_regenerated() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "this is [ not toml").unwrap();
+    fn a_file_that_is_not_a_config_is_backed_up_and_regenerated() {
+        for (what, contents) in [
+            ("not TOML", "this is [ not toml"),
+            ("not a config", CONFIG_THAT_DOES_NOT_DESERIALIZE),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            fs::write(&path, contents).unwrap();
 
-        let config = parse_config(COMMENTED_CONFIG);
-        write_config_to(&config, &path).unwrap();
+            // What both CLI flows do next: write a config built without any
+            // knowledge of the file on disk (the wizard's, or `default_config()`).
+            write_config_to(&parse_config(COMMENTED_CONFIG), &path)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
 
-        let reparsed: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(reparsed.general.backend, "groq");
+            // The rewritten file loads: a config again, not a second broken one,
+            // and carries nothing over from the file it replaced.
+            let out = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let reparsed: Config = toml::from_str(&out).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(reparsed.general.backend, "groq", "{what}");
+            assert!(!out.contains("sk-my-real-secret-key"), "{what}");
 
-        // The broken file was the only copy of the user's hand-edits: it must
-        // survive, byte for byte, as a private backup next to the config.
-        let backup = dir.path().join("config.toml.bak");
-        assert_eq!(fs::read(&backup).unwrap(), b"this is [ not toml");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "backup may hold API keys, must be 0600");
+            // The file it replaced survives byte for byte, 0600 because it may
+            // hold API keys (the second one does).
+            let backup = dir.path().join("config.toml.bak");
+            let saved = fs::read(&backup).unwrap_or_else(|e| panic!("{what}: no backup: {e}"));
+            assert_eq!(saved, contents.as_bytes(), "{what}");
+            #[cfg(unix)]
+            {
+                let mode = fs::metadata(&backup)
+                    .unwrap_or_else(|e| panic!("{what}: {e}"))
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode, 0o600,
+                    "{what}: backup may hold API keys, must be 0600"
+                );
+            }
         }
-    }
-
-    /// Issue #134: valid TOML that does not deserialize used to reach the merge
-    /// with an empty preserve set, which deleted every section the struct does
-    /// not carry, and the `.bak` backstop never fired because it only covered
-    /// files that are not TOML at all.
-    #[test]
-    fn existing_file_that_does_not_deserialize_is_backed_up_and_regenerated() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, CONFIG_THAT_DOES_NOT_DESERIALIZE).unwrap();
-
-        // What both CLI flows do next: write a config built without any
-        // knowledge of the file on disk (the wizard's, or `default_config()`).
-        let config = parse_config(COMMENTED_CONFIG);
-        write_config_to(&config, &path).unwrap();
-
-        // The rewritten file loads: it is a config again, not a second broken one.
-        let reparsed: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(reparsed.general.backend, "groq");
-
-        // And the file it replaced survives byte for byte, 0600 because it may
-        // hold API keys (this fixture does).
-        let backup = dir.path().join("config.toml.bak");
-        assert_eq!(
-            fs::read(&backup).unwrap(),
-            CONFIG_THAT_DOES_NOT_DESERIALIZE.as_bytes()
-        );
-        #[cfg(unix)]
-        {
-            let mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "backup may hold API keys, must be 0600");
-        }
-    }
-
-    /// The user-visible stake of issue #134: the `[groq] api_key` in a file the
-    /// flow could not read still leaves the live config (the struct being
-    /// written has no `[groq]` at all), but it is recoverable from the backup
-    /// instead of gone without a trace.
-    #[test]
-    fn api_key_of_an_undeserializable_config_survives_in_the_backup() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, CONFIG_THAT_DOES_NOT_DESERIALIZE).unwrap();
-
-        write_config_to(&parse_config(COMMENTED_CONFIG), &path).unwrap();
-
-        let out = fs::read_to_string(&path).unwrap();
-        assert!(
-            !out.contains("sk-my-real-secret-key"),
-            "the struct being written has no [groq]; nothing should invent one\n{out}"
-        );
-        let backup = fs::read_to_string(dir.path().join("config.toml.bak")).unwrap();
-        assert!(backup.contains("[groq]"), "{backup}");
-        assert!(
-            backup.contains(r#"api_key = "sk-my-real-secret-key""#),
-            "{backup}"
-        );
     }
 
     /// The second write after a divert must take the merge path, because the
@@ -1717,7 +1692,9 @@ model_path = "/home/u/.local/share/whisrs/models/ggml-small.en.bin"
         let path = dir.path().join("config.toml");
         fs::write(&path, COMMENTED_CONFIG).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        // Root ignores the mode bits, as in `unreadable_config_is_unusable_not_missing`.
+        // Root ignores the mode bits and there is no portable way to make a
+        // file unreadable to root, so skip rather than assert something that
+        // only holds for an unprivileged user.
         if fs::read_to_string(&path).is_ok() {
             return;
         }
@@ -1763,26 +1740,6 @@ model_path = "/home/u/.local/share/whisrs/models/ggml-small.en.bin"
             fs::read_to_string(&path).unwrap(),
             CONFIG_THAT_DOES_NOT_DESERIALIZE,
             "the only copy of the user's config must survive a failed backup"
-        );
-    }
-
-    #[test]
-    fn rewriting_identical_config_is_byte_stable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_fixture(&dir);
-
-        // First write merges the struct into the commented fixture.
-        let config = parse_config(COMMENTED_CONFIG);
-        write_config_to(&config, &path).unwrap();
-        let first = fs::read(&path).unwrap();
-
-        // Writing the identical Config again (e.g. a set_hotkey press that
-        // changes nothing) must not perturb a single byte.
-        write_config_to(&config, &path).unwrap();
-        let second = fs::read(&path).unwrap();
-        assert_eq!(
-            first, second,
-            "second write of an identical Config must be byte-identical"
         );
     }
 
@@ -1857,7 +1814,8 @@ stray = "keep me"
         let dir = tempfile::tempdir().unwrap();
         let path = write_unknown_key_fixture(&dir);
 
-        write_config_to(&parse_config(CONFIG_WITH_UNKNOWN_KEYS), &path).unwrap();
+        let config = parse_config(CONFIG_WITH_UNKNOWN_KEYS);
+        write_config_to(&config, &path).unwrap();
 
         let out = fs::read_to_string(&path).unwrap();
         // The typo the load-time warning points at, comment included.
@@ -1881,42 +1839,13 @@ stray = "keep me"
         assert!(!reparsed.input.paste);
         // Still reported, so the warning keeps naming them.
         assert!(unknown_config_keys(&out).contains(&"input.past".to_string()));
-    }
 
-    #[test]
-    fn rewriting_a_config_with_unknown_keys_is_byte_stable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_unknown_key_fixture(&dir);
-
-        let config = parse_config(CONFIG_WITH_UNKNOWN_KEYS);
+        // And the next write of the same struct leaves the file as it is.
         write_config_to(&config, &path).unwrap();
-        let first = fs::read_to_string(&path).unwrap();
-        write_config_to(&config, &path).unwrap();
-        let second = fs::read_to_string(&path).unwrap();
         assert_eq!(
-            first, second,
+            fs::read_to_string(&path).unwrap(),
+            out,
             "a preserved key must not move, duplicate, or re-render on the next write"
-        );
-    }
-
-    #[test]
-    fn a_hotkey_alias_is_recanonicalized_while_the_typo_beside_it_survives() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = rewrite(
-            &dir,
-            "[general]\nbackend = \"groq\"\n\n[hotkeys]\nread = \"Super+Shift+R\"\nbogus = \"Super+X\"\n",
-        );
-
-        // `read` is a serde alias for `speak`, so it is *known*, never
-        // preserved, and replaced by the canonical spelling exactly once;
-        // keeping both would be a `duplicate field` error on the next load.
-        assert!(!out.contains("read ="), "alias key survived: {out}");
-        assert_eq!(out.matches("speak = ").count(), 1, "{out}");
-        assert!(out.contains(r#"bogus = "Super+X""#), "{out}");
-        let reparsed: Config = toml::from_str(&out).unwrap();
-        assert_eq!(
-            reparsed.hotkeys.unwrap().speak.as_deref(),
-            Some("Super+Shift+R")
         );
     }
 
@@ -1938,57 +1867,6 @@ stray = "keep me"
         assert!(out.contains(r#"stray = "keep me""#), "{out}");
         let reparsed: Config = toml::from_str(&out).unwrap();
         assert_eq!(reparsed.llm_commands.len(), 1);
-    }
-
-    #[test]
-    fn an_unknown_key_in_an_inline_table_survives() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = rewrite(
-            &dir,
-            "[general]\nbackend = \"groq\"\n\n[overlay]\ntheme = \"custom\"\n\
-             colors = { background = \"#000000\", bogos = 1 }\n",
-        );
-
-        // `merge_inline_table` carries its own stale filter, so it needs its
-        // own copy of the exemption: the user's inline spelling survives, and
-        // so does the stray key inside it.
-        assert!(out.contains("colors = {"), "{out}");
-        assert!(out.contains("bogos = 1"), "{out}");
-        assert!(out.contains(r##"background = "#000000""##), "{out}");
-        let _: Config = toml::from_str(&out).unwrap();
-    }
-
-    #[test]
-    fn a_mixed_alias_section_is_still_dropped_whole() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = rewrite(
-            &dir,
-            "[general]\nbackend = \"local\"\n\n[local]\nmodel_path = \"/m.bin\"\nbogus = 1\n",
-        );
-
-        // `model_path` is a real setting reached through the `local` ->
-        // `local-whisper` alias, so the subtree is mixed and goes wholesale.
-        // Keeping `[local]` beside the canonical section would make the file
-        // fail to deserialize with `duplicate field`, i.e. the daemon would
-        // discard the user's entire config.
-        assert!(!out.contains("bogus = 1"), "{out}");
-        assert!(!out.contains("[local]"), "{out}");
-        assert!(out.contains("[local-whisper]"), "{out}");
-        let reparsed: Config = toml::from_str(&out).unwrap();
-        assert_eq!(reparsed.local_whisper.unwrap().model_path, "/m.bin");
-    }
-
-    #[test]
-    fn a_wholly_unknown_alias_section_is_dropped_rather_than_duplicated() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = rewrite(&dir, "[general]\nbackend = \"groq\"\n\n[asr]\nbogus = 1\n");
-
-        // Every leaf of `[asr]` is confirmed-unknown, but `asr` is a serde
-        // alias for the `asr-sidecar` section the writer emits. The file
-        // still loading is the whole point of the check.
-        assert!(!out.contains("bogus = 1"), "{out}");
-        let reparsed: Config = toml::from_str(&out).unwrap();
-        assert!(reparsed.asr_sidecar.is_some());
     }
 
     /// The class of config every other fixture here misses: a section the
@@ -2045,30 +1923,6 @@ stray = "keep me"
     }
 
     #[test]
-    fn a_typo_in_a_nested_all_optional_section_survives() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // As a standard table.
-        let out = rewrite(
-            &dir,
-            "[general]\nbackend = \"groq\"\n\n[overlay.colors]\nbogos = 1\n",
-        );
-        assert!(out.contains("bogos = 1"), "{out}");
-        let _: Config = toml::from_str(&out).unwrap();
-
-        // And as an inline table whose *every* key is unknown (`theme` is a
-        // field of `[overlay]`, not of `colors`), which is what makes the
-        // whole-table question apply one level down.
-        let out = rewrite(
-            &dir,
-            "[general]\nbackend = \"groq\"\n\n[overlay]\ncolors = { theme = \"dark\", bogos = 1 }\n",
-        );
-        assert!(out.contains(r#"theme = "dark""#), "{out}");
-        assert!(out.contains("bogos = 1"), "{out}");
-        let _: Config = toml::from_str(&out).unwrap();
-    }
-
-    #[test]
     fn a_wholly_unknown_array_of_tables_survives() {
         let dir = tempfile::tempdir().unwrap();
         let out = rewrite(
@@ -2083,53 +1937,6 @@ stray = "keep me"
         let _: Config = toml::from_str(&out).unwrap();
     }
 
-    #[test]
-    fn a_wholly_unknown_alias_section_is_dropped_in_every_spelling() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // `[vibevoice]` aliases `[asr-sidecar]` exactly as `[asr]` does.
-        let out = rewrite(
-            &dir,
-            "[general]\nbackend = \"groq\"\n\n[vibevoice]\nbogus = 1\n",
-        );
-        assert!(!out.contains("bogus = 1"), "{out}");
-        assert!(!out.contains("[vibevoice]"), "{out}");
-        let reparsed: Config = toml::from_str(&out).unwrap();
-        assert!(reparsed.asr_sidecar.is_some());
-
-        // Same section written as a root inline table, which reaches the
-        // exemption through `value_is_preserved` instead of `is_preserved`.
-        let out = rewrite(
-            &dir,
-            "asr = { bogus = 1 }\n\n[general]\nbackend = \"groq\"\n",
-        );
-        assert!(!out.contains("bogus = 1"), "{out}");
-        assert!(!out.contains("asr = {"), "{out}");
-        let reparsed: Config = toml::from_str(&out).unwrap();
-        assert!(reparsed.asr_sidecar.is_some());
-
-        // `[local]` aliases `[local-whisper]`, and since #137 gave
-        // `model_path` a serde default it can be wholly unknown as well.
-        let out = rewrite(
-            &dir,
-            "[general]\nbackend = \"groq\"\n\n[local]\nbogus = 1\n",
-        );
-        assert!(!out.contains("bogus = 1"), "{out}");
-        assert!(!out.contains("[local]"), "{out}");
-        let reparsed: Config = toml::from_str(&out).unwrap();
-        assert!(reparsed.local_whisper.is_some());
-
-        // And its inline spelling, through `value_is_preserved`.
-        let out = rewrite(
-            &dir,
-            "local = { bogus = 1 }\n\n[general]\nbackend = \"groq\"\n",
-        );
-        assert!(!out.contains("bogus = 1"), "{out}");
-        assert!(!out.contains("local = {"), "{out}");
-        let reparsed: Config = toml::from_str(&out).unwrap();
-        assert!(reparsed.local_whisper.is_some());
-    }
-
     /// The whole preserve rule as one table, driven through the real writer.
     ///
     /// The invariant that outranks every row: the rewritten file still
@@ -2140,6 +1947,8 @@ stray = "keep me"
     fn the_preserve_matrix_holds_and_every_rewrite_still_loads() {
         struct Row {
             what: &'static str,
+            /// Written after a `[general]` header, unless it holds its own: a
+            /// root inline table has to come before any header.
             contents: &'static str,
             /// Substrings the rewritten file must still contain.
             kept: &'static [&'static str],
@@ -2236,11 +2045,52 @@ stray = "keep me"
                 gone: &["read = "],
                 once: &["speak = "],
             },
+            Row {
+                what: "a hotkey alias beside a typo",
+                contents: "[hotkeys]\nread = \"Super+Shift+R\"\nbogus = \"Super+X\"\n",
+                kept: &["speak = \"Super+Shift+R\"", "bogus = \"Super+X\""],
+                gone: &["read ="],
+                once: &["speak = "],
+            },
+            Row {
+                what: "an unknown key in an inline table",
+                contents: "[overlay]\ntheme = \"custom\"\n\
+                           colors = { background = \"#000000\", bogos = 1 }\n",
+                kept: &["colors = {", "bogos = 1", "background = \"#000000\""],
+                gone: &[],
+                once: &[],
+            },
+            Row {
+                what: "a wholly unknown alias section as a root inline table",
+                contents: "asr = { bogus = 1 }\n\n[general]\nbackend = \"groq\"\n",
+                kept: &["[asr-sidecar]"],
+                gone: &["bogus = 1", "asr = {"],
+                once: &["[asr-sidecar]"],
+            },
+            Row {
+                what: "a wholly unknown [local]",
+                contents: "[local]\nbogus = 1\n",
+                kept: &["[local-whisper]"],
+                gone: &["bogus = 1", "[local]"],
+                once: &["[local-whisper]"],
+            },
+            Row {
+                what: "a wholly unknown local as a root inline table",
+                contents: "local = { bogus = 1 }\n\n[general]\nbackend = \"groq\"\n",
+                kept: &["[local-whisper]"],
+                gone: &["bogus = 1", "local = {"],
+                once: &["[local-whisper]"],
+            },
         ];
 
         let dir = tempfile::tempdir().unwrap();
         for row in rows {
-            let out = rewrite(&dir, &format!("{GENERAL}{}", row.contents));
+            let contents = if row.contents.contains("[general]") {
+                row.contents.to_string()
+            } else {
+                format!("{GENERAL}{}", row.contents)
+            };
+            let out = rewrite(&dir, &contents);
             for needle in row.kept {
                 assert!(out.contains(needle), "{}: lost `{needle}`\n{out}", row.what);
             }
@@ -2327,13 +2177,23 @@ stray = "keep me"
         assert!(out.contains(r#"important = "keep""#), "{out}");
         assert!(out.contains("[bogus.emptysub]"), "{out}");
 
-        // An empty table nested inside an inline one, two levels down.
-        let out = rewrite_checked(
-            &dir,
-            "[general]\nbackend = \"groq\"\n\n[bogus]\nimportant = \"keep\"\na = { b = {} }\n",
-        );
-        assert!(out.contains(r#"important = "keep""#), "{out}");
-        assert!(out.contains("a = { b = {} }"), "{out}");
+        // An empty table nested inside an inline one, two and three levels
+        // down. It names nothing, so the warning does not mention it.
+        for nested in ["a = { b = {} }", "a = { b = { c = {} } }"] {
+            let out = rewrite_checked(
+                &dir,
+                &format!(
+                    "[general]\nbackend = \"groq\"\n\n[bogus]\nimportant = \"keep\"\n{nested}\n"
+                ),
+            );
+            assert!(out.contains(r#"important = "keep""#), "{nested}: {out}");
+            assert!(out.contains(nested), "{nested}: {out}");
+            assert_eq!(
+                unknown_config_keys(&out),
+                vec!["bogus.important"],
+                "{nested}: {out}"
+            );
+        }
 
         // An unknown subtree of a *known* section: `[tts]` and `[overlay]` are
         // in `fresh`, so the merge recurses into them and the stale filter sees
@@ -2520,32 +2380,6 @@ stray = "keep me"
         );
     }
 
-    #[test]
-    #[cfg(unix)]
-    fn unreadable_config_is_unusable_not_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, COMMENTED_CONFIG).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        // Root ignores the mode bits and there is no portable way to make a
-        // file unreadable to root, so skip rather than assert something that
-        // only holds for an unprivileged user.
-        if fs::read_to_string(&path).is_ok() {
-            return;
-        }
-
-        let ExistingConfig::Unusable { kind, message: msg } = load_existing_config_from(&path)
-        else {
-            panic!("an unreadable file must not be reported as missing");
-        };
-        // And not as a shape problem either: this is the kind no rewrite can
-        // fix, so both flows must refuse rather than send the user to
-        // `whisrs setup` (issue #134).
-        assert_eq!(kind, UnusableKind::Unreadable);
-        assert!(msg.contains("cannot read config at"), "{msg}");
-        assert!(msg.contains(&path.display().to_string()), "{msg}");
-    }
-
     /// A directory at the config path reads as `Unreadable` too, not as a
     /// missing file: `read_to_string` fails with `IsADirectory`, and only
     /// `NotFound` is `Missing`.
@@ -2558,7 +2392,11 @@ stray = "keep me"
         let ExistingConfig::Unusable { kind, message } = load_existing_config_from(&path) else {
             panic!("a directory at the config path must not be reported as missing");
         };
+        // And not as a shape problem either: this is the kind no rewrite can
+        // fix, so both flows must refuse rather than send the user to
+        // `whisrs setup`.
         assert_eq!(kind, UnusableKind::Unreadable);
+        assert!(message.contains("cannot read config at"), "{message}");
         assert!(message.contains(&path.display().to_string()), "{message}");
     }
 
