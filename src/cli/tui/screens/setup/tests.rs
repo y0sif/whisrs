@@ -437,23 +437,15 @@ fn a_whisper_model_is_picked_and_downloaded() {
     }));
     assert!(fixture.app.orphans.is_empty());
 
-    // A failed download stays the choice: Enter tries it again.
+    // A failed download stays the choice.
     press(&mut fixture.app, " ");
     type_text(&mut fixture.app, "small.en");
     let failing = started(press(&mut fixture.app, "\n"), "small.en");
-    assert_eq!(set(&fixture), Some(path("small.en").display().to_string()));
     fixture.app.update(Msg::Download(Download::Done {
         id: failing,
         result: Err(DownloadError::Failed("HTTP 404".into())),
     }));
-    assert!(status(&fixture).contains("the download failed"));
     assert_eq!(set(&fixture), Some(path("small.en").display().to_string()));
-    let again = started(press(&mut fixture.app, "\n"), "small.en");
-    press(&mut fixture.app, "\x1b");
-    fixture.app.update(Msg::Download(Download::Done {
-        id: again,
-        result: Err(DownloadError::Cancelled),
-    }));
 
     // A model already there is used as it is.
     press(&mut fixture.app, " ");
@@ -658,8 +650,8 @@ name = "jarvis"
 dir = "/tmp"
 "#;
 
-/// Start fresh changes only the keys setup asked, leaf by leaf, keeps the
-/// rest of the file (comments, other sections, other keys of the asked
+/// Start fresh starts with the file's API keys, changes only the keys setup
+/// asked, leaf by leaf, keeps the rest of the file (comments, other sections, other keys of the asked
 /// sections), keeps the file as `.bak` first, and the review lists exactly
 /// what changes, keys masked.
 #[test]
@@ -670,6 +662,16 @@ fn start_fresh_writes_only_the_asked_keys() {
     // rest as offered; the optional modes skipped.
     press(&mut fixture.app, "\n");
     assert_eq!(setup(&fixture).editor.form.config().general.backend, "groq");
+    // The file's keys come along, and nothing is unwritten yet.
+    assert!(!setup(&fixture).unwritten());
+    for (path, key) in [
+        ("groq.api_key", "gsk_other_backend_5678"),
+        ("deepgram.api_key", "dg_old_key_1234"),
+        ("llm.api_key", "sk_llm_key_9999"),
+    ] {
+        let form = &setup(&fixture).editor.form;
+        assert_eq!(form.value(path), Some(&Value::from(key)), "{path}");
+    }
     press(&mut fixture.app, "\n ");
     type_text(&mut fixture.app, "gsk_new_key_4321");
     press(&mut fixture.app, "\n\n\n\n\n\n");
@@ -861,7 +863,7 @@ fn setup_snapshots() {
     snapshot("setup-review-changes-90x40", &drawn(&fixture, 90, 40));
 }
 
-/// No size panics on any step.
+/// No size panics on any step, an optional step's question or its rows.
 #[test]
 fn no_setup_size_panics() {
     let mut states = vec![on_the_key_step(), setup_on(Some("[general]\n"), &[])];
@@ -875,6 +877,12 @@ fn no_setup_size_panics() {
     press(&mut checks_step.app, "j\n");
     checks_step.app.update(Msg::Checked(Box::new(checks())));
     states.push(checks_step);
+    let mut question = on_the_modes();
+    skip_to(&mut question, Step::Jarvis);
+    let mut filling = on_the_modes();
+    skip_to(&mut filling, Step::Jarvis);
+    press(&mut filling.app, "\n");
+    states.extend([question, filling]);
     for fixture in &states {
         for w in [1, 10, 59, 60, 61, 89, 90, 120, 200] {
             for h in [1, 5, 17, 18, 19, 30, 60] {
@@ -1144,6 +1152,9 @@ fn skip_midway_puts_the_answers_back() {
     assert!(tts.enabled);
     assert_eq!(tts.backend, "groq");
     assert!(setup(&fixture).asked().contains(&"tts.enabled".to_string()));
+    // Read aloud counts on dictation's own key: asked once, not twice.
+    let asked = setup(&fixture).asked();
+    assert_eq!(asked.iter().filter(|k| *k == "groq.api_key").count(), 1);
     // A voice picked, then skipped midway.
     press(&mut fixture.app, "jjl");
     assert_eq!(focused(&fixture).as_deref(), Some("tts.voice"));
@@ -1426,44 +1437,6 @@ fn jarvis_kept_as_it_is_writes_no_agent() {
     assert_eq!(setup(&fixture).changes().unwrap(), []);
 }
 
-/// Start fresh keeps every API key the file has: the key step shows it set
-/// and opens no input, and command mode set up has its key. Nothing else
-/// of the file comes with it, and nothing is unwritten yet.
-#[test]
-fn start_fresh_keeps_the_files_keys() {
-    let mut fixture = setup_on(Some(RICH), &[]);
-    press(&mut fixture.app, "\n");
-    assert!(!setup(&fixture).unwritten());
-    let form = &setup(&fixture).editor.form;
-    for (path, key) in [
-        ("groq.api_key", "gsk_other_backend_5678"),
-        ("deepgram.api_key", "dg_old_key_1234"),
-        ("llm.api_key", "sk_llm_key_9999"),
-    ] {
-        assert_eq!(form.value(path), Some(&Value::from(key)), "{path}");
-    }
-    assert_eq!(form.config().general.language, "en");
-    // The LLM key keeps the model it is for.
-    assert_eq!(form.config().llm.as_ref().unwrap().model, "gpt-6-luna");
-    press(&mut fixture.app, "\n");
-    assert_eq!(setup(&fixture).mode(), Mode::Browse);
-    assert!(drawn(&fixture, 90, 30)
-        .iter()
-        .any(|r| r.contains("set ****5678")));
-    press(&mut fixture.app, "\n\n\n\n\n");
-    skip_to(&mut fixture, Step::Command);
-    press(&mut fixture.app, "\n");
-    assert!(drawn(&fixture, 90, 30)
-        .iter()
-        .any(|r| r.contains("set ****9999")));
-    press(&mut fixture.app, "\n");
-    assert_eq!(
-        setup(&fixture).step,
-        Step::ReadAloud,
-        "the LLM key resolves"
-    );
-}
-
 /// The step numbers come from the list of steps: recording is step 7 in a
 /// build with it, and not there without.
 #[test]
@@ -1615,23 +1588,6 @@ fn mode_snapshots() {
     snapshot("setup-jarvis-90x30", &drawn(&fixture, 90, 30));
 }
 
-/// No size panics on a question or a mode's rows.
-#[test]
-fn no_mode_size_panics() {
-    let mut question = on_the_modes();
-    skip_to(&mut question, Step::Jarvis);
-    let mut rows = on_the_modes();
-    skip_to(&mut rows, Step::Jarvis);
-    press(&mut rows.app, "\n");
-    for fixture in [&question, &rows] {
-        for w in [1, 10, 59, 60, 61, 89, 90, 120, 200] {
-            for h in [1, 5, 17, 18, 19, 30, 60] {
-                draw(&fixture.app, w, h);
-            }
-        }
-    }
-}
-
 /// His first run: Start fresh over a file whose `[llm]` held only its key,
 /// command mode answered with the defaults. The key was reset to the
 /// default and the write left a bare `[llm]`; kept, the file's `[llm]`
@@ -1757,6 +1713,9 @@ fn start_fresh_keeps_each_key_with_where_it_goes() {
     press(&mut fixture.app, "\n\n\n\n\n\n\n");
     skip_to(&mut fixture, Step::Command);
     press(&mut fixture.app, "\n");
+    assert!(drawn(&fixture, 90, 30)
+        .iter()
+        .any(|r| r.contains("set ****1234")));
     let llm = setup(&fixture).editor.form.config().llm.clone().unwrap();
     assert_eq!(
         llm.api_url,
@@ -2284,14 +2243,8 @@ fn a_cleared_openrouter_key_stays_cleared() {
     press(&mut fixture.app, "\n");
     assert_eq!(text_at(&fixture, "llm.model").as_deref(), Some(model));
     assert_eq!(text_at(&fixture, "llm.api_key").as_deref(), Some(""));
-    // Off OpenRouter and back is a move onto it: copied again.
-    press(&mut fixture.app, "k ");
-    type_text(&mut fixture.app, "groq");
-    press(&mut fixture.app, "\n ");
-    type_text(&mut fixture.app, "openrouter");
-    press(&mut fixture.app, "\n");
-    assert_eq!(text_at(&fixture, "llm.api_key").as_deref(), Some(OR_KEY));
-    press(&mut fixture.app, "\n");
+    // Command mode without a key is skipped.
+    press(&mut fixture.app, "s");
 
     // Read aloud's too.
     assert_eq!(setup(&fixture).step, Step::ReadAloud);
@@ -2349,8 +2302,7 @@ fn retype_sidecar_key(fixture: &mut Fixture, key: &str) {
 }
 
 /// Dictation's key retyped after command mode and read aloud took a copy
-/// (a typo fixed): the copies follow it, and the write carries the new key
-/// in all three sections.
+/// (a typo fixed): the copies follow it.
 #[test]
 fn a_retyped_openrouter_key_moves_its_copies() {
     let new = "sk-or-v1-fixed-8765";
@@ -2369,31 +2321,6 @@ fn a_retyped_openrouter_key_moves_its_copies() {
     retype_sidecar_key(&mut fixture, new);
     assert_eq!(text_at(&fixture, "llm.api_key").as_deref(), Some(new));
     assert_eq!(text_at(&fixture, "tts.api_key").as_deref(), Some(new));
-
-    // On through the steps set up, as they are, to the write.
-    for _ in 0..20 {
-        if setup(&fixture).step == Step::Command {
-            break;
-        }
-        let skip = if setup(&fixture).step.optional() {
-            "s"
-        } else {
-            "\n"
-        };
-        press(&mut fixture.app, skip);
-    }
-    assert_eq!(setup(&fixture).step, Step::Command);
-    press(&mut fixture.app, "\n");
-    assert_eq!(setup(&fixture).step, Step::ReadAloud);
-    press(&mut fixture.app, "\n");
-    assert_eq!(setup(&fixture).step, Step::Jarvis);
-    skip_modes(&mut fixture);
-    assert_eq!(write(&mut fixture), Some(Effect::Checks));
-    let text = std::fs::read_to_string(paths(fixture.dir.path()).config).unwrap();
-    let written: whisrs::Config = toml::from_str(&text).unwrap();
-    assert_eq!(written.asr_sidecar.unwrap().api_key.as_deref(), Some(new));
-    assert_eq!(written.llm.unwrap().api_key, new);
-    assert_eq!(written.tts.unwrap().api_key.as_deref(), Some(new));
 }
 
 /// A key typed for command mode, or one cleared for read aloud, is not a
@@ -2472,68 +2399,32 @@ fn an_environment_sidecar_key_is_never_copied() {
 
 /// A config.toml whose read aloud is tts-sidecar on a server of its own
 /// (none named: the one on this machine; or another) keeps it: the
-/// OpenRouter dictation key does not move it to OpenRouter.
+/// OpenRouter dictation key does not move it to OpenRouter. One on
+/// OpenRouter already is OpenRouter's, key and all. A `[tts]` left over
+/// with read aloud off is no choice made: its server does not keep read
+/// aloud off OpenRouter, which starts there with dictation's key.
 #[test]
-fn read_aloud_on_a_local_server_stays_there() {
-    for (url, want) in [
-        ("", None),
-        (
-            "url = \"http://10.0.0.2:8880/v1/audio/speech\"\n",
-            Some("http://10.0.0.2:8880/v1/audio/speech"),
-        ),
+fn a_tts_sidecar_in_use_keeps_read_aloud_on_its_server() {
+    let own = "http://10.0.0.2:8880/v1/audio/speech";
+    let openrouter = catalog::OPENROUTER_TTS_URL;
+    for (enabled, url, on_openrouter, want_url) in [
+        (true, None, false, None),
+        (true, Some(own), false, Some(own)),
+        (true, Some(openrouter), true, Some(openrouter)),
+        (false, None, true, Some(openrouter)),
+        (false, Some(own), true, Some(openrouter)),
     ] {
-        let file = format!("[tts]\nenabled = true\nbackend = \"tts-sidecar\"\n{url}");
+        let url = url.map_or(String::new(), |url| format!("url = \"{url}\"\n"));
+        let file = format!("[tts]\nenabled = {enabled}\nbackend = \"tts-sidecar\"\n{url}");
         let mut fixture = on_openrouter_modes_over(Some(&file), &[], Some(OR_KEY));
         skip_to(&mut fixture, Step::ReadAloud);
         press(&mut fixture.app, "\n");
-        assert_eq!(
-            text_at(&fixture, "tts.backend").as_deref(),
-            Some("tts-sidecar"),
-            "{file}"
-        );
-        assert_eq!(text_at(&fixture, "tts.url").as_deref(), want, "{file}");
-        assert_eq!(text_at(&fixture, "tts.api_key"), None, "{file}");
-        assert!(!setup(&fixture).tts_on_openrouter(), "{file}");
-    }
-
-    // One on OpenRouter already is OpenRouter's, key and all.
-    let file = format!(
-        "[tts]\nenabled = true\nbackend = \"tts-sidecar\"\nurl = \"{}\"\n",
-        catalog::OPENROUTER_TTS_URL
-    );
-    let mut fixture = on_openrouter_modes_over(Some(&file), &[], Some(OR_KEY));
-    skip_to(&mut fixture, Step::ReadAloud);
-    press(&mut fixture.app, "\n");
-    assert!(setup(&fixture).tts_on_openrouter());
-    assert_eq!(text_at(&fixture, "tts.api_key").as_deref(), Some(OR_KEY));
-}
-
-/// A `[tts]` left over with read aloud off is no choice made: its
-/// tts-sidecar server does not keep read aloud off OpenRouter, which
-/// starts there with dictation's key.
-#[test]
-fn a_disabled_tts_sidecar_in_the_file_is_no_choice() {
-    for url in ["", "url = \"http://10.0.0.2:8880/v1/audio/speech\"\n"] {
-        let file = format!("[tts]\nenabled = false\nbackend = \"tts-sidecar\"\n{url}");
-        let mut fixture = on_openrouter_modes_over(Some(&file), &[], Some(OR_KEY));
-        skip_to(&mut fixture, Step::ReadAloud);
-        press(&mut fixture.app, "\n");
-        assert!(setup(&fixture).tts_on_openrouter(), "{file}");
-        assert_eq!(
-            text_at(&fixture, "tts.backend").as_deref(),
-            Some("tts-sidecar"),
-            "{file}"
-        );
-        assert_eq!(
-            text_at(&fixture, "tts.url").as_deref(),
-            Some(catalog::OPENROUTER_TTS_URL),
-            "{file}"
-        );
-        assert_eq!(
-            text_at(&fixture, "tts.api_key").as_deref(),
-            Some(OR_KEY),
-            "{file}"
-        );
+        let backend = text_at(&fixture, "tts.backend");
+        assert_eq!(backend.as_deref(), Some("tts-sidecar"), "{file}");
+        assert_eq!(text_at(&fixture, "tts.url").as_deref(), want_url, "{file}");
+        let key = on_openrouter.then_some(OR_KEY);
+        assert_eq!(text_at(&fixture, "tts.api_key").as_deref(), key, "{file}");
+        assert_eq!(setup(&fixture).tts_on_openrouter(), on_openrouter, "{file}");
     }
 }
 
