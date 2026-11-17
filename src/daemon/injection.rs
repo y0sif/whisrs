@@ -1341,39 +1341,25 @@ mod tests {
     /// The default: the reply is typed (or pasted) into the focused window.
     const INJECTING: bool = false;
 
-    /// The reported defect, end to end: the model wraps a one-line command in
-    /// a fence, and it is unwrapped and injected at either target, in either
-    /// mode.
-    #[test]
-    fn a_fenced_one_liner_is_unwrapped_and_injected_anywhere() {
-        for target in [TERMINAL, NOT_A_TERMINAL] {
-            for mode in [INJECTING, CLIPBOARD_ONLY] {
-                assert_eq!(
-                    prepare_llm_injection("```bash\nsudo pacman -S steam\n```", target, mode),
-                    LlmInjection::Inject("sudo pacman -S steam".to_string()),
-                    "is_terminal = {target}, clipboard_only = {mode}"
-                );
-            }
-        }
-    }
-
     /// Cleaning does not depend on the target or on `clipboard_only`: padding
-    /// and a wrapping fence go in every case. Only the multi-line verdict is
-    /// conditional.
+    /// and a wrapping fence, with or without a language tag, go in every
+    /// case, so a fenced one-line command is injected anywhere. Only the
+    /// multi-line verdict is conditional.
     #[test]
     fn cleaning_is_unconditional() {
-        for target in [TERMINAL, NOT_A_TERMINAL] {
-            for mode in [INJECTING, CLIPBOARD_ONLY] {
-                assert_eq!(
-                    prepare_llm_injection("  \n  Wo ist der Bahnhof?  \n", target, mode),
-                    LlmInjection::Inject("Wo ist der Bahnhof?".to_string()),
-                    "is_terminal = {target}, clipboard_only = {mode}"
-                );
-                assert_eq!(
-                    prepare_llm_injection("```\nsudo pacman -S steam\n```\n", target, mode),
-                    LlmInjection::Inject("sudo pacman -S steam".to_string()),
-                    "is_terminal = {target}, clipboard_only = {mode}"
-                );
+        for (reply, cleaned) in [
+            ("  \n  Wo ist der Bahnhof?  \n", "Wo ist der Bahnhof?"),
+            ("```\nsudo pacman -S steam\n```\n", "sudo pacman -S steam"),
+            ("```bash\nsudo pacman -S steam\n```", "sudo pacman -S steam"),
+        ] {
+            for target in [TERMINAL, NOT_A_TERMINAL] {
+                for mode in [INJECTING, CLIPBOARD_ONLY] {
+                    assert_eq!(
+                        prepare_llm_injection(reply, target, mode),
+                        LlmInjection::Inject(cleaned.to_string()),
+                        "{reply:?} at is_terminal = {target}, clipboard_only = {mode}"
+                    );
+                }
             }
         }
     }
@@ -1648,15 +1634,6 @@ mod tests {
         }
     }
 
-    /// Stage 2 needs an actual dot, so the leaf set is not a second bare-string
-    /// list: only `blackbox-terminal` is a real class, plain `blackbox` is not.
-    #[test]
-    fn leaf_set_requires_a_dot() {
-        assert!(!is_terminal_class("blackbox", &[]));
-        assert!(is_terminal_class("blackbox-terminal", &[]));
-        assert!(is_terminal_class("io.example.Ghostty", &[]));
-    }
-
     /// The destructive direction: anything matched here gets Ctrl+A/Ctrl+K sent
     /// into it by command mode, which empties a GUI text field.
     #[test]
@@ -1684,6 +1661,8 @@ mod tests {
             "xfce4-terminal-emulator",
             "Stremio",
             "standardnotes",
+            // Only `blackbox-terminal` is a class, and `blackbox` is no leaf.
+            "blackbox",
             "",
             "   ",
         ] {
@@ -1694,93 +1673,42 @@ mod tests {
         }
     }
 
-    /// Issue #70, first half: the old `lower.contains("st")` matched these.
-    #[test]
-    fn repro_st_substring_matches_non_terminals_issue70() {
-        for class in [
-            "steam",
-            "com.obsproject.Studio",
-            "systemsettings",
-            "Postman",
-            "libreoffice-startcenter",
-        ] {
-            assert!(
-                !is_terminal_class(class, &[]),
-                "{class} is not a terminal but is_terminal_class says it is"
-            );
-        }
-    }
-
-    /// Issue #70, second half: the old list held only bare X11 classes, so
-    /// every reverse-DNS Wayland app_id was missed.
-    #[test]
-    fn repro_wayland_gnome_terminal_is_missed_issue70() {
-        for class in [
-            "org.gnome.Terminal",
-            "org.gnome.Console",
-            "kgx",
-            "rio",
-            "qterminal",
-        ] {
-            assert!(
-                is_terminal_class(class, &[]),
-                "{class} is a terminal but is_terminal_class says it is not"
-            );
-        }
-    }
-
     /// `[input] terminal_classes` entries match the whole class, in either
     /// casing: the compositor's (X11 hands us `Alacritty-float`) and the
-    /// user's (they may have typed it lowercase, or with stray spaces).
+    /// user's (they may have typed it lowercase, or with stray spaces). The
+    /// classes they are for match nothing built in: an st build with its own
+    /// `termname` in `config.h`, and scratchpad and dropdown classes, which
+    /// exact matching never catches on its own.
     #[test]
     fn user_terminal_classes_match_whole_identifiers_case_insensitively() {
-        let extra = user(&["st-mytermname", "  Alacritty-float  ", "kitty-dropdown"]);
+        let extra = user(&[
+            "st-mytermname",
+            "st-solarized",
+            "mysuckless-term",
+            "  Alacritty-float  ",
+            "kitty-dropdown",
+            "wezterm-quake",
+        ]);
         for class in [
             "st-mytermname",
             "ST-MYTERMNAME",
+            "st-solarized",
+            "mysuckless-term",
             "Alacritty-float",
             "alacritty-float",
             "ALACRITTY-FLOAT",
             "  alacritty-float  ",
             "kitty-dropdown",
             "Kitty-Dropdown",
+            "wezterm-quake",
         ] {
             assert!(
                 is_terminal_class(class, &extra),
                 "{class:?} is listed in terminal_classes but is_terminal_class says it is not a terminal"
             );
-        }
-    }
-
-    /// Issue #92, first case: st takes its class from `termname` in
-    /// `config.h`, so a renamed build matches nothing built in.
-    #[test]
-    fn repro_renamed_st_needs_a_user_entry_issue92() {
-        for class in ["st-mytermname", "st-solarized", "mysuckless-term"] {
             assert!(
                 !is_terminal_class(class, &[]),
-                "{class} is not a built-in class; the built-in list must stay conservative"
-            );
-            assert!(
-                is_terminal_class(class, &user(&[class])),
-                "{class} is listed in terminal_classes but is_terminal_class says it is not a terminal"
-            );
-        }
-    }
-
-    /// Issue #92, second case: scratchpad and dropdown setups rename the
-    /// class. The pre-#70 substring match caught these incidentally; exact
-    /// matching does not, so they need an explicit entry.
-    #[test]
-    fn repro_scratchpad_classes_need_a_user_entry_issue92() {
-        for class in ["Alacritty-float", "kitty-dropdown", "wezterm-quake"] {
-            assert!(
-                !is_terminal_class(class, &[]),
-                "{class} must not match on its own — exact matching is the #70 fix"
-            );
-            assert!(
-                is_terminal_class(class, &user(&[class])),
-                "{class} is listed in terminal_classes but is_terminal_class says it is not a terminal"
+                "{class:?} is not a built-in class; the built-in list must stay conservative"
             );
         }
     }
@@ -2036,16 +1964,25 @@ mod tests {
 
     /// Run `f` with `keyboard` installed as the persistent virtual keyboard,
     /// restoring whatever occupied the slot before (a previous test's mock,
-    /// or the real device slot) afterwards.
-    fn with_keyboard(keyboard: MockKeyboard, f: impl FnOnce()) {
+    /// or the real device slot) afterwards, all under [`KEYBOARD_TEST_LOCK`].
+    fn with_keyboard<T>(keyboard: MockKeyboard, f: impl FnOnce() -> T) -> T {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
         let mut guard = slot.lock().unwrap();
         let previous = guard.take();
         *guard = Some(Box::new(keyboard));
         drop(guard);
-        f();
+        let out = f();
         let mut guard = slot.lock().unwrap();
         *guard = previous;
+        out
+    }
+
+    /// [`with_modifier_probe`] for an `f` that returns a value.
+    fn probed<T>(probe: impl FnMut() -> bool + 'static, f: impl FnOnce() -> T) -> T {
+        let mut out = None;
+        with_modifier_probe(probe, || out = Some(f()));
+        out.expect("with_modifier_probe runs f")
     }
 
     /// Keystroke settings for tests: a 1 ms key delay and a 200 ms modifier
@@ -2063,63 +2000,108 @@ mod tests {
         }
     }
 
+    /// The `[input]` delivery settings: `paste`, `clipboard_fallback` and
+    /// `clipboard_only`.
+    #[derive(Clone, Copy)]
+    struct Mode {
+        paste: bool,
+        clipboard_fallback: bool,
+        clipboard_only: bool,
+    }
+
+    /// The default: typed, the clipboard untouched.
+    const TYPING: Mode = Mode {
+        paste: false,
+        clipboard_fallback: false,
+        clipboard_only: false,
+    };
+    const TYPING_WITH_FALLBACK: Mode = Mode {
+        clipboard_fallback: true,
+        ..TYPING
+    };
+    const PASTE: Mode = Mode {
+        paste: true,
+        ..TYPING
+    };
+    const PASTE_WITH_FALLBACK: Mode = Mode {
+        paste: true,
+        clipboard_fallback: true,
+        ..TYPING
+    };
+    const COPY_ONLY: Mode = Mode {
+        clipboard_only: true,
+        ..TYPING
+    };
+    /// `clipboard_only` with `paste` on too, which it overrides.
+    const COPY_ONLY_OVER_PASTE: Mode = Mode {
+        paste: true,
+        ..COPY_ONLY
+    };
+
     /// Run the testable inject core with a mock keyboard installed and a
     /// near-zero restore delay, then give any spawned restore thread time to
     /// land before returning. Generic over the concrete clipboard type so
     /// tests keep typed access to the recording mock after the call.
     fn inject<C: ClipboardBackend + 'static>(
         keyboard: MockKeyboard,
-        clipboard: Arc<C>,
+        clipboard: &Arc<C>,
         text: &str,
-        paste: bool,
-        clipboard_fallback: bool,
-        clipboard_only: bool,
+        mode: Mode,
     ) -> anyhow::Result<Injection> {
-        inject_with_keys(
-            test_keys(),
-            keyboard,
-            clipboard,
-            text,
-            paste,
-            clipboard_fallback,
-            clipboard_only,
-        )
+        inject_with_keys(test_keys(), keyboard, clipboard, text, mode)
     }
 
     /// [`inject`] with explicit keystroke settings (for the modifier cap).
     fn inject_with_keys<C: ClipboardBackend + 'static>(
         keys: KeystrokeSettings,
         keyboard: MockKeyboard,
-        clipboard: Arc<C>,
+        clipboard: &Arc<C>,
         text: &str,
-        paste: bool,
-        clipboard_fallback: bool,
-        clipboard_only: bool,
+        mode: Mode,
     ) -> anyhow::Result<Injection> {
-        let mut result = None;
         with_keyboard(keyboard, || {
-            result = Some(inject_text_with_clipboard(
+            let result = inject_text_with_clipboard(
                 text,
                 /* is_terminal = */ false,
                 keys,
-                paste,
-                clipboard_fallback,
-                clipboard_only,
+                mode.paste,
+                mode.clipboard_fallback,
+                mode.clipboard_only,
                 /* clear_line = */ false,
                 std::time::Duration::from_millis(5),
-                clipboard,
-            ));
+                Arc::clone(clipboard) as Arc<dyn ClipboardBackend>,
+            );
             // The restore thread (when spawned) sleeps its 5 ms delay, then
             // does a clipboard read + write; 100 ms is ample for it to land
             // before the test inspects the record.
             std::thread::sleep(std::time::Duration::from_millis(100));
-        });
-        result.unwrap()
+            result
+        })
+    }
+
+    /// Command mode's line clear and `"git status"` at a terminal, with
+    /// `keyboard` installed. `clipboard_only` is not a command-mode setting.
+    fn clear_line_and_inject_git_status(
+        keys: KeystrokeSettings,
+        keyboard: MockKeyboard,
+        clipboard: &Arc<ScriptedClipboard>,
+        mode: Mode,
+    ) -> anyhow::Result<Injection> {
+        assert!(!mode.clipboard_only, "command mode never copies only");
+        with_keyboard(keyboard, || {
+            clear_line_and_inject_with_clipboard(
+                "git status",
+                keys,
+                mode.paste,
+                mode.clipboard_fallback,
+                std::time::Duration::from_millis(5),
+                Arc::clone(clipboard) as Arc<dyn ClipboardBackend>,
+            )
+        })
     }
 
     #[test]
     fn paste_with_fallback_keeps_the_pasted_text_in_the_clipboard() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Same script as the restoring sibling test below: the pre-paste save
         // reads "original", and a read-back — if one happened — would see the
         // pasted text and therefore restore. With the fallback on, no
@@ -2135,14 +2117,7 @@ mod tests {
         let keyboard = MockKeyboard::default();
         let paste_combos = Arc::clone(&keyboard.paste_combos);
 
-        let result = inject(
-            keyboard,
-            Arc::clone(&clipboard),
-            "hello world",
-            /* paste = */ true,
-            /* clipboard_fallback = */ true,
-            /* clipboard_only = */ false,
-        );
+        let result = inject(keyboard, &clipboard, "hello world", PASTE_WITH_FALLBACK);
 
         assert!(result.is_ok());
         assert_eq!(*paste_combos.lock().unwrap(), 1, "Ctrl+V must have fired");
@@ -2155,7 +2130,6 @@ mod tests {
 
     #[test]
     fn paste_without_fallback_still_restores_the_previous_clipboard() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Reads: the pre-paste save ("original"), then the delayed restore
         // read-back (still the pasted text, so nothing else copied over) →
         // the original is written back exactly once.
@@ -2165,14 +2139,7 @@ mod tests {
         ]));
         let keyboard = MockKeyboard::default();
 
-        let result = inject(
-            keyboard,
-            Arc::clone(&clipboard),
-            "hello world",
-            /* paste = */ true,
-            /* clipboard_fallback = */ false,
-            /* clipboard_only = */ false,
-        );
+        let result = inject(keyboard, &clipboard, "hello world", PASTE);
 
         assert!(result.is_ok());
         assert_eq!(
@@ -2183,21 +2150,13 @@ mod tests {
 
     #[test]
     fn typing_with_fallback_copies_the_typed_text() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Typing mode never reads the clipboard (empty script would panic on
         // any read), and the fallback writes the typed text once.
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
 
-        let result = inject(
-            keyboard,
-            Arc::clone(&clipboard),
-            "hello world",
-            /* paste = */ false,
-            /* clipboard_fallback = */ true,
-            /* clipboard_only = */ false,
-        );
+        let result = inject(keyboard, &clipboard, "hello world", TYPING_WITH_FALLBACK);
 
         assert!(result.is_ok());
         assert_eq!(*typed.lock().unwrap(), vec!["hello world".to_string()]);
@@ -2206,19 +2165,11 @@ mod tests {
 
     #[test]
     fn typing_without_fallback_never_touches_the_clipboard() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
 
-        let result = inject(
-            keyboard,
-            Arc::clone(&clipboard),
-            "hello world",
-            /* paste = */ false,
-            /* clipboard_fallback = */ false,
-            /* clipboard_only = */ false,
-        );
+        let result = inject(keyboard, &clipboard, "hello world", TYPING);
 
         assert!(result.is_ok());
         assert_eq!(*typed.lock().unwrap(), vec!["hello world".to_string()]);
@@ -2230,7 +2181,6 @@ mod tests {
 
     #[test]
     fn typing_failure_still_copies_with_fallback_on() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The copy is the fallback for the failure case: it must happen even
         // when typing errors, and the typing error stays the returned Result.
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
@@ -2239,14 +2189,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = inject(
-            keyboard,
-            Arc::clone(&clipboard),
-            "hello world",
-            /* paste = */ false,
-            /* clipboard_fallback = */ true,
-            /* clipboard_only = */ false,
-        );
+        let result = inject(keyboard, &clipboard, "hello world", TYPING_WITH_FALLBACK);
 
         assert!(result.is_err(), "the typing failure is authoritative");
         assert_eq!(
@@ -2258,7 +2201,6 @@ mod tests {
 
     #[test]
     fn clipboard_only_copies_and_never_injects() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Copy-only mode must not read the clipboard (empty script panics on
         // any read), must not type, and must not fire Ctrl+V — even with
         // `paste = true` set, which it overrides.
@@ -2267,14 +2209,7 @@ mod tests {
         let typed = Arc::clone(&keyboard.typed);
         let paste_combos = Arc::clone(&keyboard.paste_combos);
 
-        let result = inject(
-            keyboard,
-            Arc::clone(&clipboard),
-            "hello world",
-            /* paste = */ true,
-            /* clipboard_fallback = */ false,
-            /* clipboard_only = */ true,
-        );
+        let result = inject(keyboard, &clipboard, "hello world", COPY_ONLY_OVER_PASTE);
 
         assert!(result.is_ok());
         assert_eq!(
@@ -2292,7 +2227,6 @@ mod tests {
 
     #[test]
     fn clipboard_only_copy_failure_is_an_error() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Unlike the typing-mode fallback (best-effort warn), a copy failure
         // in copy-only mode must surface — the copy is the entire feature.
         let mut clipboard = ScriptedClipboard::new(&[]);
@@ -2300,14 +2234,7 @@ mod tests {
         let clipboard = Arc::new(clipboard);
         let keyboard = MockKeyboard::default();
 
-        let result = inject(
-            keyboard,
-            Arc::clone(&clipboard),
-            "hello world",
-            /* paste = */ false,
-            /* clipboard_fallback = */ false,
-            /* clipboard_only = */ true,
-        );
+        let result = inject(keyboard, &clipboard, "hello world", COPY_ONLY);
 
         assert!(
             result.is_err(),
@@ -2332,59 +2259,65 @@ mod tests {
         (calls, probe)
     }
 
+    /// With nothing held the wait is one reading and no sleep, whatever the
+    /// cap: zero (`modifier_wait_ms = 0`), a cap, or none (streaming).
     #[test]
     fn modifier_wait_returns_at_once_when_nothing_is_held() {
-        let (calls, probe) = scripted_probe(0);
-        let start = std::time::Instant::now();
-        let outcome = wait_for_modifier_release(
-            probe,
+        for timeout in [
+            Some(std::time::Duration::ZERO),
             Some(std::time::Duration::from_secs(5)),
-            std::time::Duration::from_secs(5),
-            || false,
-            || panic!("nothing was held"),
-        );
-        assert_eq!(outcome, ModifierWait::NotHeld);
-        assert_eq!(*calls.lock().unwrap(), 1, "one probe, no poll");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "no sleep when nothing is held"
-        );
+            None,
+        ] {
+            let (calls, probe) = scripted_probe(0);
+            let start = std::time::Instant::now();
+            let outcome = wait_for_modifier_release(
+                probe,
+                timeout,
+                std::time::Duration::from_secs(5),
+                || false,
+                || panic!("nothing was held"),
+            );
+            assert_eq!(outcome, ModifierWait::NotHeld, "cap {timeout:?}");
+            assert_eq!(
+                *calls.lock().unwrap(),
+                1,
+                "one probe, no poll: cap {timeout:?}"
+            );
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(1),
+                "no sleep when nothing is held: cap {timeout:?}"
+            );
+        }
     }
 
+    /// A held modifier is polled until its release, then the compositor gets
+    /// time to see the physical release before the first key.
     #[test]
     fn modifier_wait_polls_until_release() {
-        let (calls, probe) = scripted_probe(3);
-        let outcome = wait_for_modifier_release(
-            probe,
-            Some(std::time::Duration::from_secs(5)),
-            std::time::Duration::from_millis(1),
-            || false,
-            || {},
-        );
-        assert!(matches!(outcome, ModifierWait::Released(_)), "{outcome:?}");
-        assert_eq!(
-            *calls.lock().unwrap(),
-            4,
-            "3 held readings, then 1 released"
-        );
-    }
-
-    #[test]
-    fn modifier_wait_settles_after_a_release() {
-        let (_calls, probe) = scripted_probe(1);
-        let start = std::time::Instant::now();
-        let outcome = wait_for_modifier_release(
-            probe,
-            Some(std::time::Duration::from_secs(5)),
-            std::time::Duration::from_millis(1),
-            || false,
-            || {},
-        );
-        assert!(matches!(outcome, ModifierWait::Released(_)), "{outcome:?}");
-        assert!(
-            start.elapsed() >= MODIFIER_RELEASE_SETTLE,
-            "the compositor gets time to see the physical release"
-        );
+        for held_for in [1, 3] {
+            let (calls, probe) = scripted_probe(held_for);
+            let start = std::time::Instant::now();
+            let outcome = wait_for_modifier_release(
+                probe,
+                Some(std::time::Duration::from_secs(5)),
+                std::time::Duration::from_millis(1),
+                || false,
+                || {},
+            );
+            assert!(
+                matches!(outcome, ModifierWait::Released(_)),
+                "held for {held_for}: {outcome:?}"
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                held_for + 1,
+                "{held_for} held readings, then 1 released"
+            );
+            assert!(
+                start.elapsed() >= MODIFIER_RELEASE_SETTLE,
+                "held for {held_for}: the compositor gets time to see the physical release"
+            );
+        }
     }
 
     #[test]
@@ -2406,7 +2339,6 @@ mod tests {
 
     #[test]
     fn modifier_probe_runs_before_any_keystroke() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
@@ -2420,19 +2352,11 @@ mod tests {
             readings <= 2
         };
 
-        let mut result = None;
-        with_modifier_probe(probe, || {
-            result = Some(inject(
-                keyboard,
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ false,
-                /* clipboard_fallback = */ false,
-                /* clipboard_only = */ false,
-            ));
+        let result = probed(probe, || {
+            inject(keyboard, &clipboard, "hello world", TYPING)
         });
 
-        assert!(result.unwrap().is_ok());
+        assert!(result.is_ok());
         // The first wait's three readings, then one reading before every key.
         let mut expected = vec!["probe"; 3];
         for _ in "hello world".chars() {
@@ -2447,63 +2371,46 @@ mod tests {
 
     #[test]
     fn clipboard_only_never_checks_modifiers() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        for paste in [false, true] {
+        for mode in [COPY_ONLY, COPY_ONLY_OVER_PASTE] {
             let clipboard = Arc::new(ScriptedClipboard::new(&[]));
             let (calls, probe) = scripted_probe(0);
 
-            let mut result = None;
-            with_modifier_probe(probe, || {
-                result = Some(inject(
-                    MockKeyboard::default(),
-                    Arc::clone(&clipboard),
-                    "hello world",
-                    paste,
-                    /* clipboard_fallback = */ false,
-                    /* clipboard_only = */ true,
-                ));
+            let result = probed(probe, || {
+                inject(MockKeyboard::default(), &clipboard, "hello world", mode)
             });
 
-            assert_eq!(result.unwrap().unwrap(), Injection::Delivered);
+            assert_eq!(result.unwrap(), Injection::Delivered);
             assert_eq!(
                 *calls.lock().unwrap(),
                 0,
-                "no keystroke, so no wait (paste = {paste})"
+                "no keystroke, so no wait (paste = {})",
+                mode.paste
             );
         }
     }
 
-    /// Run `f` with a probe that reports "held" on every reading, counting
-    /// the readings.
-    fn with_modifier_held_forever(f: impl FnOnce()) -> usize {
+    /// Run `f` with a probe that reports "held" on every reading: what `f`
+    /// returned, and the number of readings.
+    fn with_modifier_held_forever<T>(f: impl FnOnce() -> T) -> (T, usize) {
         let (calls, probe) = scripted_probe(usize::MAX);
-        with_modifier_probe(probe, f);
+        let out = probed(probe, f);
         let n = *calls.lock().unwrap();
-        n
+        (out, n)
     }
 
     #[test]
     fn zero_modifier_wait_probes_once_and_copies_when_held() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
 
-        let mut result = None;
-        let probes = with_modifier_held_forever(|| {
-            result = Some(inject_with_keys(
-                test_keys_waiting(std::time::Duration::ZERO),
-                keyboard,
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ false,
-                /* clipboard_fallback = */ false,
-                /* clipboard_only = */ false,
-            ));
+        let (result, probes) = with_modifier_held_forever(|| {
+            let keys = test_keys_waiting(std::time::Duration::ZERO);
+            inject_with_keys(keys, keyboard, &clipboard, "hello world", TYPING)
         });
 
         assert_eq!(
-            result.unwrap().unwrap(),
+            result.unwrap(),
             Injection::CopiedForHeldModifier("hello world".to_string())
         );
         assert_eq!(probes, 1, "modifier_wait_ms = 0 reads once, no polling");
@@ -2512,59 +2419,19 @@ mod tests {
     }
 
     #[test]
-    fn zero_modifier_wait_types_when_nothing_is_held() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
-        let keyboard = MockKeyboard::default();
-        let typed = Arc::clone(&keyboard.typed);
-        let (calls, probe) = scripted_probe(0);
-
-        let mut result = None;
-        with_modifier_probe(probe, || {
-            result = Some(inject_with_keys(
-                test_keys_waiting(std::time::Duration::ZERO),
-                keyboard,
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ false,
-                /* clipboard_fallback = */ false,
-                /* clipboard_only = */ false,
-            ));
-        });
-
-        assert_eq!(result.unwrap().unwrap(), Injection::Delivered);
-        assert_eq!(
-            *calls.lock().unwrap(),
-            1 + "hello world".len(),
-            "one reading for the first wait and one per key, no polling"
-        );
-        assert_eq!(*typed.lock().unwrap(), vec!["hello world".to_string()]);
-        assert!(clipboard.writes().is_empty());
-    }
-
-    #[test]
     fn held_modifier_copies_instead_of_typing() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Typing mode never reads the clipboard (empty script panics on a
         // read). With the fallback on too, the text is still written once.
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
 
-        let mut result = None;
-        let probes = with_modifier_held_forever(|| {
-            result = Some(inject(
-                keyboard,
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ false,
-                /* clipboard_fallback = */ true,
-                /* clipboard_only = */ false,
-            ));
+        let (result, probes) = with_modifier_held_forever(|| {
+            inject(keyboard, &clipboard, "hello world", TYPING_WITH_FALLBACK)
         });
 
         assert_eq!(
-            result.unwrap().unwrap(),
+            result.unwrap(),
             Injection::CopiedForHeldModifier("hello world".to_string())
         );
         assert!(probes > 1, "must have polled until the cap");
@@ -2574,7 +2441,6 @@ mod tests {
 
     #[test]
     fn held_modifier_leaves_the_paste_text_in_the_clipboard() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Scripted so that a restore, if one ran, would write "original"
         // back: the read-back would see the pasted text.
         let clipboard = Arc::new(ScriptedClipboard::new(&[
@@ -2584,20 +2450,11 @@ mod tests {
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
 
-        let mut result = None;
-        with_modifier_held_forever(|| {
-            result = Some(inject(
-                keyboard,
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ true,
-                /* clipboard_fallback = */ false,
-                /* clipboard_only = */ false,
-            ));
-        });
+        let (result, _) =
+            with_modifier_held_forever(|| inject(keyboard, &clipboard, "hello world", PASTE));
 
         assert_eq!(
-            result.unwrap().unwrap(),
+            result.unwrap(),
             Injection::CopiedForHeldModifier("hello world".to_string())
         );
         assert!(events.lock().unwrap().is_empty(), "no Ctrl+V");
@@ -2609,56 +2466,17 @@ mod tests {
     }
 
     #[test]
-    fn held_modifier_with_unreadable_clipboard_still_copies() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Paste mode, non-text clipboard: the path falls back to typing, and
-        // a held modifier then withholds that too. The text is copied rather
-        // than lost.
-        let clipboard = Arc::new(ScriptedClipboard::new(&[None]));
-        let keyboard = MockKeyboard::default();
-        let events = Arc::clone(&keyboard.events);
-
-        let mut result = None;
-        with_modifier_held_forever(|| {
-            result = Some(inject(
-                keyboard,
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ true,
-                /* clipboard_fallback = */ false,
-                /* clipboard_only = */ false,
-            ));
-        });
-
-        assert_eq!(
-            result.unwrap().unwrap(),
-            Injection::CopiedForHeldModifier("hello world".to_string())
-        );
-        assert!(events.lock().unwrap().is_empty());
-        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
-    }
-
-    #[test]
     fn held_modifier_copy_failure_is_an_error() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut clipboard = ScriptedClipboard::new(&[]);
         clipboard.fail_writes = true;
         let clipboard = Arc::new(clipboard);
 
-        let mut result = None;
-        with_modifier_held_forever(|| {
-            result = Some(inject(
-                MockKeyboard::default(),
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ false,
-                /* clipboard_fallback = */ false,
-                /* clipboard_only = */ false,
-            ));
+        let (result, _) = with_modifier_held_forever(|| {
+            inject(MockKeyboard::default(), &clipboard, "hello world", TYPING)
         });
 
         assert!(
-            result.unwrap().is_err(),
+            result.is_err(),
             "the copy was the only delivery; its failure must surface"
         );
     }
@@ -2693,7 +2511,6 @@ mod tests {
     /// no clipboard path at all: `deliver_streaming_delta` takes none.
     #[test]
     fn streaming_delta_waits_for_release_past_any_cap_then_types() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for cap in [
             std::time::Duration::ZERO,
             std::time::Duration::from_millis(200),
@@ -2705,18 +2522,14 @@ mod tests {
             let cancel = AtomicBool::new(false);
             let tracker = ModifierWaitTracker::default();
 
-            let mut delivery = None;
             let start = std::time::Instant::now();
-            with_keyboard(keyboard, || {
-                with_modifier_probe(probe, || {
-                    delivery = Some(
-                        deliver_streaming_delta("hello", test_keys_waiting(cap), &cancel, &tracker)
-                            .unwrap(),
-                    );
-                });
+            let delivery = with_keyboard(keyboard, || {
+                probed(probe, || {
+                    deliver_streaming_delta("hello", test_keys_waiting(cap), &cancel, &tracker)
+                })
             });
 
-            assert_eq!(delivery, Some(StreamingDelivery::Typed), "cap {cap:?}");
+            assert_eq!(delivery.unwrap(), StreamingDelivery::Typed, "cap {cap:?}");
             assert!(start.elapsed() > std::time::Duration::from_millis(400));
             assert_eq!(
                 *calls.lock().unwrap(),
@@ -2736,7 +2549,6 @@ mod tests {
     /// `whisrs cancel` during the wait: the delta is discarded, nothing typed.
     #[test]
     fn cancel_aborts_a_streaming_delta_waiting_on_a_modifier() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2753,16 +2565,13 @@ mod tests {
             true
         };
 
-        let mut delivery = None;
-        with_keyboard(keyboard, || {
-            with_modifier_probe(probe, || {
-                delivery = Some(
-                    deliver_streaming_delta("secret", test_keys(), &cancel, &tracker).unwrap(),
-                );
-            });
+        let delivery = with_keyboard(keyboard, || {
+            probed(probe, || {
+                deliver_streaming_delta("secret", test_keys(), &cancel, &tracker)
+            })
         });
 
-        assert_eq!(delivery, Some(StreamingDelivery::Cancelled { typed: 0 }));
+        assert_eq!(delivery.unwrap(), StreamingDelivery::Cancelled { typed: 0 });
         assert!(events.lock().unwrap().is_empty(), "nothing typed");
     }
 
@@ -2771,7 +2580,6 @@ mod tests {
     /// between the phrases that shared a batch (Deepgram sends them trimmed).
     #[test]
     fn streaming_deltas_queued_during_a_modifier_wait_are_typed_in_order() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
         let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -2798,14 +2606,13 @@ mod tests {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let tracker = ModifierWaitTracker::default();
-        let mut full_text = String::new();
-        with_keyboard(keyboard, || {
-            with_modifier_probe(probe, || {
+        let full_text = with_keyboard(keyboard, || {
+            probed(probe, || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_time()
                     .build()
                     .unwrap();
-                full_text = runtime.block_on(crate::pipeline::run_typing_batcher(
+                runtime.block_on(crate::pipeline::run_typing_batcher(
                     text_rx,
                     whisrs::transcription::StreamText::Phrases,
                     Arc::clone(&cancel),
@@ -2818,8 +2625,8 @@ mod tests {
                         assert_eq!(delivery, StreamingDelivery::Typed);
                         async move { text }
                     },
-                ));
-            });
+                ))
+            })
         });
 
         assert_eq!(
@@ -2853,27 +2660,16 @@ mod tests {
 
     #[test]
     fn command_mode_held_modifier_skips_clear_and_injection() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
 
-        let mut result = None;
-        with_keyboard(keyboard, || {
-            with_modifier_held_forever(|| {
-                result = Some(clear_line_and_inject_with_clipboard(
-                    "git status",
-                    test_keys(),
-                    /* paste = */ false,
-                    /* clipboard_fallback = */ false,
-                    std::time::Duration::from_millis(5),
-                    Arc::clone(&clipboard) as Arc<dyn ClipboardBackend>,
-                ));
-            });
+        let (result, _) = with_modifier_held_forever(|| {
+            clear_line_and_inject_git_status(test_keys(), keyboard, &clipboard, TYPING)
         });
 
         assert_eq!(
-            result.unwrap().unwrap(),
+            result.unwrap(),
             Injection::CopiedForHeldModifier("git status".to_string())
         );
         assert!(
@@ -2885,28 +2681,17 @@ mod tests {
 
     #[test]
     fn command_mode_clears_then_types_once_released() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
         let typed = Arc::clone(&keyboard.typed);
         let (_calls, probe) = scripted_probe(2);
 
-        let mut result = None;
-        with_keyboard(keyboard, || {
-            with_modifier_probe(probe, || {
-                result = Some(clear_line_and_inject_with_clipboard(
-                    "git status",
-                    test_keys(),
-                    /* paste = */ false,
-                    /* clipboard_fallback = */ false,
-                    std::time::Duration::from_millis(5),
-                    Arc::clone(&clipboard) as Arc<dyn ClipboardBackend>,
-                ));
-            });
+        let result = probed(probe, || {
+            clear_line_and_inject_git_status(test_keys(), keyboard, &clipboard, TYPING)
         });
 
-        assert_eq!(result.unwrap().unwrap(), Injection::Delivered);
+        assert_eq!(result.unwrap(), Injection::Delivered);
         let mut expected = vec!["combo", "combo"];
         expected.extend(vec!["key"; "git status".len()]);
         assert_eq!(*events.lock().unwrap(), expected);
@@ -2932,27 +2717,16 @@ mod tests {
     /// does not split the clear from the paste.
     #[test]
     fn command_mode_paste_checks_once_before_the_clear() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[Some("original")]));
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
         let (calls, probe) = pressed_after_first_reading();
 
-        let mut result = None;
-        with_keyboard(keyboard, || {
-            with_modifier_probe(probe, || {
-                result = Some(clear_line_and_inject_with_clipboard(
-                    "git status",
-                    test_keys(),
-                    /* paste = */ true,
-                    /* clipboard_fallback = */ true,
-                    std::time::Duration::from_millis(5),
-                    Arc::clone(&clipboard) as Arc<dyn ClipboardBackend>,
-                ));
-            });
+        let result = probed(probe, || {
+            clear_line_and_inject_git_status(test_keys(), keyboard, &clipboard, PASTE_WITH_FALLBACK)
         });
 
-        assert_eq!(result.unwrap().unwrap(), Injection::Delivered);
+        assert_eq!(result.unwrap(), Injection::Delivered);
         assert_eq!(*calls.lock().unwrap(), 1, "one check");
         assert_eq!(*events.lock().unwrap(), vec!["combo", "combo", "combo"]);
     }
@@ -2962,29 +2736,19 @@ mod tests {
     /// clipboard. The clear stays sent.
     #[test]
     fn command_mode_modifier_pressed_after_the_clear_copies_the_text() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
         let typed = Arc::clone(&keyboard.typed);
         let (calls, probe) = pressed_after_first_reading();
 
-        let mut result = None;
-        with_keyboard(keyboard, || {
-            with_modifier_probe(probe, || {
-                result = Some(clear_line_and_inject_with_clipboard(
-                    "git status",
-                    test_keys_waiting(std::time::Duration::from_millis(30)),
-                    /* paste = */ false,
-                    /* clipboard_fallback = */ true,
-                    std::time::Duration::from_millis(5),
-                    Arc::clone(&clipboard) as Arc<dyn ClipboardBackend>,
-                ));
-            });
+        let result = probed(probe, || {
+            let keys = test_keys_waiting(std::time::Duration::from_millis(30));
+            clear_line_and_inject_git_status(keys, keyboard, &clipboard, TYPING_WITH_FALLBACK)
         });
 
         assert_eq!(
-            result.unwrap().unwrap(),
+            result.unwrap(),
             Injection::CopiedForHeldModifier("git status".to_string())
         );
         assert!(*calls.lock().unwrap() > 2, "the first key's wait polled");
@@ -3043,7 +2807,6 @@ mod tests {
     /// text, so the byte offset is checked), and nothing is typed twice.
     #[test]
     fn batch_hold_mid_text_copies_only_the_untyped_rest() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let text = "grüße, welt";
         for cap in [
             std::time::Duration::ZERO,
@@ -3057,22 +2820,17 @@ mod tests {
                 // Free for the first wait and five keys, then held for good.
                 let probe = logged_probe(&events, |n| n > 6);
 
-                let mut result = None;
-                with_modifier_probe(probe, || {
-                    result = Some(inject_with_keys(
-                        test_keys_waiting(cap),
-                        keyboard,
-                        Arc::clone(&clipboard),
-                        text,
-                        /* paste = */ false,
-                        fallback,
-                        /* clipboard_only = */ false,
-                    ));
+                let mode = Mode {
+                    clipboard_fallback: fallback,
+                    ..TYPING
+                };
+                let result = probed(probe, || {
+                    inject_with_keys(test_keys_waiting(cap), keyboard, &clipboard, text, mode)
                 });
 
                 let case = format!("cap {cap:?}, fallback {fallback}");
                 assert_eq!(
-                    result.unwrap().unwrap(),
+                    result.unwrap(),
                     Injection::CopiedForHeldModifier(", welt".to_string()),
                     "{case}"
                 );
@@ -3090,7 +2848,6 @@ mod tests {
     /// nothing copied.
     #[test]
     fn batch_hold_mid_text_released_in_time_types_everything_once() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
@@ -3099,19 +2856,11 @@ mod tests {
         // (about 45 ms of polling, well inside the 200 ms cap), then free.
         let probe = logged_probe(&events, |n| (5..=8).contains(&n));
 
-        let mut result = None;
-        with_modifier_probe(probe, || {
-            result = Some(inject(
-                keyboard,
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ false,
-                /* clipboard_fallback = */ false,
-                /* clipboard_only = */ false,
-            ));
+        let result = probed(probe, || {
+            inject(keyboard, &clipboard, "hello world", TYPING)
         });
 
-        assert_eq!(result.unwrap().unwrap(), Injection::Delivered);
+        assert_eq!(result.unwrap(), Injection::Delivered);
         assert_eq!(*typed.lock().unwrap(), vec!["hello world".to_string()]);
         assert!(clipboard.writes().is_empty());
         let events = events.lock().unwrap();
@@ -3128,28 +2877,19 @@ mod tests {
     /// there copies only the untyped rest too.
     #[test]
     fn unreadable_clipboard_typing_copies_only_the_untyped_rest() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[None]));
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
         let events = Arc::clone(&keyboard.events);
         let probe = logged_probe(&events, |n| n > 6);
 
-        let mut result = None;
-        with_modifier_probe(probe, || {
-            result = Some(inject_with_keys(
-                test_keys_waiting(std::time::Duration::from_millis(30)),
-                keyboard,
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ true,
-                /* clipboard_fallback = */ false,
-                /* clipboard_only = */ false,
-            ));
+        let result = probed(probe, || {
+            let keys = test_keys_waiting(std::time::Duration::from_millis(30));
+            inject_with_keys(keys, keyboard, &clipboard, "hello world", PASTE)
         });
 
         assert_eq!(
-            result.unwrap().unwrap(),
+            result.unwrap(),
             Injection::CopiedForHeldModifier(" world".to_string())
         );
         assert_eq!(*typed.lock().unwrap(), vec!["hello".to_string()]);
@@ -3161,7 +2901,6 @@ mod tests {
     /// the rest; while it waits, the drain has no deadline.
     #[test]
     fn streaming_hold_mid_delta_waits_past_any_cap_then_types_the_rest() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
         let events = Arc::clone(&keyboard.events);
@@ -3187,23 +2926,15 @@ mod tests {
             logged()
         };
 
-        let mut delivery = None;
         let start = std::time::Instant::now();
-        with_keyboard(keyboard, || {
-            with_modifier_probe(probe, || {
-                delivery = Some(
-                    deliver_streaming_delta(
-                        "hello",
-                        test_keys_waiting(std::time::Duration::ZERO),
-                        &cancel,
-                        &tracker,
-                    )
-                    .unwrap(),
-                );
-            });
+        let delivery = with_keyboard(keyboard, || {
+            probed(probe, || {
+                let keys = test_keys_waiting(std::time::Duration::ZERO);
+                deliver_streaming_delta("hello", keys, &cancel, &tracker)
+            })
         });
 
-        assert_eq!(delivery, Some(StreamingDelivery::Typed));
+        assert_eq!(delivery.unwrap(), StreamingDelivery::Typed);
         assert!(start.elapsed() > std::time::Duration::from_millis(400));
         assert_eq!(*typed.lock().unwrap(), vec!["hello".to_string()]);
         assert_eq!(
@@ -3225,7 +2956,6 @@ mod tests {
     /// much was typed.
     #[test]
     fn cancel_during_a_mid_delta_wait_discards_the_rest() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
         let events = Arc::clone(&keyboard.events);
@@ -3245,16 +2975,13 @@ mod tests {
             logged()
         };
 
-        let mut delivery = None;
-        with_keyboard(keyboard, || {
-            with_modifier_probe(probe, || {
-                delivery = Some(
-                    deliver_streaming_delta("secret", test_keys(), &cancel, &tracker).unwrap(),
-                );
-            });
+        let delivery = with_keyboard(keyboard, || {
+            probed(probe, || {
+                deliver_streaming_delta("secret", test_keys(), &cancel, &tracker)
+            })
         });
 
-        assert_eq!(delivery, Some(StreamingDelivery::Cancelled { typed: 2 }));
+        assert_eq!(delivery.unwrap(), StreamingDelivery::Cancelled { typed: 2 });
         assert_eq!(*typed.lock().unwrap(), vec!["se".to_string()]);
         assert_no_key_while_held(&events.lock().unwrap());
         assert!(
@@ -3320,14 +3047,6 @@ mod tests {
         }
     }
 
-    /// Sanitize then fold, the order both dictation paths use: a bare `\r`
-    /// must come out as a space, never as Return.
-    #[test]
-    fn a_carriage_return_is_folded_not_typed() {
-        let folded = fold_line_breaks(&sanitize_for_injection("ls\rcurl x|sh\r")).into_owned();
-        assert_eq!(folded, "ls curl x|sh ");
-    }
-
     /// An unknown class is not a terminal, so GNOME and KDE (which never
     /// report one) keep typing line breaks as on every release before this.
     #[test]
@@ -3382,19 +3101,11 @@ mod tests {
 
     #[test]
     fn typed_text_is_sanitized() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
 
-        let result = inject(
-            keyboard,
-            Arc::clone(&clipboard),
-            "hello\u{1b}:q!\r",
-            /* paste = */ false,
-            /* clipboard_fallback = */ false,
-            /* clipboard_only = */ false,
-        );
+        let result = inject(keyboard, &clipboard, "hello\u{1b}:q!\r", TYPING);
 
         assert!(result.is_ok());
         assert_eq!(*typed.lock().unwrap(), vec!["hello:q!\n".to_string()]);
@@ -3404,16 +3115,13 @@ mod tests {
     /// treatment: `\x1b[201~` would end a bracketed paste early.
     #[test]
     fn copied_text_is_sanitized() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[]));
 
         let result = inject(
             MockKeyboard::default(),
-            Arc::clone(&clipboard),
+            &clipboard,
             "safe\u{1b}[201~",
-            /* paste = */ false,
-            /* clipboard_fallback = */ false,
-            /* clipboard_only = */ true,
+            COPY_ONLY,
         );
 
         assert!(result.is_ok());
@@ -3422,29 +3130,17 @@ mod tests {
 
     #[test]
     fn a_streaming_delta_is_sanitized() {
-        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
         let cancel = AtomicBool::new(false);
         let tracker = ModifierWaitTracker::default();
-        let mut delivery = None;
-        with_keyboard(keyboard, || {
-            with_modifier_probe(
+        let delivery = with_keyboard(keyboard, || {
+            probed(
                 || false,
-                || {
-                    delivery = Some(
-                        deliver_streaming_delta(
-                            "ls\r\u{1b}curl x\n",
-                            test_keys(),
-                            &cancel,
-                            &tracker,
-                        )
-                        .unwrap(),
-                    );
-                },
-            );
+                || deliver_streaming_delta("ls\r\u{1b}curl x\n", test_keys(), &cancel, &tracker),
+            )
         });
-        assert_eq!(delivery, Some(StreamingDelivery::Typed));
+        assert_eq!(delivery.unwrap(), StreamingDelivery::Typed);
         assert_eq!(*typed.lock().unwrap(), vec!["ls\ncurl x\n".to_string()]);
     }
 }
