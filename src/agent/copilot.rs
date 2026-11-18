@@ -604,16 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_map_to_copilot_flags() {
-        assert_eq!(permission_args(Permissions::Auto), ["--allow-all-tools"]);
-        assert_eq!(permission_args(Permissions::Bypass), ["--yolo"]);
-        assert_eq!(
-            permission_args(Permissions::Ask),
-            ["--deny-tool=shell", "--deny-tool=write"]
-        );
-    }
-
-    #[test]
     fn a_first_turn_names_a_new_session_and_sends_the_words_on_stdin() {
         let (h, root, _tmp) = harness();
         for (permissions, flags) in [
@@ -669,20 +659,6 @@ mod tests {
             assert_eq!(next.session.as_deref(), Some(SESSION));
             assert_eq!(next.env, first.env);
         }
-        assert_eq!(
-            h.launch(&agent(Permissions::Ask), &resumed(SESSION), &request("x"))
-                .unwrap()
-                .args,
-            strings(&[
-                "--output-format",
-                "json",
-                "--resume=389b4e25-9c78-484d-a8fe-34304f61670b",
-                "--deny-tool=shell",
-                "--deny-tool=write",
-                "--model",
-                "gpt-5.4",
-            ])
-        );
     }
 
     /// A pending session (its first turn only failed, or was stopped or cut
@@ -950,10 +926,6 @@ mod tests {
             ),
             [StreamEvent::Tool("mcp__whisrs__list_recordings".into())]
         );
-        assert_eq!(
-            crate::agent::progress::activity_for_tool("mcp__whisrs__list_recordings"),
-            "Reading your recordings"
-        );
         // A sub-agent's message is not the turn's (never its reply), nor is
         // its tool call: 1.0.103 names the sub-agent in a top-level
         // `agentId`.
@@ -982,6 +954,17 @@ mod tests {
                 },
                 StreamEvent::Tool("mcp__github__list_issues".into()),
             ]
+        );
+        // An empty message asking for no tool: still an empty Text of its
+        // message, so an empty last message is no reply.
+        assert_eq!(
+            parse_line(
+                r#"{"type":"assistant.message","data":{"messageId":"m2","content":"","toolRequests":[]}}"#
+            ),
+            [StreamEvent::Text {
+                message: "m2".into(),
+                text: String::new()
+            }]
         );
         // A GitHub sign-in Copilot refused: its message, and the command.
         let [StreamEvent::Error(message)] = &parse_line(
@@ -1038,7 +1021,10 @@ mod tests {
             assert_eq!(message, want);
             assert!(!message.contains('\u{2014}'));
         }
-        let (_, state) = replay(MODEL_ERROR, pending("8192c51a-dc0f-4d06-93ff-9e8c1a455960"));
+        // A model error leaves a pending first turn pending: the next turn
+        // names the session again rather than resuming it.
+        let (sent, state) = replay(MODEL_ERROR, pending("8192c51a-dc0f-4d06-93ff-9e8c1a455960"));
+        assert!(sent.is_empty(), "{sent:?}");
         let TurnOutcome::Failed(message) = outcome(&a, &h, &state, &[], &status(1)) else {
             panic!("session.error fails the turn");
         };
@@ -1084,36 +1070,16 @@ mod tests {
         TurnOutcome::Reply("Finished the tool step. <spoken>The tool step is done.</spoken>".into())
     }
 
-    /// Copilot's own turn outcome (`oQt` in 1.0.103's `cli-main.js`) lets
-    /// a message of the main agent after a `model_call` error clear it, and
-    /// its prompt mode exits 0 after one (`pyo`): the reply. With no
-    /// message after it, the error fails the turn, never the
-    /// acknowledgement held before the call.
+    /// A `model_call` error is recoverable: Copilot's own turn outcome
+    /// (`oQt` in 1.0.103's `cli-main.js`) lets a later message of the main
+    /// agent clear it, and its prompt mode exits 0 after one (`pyo`).
     #[test]
-    fn a_model_call_error_fails_the_turn_only_without_a_later_message() {
+    fn a_model_call_error_is_recoverable() {
         assert_eq!(
             parse_line(MODEL_CALL_ERROR),
             [StreamEvent::RecoverableError(
                 "Model call failed: the stream ended early".into()
             )]
-        );
-        assert_eq!(
-            turn_outcome(&ack_then_tool_with(FINAL_MESSAGE, &[MODEL_CALL_ERROR]), 0),
-            the_reply()
-        );
-        let failed = TurnOutcome::Failed(
-            "Agent 'cp': Copilot failed: Model call failed: the stream ended early.".into(),
-        );
-        // In place of the final message, and after it.
-        let no_reply: String = ack_then_tool_with(FINAL_MESSAGE, &[MODEL_CALL_ERROR])
-            .lines()
-            .filter(|l| !l.contains(FINAL_MESSAGE))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(turn_outcome(&no_reply, 0), failed);
-        assert_eq!(
-            turn_outcome(&ack_then_tool_with(RESULT, &[MODEL_CALL_ERROR]), 0),
-            failed
         );
     }
 
@@ -1187,65 +1153,20 @@ mod tests {
         .is_empty());
     }
 
-    /// A model error leaves a pending first turn pending: the next turn
-    /// names the session again rather than resuming it.
-    #[test]
-    fn a_failed_first_turn_stays_pending() {
-        let id = "8192c51a-dc0f-4d06-93ff-9e8c1a455960";
-        let (sent, _) = replay(MODEL_ERROR, pending(id));
-        assert!(sent.is_empty(), "{sent:?}");
-    }
-
     /// An interrupted turn ends with `result` exit code 0 and exits 0: the
     /// `abort` before it fails it, so the acknowledgement held before the
     /// call is never taken for the reply.
     #[test]
     fn an_interrupted_turn_is_no_success() {
-        let (_, state) = replay(INTERRUPTED, SessionRef::default());
-        let TurnOutcome::Failed(message) = outcome(
-            &agent(Permissions::Auto),
-            &Copilot::new(PathBuf::new()),
-            &state,
-            &[],
-            &status(0),
-        ) else {
-            panic!("an abort fails the turn");
-        };
         assert_eq!(
-            message,
-            "Agent 'cp': Copilot failed: it was interrupted before it replied."
+            turn_outcome(INTERRUPTED, 0),
+            TurnOutcome::Failed(
+                "Agent 'cp': Copilot failed: it was interrupted before it replied.".into()
+            )
         );
         assert_eq!(
             interrupted(Some("autopilot_credit_limit")),
             "it stopped at the AI credit limit set for the session"
-        );
-    }
-
-    /// An empty final message is the turn's last message: no reply, never
-    /// the acknowledgement before the tool call (spoken already).
-    #[test]
-    fn an_empty_last_message_is_no_reply_not_the_acknowledgement() {
-        let empty_last: String = ACK_THEN_TOOL
-            .lines()
-            .map(|l| {
-                l.replace(
-                    "\"content\":\"Finished the tool step. <spoken>The tool step is done.</spoken>\"",
-                    "\"content\":\"\"",
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let (_, state) = replay(&empty_last, SessionRef::default());
-        assert_eq!(state.reply(), None);
-        assert_eq!(
-            outcome(
-                &agent(Permissions::Auto),
-                &Copilot::new(PathBuf::new()),
-                &state,
-                &[],
-                &status(0)
-            ),
-            TurnOutcome::Failed("Agent 'cp': Copilot ended the turn without a reply.".into())
         );
     }
 

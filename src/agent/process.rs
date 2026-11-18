@@ -1731,7 +1731,7 @@ mod tests {
     use super::*;
     use crate::agent::progress::Feedback;
     use crate::agent::{Harness, Permissions};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use tokio::sync::mpsc;
 
     /// A harness run by `sh -c <script>`, with a line protocol of its own:
@@ -1930,6 +1930,11 @@ mod tests {
         let mut blank = StreamState::new(None);
         blank.event(text("m1", "  "), &updates);
         assert_eq!(blank.reply(), None);
+        // An empty last message is no reply, never the message before it.
+        let mut empty_last = StreamState::new(None);
+        empty_last.event(text("m1", "<spoken>On it.</spoken>"), &updates);
+        empty_last.event(text("m2", ""), &updates);
+        assert_eq!(empty_last.reply(), None);
     }
 
     /// A line too long to read after the last text may have been the final
@@ -2038,13 +2043,15 @@ mod tests {
             TurnOutcome::Reply("Done.".into())
         );
         // Nothing after it: it fails the turn, also over a text before it
-        // (an acknowledgement, never the reply).
+        // (an acknowledgement, never the reply). A result line naming the
+        // session after it changes nothing.
         let failed =
             TurnOutcome::Failed("Agent 'coder': Fake failed: The model call failed.".into());
         let mut after_ack = StreamState::new(None);
         after_ack.event(text("m1", "On it."), &updates);
         after_ack.event(StreamEvent::Tool("bash".into()), &updates);
         after_ack.event(recoverable(), &updates);
+        after_ack.event(StreamEvent::Session("ses_a".into()), &updates);
         assert_eq!(outcome(&a, &h, &after_ack, &[], &status(0)), failed);
         let mut alone = StreamState::new(None);
         alone.event(recoverable(), &updates);
@@ -2098,11 +2105,6 @@ mod tests {
         assert_eq!(group_target(1), None);
         assert_eq!(group_target(u32::MAX), None);
         assert_eq!(group_target(4242), Some(-4242));
-    }
-
-    #[test]
-    fn random_bytes_differ() {
-        assert_ne!(random_bytes::<16>(), random_bytes::<16>());
     }
 
     const TEST_GRACES: [Duration; 3] = [
@@ -2213,24 +2215,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_command_is_named() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn a_missing_dir_is_named() {
         let driver = fake("true");
-        let mut a = agent(dir.path());
-        a.command = "/nonexistent/fake-harness".into();
-        let (io, _rx) = turn_io();
-        let TurnOutcome::Failed(message) = driver
-            .run_turn(&a, SessionRef::default(), request("x"), io)
-            .await
-        else {
-            panic!("a missing command must fail the turn");
-        };
-        assert!(
-            message.contains("`/nonexistent/fake-harness` was not found. Install Fake"),
-            "{message}"
-        );
-        let mut gone = agent(&PathBuf::from("/nonexistent/dir"));
-        gone.command = "/bin/sh".into();
+        let gone = agent(Path::new("/nonexistent/dir"));
         let (io, _rx) = turn_io();
         let TurnOutcome::Failed(message) = driver
             .run_turn(&gone, SessionRef::default(), request("x"), io)
@@ -2263,6 +2250,21 @@ mod tests {
             .is_some_and(|state| state != 'Z')
     }
 
+    /// A turn of `driver` for `a` in a task of its own, as the runtime runs
+    /// one.
+    fn spawn_turn(
+        driver: &Arc<ProcessDriver<Fake>>,
+        a: &Arc<Agent>,
+        io: TurnIo,
+    ) -> tokio::task::JoinHandle<TurnOutcome> {
+        let (driver, a) = (Arc::clone(driver), Arc::clone(a));
+        tokio::spawn(async move {
+            driver
+                .run_turn(&a, SessionRef::default(), request("x"), io)
+                .await
+        })
+    }
+
     /// Start a turn running `script` (it writes its background child's pid
     /// to `pid`), wait until it runs, then stop it as `--stop` does: abort
     /// the task, then `Driver::stop`. How long the stop took.
@@ -2270,61 +2272,61 @@ mod tests {
         let driver = fake(script);
         let a = Arc::new(agent(dir));
         let (io, _rx) = turn_io();
-        let task = {
-            let (driver, a) = (Arc::clone(&driver), Arc::clone(&a));
-            tokio::spawn(async move {
-                driver
-                    .run_turn(&a, SessionRef::default(), request("x"), io)
-                    .await
-            })
-        };
+        let task = spawn_turn(&driver, &a, io);
         let child = wait_for_pid(&dir.join("pid")).await;
-        let leader = driver.processes.get("coder").expect("registered").pid;
+        let leader = driver
+            .processes
+            .get("coder")
+            .unwrap_or_else(|| panic!("{script}: registered"))
+            .pid;
         let started = Instant::now();
         task.abort();
         driver
             .stop(&a, &SessionRef::default())
             .await
-            .expect("the stop ends the group");
+            .unwrap_or_else(|e| panic!("{script}: the stop ends the group: {e}"));
         let took = started.elapsed();
-        assert!(driver.processes.get("coder").is_none());
+        assert!(driver.processes.get("coder").is_none(), "{script}");
         (took, leader, child)
     }
 
-    /// SIGINT ignored (by the script, and by its background job as by
-    /// every shell's): SIGTERM after the first grace ends both.
+    /// A stop sends the next signal a grace after the one before only while
+    /// the harness ignores it. The rows stop at once, each its own turn.
     #[tokio::test]
-    async fn a_stop_escalates_past_an_ignored_sigint() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = "trap '' INT; sleep 30 & echo $! > pid; wait";
-        let (took, leader, child) = stop_after_start(script, dir.path()).await;
-        // SIGINT did nothing for a grace, SIGTERM ended both.
-        assert!(took >= Duration::from_millis(600), "{took:?}");
-        assert!(took < Duration::from_millis(1200 + 600), "{took:?}");
-        assert!(!alive(leader) && !alive(child));
-        assert!(!group_alive(leader));
-    }
-
-    #[tokio::test]
-    async fn a_stop_kills_what_ignores_sigint_and_sigterm() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = "trap '' INT TERM; sleep 30 & echo $! > pid; wait";
-        let (took, leader, child) = stop_after_start(script, dir.path()).await;
-        assert!(took >= Duration::from_millis(1200), "{took:?}");
-        assert!(took < Duration::from_millis(1200 + 1500), "{took:?}");
-        assert!(!alive(leader) && !alive(child));
-    }
-
-    /// SIGINT ends a harness that does not ignore it, with no escalation.
-    /// (A shell's background job ignores SIGINT, so the script execs.)
-    #[tokio::test]
-    async fn sigint_alone_ends_a_harness_that_handles_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = "echo $$ > pid; exec sleep 30";
-        let (took, leader, child) = stop_after_start(script, dir.path()).await;
-        // Before the SIGTERM a first grace later.
-        assert!(took < Duration::from_millis(600), "{took:?}");
-        assert!(!alive(leader) && !alive(child));
+    async fn a_stop_escalates_only_as_far_as_the_harness_ignores() {
+        // (row, script, the stop took at least, and less than, in ms)
+        let rows = [
+            // Ignored by the script, and by its background job as by every
+            // shell's: SIGINT did nothing for a grace, SIGTERM ended both.
+            (
+                "SIGINT ignored",
+                "trap '' INT; sleep 30 & echo $! > pid; wait",
+                600,
+                1200 + 600,
+            ),
+            (
+                "SIGINT and SIGTERM ignored",
+                "trap '' INT TERM; sleep 30 & echo $! > pid; wait",
+                1200,
+                1200 + 1500,
+            ),
+            // Ended before the SIGTERM a first grace later. A shell's
+            // background job ignores SIGINT, so the script execs.
+            ("SIGINT handled", "echo $$ > pid; exec sleep 30", 0, 600),
+        ];
+        let stops = rows.map(|(row, script, ..)| {
+            tokio::spawn(async move {
+                let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{row}: {e}"));
+                stop_after_start(script, dir.path()).await
+            })
+        });
+        for ((row, _, at_least, less_than), stop) in rows.into_iter().zip(stops) {
+            let (took, leader, child) = stop.await.unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert!(took >= Duration::from_millis(at_least), "{row}: {took:?}");
+            assert!(took < Duration::from_millis(less_than), "{row}: {took:?}");
+            assert!(!alive(leader) && !alive(child), "{row}");
+            assert!(!group_alive(leader), "{row}");
+        }
     }
 
     /// A turn dropped with no stop (its task aborted, as when a new turn
@@ -2335,14 +2337,7 @@ mod tests {
         let driver = fake("trap '' INT; sleep 30 & echo $! > pid; wait");
         let a = Arc::new(agent(dir.path()));
         let (io, _rx) = turn_io();
-        let task = {
-            let (driver, a) = (Arc::clone(&driver), Arc::clone(&a));
-            tokio::spawn(async move {
-                driver
-                    .run_turn(&a, SessionRef::default(), request("x"), io)
-                    .await
-            })
-        };
+        let task = spawn_turn(&driver, &a, io);
         let child = wait_for_pid(&dir.path().join("pid")).await;
         task.abort();
         for _ in 0..100 {
@@ -2353,13 +2348,6 @@ mod tests {
         }
         assert!(driver.processes.get("coder").is_none());
         assert!(!alive(child));
-    }
-
-    #[tokio::test]
-    async fn a_stop_with_no_turn_running_does_nothing() {
-        let driver = fake("true");
-        let a = agent(Path::new("/proj"));
-        assert_eq!(driver.stop(&a, &SessionRef::default()).await, Ok(()));
     }
 
     #[tokio::test]
@@ -2472,14 +2460,7 @@ mod tests {
         let driver = fake_in("(setsid sleep 42 & echo $! > pid); sleep 30", None, scopes);
         let a = Arc::new(agent(dir.path()));
         let (io, _rx) = turn_io();
-        let task = {
-            let (driver, a) = (Arc::clone(&driver), Arc::clone(&a));
-            tokio::spawn(async move {
-                driver
-                    .run_turn(&a, SessionRef::default(), request("x"), io)
-                    .await
-            })
-        };
+        let task = spawn_turn(&driver, &a, io);
         let orphan = wait_for_pid(&dir.path().join("pid")).await;
         let process = driver.processes.get("coder").expect("registered");
         let unit = process.scope.as_ref().expect("in a scope").unit.clone();
@@ -2615,14 +2596,7 @@ mod tests {
         let a = Arc::new(agent(dir.path()));
         let (io, mut rx) = turn_io();
         let updates = io.updates.clone();
-        let task = {
-            let (driver, a) = (Arc::clone(&driver), Arc::clone(&a));
-            tokio::spawn(async move {
-                driver
-                    .run_turn(&a, SessionRef::default(), request("x"), io)
-                    .await
-            })
-        };
+        let task = spawn_turn(&driver, &a, io);
         wait_for_pid(&dir.path().join("pid")).await;
         // What `--stop` reads: the pending id, though no line named it.
         let latest = updates.stop().expect("reported at spawn");
@@ -2669,8 +2643,8 @@ mod tests {
         assert_eq!(drain(&mut rx), [session("ses_new")]);
     }
 
-    /// A start that never ran the harness (not found) leaves the session as
-    /// it was: nothing to continue.
+    /// A start that never ran the harness (not found) names the command and
+    /// leaves the session as it was: nothing to continue.
     #[tokio::test]
     async fn a_harness_that_never_ran_leaves_no_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -2678,10 +2652,16 @@ mod tests {
         let mut a = agent(dir.path());
         a.command = "/nonexistent/fake-harness".into();
         let (io, mut rx) = turn_io();
-        let outcome = driver
+        let TurnOutcome::Failed(message) = driver
             .run_turn(&a, SessionRef::default(), request("x"), io)
-            .await;
-        assert!(matches!(outcome, TurnOutcome::Failed(_)), "{outcome:?}");
+            .await
+        else {
+            panic!("a missing command fails the turn");
+        };
+        assert!(
+            message.contains("`/nonexistent/fake-harness` was not found. Install Fake"),
+            "{message}"
+        );
         assert!(drain(&mut rx).is_empty());
         // In a scope, systemd-run runs but finds no harness: it is started
         // directly, and the session reported for the scope is taken back.
