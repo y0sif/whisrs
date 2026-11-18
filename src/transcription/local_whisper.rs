@@ -1141,42 +1141,24 @@ mod tests {
     }
 
     #[test]
-    fn decapitalize_first_lowercases_ascii_uppercase() {
-        assert_eq!(decapitalize_first("Hello world"), "hello world");
-    }
-
-    #[test]
-    fn decapitalize_first_leaves_lowercase_unchanged() {
-        assert_eq!(decapitalize_first("hello World"), "hello World");
-    }
-
-    #[test]
-    fn decapitalize_first_leaves_digit_and_punct_unchanged() {
-        assert_eq!(decapitalize_first("42 things"), "42 things");
-        assert_eq!(decapitalize_first("...And then"), "...And then");
-    }
-
-    #[test]
-    fn decapitalize_first_handles_multibyte_uppercase() {
-        assert_eq!(decapitalize_first("École normale"), "école normale");
-    }
-
-    #[test]
-    fn decapitalize_first_handles_empty_string() {
-        assert_eq!(decapitalize_first(""), "");
-    }
-
-    #[test]
-    fn decapitalize_first_keeps_pronoun_i() {
-        assert_eq!(decapitalize_first("I think so"), "I think so");
-        assert_eq!(decapitalize_first("I'm here"), "I'm here");
-        assert_eq!(decapitalize_first("I"), "I");
-    }
-
-    #[test]
-    fn decapitalize_first_still_lowercases_i_words() {
-        assert_eq!(decapitalize_first("It works"), "it works");
-        assert_eq!(decapitalize_first("Instead of that"), "instead of that");
+    fn decapitalize_first_lowers_only_a_leading_capital() {
+        for (input, want) in [
+            ("Hello world", "hello world"),
+            ("hello World", "hello World"),
+            ("42 things", "42 things"),
+            ("...And then", "...And then"),
+            ("École normale", "école normale"),
+            ("", ""),
+            // The pronoun I stays, alone or in a contraction.
+            ("I think so", "I think so"),
+            ("I'm here", "I'm here"),
+            ("I", "I"),
+            // A word that only starts with I is lowered.
+            ("It works", "it works"),
+            ("Instead of that", "instead of that"),
+        ] {
+            assert_eq!(decapitalize_first(input), want, "{input:?}");
+        }
     }
 
     #[test]
