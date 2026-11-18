@@ -319,9 +319,16 @@ mod tests {
         assert_eq!(vocab.parent(), crate::config_path().parent());
     }
 
+    /// One term per line: blank and `#` comment lines skipped, every line
+    /// trimmed, a `#` inside a term kept. A leading BOM is stripped from the
+    /// whole file: `str::trim` keeps U+FEFF, so it would ride into the first
+    /// term, and a BOM-only file would leave a one-character term.
     #[test]
-    fn parse_skips_blanks_and_comments_and_trims() {
-        let contents = "\
+    fn parse_reads_one_term_per_line() {
+        let rows: &[(&str, &str, &[&str])] = &[
+            (
+                "blanks, comments and padding",
+                "\
 # Deepgram nova-3 keyterms: this casing comes back.
 whisrs
 
@@ -329,86 +336,45 @@ whisrs
 \t
 NixOS
 # trailing comment
-";
-        assert_eq!(
-            parse_vocabulary(contents),
-            vec!["whisrs", "Claude Code", "NixOS"]
-        );
+",
+                &["whisrs", "Claude Code", "NixOS"],
+            ),
+            ("a # inside a term", "C# dev\n", &["C# dev"]),
+            ("empty file", "", &[]),
+            ("comments only", "# only a comment\n\n", &[]),
+            (
+                "leading BOM",
+                "\u{feff}NixOS\nwhisrs\n",
+                &["NixOS", "whisrs"],
+            ),
+            ("BOM only", "\u{feff}", &[]),
+            ("BOM and a newline", "\u{feff}\n", &[]),
+        ];
+        for (row, contents, expected) in rows {
+            assert_eq!(parse_vocabulary(contents), *expected, "{row}");
+        }
     }
 
-    #[test]
-    fn parse_keeps_inline_hash() {
-        assert_eq!(parse_vocabulary("C# dev\n"), vec!["C# dev"]);
-    }
-
-    #[test]
-    fn parse_empty_and_comment_only_files_yield_no_terms() {
-        assert!(parse_vocabulary("").is_empty());
-        assert!(parse_vocabulary("# only a comment\n\n").is_empty());
-    }
-
-    /// `str::trim` strips `\r` but not U+FEFF, so a BOM used to ride into the
-    /// term itself and reach Deepgram as `%EF%BB%BFNixOS`.
-    #[test]
-    fn parse_strips_a_leading_utf8_bom() {
-        assert_eq!(
-            parse_vocabulary("\u{feff}NixOS\nwhisrs\n"),
-            vec!["NixOS", "whisrs"]
-        );
-    }
-
-    /// A BOM-only file is an empty file. Trimming per line would leave the BOM
-    /// standing as a one-character term.
-    #[test]
-    fn parse_bom_only_file_yields_no_terms() {
-        assert!(parse_vocabulary("\u{feff}").is_empty());
-        assert!(parse_vocabulary("\u{feff}\n").is_empty());
-    }
-
+    /// config.toml's terms first, then the file's, each once. Case-sensitive:
+    /// Deepgram returns each keyterm in the casing configured.
     #[test]
     fn merge_puts_config_first_and_drops_duplicates() {
-        let config = vec!["whisrs".to_string(), "GNOME".to_string()];
-        let file = vec![
-            "Deepgram".to_string(),
-            "whisrs".to_string(),
-            "NixOS".to_string(),
-        ];
-        assert_eq!(
-            merge_vocabulary(config, file),
-            vec!["whisrs", "GNOME", "Deepgram", "NixOS"]
-        );
-    }
-
-    #[test]
-    fn merge_is_case_sensitive() {
-        let merged = merge_vocabulary(vec!["whisrs".to_string()], vec!["Whisrs".to_string()]);
-        assert_eq!(merged, vec!["whisrs", "Whisrs"]);
-    }
-
-    #[test]
-    fn missing_file_is_not_an_error() {
-        let dir = std::env::temp_dir().join("whisrs-vocab-test-missing");
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(
-            load_vocabulary_file(&dir.join("vocabulary.txt")).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn write_then_load_round_trips() {
-        let dir = std::env::temp_dir().join("whisrs-vocab-test-roundtrip");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("vocabulary.txt");
-
-        write_vocabulary_file(&path, &[]).unwrap();
-        assert_eq!(load_vocabulary_file(&path).unwrap(), Some(Vec::new()));
-
-        let terms = vec!["whisrs".to_string(), "Claude Code".to_string()];
-        write_vocabulary_file(&path, &terms).unwrap();
-        assert_eq!(load_vocabulary_file(&path).unwrap(), Some(terms));
-
-        let _ = std::fs::remove_dir_all(&dir);
+        for (row, config, file, expected) in [
+            (
+                "config first, duplicates dropped",
+                terms(&["whisrs", "GNOME"]),
+                terms(&["Deepgram", "whisrs", "NixOS"]),
+                terms(&["whisrs", "GNOME", "Deepgram", "NixOS"]),
+            ),
+            (
+                "case-sensitive",
+                terms(&["whisrs"]),
+                terms(&["Whisrs"]),
+                terms(&["whisrs", "Whisrs"]),
+            ),
+        ] {
+            assert_eq!(merge_vocabulary(config, file), expected, "{row}");
+        }
     }
 
     /// The property the migration depends on: whatever the writer puts on disk,
@@ -457,7 +423,8 @@ NixOS
     /// (`src/transcription/deepgram.rs`) trims and drops blanks before any
     /// counting or budgeting, so `Config::validate` and the request builder
     /// both ignore them; the `whisrs config` list editor drops a blank item.
-    /// A blank entry is not a term anywhere in whisrs.
+    /// A blank entry is not a term anywhere in whisrs. An empty list still
+    /// writes the file, which loads as no terms, not as a missing file.
     #[test]
     fn empty_and_whitespace_only_terms_are_dropped_not_round_tripped() {
         let dir = tempfile::tempdir().unwrap();
@@ -474,6 +441,9 @@ NixOS
             load_vocabulary_file(&path).unwrap(),
             Some(vec!["NixOS".to_string()])
         );
+
+        write_vocabulary_file(&path, &[]).unwrap();
+        assert_eq!(load_vocabulary_file(&path).unwrap(), Some(Vec::new()));
     }
 
     /// A `#` term written by the migration is a term, not a comment, and a
@@ -493,7 +463,8 @@ NixOS
 
     /// The file is replaced, not truncated and rewritten: a new inode is
     /// renamed over the old one, so a crash mid-write leaves the old list
-    /// whole, and no temp file stays behind.
+    /// whole, and no temp file stays behind. It holds what lived in the 0600
+    /// config.toml, so one that drifted to 0644 comes out 0600.
     #[cfg(unix)]
     #[test]
     fn the_file_is_replaced_atomically() {
@@ -502,6 +473,7 @@ NixOS
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vocabulary.txt");
         std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let before = std::fs::metadata(&path).unwrap().ino();
         write_vocabulary_file(&path, &["new".to_string()]).unwrap();
         let after = std::fs::metadata(&path).unwrap();
@@ -548,108 +520,8 @@ NixOS
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "again\n");
     }
 
-    /// The file holds vocabulary that used to live in the 0600 config.toml, so
-    /// splitting it out must not widen who can read it. `fs::write` under the
-    /// usual umask leaves 0644.
-    #[cfg(unix)]
-    #[test]
-    fn written_file_is_private() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vocabulary.txt");
-
-        write_vocabulary_file(&path, &["NixOS".to_string()]).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-
-        // A file that already drifted to laxer permissions is tightened, not
-        // left as it was found.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_vocabulary_file(&path, &["NixOS".to_string(), "whisrs".to_string()]).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
     fn terms(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// No vocabulary.txt means no migration, however the list was edited: the
-    /// terms stay in config.toml, which is the pre-feature behavior.
-    #[test]
-    fn without_a_vocabulary_file_nothing_migrates() {
-        assert!(!should_migrate_vocabulary(
-            false,
-            &terms(&["whisrs"]),
-            &terms(&["whisrs", "NixOS"])
-        ));
-    }
-
-    /// The bug this gate exists for: a save that never touched the vocabulary
-    /// used to rewrite vocabulary.txt flat and blank `[general] vocabulary` in
-    /// config.toml. An unchanged list must leave both stores alone.
-    #[test]
-    fn an_unchanged_vocabulary_does_not_migrate() {
-        // Equal by value, not the same Vec: the save path compares the list
-        // the editor started from against the one it ends with.
-        assert!(!should_migrate_vocabulary(
-            true,
-            &terms(&["whisrs", "Hyprland"]),
-            &terms(&["whisrs", "Hyprland"])
-        ));
-    }
-
-    /// An empty vocabulary.txt is a legitimate way to opt in, so its mere
-    /// existence is not a reason to write anything. Nothing on either side, or
-    /// terms that only ever lived in config.toml, both stay put.
-    #[test]
-    fn an_empty_vocabulary_file_alone_does_not_migrate() {
-        assert!(!should_migrate_vocabulary(true, &[], &[]));
-        assert!(!should_migrate_vocabulary(
-            true,
-            &terms(&["whisrs"]),
-            &terms(&["whisrs"])
-        ));
-    }
-
-    /// Adding, removing or reordering a term is an edit, and an edit is what
-    /// moves the whole list into vocabulary.txt.
-    #[test]
-    fn any_vocabulary_edit_migrates() {
-        let baseline = terms(&["whisrs", "Hyprland"]);
-        for current in [
-            terms(&["whisrs", "Hyprland", "NixOS"]),
-            terms(&["whisrs"]),
-            terms(&["Hyprland", "whisrs"]),
-        ] {
-            assert!(
-                should_migrate_vocabulary(true, &baseline, &current),
-                "editing {baseline:?} into {current:?} must migrate"
-            );
-        }
-    }
-
-    /// Deleting every term still migrates, so vocabulary.txt is written empty
-    /// rather than left holding the terms the user just removed.
-    #[test]
-    fn clearing_the_vocabulary_migrates() {
-        assert!(should_migrate_vocabulary(
-            true,
-            &terms(&["whisrs", "Hyprland"]),
-            &[]
-        ));
-    }
-
-    /// Casing is part of the term: Deepgram echoes each keyterm back in the
-    /// casing configured, so `Whisrs` is a different term from `whisrs`.
-    #[test]
-    fn a_case_only_vocabulary_change_migrates() {
-        assert!(should_migrate_vocabulary(
-            true,
-            &terms(&["whisrs"]),
-            &terms(&["Whisrs"])
-        ));
     }
 
     fn baseline(use_file: bool, config_toml: &[&str], file: &[&str]) -> VocabularyBaseline {
@@ -705,43 +577,6 @@ NixOS
             vocabulary_save_plan(&vocab, &terms(&["whisrs", "NixOS"])).vocabulary_txt,
             None,
             "an unreadable file is never written"
-        );
-    }
-
-    /// The regression a naive "just don't migrate" fix introduces: the editor
-    /// holds the merged list, so an untouched save must put config.toml's own
-    /// half back rather than write the merge into it. Otherwise vocabulary.txt's
-    /// terms are silently copied into config.toml and stored twice.
-    #[test]
-    fn an_untouched_save_leaves_config_toml_holding_only_its_own_terms() {
-        let vocab = baseline(true, &["whisrs"], &["NixOS"]);
-        let current = vocab.merged.clone();
-        assert_eq!(
-            config_toml_vocabulary(&vocab, &current),
-            terms(&["whisrs"]),
-            "NixOS lives in vocabulary.txt and must not be copied into config.toml"
-        );
-    }
-
-    /// Once the user edits the list, vocabulary.txt becomes the single store
-    /// and config.toml is emptied, so deleting a term cannot resurrect it.
-    #[test]
-    fn an_edited_vocabulary_empties_config_toml() {
-        let vocab = baseline(true, &["whisrs"], &["NixOS"]);
-        assert!(
-            config_toml_vocabulary(&vocab, &terms(&["whisrs", "NixOS", "Hyprland"])).is_empty()
-        );
-        assert!(config_toml_vocabulary(&vocab, &[]).is_empty());
-    }
-
-    /// With no vocabulary.txt there was no merge, so the edited list is what
-    /// config.toml gets, the behavior from before the file existed.
-    #[test]
-    fn without_a_vocabulary_file_config_toml_keeps_the_edited_list() {
-        let vocab = baseline(false, &["whisrs"], &[]);
-        assert_eq!(
-            config_toml_vocabulary(&vocab, &terms(&["whisrs", "Hyprland"])),
-            terms(&["whisrs", "Hyprland"])
         );
     }
 
@@ -903,6 +738,17 @@ NixOS
                 expect_config_toml: &["Claude, Code"],
                 expect_file: None,
             },
+            PlanRow {
+                // A session that only ever loaded the config: the list in
+                // memory is the raw merge, padding and all.
+                what: "padded and comma terms, editor never opened",
+                use_file: true,
+                config_toml: &[" whisrs ", "Claude, Code"],
+                file: &["NixOS"],
+                current: &[" whisrs ", "Claude, Code", "NixOS"],
+                expect_config_toml: &[" whisrs ", "Claude, Code"],
+                expect_file: None,
+            },
         ];
 
         for row in rows {
@@ -920,51 +766,45 @@ NixOS
         }
     }
 
-    /// A `whisrs config` session that only ever loaded the config: the baseline
-    /// and the in-memory list are the same raw merged list, padding and all.
-    /// Nothing may migrate.
-    #[test]
-    fn a_save_that_never_opened_the_vocabulary_editor_does_not_migrate() {
-        let vocab = baseline(true, &[" whisrs ", "Claude, Code"], &["NixOS"]);
-        let untouched = vocab.merged.clone();
-        assert_eq!(
-            vocabulary_save_plan(&vocab, &untouched).vocabulary_txt,
-            None
-        );
-    }
-
     /// A config.toml + vocabulary.txt pair in a fresh temp dir, driven through
     /// the real save path. Returns the two paths and what the vocabulary write
-    /// reported.
+    /// reported. `row` names the case in a failure.
     fn run_save(
+        row: &str,
         vocab: &VocabularyBaseline,
-        current: &[&str],
+        current: &[String],
         vocabulary_txt: Option<&str>,
     ) -> (tempfile::TempDir, PathBuf, PathBuf, Option<PathBuf>) {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{row}: temp dir: {e}"));
         let config_path = dir.path().join("config.toml");
         let vocab_path = dir.path().join("vocabulary.txt");
         if let Some(contents) = vocabulary_txt {
-            std::fs::write(&vocab_path, contents).expect("seed vocabulary.txt");
+            std::fs::write(&vocab_path, contents)
+                .unwrap_or_else(|e| panic!("{row}: seed vocabulary.txt: {e}"));
         }
 
         let mut config: Config = toml::from_str("").expect("empty config uses defaults");
-        config.general.vocabulary = terms(current);
+        config.general.vocabulary = current.to_vec();
         let written = write_config_and_vocabulary(&config, vocab, &config_path, &vocab_path)
-            .expect("save succeeds")
+            .unwrap_or_else(|e| panic!("{row}: save failed: {e:#}"))
             .vocabulary;
 
         (dir, config_path, vocab_path, written)
     }
 
-    fn config_toml_terms(path: &Path) -> Vec<String> {
-        let contents = std::fs::read_to_string(path).expect("config.toml exists");
-        let parsed: Config = toml::from_str(&contents).expect("config.toml reparses");
+    fn config_toml_terms(row: &str, path: &Path) -> Vec<String> {
+        let contents = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{row}: config.toml unreadable: {e}"));
+        let parsed: Config = toml::from_str(&contents)
+            .unwrap_or_else(|e| panic!("{row}: config.toml does not reparse: {e}"));
         parsed.general.vocabulary
     }
 
     /// The composition, not the pieces: an edit must put the *whole merged
-    /// list* in vocabulary.txt and an empty list in config.toml, in that order.
+    /// list* in vocabulary.txt and an empty list in config.toml, in that order,
+    /// so what the daemon merges at its next start is exactly what the editor
+    /// showed. A deleted term is then in neither store and cannot come back,
+    /// and a term starting with `#` is a term in the file, not a comment.
     ///
     /// Writing the blanked config.toml list to the file, skipping the file
     /// write, or writing the merged list into config.toml each destroy or
@@ -972,111 +812,96 @@ NixOS
     /// site. All three fail here.
     #[test]
     fn a_migrating_save_writes_the_whole_list_to_the_file_and_blanks_config_toml() {
-        let vocab = baseline(true, &["whisrs"], &["NixOS"]);
-        let (_dir, config_path, vocab_path, written) = run_save(
-            &vocab,
-            &["whisrs", "NixOS", "Deepgram"],
-            Some("# hand-written\nNixOS\n"),
-        );
+        let rows = [
+            (
+                "term added",
+                baseline(true, &["whisrs"], &["NixOS"]),
+                terms(&["whisrs", "NixOS", "Deepgram"]),
+                "# hand-written\nNixOS\n",
+            ),
+            (
+                "term deleted",
+                baseline(true, &["whisrs", "ghost"], &["NixOS"]),
+                terms(&["whisrs", "NixOS"]),
+                "NixOS\n",
+            ),
+            (
+                "#-leading term",
+                baseline(true, &["#1", "NixOS"], &[]),
+                terms(&["#1", "NixOS", "Deepgram"]),
+                "",
+            ),
+        ];
+        for (row, vocab, current, seeded) in rows {
+            let (_dir, config_path, vocab_path, written) =
+                run_save(row, &vocab, &current, Some(seeded));
 
-        assert_eq!(written.as_deref(), Some(vocab_path.as_path()));
-        assert_eq!(
-            load_vocabulary_file(&vocab_path).expect("readable"),
-            Some(terms(&["whisrs", "NixOS", "Deepgram"])),
-            "vocabulary.txt must hold every term the editor showed"
-        );
-        assert!(
-            config_toml_terms(&config_path).is_empty(),
-            "config.toml must be blanked so no term is stored twice"
-        );
+            assert_eq!(written.as_deref(), Some(vocab_path.as_path()), "{row}");
+            let from_file = load_vocabulary_file(&vocab_path)
+                .unwrap_or_else(|e| panic!("{row}: vocabulary.txt unreadable: {e}"));
+            assert_eq!(
+                from_file.as_ref(),
+                Some(&current),
+                "{row}: vocabulary.txt must hold every term the editor showed"
+            );
+            let in_config_toml = config_toml_terms(row, &config_path);
+            assert!(
+                in_config_toml.is_empty(),
+                "{row}: config.toml must be blanked so no term is stored twice"
+            );
+            assert_eq!(
+                merge_vocabulary(in_config_toml, from_file.unwrap_or_default()),
+                current,
+                "{row}: the daemon must load exactly what the editor showed"
+            );
+        }
     }
 
     /// The other half of the composition: with no edit, neither store is
     /// touched. vocabulary.txt keeps its comments byte for byte and config.toml
-    /// gets back exactly its own half of the list, not the merge.
+    /// gets back exactly its own half of the list, not the merge. That holds
+    /// for a pass through the editor that changed nothing, too: opening
+    /// "Vocabulary & prompt" to change only the prompt and pressing Enter over
+    /// the vocabulary line, with config.toml terms that have padding or a
+    /// comma in them, which the editor's round trip trims and splits.
     #[test]
     fn a_save_without_a_vocabulary_edit_leaves_both_stores_alone() {
-        let seeded = "# Deepgram keyterms\n\n# proper nouns\nNixOS\n";
-        let vocab = baseline(true, &["whisrs"], &["NixOS"]);
-        let (_dir, config_path, vocab_path, written) =
-            run_save(&vocab, &["whisrs", "NixOS"], Some(seeded));
-
-        assert_eq!(written, None);
-        assert_eq!(
-            std::fs::read_to_string(&vocab_path).expect("readable"),
-            seeded,
-            "an untouched vocabulary must not cost the user their comments"
-        );
-        assert_eq!(
-            config_toml_terms(&config_path),
-            terms(&["whisrs"]),
-            "config.toml keeps its own half; the file's terms must not leak in"
-        );
-    }
-
-    /// FIX for the editor round trip: opening "Vocabulary & prompt" to change
-    /// only the prompt and pressing Enter over the vocabulary line is not an
-    /// edit, even when config.toml's terms have padding or a comma in them.
-    /// Before this, `parse_csv_list` normalized them, the lists compared
-    /// unequal, and a migration the user never asked for flattened their
-    /// hand-maintained vocabulary.txt.
-    #[test]
-    fn an_unedited_pass_through_the_editor_does_not_migrate() {
-        let seeded = "# grouped by project\nNixOS\n\n# people\nClaude\n";
-        let vocab = baseline(true, &[" whisrs ", "Claude, Code"], &["NixOS", "Claude"]);
+        let untouched = baseline(true, &["whisrs"], &["NixOS"]);
+        let padded = baseline(true, &[" whisrs ", "Claude, Code"], &["NixOS", "Claude"]);
         // Exactly what the editor hands back when the user accepts the default.
-        let echoed = normalized_vocabulary(&vocab.merged);
-        let echoed: Vec<&str> = echoed.iter().map(String::as_str).collect();
+        let echoed = normalized_vocabulary(&padded.merged);
+        let rows = [
+            (
+                "untouched",
+                &untouched,
+                terms(&["whisrs", "NixOS"]),
+                "# Deepgram keyterms\n\n# proper nouns\nNixOS\n",
+                terms(&["whisrs"]),
+            ),
+            (
+                "editor pass, padded and comma terms",
+                &padded,
+                echoed,
+                "# grouped by project\nNixOS\n\n# people\nClaude\n",
+                terms(&[" whisrs ", "Claude, Code"]),
+            ),
+        ];
+        for (row, vocab, current, seeded, own_half) in rows {
+            let (_dir, config_path, vocab_path, written) =
+                run_save(row, vocab, &current, Some(seeded));
 
-        let (_dir, config_path, vocab_path, written) = run_save(&vocab, &echoed, Some(seeded));
-
-        assert_eq!(written, None, "an unedited pass must not write the file");
-        assert_eq!(
-            std::fs::read_to_string(&vocab_path).expect("readable"),
-            seeded
-        );
-        assert_eq!(
-            config_toml_terms(&config_path),
-            terms(&[" whisrs ", "Claude, Code"]),
-            "config.toml must keep its terms verbatim"
-        );
-    }
-
-    /// Deleting a term is the case blanking config.toml exists for: the term
-    /// must be in neither store afterwards, so the daemon's startup merge
-    /// cannot bring it back. This is the resurrection scenario end to end:
-    /// save, then re-run the merge the daemon does.
-    #[test]
-    fn a_deleted_term_cannot_resurrect_from_config_toml() {
-        let vocab = baseline(true, &["whisrs", "ghost"], &["NixOS"]);
-        let (_dir, config_path, vocab_path, _) =
-            run_save(&vocab, &["whisrs", "NixOS"], Some("NixOS\n"));
-
-        let from_file = load_vocabulary_file(&vocab_path)
-            .expect("readable")
-            .expect("written");
-        let merged = merge_vocabulary(config_toml_terms(&config_path), from_file);
-        assert_eq!(
-            merged,
-            terms(&["whisrs", "NixOS"]),
-            "the daemon must load exactly what the editor showed after the delete"
-        );
-    }
-
-    /// A term starting with `#` survives the migration. It used to be written
-    /// as a line the parser reads as a comment, so it disappeared from
-    /// vocabulary.txt in the same save that blanked config.toml, gone from
-    /// both stores, silently.
-    #[test]
-    fn a_hash_leading_term_survives_the_migration() {
-        let vocab = baseline(true, &["#1", "NixOS"], &[]);
-        let (_dir, config_path, vocab_path, _) =
-            run_save(&vocab, &["#1", "NixOS", "Deepgram"], Some(""));
-
-        let from_file = load_vocabulary_file(&vocab_path)
-            .expect("readable")
-            .expect("written");
-        let merged = merge_vocabulary(config_toml_terms(&config_path), from_file);
-        assert_eq!(merged, terms(&["#1", "NixOS", "Deepgram"]));
+            assert_eq!(written, None, "{row}: the file must not be written");
+            assert_eq!(
+                std::fs::read_to_string(&vocab_path)
+                    .unwrap_or_else(|e| panic!("{row}: vocabulary.txt unreadable: {e}")),
+                seeded,
+                "{row}: an untouched vocabulary must not cost the user their comments"
+            );
+            assert_eq!(
+                config_toml_terms(row, &config_path),
+                own_half,
+                "{row}: config.toml keeps its own half verbatim; the file's terms must not leak in"
+            );
+        }
     }
 }
