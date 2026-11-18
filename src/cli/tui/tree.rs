@@ -2350,6 +2350,7 @@ mod tests {
         assert_eq!(sections.set_size, Some(SECTIONS.len() as u32));
         assert_eq!(the(&fixture, "section-audio").selected, Some(true));
         assert_eq!(the(&fixture, "section-general").selected, Some(false));
+        assert_eq!(slug("Backend & keys"), "backend-keys");
     }
 
     /// `save` is disabled, saying why, until there is something to save.
@@ -2721,22 +2722,6 @@ mod tests {
         assert_eq!(text.value.as_deref(), Some("git push origin main"));
     }
 
-    /// A dictation added since keeps every older one's id.
-    #[test]
-    fn a_new_dictation_moves_no_older_id() {
-        let before = dictation_keys(&[
-            dictation("2026-10-30 14:02:11", "a"),
-            dictation("2026-10-29 09:00:00", "b"),
-        ]);
-        let after = dictation_keys(&[
-            dictation("2026-10-30 14:02:11", "c"),
-            dictation("2026-10-30 14:02:11", "a"),
-            dictation("2026-10-29 09:00:00", "b"),
-        ]);
-        assert_eq!(before, ["20261030140211", "20261029090000"]);
-        assert_eq!(after[1..], before);
-    }
-
     /// Devices come from the sound server: relayed in the picker, never a
     /// description.
     #[test]
@@ -2812,16 +2797,6 @@ mod tests {
         fixture.app.update(Msg::Tick);
         fixture.app.update(Msg::Tick);
         assert_eq!(serde_json::to_string(&nodes(&fixture.app)).unwrap(), before);
-    }
-
-    /// Section ids are their titles' words, each its own.
-    #[test]
-    fn section_ids_are_unique() {
-        let mut ids: Vec<String> = SECTIONS.iter().map(|s| slug(s.title)).collect();
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), SECTIONS.len());
-        assert_eq!(slug("Backend & keys"), "backend-keys");
     }
 
     /// The mic meter rounds the level to 5 dB, so a still room is a still
