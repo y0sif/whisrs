@@ -411,6 +411,8 @@ mod tests {
         typed_live: &'static [&'static str],
         /// Server events sent in reply to the end-of-stream commit.
         after_commit: Vec<Value>,
+        /// How long the server stays quiet after the first of those events.
+        quiet_after_first: Duration,
         /// The server closes the socket after those events, as llama.cpp does.
         closes: bool,
         typed_tail: &'static [&'static str],
@@ -431,13 +433,16 @@ mod tests {
                 ],
                 typed_live: &["hello world", "good morning"],
                 after_commit: vec![completed("item-3", "tail flush")],
+                quiet_after_first: Duration::ZERO,
                 closes: false,
                 typed_tail: &["tail flush"],
                 session_rate: None,
             },
             // Deltas are typed as they arrive. The commit is acknowledged, the
-            // word the model still held at the stop arrives as one more delta
-            // of the same item, and its completed adds nothing.
+            // server goes quiet for longer than the 2 s grace (a server slower
+            // than real time working through a pause in the speech), then the
+            // word it still held arrives as one more delta of the same item,
+            // and its completed adds nothing.
             StreamCase {
                 profile: "llamacpp",
                 live: vec![delta("item_1", " Hello"), delta("item_1", " there")],
@@ -450,6 +455,7 @@ mod tests {
                     delta("item_1", " friend"),
                     completed("item_1", " Hello there friend"),
                 ],
+                quiet_after_first: Duration::from_millis(2500),
                 closes: true,
                 typed_tail: &[" friend"],
                 session_rate: Some(16_000),
@@ -460,7 +466,12 @@ mod tests {
             let name = case.profile;
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let (live, after_commit, closes) = (case.live, case.after_commit, case.closes);
+            let (live, after_commit, quiet, closes) = (
+                case.live,
+                case.after_commit,
+                case.quiet_after_first,
+                case.closes,
+            );
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut ws = accept_async(stream).await.unwrap();
@@ -475,10 +486,13 @@ mod tests {
                 }
 
                 let commit = recv_json(&mut ws).await;
-                for event in after_commit {
+                for (i, event) in after_commit.into_iter().enumerate() {
                     ws.send(Message::Text(event.to_string().into()))
                         .await
                         .unwrap();
+                    if i == 0 {
+                        sleep(quiet).await;
+                    }
                 }
                 if closes {
                     ws.send(Message::Close(None)).await.unwrap();

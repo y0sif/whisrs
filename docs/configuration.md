@@ -236,7 +236,8 @@ pickers in `whisrs config` list models with their voices and prices; any other c
 `openai-compatible-realtime` streams to a server that speaks the OpenAI Realtime
 transcription events over a WebSocket. Its `profile` names the server's dialect: `lemonade`
 types completed phrases, and `llamacpp` types words as they arrive. A llama.cpp server
-running Voxtral Realtime listens on `ws://localhost:<port>/v1/realtime`.
+running Voxtral Realtime listens on `ws://localhost:<port>/v1/realtime`. On a server slower
+than real time, typing lags behind your speech and the last words arrive after you stop.
 
 With `lemonade` and `turn_detection = "server-vad"`, the server ends a phrase at each
 pause, so text appears as you talk; `"manual-commit"` sends one result when you stop.

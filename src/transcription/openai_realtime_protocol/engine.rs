@@ -21,6 +21,7 @@ const FINAL_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_
 // (and for append-only profiles any final completion is a duplicate that gets
 // deduped anyway), we only grant a brief grace for a real completion before
 // finalizing gracefully, instead of stalling the daemon for the full timeout.
+// A profile whose server completes every commit waits for that completion.
 const POST_COMMIT_GRACE_AFTER_TEXT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Immutable connection options for the shared realtime engine.
@@ -385,8 +386,13 @@ impl OpenAiRealtimeProtocolEngine {
                     // grant a short grace period before finalizing gracefully and
                     // never stall the daemon for the full timeout. If nothing has
                     // been emitted yet we are still waiting for the only result,
-                    // so we keep the full FINAL_COMPLETION_TIMEOUT.
-                    let post_commit_timeout = if state.emitted_any_text {
+                    // so we keep the full FINAL_COMPLETION_TIMEOUT. A profile whose
+                    // server completes every commit keeps it too: that completion
+                    // always comes, and a server slower than real time can be
+                    // quiet for longer than the grace while it catches up.
+                    let post_commit_timeout = if state.emitted_any_text
+                        && !profile.completes_every_commit()
+                    {
                         self.post_commit_grace_timeout()
                     } else {
                         self.final_completion_timeout()

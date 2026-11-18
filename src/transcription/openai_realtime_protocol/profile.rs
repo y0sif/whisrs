@@ -67,6 +67,18 @@ impl OpenAiRealtimeProfile {
         }
     }
 
+    /// Whether the server answers the end-of-stream commit with a `completed`
+    /// event once it has transcribed all the committed audio. llama.cpp does,
+    /// so the engine waits for that event after the stop: a server slower than
+    /// real time can stay quiet for seconds while it works through a pause in
+    /// the speech, and still have the last words to send.
+    pub fn completes_every_commit(self) -> bool {
+        match self {
+            Self::LlamaCpp => true,
+            Self::OpenAi | Self::Lemonade => false,
+        }
+    }
+
     pub fn session_update(
         self,
         model: &str,
