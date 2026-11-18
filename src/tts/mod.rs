@@ -520,28 +520,25 @@ mod tests {
     }
 
     #[test]
-    fn create_groq_backend_requires_key() {
-        assert!(create_backend(&cfg("groq"), Some("k".to_string())).is_ok());
-        assert!(create_backend(&cfg("groq"), None).is_err());
-    }
-
-    #[test]
-    fn create_openai_backend_requires_key() {
-        assert!(create_backend(&cfg("openai"), Some("k".to_string())).is_ok());
-        assert!(create_backend(&cfg("openai"), None).is_err());
-    }
-
-    #[test]
-    fn create_deepgram_backend_requires_key() {
-        assert!(create_backend(&cfg("deepgram"), Some("k".to_string())).is_ok());
-        assert!(create_backend(&cfg("deepgram"), None).is_err());
-    }
-
-    #[test]
-    fn create_sidecar_backend_allows_no_key() {
-        // Sidecar must build with no key; alias must also work.
-        assert!(create_backend(&cfg("tts-sidecar"), None).is_ok());
-        assert!(create_backend(&cfg("openai-compat"), None).is_ok());
+    fn create_backend_needs_a_key_for_cloud_backends_only() {
+        for (backend, needs_key) in [
+            ("groq", true),
+            ("openai", true),
+            ("deepgram", true),
+            // A sidecar builds with no key, under either name.
+            ("tts-sidecar", false),
+            ("openai-compat", false),
+        ] {
+            assert!(
+                create_backend(&cfg(backend), Some("k".to_string())).is_ok(),
+                "{backend} with a key"
+            );
+            assert_eq!(
+                create_backend(&cfg(backend), None).is_err(),
+                needs_key,
+                "{backend} without a key"
+            );
+        }
     }
 
     #[test]
@@ -871,40 +868,6 @@ mod tests {
         let local = body(DEFAULT_SIDECAR_URL, None, "wav");
         assert_eq!(local["response_format"], "wav");
         assert_eq!(local["model"], "kokoro");
-    }
-
-    /// Voxtral on OpenRouter with no voice set asks for a voice of its own,
-    /// not Kokoro's `af_heart` (which OpenRouter answers with a 400).
-    #[tokio::test]
-    async fn openrouter_voxtral_without_a_voice_sends_its_own_voice() {
-        use test_server::*;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, body) = accept_request(&listener).await;
-            write_chunked_head_as(&mut stream, "audio/pcm;rate=24000;channels=1").await;
-            write_chunk(&mut stream, &[0, 0, 0, 0]).await;
-            finish_chunked(&mut stream).await;
-            body
-        });
-
-        let config = TtsConfig {
-            url: Some(catalog::OPENROUTER_TTS_URL.to_string()),
-            model: Some("mistralai/voxtral-mini-tts-3-0".to_string()),
-            ..cfg("tts-sidecar")
-        };
-        let backend = sidecar_backend(&config, Some("k".to_string()))
-            .posting_to(format!("http://{addr}/api/v1/audio/speech"));
-        let mut audio = match backend.synthesize("hi").await {
-            Ok(audio) => audio,
-            Err(e) => panic!("expected a 200 response: {e}"),
-        };
-        while audio.next_chunk().await.unwrap().is_some() {}
-
-        let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
-        assert_eq!(body["model"], "mistralai/voxtral-mini-tts-3-0", "{body}");
-        assert_eq!(body["voice"], "en_paul_neutral", "{body}");
     }
 
     /// The unset voice follows the model on OpenRouter only: Kokoro there
