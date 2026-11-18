@@ -407,21 +407,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn groq_sends_the_prompt() {
-        let request = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "whisper-large-v3-turbo".to_string(),
-            prompt: Some("Hyprland, whisrs".to_string()),
-            keyterms: Vec::new(),
-            diarize: false,
-            vad: Default::default(),
-            soft_voices: true,
-        };
-
-        assert!(GroqBackend::new(String::new()).sends_prompt(&request));
-    }
-
-    #[test]
     fn parse_verbose_json_response() {
         let body = r#"{
             "text": "Hello, how are you?",
@@ -458,111 +443,25 @@ mod tests {
         assert!(resp.words.is_empty());
     }
 
-    #[test]
-    fn parse_error_response() {
-        let body = r#"{"error": {"message": "Invalid API key", "type": "invalid_request_error"}}"#;
-        let err: GroqErrorResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(err.error.message, "Invalid API key");
-        assert_eq!(
-            err.error.error_type.as_deref(),
-            Some("invalid_request_error")
-        );
-    }
-
-    #[test]
-    fn parse_response_with_extra_fields() {
-        // The API may return extra fields we don't model — ensure we don't fail.
-        let body = r#"{
-            "task": "transcribe",
-            "language": "english",
-            "duration": 3.5,
-            "text": "Test transcription",
-            "words": [],
-            "segments": [{"id": 0}]
-        }"#;
-        let resp = parse_response(body).unwrap();
-        assert_eq!(resp.text, "Test transcription");
-    }
-
     #[tokio::test]
-    async fn transcribe_rejects_empty_audio() {
+    async fn transcribe_rejects_audio_the_api_would_refuse() {
         let backend = GroqBackend::new("test-key".to_string());
-        let config = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "whisper-large-v3-turbo".to_string(),
-            prompt: None,
-            keyterms: Vec::new(),
-            diarize: false,
-            vad: Default::default(),
-            soft_voices: true,
-        };
-        let err = backend.transcribe(&[], &config).await.unwrap_err();
-        assert!(err.to_string().contains("empty audio"));
-    }
-
-    #[tokio::test]
-    async fn transcribe_rejects_oversized_audio() {
-        let backend = GroqBackend::new("test-key".to_string());
-        let config = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "whisper-large-v3-turbo".to_string(),
-            prompt: None,
-            keyterms: Vec::new(),
-            diarize: false,
-            vad: Default::default(),
-            soft_voices: true,
-        };
-        let huge = vec![0u8; MAX_FILE_SIZE + 1];
-        let err = backend.transcribe(&huge, &config).await.unwrap_err();
-        assert!(err.to_string().contains("too large"));
-    }
-
-    /// reqwest's Form is opaque; building must at least succeed for both the
-    /// dictation and recording shapes, with this config.
-    fn form_config() -> TranscriptionConfig {
-        TranscriptionConfig {
-            language: "auto".to_string(),
-            model: "whisper-large-v3-turbo".to_string(),
-            prompt: Some("whisrs".to_string()),
-            keyterms: Vec::new(),
-            diarize: false,
-            vad: Default::default(),
-            soft_voices: true,
+        let (_, config) = recording_request();
+        for (name, audio, want) in [
+            ("empty", vec![], "empty audio"),
+            ("over 25 MB", vec![0u8; MAX_FILE_SIZE + 1], "too large"),
+        ] {
+            let Err(err) = backend.transcribe(&audio, &config).await else {
+                panic!("{name}: accepted");
+            };
+            assert!(err.to_string().contains(want), "{name}: {err}");
         }
-    }
-
-    #[test]
-    fn dictation_form_builds_with_word_timestamps() {
-        let config = form_config();
-        assert!(build_form(&[1, 2, 3], UploadFormat::WAV, &config, &["word"]).is_ok());
-    }
-
-    // The recording shape is FLAC, which comes with the recording feature.
-    #[cfg(feature = "recording")]
-    #[test]
-    fn recording_form_builds_with_segment_and_word_timestamps() {
-        let config = form_config();
-        let recording = build_form(
-            &[1, 2, 3],
-            UploadFormat::FLAC,
-            &config,
-            &["segment", "word"],
-        );
-        assert!(recording.is_ok());
     }
 
     #[test]
     fn groq_chunks_fit_the_upload_cap() {
         let backend = GroqBackend::new(String::new());
-        let config = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "whisper-large-v3-turbo".to_string(),
-            prompt: None,
-            keyterms: Vec::new(),
-            diarize: false,
-            vad: Default::default(),
-            soft_voices: true,
-        };
+        let (_, config) = recording_request();
         let secs = backend.max_segment_chunk_secs(&config).unwrap() as usize;
         // 16 kHz mono i16 plus a 44-byte header.
         assert!(secs * 32_000 + 44 <= MAX_FILE_SIZE);
@@ -580,16 +479,7 @@ mod tests {
     #[cfg(feature = "recording")]
     #[tokio::test]
     async fn recording_chunks_upload_as_flac() {
-        let config = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "whisper-large-v3-turbo".to_string(),
-            prompt: None,
-            keyterms: Vec::new(),
-            diarize: false,
-            vad: Default::default(),
-            soft_voices: true,
-        };
-        let wav = encode_wav(&[300i16; 16_000]).unwrap();
+        let (wav, config) = recording_request();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);
@@ -608,10 +498,12 @@ mod tests {
 
     #[tokio::test]
     async fn dictation_uploads_as_wav() {
+        // Language auto and a prompt, so the form's no-language and prompt
+        // branches run too.
         let config = TranscriptionConfig {
-            language: "en".to_string(),
+            language: "auto".to_string(),
             model: "whisper-large-v3-turbo".to_string(),
-            prompt: None,
+            prompt: Some("whisrs".to_string()),
             keyterms: Vec::new(),
             diarize: false,
             vad: Default::default(),
@@ -621,7 +513,12 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);
-        let server = tokio::spawn(serve_once(listener, r#"{"text": "hi"}"#));
+        // The real verbose_json answer carries fields the parse ignores.
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"task": "transcribe", "language": "english", "duration": 3.5,
+                "text": "hi", "words": [], "segments": [{"id": 0}]}"#,
+        ));
         assert_eq!(backend.transcribe(&wav, &config).await.unwrap(), "hi");
         let request = server.await.unwrap();
         let (headers, data) = request.file_part();
@@ -708,7 +605,7 @@ mod tests {
             listener,
             vec![(
                 400,
-                r#"{"error": {"message": "could not decode the audio"}}"#,
+                r#"{"error": {"message": "could not decode the audio", "type": "invalid_request_error"}}"#,
             )],
         ));
         let err = retry_transient(RATE_LIMIT_BUDGET, &QUICK, || {
