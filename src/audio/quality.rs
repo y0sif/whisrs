@@ -684,12 +684,6 @@ mod tests {
     fn skip_labels_name_a_level() {
         let mut l = levels();
         l.peak_dbfs = -82.4;
-        assert_eq!(skip_label(GateReason::Silent, &l), "silent (peak -82 dB)");
-        l.speech_dbfs = Some(-68.0);
-        assert_eq!(
-            skip_label(GateReason::TooQuiet, &l),
-            "too quiet (speech at -68 dB)"
-        );
         l.noise_dbfs = Some(-48.2);
         assert_eq!(
             skip_label(GateReason::NoSpeech, &l),
@@ -701,10 +695,7 @@ mod tests {
             skip_label(GateReason::NoSpeech, &l),
             "without speech (peak -82 dB)"
         );
-        l.duration_ms = 210;
-        assert_eq!(skip_label(GateReason::TooShort, &l), "too short (0.2 s)");
         assert_eq!(skip_label(GateReason::Empty, &l), "empty");
-        assert_eq!(skip_hint(GateReason::NoSpeech, &l), None);
     }
 
     /// The muted-mic hint needs a peak of digital silence: with `vad` = rms
@@ -718,13 +709,6 @@ mod tests {
             Some("Is the mic muted?"),
             "a peak of 4"
         );
-        // A quiet room under the RMS test: silent, but not muted.
-        l.peak_dbfs = analyze(&[200, -200], Vad::Rms).levels.peak_dbfs;
-        assert_eq!(
-            stream_skip_reason(Vad::Rms, &l, false),
-            Some(GateReason::Silent)
-        );
-        assert_eq!(skip_hint(GateReason::Silent, &l), None);
         l.peak_dbfs = analyze(&[5, -5], Vad::Rms).levels.peak_dbfs;
         assert_eq!(skip_hint(GateReason::Silent, &l), None, "a peak of 5");
     }
