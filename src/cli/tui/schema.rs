@@ -645,7 +645,7 @@ const BACKEND: &[Field] = &[
         "openai-compatible-realtime.profile",
         "realtime profile",
         Kind::Choice(catalog::REALTIME_PROFILES),
-        "Which server dialect to speak. Only lemonade works so far.",
+        "Which server dialect to speak. lemonade and llamacpp work here; openai does not.",
     ),
     field(
         "openai-compatible-realtime.turn_detection",

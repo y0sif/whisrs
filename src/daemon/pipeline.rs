@@ -540,9 +540,10 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 /// The daemon text channel is intentionally append-only. For OpenAI realtime
 /// this still feels token-by-token because the backend emits stable append
 /// deltas (`Fragments`, with a space the engine puts where one utterance
-/// follows another). For Lemonade-compatible profiles, the protocol layer
-/// only forwards completed utterances (`Phrases`), so this loop naturally
-/// types phrase-sized chunks without needing any replacement semantics.
+/// follows another). `openai-compatible-realtime` follows its profile's
+/// `stream_text()`: `lemonade` forwards only completed utterances (`Phrases`),
+/// so this loop types phrase-sized chunks without any replacement semantics,
+/// and `llamacpp` forwards append deltas (`Fragments`).
 pub(crate) async fn run_typing_batcher<F, Fut>(
     mut text_rx: tokio::sync::mpsc::Receiver<String>,
     stream_text: StreamText,

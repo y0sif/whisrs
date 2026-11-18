@@ -234,14 +234,17 @@ pickers in `whisrs config` list models with their voices and prices; any other c
 ### Realtime servers
 
 `openai-compatible-realtime` streams to a server that speaks the OpenAI Realtime
-transcription events over a WebSocket, such as Lemonade (`profile = "lemonade"`, the only
-profile that works so far), and types only completed phrases. With `turn_detection =
-"server-vad"` the server ends a phrase at each pause, so text appears as you talk;
-`"manual-commit"` sends one result when you stop. `whisrs setup` fills in Lemonade's `url`,
-`ws://localhost:12345/realtime`; Lemonade must load the model (not only `pull` it), or it
-returns empty text. NVIDIA's Nemotron 3.5 ASR Streaming in
-[`nemo-speech`](../contrib/asr-sidecars/nemo-speech/) works too, run with `--endpointing`
-to type each phrase at a pause.
+transcription events over a WebSocket. Its `profile` names the server's dialect: `lemonade`
+types completed phrases, and `llamacpp` types words as they arrive. A llama.cpp server
+running Voxtral Realtime listens on `ws://localhost:<port>/v1/realtime`. On a server slower
+than real time, typing lags behind your speech and the last words arrive after you stop.
+
+With `lemonade` and `turn_detection = "server-vad"`, the server ends a phrase at each
+pause, so text appears as you talk; `"manual-commit"` sends one result when you stop.
+`whisrs setup` fills in Lemonade's `url`, `ws://localhost:12345/realtime`; Lemonade must
+load the model (not only `pull` it), or it returns empty text. NVIDIA's Nemotron 3.5 ASR
+Streaming in [`nemo-speech`](../contrib/asr-sidecars/nemo-speech/) works with `lemonade`
+too, run with `--endpointing` to type each phrase at a pause.
 
 ## Read aloud
 

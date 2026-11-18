@@ -2214,8 +2214,9 @@ impl Setup {
                 ),
                 "openai-compatible-realtime" => (
                     "Realtime server".to_string(),
-                    "Your OpenAI-compatible realtime server (Lemonade): its WebSocket URL, the \
-                     model it loads, and a bearer token if it needs one."
+                    "Your own OpenAI-compatible realtime server (Lemonade, llama.cpp): its \
+                     WebSocket URL, the model it loads, the profile for its dialect, and a \
+                     bearer token if it needs one."
                         .to_string(),
                 ),
                 "asr-sidecar" | "asr" | "vibevoice" if self.dictation_on_openrouter() => (

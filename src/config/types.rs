@@ -2264,9 +2264,9 @@ impl Config {
                         "OpenAI-compatible realtime profile is invalid: {e}"
                     ))
                 })?;
-                if config.profile.trim() != "lemonade" {
+                if !matches!(config.profile.trim(), "lemonade" | "llamacpp") {
                     return Err(WhisrsError::Config(
-                        "OpenAI-compatible realtime backend currently supports only profile 'lemonade'."
+                        "OpenAI-compatible realtime backend supports only the 'lemonade' and 'llamacpp' profiles."
                             .to_string(),
                     ));
                 }
@@ -3500,10 +3500,10 @@ impl Config {
                          a nova-3 model to get a hint channel back."
                     ),
                     InertPromptCase::Lemonade => format!(
-                        "[general] prompt is ignored with backend = \"{backend}\": the Lemonade \
-                         session.update carries no prompt field, so the hint never reaches the \
-                         wire. Switch to a backend that sends it (groq, openai, asr-sidecar) to \
-                         use a prompt."
+                        "[general] prompt is ignored with backend = \"{backend}\": the realtime \
+                         server's session.update carries no prompt field, so the hint never \
+                         reaches the wire. Switch to a backend that sends it (groq, openai, \
+                         asr-sidecar) to use a prompt."
                     ),
                     InertPromptCase::OpenAiRealtimePromptless { model } => format!(
                         "[general] prompt is ignored with backend = \"{backend}\" on [openai] \
@@ -3549,7 +3549,8 @@ impl Config {
                     Some(format!(
                         "[general] vocabulary is ignored with backend = \"{backend}\": the \
                          {terms} term(s) are folded into the transcription prompt, and the \
-                         Lemonade session.update carries no prompt field, so they reach nothing. \
+                         realtime server's session.update carries no prompt field, so they \
+                         reach nothing. \
                          Switch to a backend that sends the prompt (groq, openai, \
                          asr-sidecar){deepgram_clause}."
                     ))
@@ -5372,40 +5373,43 @@ mod tests {
 
     #[test]
     fn config_validate_openai_compatible_realtime_with_valid_config() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "openai-compatible-realtime".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
-                url: "ws://localhost:1234/realtime".to_string(),
-                model: "Whisper-Tiny".to_string(),
-                profile: "lemonade".to_string(),
-                turn_detection: "server-vad".to_string(),
-                api_key: None,
-            }),
-            llm: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
+        for profile in ["lemonade", "llamacpp"] {
+            let config = Config {
+                general: GeneralConfig {
+                    backend: "openai-compatible-realtime".to_string(),
+                    ..Default::default()
+                },
+                audio: Default::default(),
+                input: Default::default(),
+                deepgram: None,
+                groq: None,
+                openai: None,
+                local_whisper: None,
+                local_vosk: None,
+                local_parakeet: None,
+                asr_sidecar: None,
+                openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
+                    url: "ws://localhost:1234/realtime".to_string(),
+                    model: "Whisper-Tiny".to_string(),
+                    profile: profile.to_string(),
+                    turn_detection: "server-vad".to_string(),
+                    api_key: None,
+                }),
+                llm: None,
+                hotkeys: None,
+                hooks: None,
+                llm_commands: Vec::new(),
+                agents: Vec::new(),
+                agent_overlay: None,
+                replacements: BTreeMap::new(),
+                recording: None,
+                overlay: None,
+                tts: None,
+            };
 
-        assert!(config.validate().is_ok());
+            let result = config.validate();
+            assert!(result.is_ok(), "{profile}: {result:?}");
+        }
     }
 
     #[test]
