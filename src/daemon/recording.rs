@@ -4911,7 +4911,9 @@ mod tests {
     /// Dictation and voice-command toasts never say "recording", the
     /// recording feature's word, so the two cannot be mistaken for each
     /// other. The audio gate's skip toast is built in one place and pinned
-    /// by its own test (`gate_skip_message_per_origin`).
+    /// by its own test (`gate_skip_toast_names_a_level_per_reason_and_origin`),
+    /// and the prompt-echo toast, a const, by
+    /// `batch_path_drops_echo_shaped_text_only_from_a_prompting_backend`.
     #[test]
     fn dictation_toasts_never_say_recording() {
         for (file, source) in [

@@ -833,18 +833,50 @@ mod tests {
             .all(|c| c.downcast_ref::<RetryableHttpError>().is_none()));
     }
 
+    /// The trimmed prompt, then the vocabulary joined by ", ", with ". "
+    /// between them; a blank prompt counts as none, so it never bleeds an
+    /// empty "" into the output.
     #[test]
     fn transcription_prompt_joins_prompt_and_vocabulary() {
-        let vocab = vec!["Hyprland".to_string(), "whisrs".to_string()];
-        assert_eq!(
-            transcription_prompt(Some(" Notes. "), &vocab).as_deref(),
-            Some("Notes.. Hyprland, whisrs")
-        );
-        assert_eq!(transcription_prompt(Some("  "), &[]), None);
-        assert_eq!(
-            transcription_prompt(None, &vocab).as_deref(),
-            Some("Hyprland, whisrs")
-        );
+        // (name, prompt, vocabulary, the joined prompt)
+        type Row<'a> = (&'a str, Option<&'a str>, &'a [&'a str], Option<&'a str>);
+        let cases: [Row; 7] = [
+            (
+                "prompt and vocabulary",
+                Some(" Notes. "),
+                &["Hyprland", "whisrs"],
+                Some("Notes.. Hyprland, whisrs"),
+            ),
+            (
+                "vocabulary only",
+                None,
+                &["Hyprland", "whisrs"],
+                Some("Hyprland, whisrs"),
+            ),
+            (
+                "prompt only",
+                Some("Embedded Linux dictation."),
+                &[],
+                Some("Embedded Linux dictation."),
+            ),
+            (
+                "blank prompt with vocabulary",
+                Some("   \t\n  "),
+                &["whisrs"],
+                Some("whisrs"),
+            ),
+            ("blank prompt, no vocabulary", Some("  "), &[], None),
+            ("empty prompt, no vocabulary", Some(""), &[], None),
+            ("neither", None, &[], None),
+        ];
+        for (name, prompt, vocabulary, want) in cases {
+            let vocabulary: Vec<String> = vocabulary.iter().map(|t| t.to_string()).collect();
+            assert_eq!(
+                transcription_prompt(prompt, &vocabulary).as_deref(),
+                want,
+                "{name}"
+            );
+        }
     }
 
     #[test]
