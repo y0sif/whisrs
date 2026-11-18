@@ -14,7 +14,8 @@
 #   WHISRS_VERSION=v0.2.1    Pin to a specific tag (default: latest)
 #   WHISRS_MINIMAL=1         Use the minimal build (cloud-only, no whisper.cpp;
 #                            still includes the tray icon, overlay, recordings and
-#                            MCP server)
+#                            MCP server). Chosen automatically on a CPU without
+#                            AVX2 (x86_64) or dotprod (aarch64)
 
 set -euo pipefail
 
@@ -142,8 +143,23 @@ fi
 
 step 3 "Downloading prebuilt tarball..."
 
+# The full build's whisper.cpp needs AVX2 on x86_64 and dotprod on aarch64;
+# without it, whisrsd crashes as soon as it loads a local model.
+case "$ARCH" in
+    x86_64)  CPU_FLAG="avx2"    CPU_NAME="AVX2" ;;
+    aarch64) CPU_FLAG="asimddp" CPU_NAME="dotprod (ARMv8.2)" ;;
+esac
+cpu_lacks_floor() {
+    [ -r /proc/cpuinfo ] && ! grep -qw "$CPU_FLAG" /proc/cpuinfo
+}
+
 if [ "${WHISRS_MINIMAL:-}" = "1" ]; then
     ARTIFACT="whisrs-linux-${ARCH}-minimal.tar.gz"
+    info "Variant:" "minimal (cloud backends only)"
+elif cpu_lacks_floor; then
+    ARTIFACT="whisrs-linux-${ARCH}-minimal.tar.gz"
+    warn "This CPU has no ${CPU_NAME}, which the full build's offline whisper.cpp needs."
+    echo "  For offline models, build from source: cargo install whisrs --locked"
     info "Variant:" "minimal (cloud backends only)"
 else
     ARTIFACT="whisrs-linux-${ARCH}.tar.gz"

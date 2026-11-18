@@ -286,8 +286,8 @@ pub fn backend_refusal(value: &str) -> Option<(&'static str, String)> {
     if matches!(value, "local-whisper" | "local") && !Gate::LocalWhisper.built() {
         return Some((
             "not built in",
-            "this whisrs was built without local-whisper: use a release build, or rebuild \
-             with cargo install whisrs --features local-whisper"
+            "this whisrs was built without local-whisper: use a full release build (it needs \
+             AVX2, or dotprod on ARM), or build from source with cargo install whisrs --locked"
                 .to_string(),
         ));
     }
