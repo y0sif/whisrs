@@ -784,16 +784,22 @@ mod tests {
         }
     }
 
-    /// A call: the user, then the system voices in the order given, each
-    /// first heard a second after the one before.
-    fn call(voices: &[Speaker]) -> (Vec<Speaker>, Vec<TranscriptSegment>) {
-        let mut speakers = vec![speaker(ME, TrackKind::Mic)];
-        speakers.extend(voices.iter().cloned());
-        let segments = speakers
+    /// One segment per speaker, in the order given, each first heard a
+    /// second after the one before.
+    fn in_order(speakers: &[Speaker]) -> Vec<TranscriptSegment> {
+        speakers
             .iter()
             .enumerate()
             .map(|(i, s)| seg(i as u64 * 1000, &s.id))
-            .collect();
+            .collect()
+    }
+
+    /// A call: the user, then the system voices in the order given
+    /// ([`in_order`]).
+    fn call(voices: &[Speaker]) -> (Vec<Speaker>, Vec<TranscriptSegment>) {
+        let mut speakers = vec![speaker(ME, TrackKind::Mic)];
+        speakers.extend(voices.iter().cloned());
+        let segments = in_order(&speakers);
         (speakers, segments)
     }
 
@@ -931,11 +937,7 @@ mod tests {
             speaker(MIC, TrackKind::Mic),
             speaker("S1", TrackKind::System),
         ];
-        let segments: Vec<_> = speakers
-            .iter()
-            .enumerate()
-            .map(|(i, s)| seg(i as u64 * 1000, &s.id))
-            .collect();
+        let segments = in_order(&speakers);
         let mut case = Case::with(&["Sarah"]);
         case.shared_mic = true;
         assert_eq!(
@@ -1024,11 +1026,7 @@ mod tests {
             speaker("M2", TrackKind::Mic),
             speaker("S1", TrackKind::System),
         ];
-        let segments: Vec<_> = speakers
-            .iter()
-            .enumerate()
-            .map(|(i, s)| seg(i as u64 * 1000, &s.id))
-            .collect();
+        let segments = in_order(&speakers);
         let mut case = Case::with(&["Sarah"]);
         case.shared_mic = true;
         assert_eq!(
@@ -1351,11 +1349,7 @@ mod tests {
             speaker("S3", TrackKind::System),
             speaker(OTHERS, TrackKind::System),
         ];
-        let segments: Vec<_> = speakers
-            .iter()
-            .enumerate()
-            .map(|(i, s)| seg(i as u64 * 1000, &s.id))
-            .collect();
+        let segments = in_order(&speakers);
         let case = Case::with(&[])
             .user("S3", "Omar")
             .llm("me", "Dana")
@@ -1378,11 +1372,7 @@ mod tests {
             speaker("M2", TrackKind::Mic),
             speaker(MIC, TrackKind::Mic),
         ];
-        let segments: Vec<_> = speakers
-            .iter()
-            .enumerate()
-            .map(|(i, s)| seg(i as u64 * 1000, &s.id))
-            .collect();
+        let segments = in_order(&speakers);
         let mut case = Case::with(&[]).llm("M2", "Lee").llm("mic", "Max");
         case.shared_mic = true;
         assert_eq!(
