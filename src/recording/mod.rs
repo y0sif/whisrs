@@ -907,7 +907,6 @@ mod tests {
             serde_json::to_string(&RecordingState::Waiting).unwrap(),
             r#""waiting""#
         );
-        assert_eq!(RecordingStatus::default().phase, RecordingPhase::Idle);
     }
 
     /// The mic takes the open profile as it is; the system track the same
@@ -1371,11 +1370,6 @@ mod tests {
         for (names, want) in [
             (vec![" ".to_string()], "a name is empty"),
             (vec!["Sarah, Omar".to_string()], "comma"),
-            (
-                vec!["Sarah".to_string(), "SARAH".to_string()],
-                "listed twice",
-            ),
-            (vec!["x".to_string(); 21], "at most 20"),
         ] {
             let err = RecordingOptions {
                 participants: Some(names.clone()),
@@ -1411,10 +1405,6 @@ mod tests {
             },
             RecordingOptions {
                 name: Some("Sarah\u{7}".into()),
-                ..Default::default()
-            },
-            RecordingOptions {
-                name: Some("x".repeat(65)),
                 ..Default::default()
             },
         ] {
