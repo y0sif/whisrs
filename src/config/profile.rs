@@ -1341,16 +1341,6 @@ max_duration_minutes = 90
         assert!(eff.error.unwrap().contains("Unknown backend 'nope'"));
     }
 
-    #[test]
-    fn next_wraps_through_base_and_the_names() {
-        let names: Vec<String> = ["meeting", "offline", "work"].map(String::from).to_vec();
-        assert_eq!(next(&names, None).as_deref(), Some("meeting"));
-        assert_eq!(next(&names, Some("meeting")).as_deref(), Some("offline"));
-        assert_eq!(next(&names, Some("work")), None, "wraps to base");
-        assert_eq!(next(&names, Some("nope")).as_deref(), Some("offline"));
-        assert_eq!(next(&[], None), None);
-    }
-
     /// `next` passes over what would not load, in the order and wrapping,
     /// and says what it skipped; with nothing else loading it refuses,
     /// naming each with a short why.
