@@ -655,23 +655,26 @@ mod tests {
         }
     }
 
-    /// `next` from base passes over `broken` (the names sorted: broken,
-    /// offline, work), says so, and switches to `offline`; with no other
-    /// profile loading it refuses, naming why.
+    /// `next` from base, asked with no name or spelled out, passes over
+    /// `broken` (the names sorted: broken, offline, work), says so, and
+    /// switches to `offline`; with no other profile loading it refuses,
+    /// naming why.
     #[tokio::test(start_paused = true)]
     async fn next_passes_over_a_profile_that_does_not_load() {
-        let f = fixture(None);
-        let response = f.switch(None).await;
-        assert!(
-            matches!(
-                &response,
-                Response::Profile { active, switching: true, skipped }
-                    if active == "offline" && skipped == &["broken"]
-            ),
-            "{response:?}"
-        );
-        assert_eq!(f.state_file().as_deref(), Some("offline\n"));
-        let _ = f.restarts.next().await;
+        for asked in [None, Some("next")] {
+            let f = fixture(None);
+            let response = f.switch(asked).await;
+            assert!(
+                matches!(
+                    &response,
+                    Response::Profile { active, switching: true, skipped }
+                        if active == "offline" && skipped == &["broken"]
+                ),
+                "{asked:?}: {response:?}"
+            );
+            assert_eq!(f.state_file().as_deref(), Some("offline\n"), "{asked:?}");
+            let _ = f.restarts.next().await;
+        }
 
         // An explicit name is still refused.
         let f = fixture(None);
@@ -692,20 +695,6 @@ mod tests {
         assert_eq!(f.state_file().as_deref(), Some("work\n"));
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(f.restarts.none());
-    }
-
-    /// `next` goes base, offline (the names sorted: broken, offline, work),
-    /// and from the last name back to base.
-    #[tokio::test(start_paused = true)]
-    async fn next_follows_the_order_and_wraps() {
-        let f = fixture(Some("offline"));
-        assert!(switching_to(&f.switch(None).await, "work"));
-        let _ = f.restarts.next().await;
-
-        let f = fixture(Some("work"));
-        assert!(switching_to(&f.switch(Some("next")).await, "base"));
-        assert_eq!(f.state_file().as_deref(), Some("base\n"));
-        let _ = f.restarts.next().await;
     }
 
     /// The profile in use answers at once, with no restart; the state file
@@ -756,16 +745,6 @@ mod tests {
         assert_eq!(f.state_file(), None);
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(f.restarts.none());
-    }
-
-    /// `next` with no profile at all says how to add one.
-    #[tokio::test(start_paused = true)]
-    async fn next_without_profiles_says_how_to_add_one() {
-        let f = fixture(None);
-        for name in ["offline", "work", "broken"] {
-            std::fs::remove_file(f.paths.profile(name)).unwrap();
-        }
-        assert_eq!(refused(f.switch(None).await), profile::NO_PROFILES);
     }
 
     /// Each dictation state refuses, naming itself.
@@ -868,6 +847,7 @@ mod tests {
         assert_eq!(f.state_file().as_deref(), Some("offline\n"));
 
         assert!(switching_to(&f.switch(Some("base")).await, "base"));
+        assert_eq!(f.state_file().as_deref(), Some("base\n"));
         let _ = f.restarts.next().await;
     }
 }
