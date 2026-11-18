@@ -516,29 +516,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_fallback_restores_a_text_clipboard() {
-        // saved = "original", post-copy read = "copied text", still there at
-        // restore time => the original text is written back, once.
-        let clipboard = ScriptedClipboard::new(
-            "",
-            &[Some("original"), Some("copied text"), Some("copied text")],
-        );
-        let fired = Arc::new(AtomicBool::new(false));
-
-        let result = capture_selection_impl(
-            &clipboard,
-            tracking_copy(Arc::clone(&fired)),
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .await;
-
-        assert_eq!(result, Ok("copied text".to_string()));
-        assert!(fired.load(Ordering::SeqCst), "copy fallback should fire");
-        assert_eq!(clipboard.writes(), vec!["original".to_string()]);
-    }
-
-    #[tokio::test]
     async fn copy_fallback_never_restores_over_a_non_text_clipboard() {
         // The original clipboard is an image (get_text errs). The copy
         // overwrites it — inherent to copying — but no "" restore follows:
@@ -560,140 +537,96 @@ mod tests {
         assert!(clipboard.writes().is_empty(), "must not restore \"\"");
     }
 
+    /// With no primary selection the copy fallback runs. What it answers,
+    /// and what it writes back: the original text only when the copy
+    /// changed the clipboard and nothing replaced it since.
     #[tokio::test]
-    async fn unchanged_clipboard_is_reported_as_ambiguous_not_empty() {
-        // The copy returned what the clipboard already held. Usually that
-        // means nothing was selected — but it is not knowable from here, so
-        // it is `ClipboardUnchanged`, never `NothingSelected`. Nothing is
-        // written back either: there is nothing to undo.
-        let clipboard = ScriptedClipboard::new("", &[Some("original"), Some("original")]);
-        let fired = Arc::new(AtomicBool::new(false));
-
-        let result = capture_selection_impl(
-            &clipboard,
-            tracking_copy(Arc::clone(&fired)),
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .await;
-
-        assert_eq!(result, Err(CaptureError::ClipboardUnchanged));
-        assert!(clipboard.writes().is_empty());
-    }
-
-    #[tokio::test]
-    async fn an_empty_clipboard_after_the_copy_is_nothing_selected() {
-        // The unambiguous case: nothing on the clipboard before, nothing
-        // after. This is the only variant a caller could read as "the user
-        // selected nothing" and act on.
-        let clipboard = ScriptedClipboard::new("", &[Some(""), Some("")]);
-        let fired = Arc::new(AtomicBool::new(false));
-
-        let result = capture_selection_impl(
-            &clipboard,
-            tracking_copy(Arc::clone(&fired)),
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .await;
-
-        assert_eq!(result, Err(CaptureError::NothingSelected));
-        assert!(clipboard.writes().is_empty());
-    }
-
-    /// The destructive sequence from the #91 review: the user highlights
-    /// text, presses Ctrl+C out of habit, then fires the command hotkey. The
-    /// app doesn't publish a primary selection, so the fallback copy runs and
-    /// returns bytes identical to the clipboard the user just filled. The
-    /// selection is real and still live, so this must not be reported as
-    /// `NothingSelected`: that variant is the one a caller may act on by
-    /// typing at the cursor, and typing replaces a live selection.
-    #[tokio::test]
-    async fn ctrl_c_before_the_hotkey_is_never_reported_as_nothing_selected() {
-        let clipboard = ScriptedClipboard::new(
-            "",
-            &[
-                Some("the user's live selection"),
-                Some("the user's live selection"),
-            ],
+    async fn the_copy_fallback_answers_and_restores_by_the_policy() {
+        let original = Some("original");
+        let copied = Some("copied text");
+        type Case<'a> = (
+            &'a str,
+            &'a [Option<&'a str>],
+            bool,
+            Result<&'a str, CaptureError>,
+            &'a [&'a str],
         );
-        let fired = Arc::new(AtomicBool::new(false));
+        let cases: [Case; 6] = [
+            (
+                "a text clipboard is put back",
+                &[original, copied, copied],
+                false,
+                Ok("copied text"),
+                &["original"],
+            ),
+            // Usually nothing was selected, but it reads the same when the
+            // user highlighted text and pressed Ctrl+C before the hotkey: the
+            // selection is real and still live. So never `NothingSelected`,
+            // the variant a caller may act on by typing at the cursor, which
+            // replaces a live selection. Nothing to undo, nothing written.
+            (
+                "an unchanged clipboard is ambiguous, not empty",
+                &[original, original],
+                false,
+                Err(CaptureError::ClipboardUnchanged),
+                &[],
+            ),
+            // Nothing before, nothing after: the only variant a caller could
+            // read as "the user selected nothing".
+            (
+                "nothing on the clipboard after the copy",
+                &[Some(""), Some("")],
+                false,
+                Err(CaptureError::NothingSelected),
+                &[],
+            ),
+            // Something else copied over the simulated Ctrl+C before the
+            // restore: the intruder is left alone.
+            (
+                "a clipboard replaced after the copy is left alone",
+                &[original, copied, Some("intruder")],
+                false,
+                Ok("copied text"),
+                &[],
+            ),
+            (
+                "a failed copy",
+                &[original],
+                true,
+                Err(CaptureError::CopyFailed("uinput unavailable".to_string())),
+                &[],
+            ),
+            // Unreadable after the copy: the selection may well have been
+            // real, so this never looks like an empty selection.
+            (
+                "an unreadable clipboard after the copy",
+                &[original, None],
+                false,
+                Err(CaptureError::ClipboardReadFailed(
+                    "clipboard holds non-text content".to_string(),
+                )),
+                &[],
+            ),
+        ];
+        for (name, texts, copy_fails, want, writes) in cases {
+            let clipboard = ScriptedClipboard::new("", texts);
+            let fired = Arc::new(AtomicBool::new(false));
+            let copy_fired = Arc::clone(&fired);
+            let copy = move || {
+                copy_fired.store(true, Ordering::SeqCst);
+                if copy_fails {
+                    anyhow::bail!("uinput unavailable");
+                }
+                Ok(KeystrokeOutcome::Sent)
+            };
 
-        let result = capture_selection_impl(
-            &clipboard,
-            tracking_copy(Arc::clone(&fired)),
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .await;
+            let result =
+                capture_selection_impl(&clipboard, copy, Duration::ZERO, Duration::ZERO).await;
 
-        assert_eq!(result, Err(CaptureError::ClipboardUnchanged));
-        assert_ne!(result, Err(CaptureError::NothingSelected));
-    }
-
-    #[tokio::test]
-    async fn clipboard_replaced_after_copy_skips_restore() {
-        // Something else copied over our simulated Ctrl+C between the
-        // post-copy read and the restore: leave the intruder alone.
-        let clipboard = ScriptedClipboard::new(
-            "",
-            &[Some("original"), Some("copied text"), Some("intruder")],
-        );
-        let fired = Arc::new(AtomicBool::new(false));
-
-        let result = capture_selection_impl(
-            &clipboard,
-            tracking_copy(Arc::clone(&fired)),
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .await;
-
-        assert_eq!(result, Ok("copied text".to_string()));
-        assert!(clipboard.writes().is_empty());
-    }
-
-    #[tokio::test]
-    async fn copy_failure_surfaces_an_error_without_writing() {
-        let clipboard = ScriptedClipboard::new("", &[Some("original")]);
-
-        let result = capture_selection_impl(
-            &clipboard,
-            || anyhow::bail!("uinput unavailable"),
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .await;
-
-        assert_eq!(
-            result,
-            Err(CaptureError::CopyFailed("uinput unavailable".to_string()))
-        );
-        assert!(clipboard.writes().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_clipboard_read_failure_after_the_copy_is_infrastructure() {
-        // Non-text (or unreadable) clipboard *after* the copy: the selection
-        // may well have been real, so this must never look like an empty
-        // selection to a caller.
-        let clipboard = ScriptedClipboard::new("", &[Some("original"), None]);
-        let fired = Arc::new(AtomicBool::new(false));
-
-        let result = capture_selection_impl(
-            &clipboard,
-            tracking_copy(Arc::clone(&fired)),
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .await;
-
-        assert_eq!(
-            result,
-            Err(CaptureError::ClipboardReadFailed(
-                "clipboard holds non-text content".to_string()
-            ))
-        );
+            assert_eq!(result, want.map(String::from), "{name}");
+            assert!(fired.load(Ordering::SeqCst), "{name}: the copy should fire");
+            assert_eq!(clipboard.writes(), writes, "{name}");
+        }
     }
 
     /// The user-visible half of the typed error. Read-aloud renders these
