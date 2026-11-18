@@ -1331,35 +1331,26 @@ mod tests {
         buf.into_inner()
     }
 
+    /// `decode_wav` reads the format and every sample of an i16 or f32 WAV,
+    /// normalized into [-1.0, 1.0].
     #[test]
-    fn decode_i16_stereo_wav() {
-        let wav = make_i16_wav(24_000, 2, 100);
-        let decoded = decode_wav(&wav).unwrap();
-        assert_eq!(decoded.sample_rate, 24_000);
-        assert_eq!(decoded.channels, 2);
-        assert_eq!(decoded.samples.len(), 200);
-        assert_eq!(decoded.frames(), 100);
-        // Normalized into [-1.0, 1.0].
-        assert!(decoded.samples.iter().all(|s| (-1.0..=1.0).contains(s)));
-    }
-
-    #[test]
-    fn decode_i16_mono_wav() {
-        let wav = make_i16_wav(16_000, 1, 50);
-        let decoded = decode_wav(&wav).unwrap();
-        assert_eq!(decoded.sample_rate, 16_000);
-        assert_eq!(decoded.channels, 1);
-        assert_eq!(decoded.samples.len(), 50);
-        assert_eq!(decoded.frames(), 50);
-    }
-
-    #[test]
-    fn decode_f32_wav() {
-        let wav = make_f32_wav(44_100, 1, 64);
-        let decoded = decode_wav(&wav).unwrap();
-        assert_eq!(decoded.sample_rate, 44_100);
-        assert_eq!(decoded.channels, 1);
-        assert_eq!(decoded.samples.len(), 64);
+    fn decode_wav_reads_format_and_samples() {
+        for (kind, wav, rate, channels, frames) in [
+            ("i16", make_i16_wav(24_000, 2, 100), 24_000, 2, 100),
+            ("i16", make_i16_wav(16_000, 1, 50), 16_000, 1, 50),
+            ("f32", make_f32_wav(44_100, 1, 64), 44_100, 1, 64),
+        ] {
+            let row = format!("{kind}, {channels} ch, {rate} Hz");
+            let decoded = decode_wav(&wav).unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert_eq!(decoded.sample_rate, rate, "{row}");
+            assert_eq!(decoded.channels, channels, "{row}");
+            assert_eq!(decoded.samples.len(), frames * channels as usize, "{row}");
+            assert_eq!(decoded.frames(), frames, "{row}");
+            assert!(
+                decoded.samples.iter().all(|s| (-1.0..=1.0).contains(s)),
+                "{row}: a sample outside [-1.0, 1.0]"
+            );
+        }
     }
 
     #[test]
@@ -1534,18 +1525,19 @@ mod tests {
         p
     }
 
-    /// Parse `header` fed one split at every offset; all must agree.
-    fn assert_parses_at_every_split(header: &[u8]) -> (WavFormat, Option<u64>) {
+    /// Parse `header` fed one split at every offset; all must agree. `row`
+    /// names the case in a failure.
+    fn assert_parses_at_every_split(row: &str, header: &[u8]) -> (WavFormat, Option<u64>) {
         let whole = match parse_wav_header(header) {
             HeaderParse::Parsed {
                 format,
                 data_offset,
                 data_len,
             } => {
-                assert_eq!(data_offset, header.len());
+                assert_eq!(data_offset, header.len(), "{row}: data offset");
                 (format, data_len)
             }
-            other => panic!("whole header did not parse: {other:?}"),
+            other => panic!("{row}: whole header did not parse: {other:?}"),
         };
         for split in 0..=header.len() {
             let mut dec = WavStreamDecoder::new();
@@ -1556,54 +1548,55 @@ mod tests {
                     PushEvent::HeaderParsed { format, data_len } => {
                         parsed = Some((format, data_len))
                     }
-                    PushEvent::Fallback(r) => panic!("split {split}: fell back: {r}"),
+                    PushEvent::Fallback(r) => panic!("{row}: split {split}: fell back: {r}"),
                     PushEvent::None => {}
                 }
             }
-            assert_eq!(parsed, Some(whole), "split at {split}");
-            assert!(out.is_empty());
+            assert_eq!(parsed, Some(whole), "{row}: split at {split}");
+            assert!(out.is_empty(), "{row}: split at {split}: samples out");
             // A strict prefix is never enough.
             if split < header.len() {
                 assert_eq!(
                     parse_wav_header(&header[..split]),
                     HeaderParse::Incomplete,
-                    "prefix of {split} bytes"
+                    "{row}: prefix of {split} bytes"
                 );
             }
         }
         whole
     }
 
+    /// A header parses the same at every split, and no strict prefix of it
+    /// does: a clean 44-byte one, ffmpeg's with a LIST chunk and sentinel
+    /// sizes, and one with an odd-sized chunk and its pad byte.
     #[test]
-    fn stream_header_clean_44_bytes_every_split() {
-        let wav = make_i16_wav(24_000, 1, 10);
-        let header = &wav[..44];
-        let (format, data_len) = assert_parses_at_every_split(header);
-        assert_eq!(format.sample_rate, 24_000);
-        assert_eq!(format.channels, 1);
-        assert_eq!(format.bits, 16);
-        assert_eq!(format.kind, SampleKind::I16);
-        assert_eq!(data_len, Some(20));
-    }
-
-    #[test]
-    fn stream_header_ffmpeg_list_chunk_every_split() {
-        let fmt = fmt_payload(1, 1, 24_000, 16);
-        let list = lavf_list_chunk();
-        let header = build_header(&fmt, &[(b"LIST", &list)], u32::MAX, u32::MAX);
-        assert_eq!(header.len(), 44 + 8 + 26);
-        let (format, data_len) = assert_parses_at_every_split(&header);
-        assert_eq!(format.sample_rate, 24_000);
-        assert_eq!(data_len, None);
-    }
-
-    #[test]
-    fn stream_header_odd_chunk_is_padded() {
-        let fmt = fmt_payload(1, 2, 48_000, 16);
-        let header = build_header(&fmt, &[(b"junk", &[1, 2, 3])], 0, 0x1000);
-        let (format, data_len) = assert_parses_at_every_split(&header);
-        assert_eq!(format.channels, 2);
-        assert_eq!(data_len, Some(0x1000));
+    fn stream_header_parses_at_every_split() {
+        let clean = make_i16_wav(24_000, 1, 10);
+        let ffmpeg = build_header(
+            &fmt_payload(1, 1, 24_000, 16),
+            &[(b"LIST", &lavf_list_chunk())],
+            u32::MAX,
+            u32::MAX,
+        );
+        assert_eq!(ffmpeg.len(), 44 + 8 + 26, "the ffmpeg header's length");
+        let odd = build_header(
+            &fmt_payload(1, 2, 48_000, 16),
+            &[(b"junk", &[1, 2, 3])],
+            0,
+            0x1000,
+        );
+        for (row, header, rate, channels, data_len) in [
+            ("clean 44-byte header", &clean[..44], 24_000, 1, Some(20)),
+            ("ffmpeg LIST, sentinels", &ffmpeg[..], 24_000, 1, None),
+            ("odd-sized chunk padded", &odd[..], 48_000, 2, Some(0x1000)),
+        ] {
+            let (format, parsed_len) = assert_parses_at_every_split(row, header);
+            assert_eq!(format.sample_rate, rate, "{row}");
+            assert_eq!(format.channels, channels, "{row}");
+            assert_eq!(format.bits, 16, "{row}");
+            assert_eq!(format.kind, SampleKind::I16, "{row}");
+            assert_eq!(parsed_len, data_len, "{row}");
+        }
     }
 
     #[test]
@@ -1639,22 +1632,15 @@ mod tests {
             &b"RIFX...."[..],
             &b"RIFF\x00\x00\x00\x00AVI LIST"[..],
             &b"{\"error\": \"nope\"}"[..],
+            // One byte is enough to tell.
+            &b"{"[..],
         ] {
             let mut dec = WavStreamDecoder::new();
             let mut out = Vec::new();
             let ev = dec.push(body, &mut out);
             assert!(matches!(ev, PushEvent::Fallback(_)), "{body:?}: {ev:?}");
-            assert_eq!(dec.finish().as_deref(), Some(body));
+            assert_eq!(dec.finish().as_deref(), Some(body), "{body:?}");
         }
-    }
-
-    #[test]
-    fn stream_non_riff_falls_back_after_one_byte() {
-        let mut dec = WavStreamDecoder::new();
-        assert!(matches!(
-            dec.push(b"{", &mut Vec::new()),
-            PushEvent::Fallback(_)
-        ));
     }
 
     #[test]
@@ -1675,75 +1661,74 @@ mod tests {
         assert_eq!(fallback.as_deref(), Some(&wav[..30]));
     }
 
-    fn assert_stream_matches_decode_wav(wav: &[u8]) {
-        let expected = decode_wav(wav).unwrap();
+    /// Stream `wav` in random chunks, at five seeds and chunk sizes, and
+    /// check it decodes to what `decode_wav` gives. `row` names the case in
+    /// a failure.
+    fn assert_stream_matches_decode_wav(row: &str, wav: &[u8]) {
+        let expected = decode_wav(wav).unwrap_or_else(|e| panic!("{row}: {e}"));
         for (seed, max) in [(1, 1), (2, 3), (3, 17), (4, 256), (5, 4096)] {
             let (samples, format, fallback) = stream_decode(&random_chunks(wav, seed, max));
-            let format = format.expect("header parsed");
-            assert!(fallback.is_none());
-            assert_eq!(format.sample_rate, expected.sample_rate);
-            assert_eq!(format.channels, expected.channels);
-            assert_eq!(samples, expected.samples, "seed {seed}, max chunk {max}");
+            let format = format.unwrap_or_else(|| panic!("{row}: seed {seed}: header not parsed"));
+            assert!(fallback.is_none(), "{row}: seed {seed}: fell back");
+            assert_eq!(format.sample_rate, expected.sample_rate, "{row}");
+            assert_eq!(format.channels, expected.channels, "{row}");
+            assert_eq!(
+                samples, expected.samples,
+                "{row}: seed {seed}, max chunk {max}"
+            );
         }
     }
 
-    #[test]
-    fn stream_decode_matches_decode_wav_i16_mono() {
-        assert_stream_matches_decode_wav(&make_i16_wav(24_000, 1, 1000));
-    }
-
-    #[test]
-    fn stream_decode_matches_decode_wav_i16_stereo() {
-        assert_stream_matches_decode_wav(&make_i16_wav(48_000, 2, 777));
-    }
-
-    #[test]
-    fn stream_decode_matches_decode_wav_f32() {
-        assert_stream_matches_decode_wav(&make_f32_wav(44_100, 1, 500));
-        assert_stream_matches_decode_wav(&make_f32_wav(44_100, 2, 333));
-    }
-
-    #[test]
-    fn stream_decode_matches_decode_wav_other_int_depths() {
-        for bits in [8u16, 24, 32] {
-            let spec = hound::WavSpec {
-                channels: 2,
-                sample_rate: 22_050,
-                bits_per_sample: bits,
-                sample_format: hound::SampleFormat::Int,
-            };
-            let mut buf = Cursor::new(Vec::new());
-            {
-                let mut w = hound::WavWriter::new(&mut buf, spec).unwrap();
-                let max = ((1i64 << (bits - 1)) - 1) as f32;
-                for i in 0..300 {
-                    let v = ((i as f32 * 0.03).sin() * max) as i32;
-                    w.write_sample(v).unwrap();
-                    w.write_sample(-v).unwrap();
-                }
-                w.finalize().unwrap();
+    /// A stereo 22.05 kHz int WAV of `bits` bits per sample. hound writes
+    /// >16-bit or >2-channel files as WAVE_FORMAT_EXTENSIBLE.
+    fn make_int_wav(bits: u16) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 22_050,
+            bits_per_sample: bits,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = hound::WavWriter::new(&mut buf, spec).unwrap();
+            let max = ((1i64 << (bits - 1)) - 1) as f32;
+            for i in 0..300 {
+                let v = ((i as f32 * 0.03).sin() * max) as i32;
+                w.write_sample(v).unwrap();
+                w.write_sample(-v).unwrap();
             }
-            let wav = buf.into_inner();
-            // hound writes >16-bit or >2-channel files as WAVE_FORMAT_EXTENSIBLE.
-            assert_stream_matches_decode_wav(&wav);
+            w.finalize().unwrap();
         }
+        buf.into_inner()
     }
 
+    /// The streaming decoder gives what `decode_wav` gives, however the
+    /// body is chunked.
     #[test]
-    fn stream_decode_matches_decode_wav_ffmpeg_sentinels() {
-        // ffmpeg layout: fmt, LIST/INFO, data with 0xFFFFFFFF sizes.
+    fn stream_decode_matches_decode_wav() {
+        // ffmpeg layout: fmt, LIST/INFO, data with 0xFFFFFFFF sizes. Only
+        // `data` carries the sentinel, so decode_wav's repair walks past
+        // LIST; both paths must agree.
         let clean = make_i16_wav(24_000, 1, 400);
-        let body = &clean[44..];
-        let mut wav = build_header(
+        let mut ffmpeg = build_header(
             &fmt_payload(1, 1, 24_000, 16),
             &[(b"LIST", &lavf_list_chunk())],
             u32::MAX,
             u32::MAX,
         );
-        wav.extend_from_slice(body);
-        // Only `data` carries the sentinel, so decode_wav's repair walks past
-        // LIST; both paths must agree.
-        assert_stream_matches_decode_wav(&wav);
+        ffmpeg.extend_from_slice(&clean[44..]);
+        for (row, wav) in [
+            ("i16 mono", make_i16_wav(24_000, 1, 1000)),
+            ("i16 stereo", make_i16_wav(48_000, 2, 777)),
+            ("f32 mono", make_f32_wav(44_100, 1, 500)),
+            ("f32 stereo", make_f32_wav(44_100, 2, 333)),
+            ("int 8-bit", make_int_wav(8)),
+            ("int 24-bit (extensible)", make_int_wav(24)),
+            ("int 32-bit (extensible)", make_int_wav(32)),
+            ("ffmpeg LIST chunk, sentinel sizes", ffmpeg),
+        ] {
+            assert_stream_matches_decode_wav(row, &wav);
+        }
     }
 
     #[test]
@@ -1756,12 +1741,15 @@ mod tests {
         assert_eq!(samples.len(), 20);
     }
 
+    /// Resample `src` in uneven chunks and check it against
+    /// `resample_remap`; a failure names the row by its values.
     fn assert_resampler_matches(src: &[f32], sc: u16, sr: u32, dc: u16, dr: u32, seed: u64) {
         let expected = resample_remap(src, sc, sr, dc, dr);
         let mut rs = StreamResampler::new(sc, sr, dc, dr);
         let mut out = Vec::new();
         let mut rng = Lcg(seed);
         let frames = src.len() / sc as usize;
+        let row = format!("{frames} frames, {sc} ch {sr} Hz to {dc} ch {dr} Hz, seed {seed}");
         let mut f = 0;
         while f < frames {
             // Uneven chunks, including empty and single-frame ones.
@@ -1772,14 +1760,18 @@ mod tests {
         rs.finish(&mut out);
         let dc = dc as usize;
         let len_diff = (out.len() as isize - expected.len() as isize).unsigned_abs();
-        assert!(len_diff <= dc, "{} vs {}", out.len(), expected.len());
+        assert!(len_diff <= dc, "{row}: {} vs {}", out.len(), expected.len());
         for (i, (a, b)) in out.iter().zip(&expected).enumerate() {
-            assert!((a - b).abs() < 1e-4, "sample {i}: {a} vs {b}");
+            assert!((a - b).abs() < 1e-4, "{row}: sample {i}: {a} vs {b}");
         }
         // Bounded memory: at most one output step of history (plus the
         // interpolation neighbour) is retained.
         let bound = (sr as usize).div_ceil(dr as usize) + 2;
-        assert!(rs.mono.len() <= bound, "retained {} frames", rs.mono.len());
+        assert!(
+            rs.mono.len() <= bound,
+            "{row}: retained {} frames",
+            rs.mono.len()
+        );
     }
 
     fn tone(frames: usize, channels: u16) -> Vec<f32> {
@@ -1788,28 +1780,24 @@ mod tests {
             .collect()
     }
 
+    /// The streaming resampler matches `resample_remap`, fed in uneven
+    /// chunks, at every rate and channel change, down to a 3-frame and a
+    /// 1-frame input.
     #[test]
-    fn stream_resampler_24k_mono_to_48k_stereo_matches() {
-        let src = tone(2_401, 1);
-        for seed in 1..6 {
-            assert_resampler_matches(&src, 1, 24_000, 2, 48_000, seed);
+    fn stream_resampler_matches_resample_remap() {
+        for (frames, sc, sr, dc, dr, seeds) in [
+            (2_401, 1, 24_000, 2, 48_000, 1..6),
+            (4_801, 2, 48_000, 2, 44_100, 1..6),
+            (1_000, 1, 22_050, 2, 48_000, 11..12),
+            (1_000, 2, 16_000, 1, 16_000, 12..13),
+            (3, 1, 48_000, 2, 8_000, 13..14),
+            (1, 1, 24_000, 2, 48_000, 14..15),
+        ] {
+            let src = tone(frames, sc);
+            for seed in seeds {
+                assert_resampler_matches(&src, sc, sr, dc, dr, seed);
+            }
         }
-    }
-
-    #[test]
-    fn stream_resampler_48k_stereo_to_44k1_stereo_matches() {
-        let src = tone(4_801, 2);
-        for seed in 1..6 {
-            assert_resampler_matches(&src, 2, 48_000, 2, 44_100, seed);
-        }
-    }
-
-    #[test]
-    fn stream_resampler_other_ratios_match() {
-        assert_resampler_matches(&tone(1_000, 1), 1, 22_050, 2, 48_000, 11);
-        assert_resampler_matches(&tone(1_000, 2), 2, 16_000, 1, 16_000, 12);
-        assert_resampler_matches(&tone(3, 1), 1, 48_000, 2, 8_000, 13);
-        assert_resampler_matches(&tone(1, 1), 1, 24_000, 2, 48_000, 14);
     }
 
     #[test]
