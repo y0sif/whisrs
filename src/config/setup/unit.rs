@@ -505,67 +505,68 @@ mod tests {
 
     /// `whisrs setup` rewrites the packaged unit's `ExecStart=` instead of
     /// copying it, because systemd resolves a bare `whisrsd` against a
-    /// compiled-in search path that never contains `~/.cargo/bin`. Verified
-    /// directly: a user unit with `ExecStart=whisrsd` fails to run while the
-    /// same unit with an absolute path starts, on the same binary.
+    /// compiled-in search path that never contains `~/.cargo/bin`: a user
+    /// unit with `ExecStart=whisrsd` fails to run while the same unit with an
+    /// absolute path starts, on the same binary. Only the binary token
+    /// changes.
     #[test]
-    fn exec_start_rewrite_repoints_the_binary() {
-        let out = rewrite_exec_start("[Service]\nExecStart=whisrsd\n", "/opt/bin/whisrsd");
-        assert_eq!(out, "[Service]\nExecStart=/opt/bin/whisrsd\n");
-    }
-
-    /// The obvious spelling of the rewrite replaces the whole line, which
-    /// throws away every argument. `contrib/whisrs.service` carries none
-    /// today, so nothing would have caught it: the first flag added to the
-    /// unit would just stop reaching the daemon, on the install path least
-    /// likely to be re-tested.
-    #[test]
-    fn exec_start_rewrite_keeps_arguments() {
-        let out = rewrite_exec_start("ExecStart=whisrsd --foo bar\n", "/opt/bin/whisrsd");
-        assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo bar\n");
-
-        // Not `split_once(' ')`: systemd tokenises on any whitespace run, and a
-        // space-only split drops a tab-separated flag entirely.
-        let out = rewrite_exec_start("ExecStart=whisrsd\t--foo\n", "/opt/bin/whisrsd");
-        assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo\n");
-    }
-
-    /// systemd strips whitespace around a directive value, so `ExecStart= x`
-    /// names the binary `x`. Splitting on whitespace before trimming re-emits
-    /// that name as an argument to the path just resolved, producing
-    /// `ExecStart=/abs/whisrsd whisrsd`, which clap rejects with exit 2 while
-    /// `Restart=on-failure` burns its retries. The whole-line replace this
-    /// function replaced was accidentally right here, so the argument fix has
-    /// to not regress it.
-    #[test]
-    fn exec_start_rewrite_trims_before_splitting() {
-        let out = rewrite_exec_start("ExecStart= whisrsd\n", "/opt/bin/whisrsd");
-        assert_eq!(out, "ExecStart=/opt/bin/whisrsd\n");
-
-        let out = rewrite_exec_start("ExecStart=  whisrsd --foo\n", "/opt/bin/whisrsd");
-        assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo\n");
-    }
-
-    /// systemd's execution prefixes sit before the binary, so a rewrite that
-    /// starts at the `=` swallows them. `@` in particular takes the next token
-    /// as argv[0], so dropping it silently promotes that token to a real
-    /// argument.
-    #[test]
-    fn exec_start_rewrite_keeps_execution_prefixes() {
-        let out = rewrite_exec_start("ExecStart=-whisrsd\n", "/opt/bin/whisrsd");
-        assert_eq!(out, "ExecStart=-/opt/bin/whisrsd\n");
-
-        let out = rewrite_exec_start("ExecStart=@whisrsd argv0 --foo\n", "/opt/bin/whisrsd");
-        assert_eq!(out, "ExecStart=@/opt/bin/whisrsd argv0 --foo\n");
-    }
-
-    /// `ExecStartPre=`/`ExecStartPost=`/`ExecStop=` are not the daemon, so
-    /// repointing them at the daemon path would be nonsense. `starts_with`
-    /// on the bare directive name would match the first two.
-    #[test]
-    fn exec_start_rewrite_leaves_sibling_directives_alone() {
-        let unit = "ExecStartPre=/bin/true\nExecStartPost=/bin/true\nExecStop=/bin/kill\n";
-        assert_eq!(rewrite_exec_start(unit, "/opt/bin/whisrsd"), unit);
+    fn exec_start_rewrite_replaces_only_the_binary() {
+        let siblings = "ExecStartPre=/bin/true\nExecStartPost=/bin/true\nExecStop=/bin/kill\n";
+        for (row, unit, expected) in [
+            (
+                "bare name",
+                "[Service]\nExecStart=whisrsd\n",
+                "[Service]\nExecStart=/opt/bin/whisrsd\n",
+            ),
+            // The arguments stay: the first flag added to the unit must
+            // still reach the daemon.
+            (
+                "arguments",
+                "ExecStart=whisrsd --foo bar\n",
+                "ExecStart=/opt/bin/whisrsd --foo bar\n",
+            ),
+            // systemd tokenises on any whitespace run, not only a space.
+            (
+                "tab before an argument",
+                "ExecStart=whisrsd\t--foo\n",
+                "ExecStart=/opt/bin/whisrsd --foo\n",
+            ),
+            // systemd strips whitespace around the value, so `ExecStart= x`
+            // names the binary `x`, which must not come back as an argument
+            // (clap rejects it, and `Restart=on-failure` burns its retries).
+            (
+                "space after =",
+                "ExecStart= whisrsd\n",
+                "ExecStart=/opt/bin/whisrsd\n",
+            ),
+            (
+                "spaces after =, argument",
+                "ExecStart=  whisrsd --foo\n",
+                "ExecStart=/opt/bin/whisrsd --foo\n",
+            ),
+            // Execution prefixes sit before the binary. `@` takes the next
+            // token as argv[0], so dropping it promotes that token to an
+            // argument.
+            (
+                "- prefix",
+                "ExecStart=-whisrsd\n",
+                "ExecStart=-/opt/bin/whisrsd\n",
+            ),
+            (
+                "@ prefix and argv0",
+                "ExecStart=@whisrsd argv0 --foo\n",
+                "ExecStart=@/opt/bin/whisrsd argv0 --foo\n",
+            ),
+            // Not the daemon: `starts_with` on the bare directive name would
+            // match the first two.
+            ("sibling directives", siblings, siblings),
+        ] {
+            assert_eq!(
+                rewrite_exec_start(unit, "/opt/bin/whisrsd"),
+                expected,
+                "{row}"
+            );
+        }
     }
 
     /// The rewrite is the only edit: comments, blank lines, section order and
@@ -598,56 +599,51 @@ mod tests {
         );
     }
 
-    /// The reader behind the issue #146 repoint check must pick the same
-    /// token the rewrite replaces, or setup would offer a repoint it then
-    /// applies to a different part of the line.
+    /// The reader behind the repoint check picks the token the rewrite
+    /// replaces, or setup would offer a repoint it then applies to a
+    /// different part of the line; `None` without an `ExecStart=` that names
+    /// a binary.
     #[test]
-    fn exec_start_binary_reads_plain_and_argument_forms() {
-        assert_eq!(
-            exec_start_binary("[Service]\nExecStart=/usr/bin/whisrsd\n"),
-            Some("/usr/bin/whisrsd")
-        );
-        assert_eq!(
-            exec_start_binary("ExecStart=/usr/bin/whisrsd --foo bar\n"),
-            Some("/usr/bin/whisrsd")
-        );
-        assert_eq!(
-            exec_start_binary("ExecStart=/usr/bin/whisrsd\t--foo\n"),
-            Some("/usr/bin/whisrsd")
-        );
-    }
-
-    #[test]
-    fn exec_start_binary_strips_prefixes_and_leading_whitespace() {
-        for line in [
-            "ExecStart=@/usr/bin/whisrsd argv0",
-            "ExecStart=-/usr/bin/whisrsd",
-            "ExecStart=:/usr/bin/whisrsd",
-            "ExecStart=+/usr/bin/whisrsd",
-            "ExecStart=!/usr/bin/whisrsd",
-            "ExecStart=-@/usr/bin/whisrsd argv0",
-            "ExecStart=  /usr/bin/whisrsd --foo",
+    fn exec_start_binary_reads_the_token_the_rewrite_replaces() {
+        for (unit, expected) in [
+            (
+                "[Service]\nExecStart=/usr/bin/whisrsd\n",
+                Some("/usr/bin/whisrsd"),
+            ),
+            (
+                "ExecStart=/usr/bin/whisrsd --foo bar\n",
+                Some("/usr/bin/whisrsd"),
+            ),
+            (
+                "ExecStart=/usr/bin/whisrsd\t--foo\n",
+                Some("/usr/bin/whisrsd"),
+            ),
+            (
+                "ExecStart=@/usr/bin/whisrsd argv0",
+                Some("/usr/bin/whisrsd"),
+            ),
+            ("ExecStart=-/usr/bin/whisrsd", Some("/usr/bin/whisrsd")),
+            ("ExecStart=:/usr/bin/whisrsd", Some("/usr/bin/whisrsd")),
+            ("ExecStart=+/usr/bin/whisrsd", Some("/usr/bin/whisrsd")),
+            ("ExecStart=!/usr/bin/whisrsd", Some("/usr/bin/whisrsd")),
+            (
+                "ExecStart=-@/usr/bin/whisrsd argv0",
+                Some("/usr/bin/whisrsd"),
+            ),
+            (
+                "ExecStart=  /usr/bin/whisrsd --foo",
+                Some("/usr/bin/whisrsd"),
+            ),
+            // The shipped unit's line, which
+            // exec_start_rewrite_touches_nothing_else_in_the_shipped_unit pins.
+            ("ExecStart=whisrsd\n", Some("whisrsd")),
+            ("[Service]\nRestart=on-failure\n", None),
+            ("ExecStartPre=/bin/true\nExecStartPost=/bin/true\n", None),
+            ("ExecStart=\n", None),
+            ("ExecStart=  \n", None),
         ] {
-            assert_eq!(exec_start_binary(line), Some("/usr/bin/whisrsd"), "{line}");
+            assert_eq!(exec_start_binary(unit), expected, "{unit:?}");
         }
-    }
-
-    #[test]
-    fn exec_start_binary_is_none_without_an_exec_start() {
-        assert_eq!(exec_start_binary("[Service]\nRestart=on-failure\n"), None);
-        assert_eq!(
-            exec_start_binary("ExecStartPre=/bin/true\nExecStartPost=/bin/true\n"),
-            None
-        );
-        assert_eq!(exec_start_binary("ExecStart=\n"), None);
-        assert_eq!(exec_start_binary("ExecStart=  \n"), None);
-    }
-
-    #[test]
-    fn exec_start_binary_reads_the_shipped_unit() {
-        let src = find_contrib_file("whisrs.service").expect("contrib/whisrs.service is on disk");
-        let unit = std::fs::read_to_string(&src).expect("contrib unit is readable");
-        assert_eq!(exec_start_binary(&unit), Some("whisrsd"));
     }
 
     /// Two real files plus a symlink to one of them, in a scratch dir.
@@ -804,32 +800,25 @@ mod tests {
         assert!(!needs_repoint("whisrsd", Path::new("whisrsd")));
     }
 
+    /// `%h` is the home and `%%` a literal `%`; any other specifier, or a
+    /// lone trailing `%`, cannot be resolved here.
     #[test]
-    fn expand_unit_specifiers_handles_home_and_literal_percent() {
+    fn expand_unit_specifiers_expands_h_and_percent_only() {
         let home = tempfile::tempdir().unwrap();
-        let expected = format!("{}/.cargo/bin/whisrsd", home.path().display());
-        assert_eq!(
-            expand_unit_specifiers("%h/.cargo/bin/whisrsd", home.path()),
-            Some(expected)
-        );
-        assert_eq!(
-            expand_unit_specifiers("/opt/100%%/whisrsd", home.path()),
-            Some("/opt/100%/whisrsd".to_string())
-        );
-        assert_eq!(
-            expand_unit_specifiers("/usr/bin/whisrsd", home.path()),
-            Some("/usr/bin/whisrsd".to_string())
-        );
-    }
-
-    #[test]
-    fn expand_unit_specifiers_rejects_unsupported_specifiers() {
-        let home = tempfile::tempdir().unwrap();
-        assert_eq!(expand_unit_specifiers("%U/x", home.path()), None);
-        assert_eq!(
-            expand_unit_specifiers("/usr/bin/whisrsd%", home.path()),
-            None
-        );
+        let in_home = format!("{}/.cargo/bin/whisrsd", home.path().display());
+        for (token, expected) in [
+            ("%h/.cargo/bin/whisrsd", Some(in_home.as_str())),
+            ("/opt/100%%/whisrsd", Some("/opt/100%/whisrsd")),
+            ("/usr/bin/whisrsd", Some("/usr/bin/whisrsd")),
+            ("%U/x", None),
+            ("/usr/bin/whisrsd%", None),
+        ] {
+            assert_eq!(
+                expand_unit_specifiers(token, home.path()).as_deref(),
+                expected,
+                "{token}"
+            );
+        }
     }
 
     /// The inline OpenRC fallback is used on `cargo install`, where `contrib/`
