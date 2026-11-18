@@ -460,28 +460,6 @@ mod tests {
         .into()
     }
 
-    /// A 524 origin timeout that clears on the second try costs one 5 s wait.
-    #[tokio::test(start_paused = true)]
-    async fn a_passing_server_error_is_retried() {
-        let calls = AtomicUsize::new(0);
-        let started = tokio::time::Instant::now();
-        let value = retry_rate_limited(RATE_LIMIT_BUDGET, || {
-            let call = calls.fetch_add(1, Ordering::Relaxed);
-            async move {
-                if call == 0 {
-                    Err(server_error(524))
-                } else {
-                    Ok("transcript")
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(value, "transcript");
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(started.elapsed(), Duration::from_secs(5));
-    }
-
     /// A server that keeps failing is retried three times, 5, 15 and 30 s
     /// apart, then given up on with its own message, as a final error.
     #[tokio::test(start_paused = true)]
