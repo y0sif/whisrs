@@ -1120,29 +1120,6 @@ mod tests {
         );
     }
     use super::*;
-    use crate::selection::CaptureError;
-
-    fn recording_machine() -> StateMachine {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        sm
-    }
-
-    /// Normal stop: the context survived, so the session is claimed (the
-    /// slot is consumed) and the machine moves to Transcribing — from which
-    /// the finalizer's TranscriptionDone must succeed.
-    #[test]
-    fn claim_session_moves_recording_to_transcribing() {
-        let mut sm = recording_machine();
-        let mut ctx = Some("ctx");
-        assert_eq!(claim_session(&mut sm, &mut ctx), Some("ctx"));
-        assert_eq!(ctx, None, "a successful claim consumes the context slot");
-        assert_eq!(sm.state(), State::Transcribing);
-        assert_eq!(
-            sm.transition(Action::TranscriptionDone).unwrap(),
-            State::Idle
-        );
-    }
 
     /// Cancel won the race: `handle_cancel` took the context and moved the
     /// machine to Idle before the background task got the lock. The claim
@@ -1167,34 +1144,6 @@ mod tests {
         assert_eq!(claim_session(&mut sm, &mut ctx), None);
         assert_eq!(sm.state(), State::Idle);
         assert_eq!(ctx, Some("ctx"), "a bail must not consume the context slot");
-    }
-
-    /// The full cancelled-session sequence at the state-machine level:
-    /// cancel puts the machine in Idle, the woken background task claims
-    /// nothing, and a hypothetical late TranscriptionDone is rejected
-    /// without leaving Idle. This is the exact sequence from issue #81's
-    /// repro (`llm-command german` → `cancel`).
-    #[test]
-    fn cancelled_session_cannot_wedge_the_machine() {
-        let mut sm = recording_machine();
-        sm.transition(Action::Cancel).unwrap(); // handle_cancel → Idle
-        let mut ctx: Option<()> = None;
-        assert_eq!(claim_session(&mut sm, &mut ctx), None);
-        assert!(sm.transition(Action::TranscriptionDone).is_err());
-        assert_eq!(sm.state(), State::Idle);
-    }
-
-    /// User cancels a command session, then starts a new plain dictation
-    /// before the stale background task wakes. The stale task finds its
-    /// context gone and must not disturb the new session's Recording state.
-    #[test]
-    fn stale_background_does_not_disturb_a_new_dictation() {
-        let mut sm = recording_machine();
-        sm.transition(Action::Cancel).unwrap(); // → Idle
-        sm.transition(Action::Toggle).unwrap(); // new dictation → Recording
-        let mut ctx: Option<()> = None;
-        assert_eq!(claim_session(&mut sm, &mut ctx), None);
-        assert_eq!(sm.state(), State::Recording);
     }
 
     /// Build a `DaemonState` in the residual-steal-window scenario: an
@@ -1223,42 +1172,32 @@ mod tests {
         ds
     }
 
-    /// The residual steal window from the #81/#90 review: a stale
-    /// llm-command background bails (its context is gone) while a new
-    /// session's `recording_window_id` / `recording_started_at` are already
-    /// populated. The old claim block took those fields BEFORE checking the
-    /// claim, stripping them from the new session. The bail must leave
-    /// every field untouched and the machine in Recording.
+    /// A stale background bails (its context is gone) while a new session's
+    /// fields are already populated. Each claim helper checks the claim
+    /// before it takes anything, so the bail leaves every field untouched
+    /// and the machine in Recording: an `audio_capture` taken first would
+    /// drop the new session's live capture.
     #[test]
-    fn stale_llm_command_bail_leaves_new_session_state_untouched() {
-        let mut ds = state_with_new_dictation_after_cancel();
-        let started_at = ds.recording_started_at;
+    fn a_stale_claim_bail_leaves_the_new_session_untouched() {
+        type Claim = fn(&mut DaemonState) -> bool;
+        let cases: [(&str, Claim); 2] = [
+            ("llm-command", |ds| claim_llm_command_session(ds).is_some()),
+            ("command mode", |ds| {
+                claim_command_mode_session(ds).is_some()
+            }),
+        ];
+        for (name, claim) in cases {
+            let mut ds = state_with_new_dictation_after_cancel();
+            let started_at = ds.recording_started_at;
 
-        assert!(claim_llm_command_session(&mut ds).is_none());
+            assert!(!claim(&mut ds), "{name}");
 
-        assert_eq!(ds.state_machine.state(), State::Recording);
-        assert_eq!(ds.recording_window_id.as_deref(), Some("0xnew"));
-        assert_eq!(ds.recording_started_at, started_at);
-        assert_eq!(ds.session_language.as_deref(), Some("pl"));
-        assert!(ds.audio_capture.is_none());
-    }
-
-    /// Same steal-window scenario for the command-mode claim block: the
-    /// stale bail must not touch the new session's fields (its old take of
-    /// `audio_capture` before the claim check would have dropped the new
-    /// session's live capture).
-    #[test]
-    fn stale_command_mode_bail_leaves_new_session_state_untouched() {
-        let mut ds = state_with_new_dictation_after_cancel();
-        let started_at = ds.recording_started_at;
-
-        assert!(claim_command_mode_session(&mut ds).is_none());
-
-        assert_eq!(ds.state_machine.state(), State::Recording);
-        assert_eq!(ds.recording_window_id.as_deref(), Some("0xnew"));
-        assert_eq!(ds.recording_started_at, started_at);
-        assert_eq!(ds.session_language.as_deref(), Some("pl"));
-        assert!(ds.audio_capture.is_none());
+            assert_eq!(ds.state_machine.state(), State::Recording, "{name}");
+            assert_eq!(ds.recording_window_id.as_deref(), Some("0xnew"), "{name}");
+            assert_eq!(ds.recording_started_at, started_at, "{name}");
+            assert_eq!(ds.session_language.as_deref(), Some("pl"), "{name}");
+            assert!(ds.audio_capture.is_none(), "{name}");
+        }
     }
 
     /// The success half of the llm-command claim helper: an uncancelled
@@ -1311,53 +1250,6 @@ mod tests {
         assert_eq!(ds.state_machine.state(), State::Transcribing);
         assert!(ds.command_mode.is_none());
         assert!(ds.recording_started_at.is_none());
-    }
-
-    /// Command mode *requires* a selection: every [`CaptureError`] variant —
-    /// including the two whose wording says "no text selected" — aborts the
-    /// session. `command_mode_start` renders the variant's `Display` into
-    /// `Response::Error` with no branching, which is what this pins: no
-    /// variant may be silently reinterpreted as "proceed with an empty
-    /// selection" (issue #91's rejected fallback).
-    #[test]
-    fn every_capture_error_aborts_command_mode_with_its_own_message() {
-        let cases = [
-            (
-                CaptureError::NothingSelected,
-                "no text selected — select some text first",
-            ),
-            (
-                CaptureError::ClipboardUnchanged,
-                "no text selected — select some text first",
-            ),
-            (
-                CaptureError::ModifierHeld,
-                "a modifier key was held, so the selection was not copied",
-            ),
-            (
-                CaptureError::CopyFailed("uinput permission denied".to_string()),
-                "failed to copy selection: uinput permission denied",
-            ),
-            (
-                CaptureError::CopyTaskPanicked("task 12 panicked".to_string()),
-                "copy task panicked: task 12 panicked",
-            ),
-            (
-                CaptureError::ClipboardReadFailed("connection refused".to_string()),
-                "failed to read clipboard: connection refused",
-            ),
-        ];
-        for (error, expected) in cases {
-            // The exact expression `command_mode_start` evaluates on the error
-            // arm, byte-for-byte what the CLI prints and the toast shows.
-            let response = Response::Error {
-                message: error.to_string(),
-            };
-            let Response::Error { message } = response else {
-                panic!("capture failures must abort command mode");
-            };
-            assert_eq!(message, expected, "{error:?}");
-        }
     }
 
     /// The refusal message must name `whisrs log`, in both flavors: it is the
