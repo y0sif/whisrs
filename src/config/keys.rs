@@ -346,42 +346,31 @@ api_key = "tts-SECRET-gggg"
         }
     }
 
+    /// Each keyed backend, as the daemon resolves it: a non-empty env key
+    /// wins, with or without a key in the file; else the file's key; else
+    /// none (the sidecar's is optional).
     #[test]
-    fn key_summary_shows_an_env_key_without_a_config_key() {
+    fn key_summary_of_each_keyed_backend() {
         for &(backend, section, var) in KEYED_BACKENDS {
             let absent = format!("[general]\nbackend = \"{backend}\"\n");
             let empty = format!("{absent}[{section}]\napi_key = \"\"\n");
-            for toml in [absent, empty] {
-                let summary = key_summary(&toml, &[(var, "env-key-9876")]);
-                assert_eq!(summary, env_key(var, "****9876"), "{backend}");
-            }
-        }
-    }
-
-    #[test]
-    fn key_summary_prefers_the_env_key_like_the_daemon() {
-        for &(backend, section, var) in KEYED_BACKENDS {
-            let toml = format!(
-                "[general]\nbackend = \"{backend}\"\n[{section}]\napi_key = \"file-key-1234\"\n"
-            );
-            let both = key_summary(&toml, &[(var, "env-key-9876")]);
-            assert_eq!(both, env_key(var, "****9876"), "{backend}");
-
-            let file_only = key_summary(&toml, &[]);
-            assert_eq!(file_only, file_key("****1234"), "{backend}");
-        }
-    }
-
-    #[test]
-    fn key_summary_without_any_key_is_unchanged() {
-        for &(backend, section, _) in KEYED_BACKENDS {
-            let summary = key_summary(&format!("[general]\nbackend = \"{backend}\"\n"), &[]);
-            let expected = if section == "asr-sidecar" {
+            let keyed = format!("{absent}[{section}]\napi_key = \"file-key-1234\"\n");
+            let none = if section == "asr-sidecar" {
                 KeySummary::Optional("API key")
             } else {
                 KeySummary::NotSet
             };
-            assert_eq!(summary, expected, "{backend}");
+            let env = [(var, "env-key-9876")];
+            let from_env = env_key(var, "****9876");
+            for (row, toml, env, expected) in [
+                ("env, no section", &absent, &env[..], from_env.clone()),
+                ("env, an empty file key", &empty, &env[..], from_env.clone()),
+                ("env over the file", &keyed, &env[..], from_env),
+                ("the file alone", &keyed, &[][..], file_key("****1234")),
+                ("nothing", &absent, &[][..], none),
+            ] {
+                assert_eq!(key_summary(toml, env), expected, "{backend}: {row}");
+            }
         }
     }
 
