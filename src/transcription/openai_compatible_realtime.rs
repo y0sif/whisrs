@@ -189,62 +189,67 @@ mod tests {
     use tokio::time::{sleep, timeout, Duration};
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-    #[test]
-    fn rejects_empty_url() {
-        let err = OpenAiCompatibleRealtimeBackend::new(
-            String::new(),
+    const LOCAL_URL: &str = "ws://localhost:1234/realtime";
+
+    /// A Lemonade backend on `url` with server VAD and no key.
+    fn lemonade(url: &str) -> OpenAiCompatibleRealtimeBackend {
+        OpenAiCompatibleRealtimeBackend::new(
+            url.to_string(),
             "Whisper-Tiny".to_string(),
             "lemonade".to_string(),
             "server-vad".to_string(),
             None,
         )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("URL cannot be empty"));
+        .unwrap()
     }
 
     #[test]
-    fn rejects_non_websocket_url() {
-        let err = OpenAiCompatibleRealtimeBackend::new(
-            "http://localhost:1234/realtime".to_string(),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("ws:// or wss://"));
-    }
-
-    #[test]
-    fn rejects_empty_model() {
-        let err = OpenAiCompatibleRealtimeBackend::new(
-            "ws://localhost:1234/realtime".to_string(),
-            "  ".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("model cannot be empty"));
-    }
-
-    #[test]
-    fn rejects_unsupported_profile() {
-        let err = OpenAiCompatibleRealtimeBackend::new(
-            "ws://localhost:1234/realtime".to_string(),
-            "Whisper-Tiny".to_string(),
-            "openai".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("supports only the 'lemonade' and 'llamacpp' profiles"));
+    fn new_rejects_an_unusable_config() {
+        for (name, args, want) in [
+            (
+                "empty URL",
+                ["", "Whisper-Tiny", "lemonade", "server-vad"],
+                "URL cannot be empty",
+            ),
+            (
+                "http URL",
+                [
+                    "http://localhost:1234/realtime",
+                    "Whisper-Tiny",
+                    "lemonade",
+                    "server-vad",
+                ],
+                "ws:// or wss://",
+            ),
+            (
+                "blank model",
+                [LOCAL_URL, "  ", "lemonade", "server-vad"],
+                "model cannot be empty",
+            ),
+            (
+                "openai profile",
+                [LOCAL_URL, "Whisper-Tiny", "openai", "server-vad"],
+                "supports only the 'lemonade' and 'llamacpp' profiles",
+            ),
+            (
+                "unknown profile",
+                [LOCAL_URL, "Whisper-Tiny", "bogus", "server-vad"],
+                "unsupported OpenAI-compatible realtime profile 'bogus'",
+            ),
+            (
+                "unknown turn detection",
+                [LOCAL_URL, "Whisper-Tiny", "lemonade", "bogus"],
+                "unsupported turn detection",
+            ),
+        ] {
+            let [url, model, profile, turn_detection] = args.map(str::to_string);
+            let Err(err) =
+                OpenAiCompatibleRealtimeBackend::new(url, model, profile, turn_detection, None)
+            else {
+                panic!("{name}: accepted");
+            };
+            assert!(err.to_string().contains(want), "{name}: {err}");
+        }
     }
 
     /// `lemonade` forwards completed utterances, so queued ones need a space
@@ -283,20 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_turn_detection() {
-        let err = OpenAiCompatibleRealtimeBackend::new(
-            "ws://localhost:1234/realtime".to_string(),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "bogus".to_string(),
-            None,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("unsupported turn detection"));
-    }
-
-    #[test]
     fn trims_optional_bearer_and_sanitizes_endpoint_display() {
         let backend = OpenAiCompatibleRealtimeBackend::new(
             "ws://user:secret@localhost:1234/realtime".to_string(),
@@ -312,18 +303,12 @@ mod tests {
             backend.endpoint_display,
             "ws://localhost:1234/realtime".to_string()
         );
+        assert_eq!(backend.turn_detection, TurnDetectionMode::ManualCommit);
     }
 
     #[test]
     fn falls_back_to_configured_model_when_request_model_is_blank() {
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            "ws://localhost:1234/realtime".to_string(),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap();
+        let backend = lemonade(LOCAL_URL);
 
         let request = backend.request_for_call(&TranscriptionConfig {
             language: "auto".to_string(),
@@ -340,30 +325,9 @@ mod tests {
 
     #[test]
     fn supports_streaming_is_true() {
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            "ws://localhost:1234/realtime".to_string(),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap();
+        let backend = lemonade(LOCAL_URL);
 
         assert!(backend.supports_streaming());
-    }
-
-    #[test]
-    fn accepts_manual_commit_turn_detection() {
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            "ws://localhost:1234/realtime".to_string(),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "manual-commit".to_string(),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(backend.turn_detection, TurnDetectionMode::ManualCommit);
     }
 
     fn test_request() -> TranscriptionConfig {
@@ -587,14 +551,7 @@ mod tests {
             sleep(Duration::from_millis(100)).await;
         });
 
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            format!("ws://{addr}/realtime"),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap();
+        let backend = lemonade(&format!("ws://{addr}/realtime"));
         let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(4);
         let (text_tx, _text_rx) = mpsc::channel::<String>(4);
 
@@ -635,15 +592,8 @@ mod tests {
             sleep(Duration::from_millis(250)).await;
         });
 
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            format!("ws://{addr}/realtime"),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap()
-        .with_final_completion_timeout(Duration::from_millis(50));
+        let backend = lemonade(&format!("ws://{addr}/realtime"))
+            .with_final_completion_timeout(Duration::from_millis(50));
         let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(4);
         let (text_tx, _text_rx) = mpsc::channel::<String>(4);
 
@@ -707,14 +657,7 @@ mod tests {
             }
         });
 
-        let backend = OpenAiCompatibleRealtimeBackend::new(
-            format!("ws://{addr}/realtime"),
-            "Whisper-Tiny".to_string(),
-            "lemonade".to_string(),
-            "server-vad".to_string(),
-            None,
-        )
-        .unwrap();
+        let backend = lemonade(&format!("ws://{addr}/realtime"));
         let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(4);
         let (text_tx, mut text_rx) = mpsc::channel::<String>(4);
 

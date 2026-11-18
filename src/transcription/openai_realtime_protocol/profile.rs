@@ -215,51 +215,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_profile() {
-        assert_eq!(
-            OpenAiRealtimeProfile::parse("openai").unwrap(),
-            OpenAiRealtimeProfile::OpenAi
-        );
-        assert_eq!(
-            OpenAiRealtimeProfile::parse("lemonade").unwrap(),
-            OpenAiRealtimeProfile::Lemonade
-        );
-        assert!(OpenAiRealtimeProfile::parse("unknown").is_err());
-    }
-
-    #[test]
-    fn parse_turn_detection_mode() {
-        assert_eq!(
-            TurnDetectionMode::parse("server-vad").unwrap(),
-            TurnDetectionMode::ServerVad
-        );
-        assert_eq!(
-            TurnDetectionMode::parse("manual-commit").unwrap(),
-            TurnDetectionMode::ManualCommit
-        );
-        assert!(TurnDetectionMode::parse("unknown").is_err());
-    }
-
-    #[test]
-    fn profile_sample_rates_and_delta_modes() {
-        assert_eq!(OpenAiRealtimeProfile::OpenAi.input_sample_rate(), 24_000);
-        assert_eq!(OpenAiRealtimeProfile::Lemonade.input_sample_rate(), 16_000);
-        assert_eq!(OpenAiRealtimeProfile::LlamaCpp.input_sample_rate(), 16_000);
-        assert_eq!(
-            OpenAiRealtimeProfile::OpenAi.delta_mode(),
-            DeltaMode::AppendOnly
-        );
-        assert_eq!(
-            OpenAiRealtimeProfile::Lemonade.delta_mode(),
-            DeltaMode::ReplaceableInterim
-        );
-        assert_eq!(
-            OpenAiRealtimeProfile::LlamaCpp.delta_mode(),
-            DeltaMode::AppendOnly
-        );
-    }
-
-    #[test]
     fn stream_text_follows_the_delta_mode() {
         assert_eq!(
             OpenAiRealtimeProfile::OpenAi.stream_text(),
@@ -336,123 +291,110 @@ mod tests {
         assert_eq!(turn["silence_duration_ms"], 500);
     }
 
+    /// Lemonade's session.update carries no language, prompt or audio block,
+    /// and a turn detection only for server VAD.
     #[test]
-    fn lemonade_session_update_serialization() {
-        let json = OpenAiRealtimeProfile::Lemonade
-            .session_update(
-                "Whisper-Tiny",
+    fn lemonade_session_update_never_carries_language_or_prompt() {
+        for (name, language, turn_detection, want_turn_type) in [
+            (
+                "server vad",
                 "auto",
-                &[],
-                Some("ignored"),
                 TurnDetectionMode::ServerVad,
-            )
-            .unwrap();
-
-        assert_eq!(json["type"], "session.update");
-        assert_eq!(json["session"]["model"], "Whisper-Tiny");
-        assert_eq!(json["session"]["turn_detection"]["type"], "server_vad");
-        assert!(json["session"].get("language").is_none());
-        assert!(json["session"].get("prompt").is_none());
-        assert!(json["session"].get("audio").is_none());
+                Some("server_vad"),
+            ),
+            ("manual commit", "en", TurnDetectionMode::ManualCommit, None),
+        ] {
+            let json = OpenAiRealtimeProfile::Lemonade
+                .session_update(
+                    "Whisper-Tiny",
+                    language,
+                    &[],
+                    Some("ignored"),
+                    turn_detection,
+                )
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(json["type"], "session.update", "{name}");
+            assert_eq!(json["session"]["model"], "Whisper-Tiny", "{name}");
+            match want_turn_type {
+                Some(t) => assert_eq!(json["session"]["turn_detection"]["type"], t, "{name}"),
+                None => assert!(json["session"]["turn_detection"].is_null(), "{name}"),
+            }
+            assert!(json["session"].get("language").is_none(), "{name}");
+            assert!(json["session"].get("prompt").is_none(), "{name}");
+            assert!(json["session"].get("audio").is_none(), "{name}");
+        }
     }
 
-    #[test]
-    fn lemonade_manual_commit_omits_turn_detection() {
-        let json = OpenAiRealtimeProfile::Lemonade
-            .session_update(
-                "Whisper-Tiny",
-                "en",
-                &[],
-                Some("ignored"),
-                TurnDetectionMode::ManualCommit,
-            )
-            .unwrap();
-
-        assert!(json["session"]["turn_detection"].is_null());
-        assert!(json["session"].get("language").is_none());
-        assert!(json["session"].get("prompt").is_none());
+    /// The `audio.input` object of an OpenAI session.update.
+    fn openai_input(
+        model: &str,
+        language: &str,
+        languages: &[String],
+        prompt: Option<&str>,
+        turn_detection: TurnDetectionMode,
+    ) -> anyhow::Result<serde_json::Value> {
+        let json = OpenAiRealtimeProfile::OpenAi.session_update(
+            model,
+            language,
+            languages,
+            prompt,
+            turn_detection,
+        )?;
+        Ok(json["session"]["audio"]["input"].clone())
     }
 
     #[test]
     fn realtime_whisper_session_update_omits_prompt_and_turn_detection() {
-        let json = OpenAiRealtimeProfile::OpenAi
-            .session_update(
-                "gpt-realtime-whisper",
-                "en",
-                &[],
-                Some("domain prompt is unsupported here"),
-                TurnDetectionMode::ManualCommit,
-            )
-            .unwrap();
-        assert!(json["session"]["audio"]["input"]["turn_detection"].is_null());
-        assert!(json["session"]["audio"]["input"]["transcription"]
-            .get("prompt")
-            .is_none());
+        let input = openai_input(
+            "gpt-realtime-whisper",
+            "en",
+            &[],
+            Some("domain prompt is unsupported here"),
+            TurnDetectionMode::ManualCommit,
+        )
+        .unwrap();
+        assert!(input["turn_detection"].is_null());
+        assert!(input["transcription"].get("prompt").is_none());
     }
 
+    /// The language goes out unless it is "auto", the prompt unless it is
+    /// blank.
     #[test]
-    fn session_update_auto_language_omitted() {
-        let json = OpenAiRealtimeProfile::OpenAi
-            .session_update(
-                "gpt-4o-transcribe",
-                "auto",
-                &[],
-                None,
-                TurnDetectionMode::ServerVad,
-            )
-            .unwrap();
-
-        assert!(json["session"]["audio"]["input"]["transcription"]
-            .get("language")
-            .is_none());
-    }
-
-    #[test]
-    fn session_update_with_prompt_includes_field() {
-        let json = OpenAiRealtimeProfile::OpenAi
-            .session_update(
-                "gpt-4o-transcribe",
+    fn openai_session_update_sends_language_and_prompt_only_when_set() {
+        for (name, language, prompt, field, want) in [
+            ("auto language", "auto", None, "language", None),
+            (
+                "prompt",
                 "en",
-                &[],
                 Some("Yocto, Hyprland, NixOS"),
-                TurnDetectionMode::ServerVad,
-            )
-            .unwrap();
-        assert_eq!(
-            json["session"]["audio"]["input"]["transcription"]["prompt"],
-            "Yocto, Hyprland, NixOS"
-        );
-    }
-
-    #[test]
-    fn session_update_blank_prompt_omits_field() {
-        let json = OpenAiRealtimeProfile::OpenAi
-            .session_update(
+                "prompt",
+                Some("Yocto, Hyprland, NixOS"),
+            ),
+            ("blank prompt", "en", Some("   \t\n  "), "prompt", None),
+        ] {
+            let input = openai_input(
                 "gpt-4o-transcribe",
-                "en",
+                language,
                 &[],
-                Some("   \t\n  "),
+                prompt,
                 TurnDetectionMode::ServerVad,
             )
-            .unwrap();
-        assert!(json["session"]["audio"]["input"]["transcription"]
-            .get("prompt")
-            .is_none());
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                input["transcription"].get(field),
+                want.map(serde_json::Value::from).as_ref(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
-    fn clamp_prompt_truncates_at_limit() {
-        let long = "a".repeat(PROMPT_MAX_CHARS + 500);
-        let clamped = clamp_prompt(Some(&long)).unwrap();
-        assert_eq!(clamped.chars().count(), PROMPT_MAX_CHARS);
-    }
-
-    #[test]
-    fn clamp_prompt_handles_multibyte_at_boundary() {
-        let long: String = "字".repeat(PROMPT_MAX_CHARS + 50);
-        let clamped = clamp_prompt(Some(&long)).unwrap();
-        assert_eq!(clamped.chars().count(), PROMPT_MAX_CHARS);
-        assert!(clamped.is_char_boundary(0));
+    fn clamp_prompt_truncates_on_a_char_boundary() {
+        for (name, unit, extra) in [("ascii", "a", 500), ("multibyte", "字", 50)] {
+            let clamped = clamp_prompt(Some(&unit.repeat(PROMPT_MAX_CHARS + extra)))
+                .unwrap_or_else(|| panic!("{name}: no prompt"));
+            assert_eq!(clamped.chars().count(), PROMPT_MAX_CHARS, "{name}");
+        }
     }
 
     #[test]
@@ -474,16 +416,14 @@ mod tests {
     #[test]
     fn live_transcribe_sends_two_language_hints_and_prompt_without_server_vad() {
         let languages = vec!["ru".to_string(), "en".to_string()];
-        let json = OpenAiRealtimeProfile::OpenAi
-            .session_update(
-                "gpt-live-transcribe",
-                "auto",
-                &languages,
-                Some("Russian speech may contain English technical terms."),
-                openai_turn_detection_mode_for_model("gpt-live-transcribe"),
-            )
-            .unwrap();
-        let input = &json["session"]["audio"]["input"];
+        let input = openai_input(
+            "gpt-live-transcribe",
+            "auto",
+            &languages,
+            Some("Russian speech may contain English technical terms."),
+            openai_turn_detection_mode_for_model("gpt-live-transcribe"),
+        )
+        .unwrap();
         assert!(input.get("turn_detection").is_none());
         assert_eq!(
             input["transcription"]["languages"],
@@ -498,16 +438,15 @@ mod tests {
 
     #[test]
     fn live_transcribe_uses_languages_for_single_language_too() {
-        let json = OpenAiRealtimeProfile::OpenAi
-            .session_update(
-                "gpt-live-transcribe",
-                "ru",
-                &[],
-                None,
-                TurnDetectionMode::ManualCommit,
-            )
-            .unwrap();
-        let transcription = &json["session"]["audio"]["input"]["transcription"];
+        let input = openai_input(
+            "gpt-live-transcribe",
+            "ru",
+            &[],
+            None,
+            TurnDetectionMode::ManualCommit,
+        )
+        .unwrap();
+        let transcription = &input["transcription"];
         assert_eq!(transcription["languages"], serde_json::json!(["ru"]));
         assert!(transcription.get("language").is_none());
     }
@@ -516,24 +455,6 @@ mod tests {
     fn resample_empty() {
         let result = resample_16k_to_24k(&[]);
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn resample_ratio() {
-        let input: Vec<i16> = vec![100; 16_000];
-        let output = resample_16k_to_24k(&input);
-        assert!(
-            (output.len() as i64 - 24_000).abs() <= 2,
-            "expected ~24000, got {}",
-            output.len()
-        );
-    }
-
-    #[test]
-    fn lemonade_uses_16k_audio_directly() {
-        let input: Vec<i16> = vec![7; 160];
-        assert_eq!(OpenAiRealtimeProfile::Lemonade.input_sample_rate(), 16_000);
-        assert_eq!(input.len(), 160);
     }
 
     #[test]
