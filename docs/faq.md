@@ -16,4 +16,4 @@ whisrs reads the selected text aloud with `whisrs speak` (alias `read`) once `[t
 
 ## Which Linux distributions does whisrs support?
 
-whisrs runs on any Linux distribution with ALSA and libxkbcommon, on x86_64 and aarch64, under systemd or OpenRC. Install it with the install script, a prebuilt tarball, the AUR, `cargo install whisrs --locked` or the Nix flake ([Installation](../README.md#installation)). Building from source also needs clang and cmake for the bundled whisper.cpp.
+whisrs runs on any Linux distribution with ALSA and libxkbcommon, on x86_64 and aarch64, under systemd or OpenRC. Install it with the install script, a prebuilt tarball, the AUR, `cargo install whisrs --locked` or the Nix flake ([Installation](../README.md#installation)). The prebuilt full builds need AVX2 on x86_64 and ARMv8.2 with dotprod on aarch64 (Raspberry Pi 5 and Apple M1, not the Pi 4); on an older CPU, use a `-minimal` build or build from source. Building from source also needs clang and cmake for the bundled whisper.cpp.

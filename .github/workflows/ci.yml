@@ -104,16 +104,21 @@ jobs:
 
   release-build:
     name: Release build — ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
           - name: full (default features)
+            runner: ubuntu-latest
             features: ""
           - name: minimal (no local-whisper)
+            runner: ubuntu-latest
             features: "--no-default-features --features tray,overlay,hooks,recording,mcp"
-    # Same CPU baseline as the x86_64 rows of release.yml, so a regression
-    # fails the PR instead of the tag (#152).
+          - name: full aarch64 (default features)
+            runner: ubuntu-24.04-arm
+            features: ""
+    # Same CPU baseline as release.yml, so a regression fails the PR instead
+    # of the tag. ARM has only a full row: the minimal build has no ggml.
     env:
       GGML_NATIVE: "OFF"
     steps:
@@ -124,6 +129,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Pin ARM CPU baseline
+        if: runner.arch == 'ARM64'
+        run: echo "GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@v2
         with:
           env-vars: GGML
@@ -131,5 +140,5 @@ jobs:
       - name: Release build
         run: cargo build --release ${{ matrix.features }}
 
-      - name: Check for AVX-512 instructions
-        run: scripts/check-no-avx512.sh
+      - name: Check CPU baseline
+        run: scripts/check-cpu-baseline.sh

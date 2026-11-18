@@ -51,7 +51,7 @@ Run it: `whisrs setup` (TUI wizard, needs a terminal), then `whisrsd` or
 | `crates/audio-silence-gate/` | the speech detector: earshot VAD and RMS gate, auto-stop, speech gate, level meter |
 | `crates/{asr-dedup,filler-remove,prompt-echo}/` | chunk dedup for chunked ASR; filler-word removal; prompt-echo filter |
 | `contrib/` | man pages, systemd unit, `openrc/`, udev rule, `asr-sidecars/`, `diarization-sidecars/`, `agent-skill/`, GNOME extension |
-| `scripts/` | `dev-install.sh`; `check-docs.sh` and `check-no-avx512.sh` (CI) |
+| `scripts/` | `dev-install.sh`; `check-docs.sh` and `check-cpu-baseline.sh` (CI) |
 | `tests/` | the built-without-recording test, agent output fixtures |
 | `docs/` | user docs; only the pages whitelisted in `.gitignore` are tracked |
 
