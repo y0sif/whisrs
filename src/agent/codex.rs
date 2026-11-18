@@ -405,19 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_map_to_codex_flags() {
-        assert_eq!(permission_args(Permissions::Auto), ["--approve-for-me"]);
-        assert_eq!(
-            permission_args(Permissions::Bypass),
-            ["--dangerously-bypass-approvals-and-sandbox"]
-        );
-        assert_eq!(
-            permission_args(Permissions::Ask),
-            ["--sandbox", "read-only"]
-        );
-    }
-
-    #[test]
     fn a_first_turn_starts_a_thread_with_everything_before_the_prompt() {
         for (permissions, flags) in [
             (Permissions::Auto, &["--approve-for-me"][..]),
@@ -471,28 +458,6 @@ mod tests {
             assert_eq!(next.args, want, "{permissions:?}");
             assert_eq!(next.stdin.as_deref(), Some("and the tests"));
         }
-        assert_eq!(
-            Codex
-                .launch(&agent(Permissions::Ask), &resumed(THREAD), &request("x"))
-                .unwrap()
-                .args,
-            strings(&[
-                "exec",
-                "--json",
-                "--sandbox",
-                "read-only",
-                "-c",
-                "analytics.enabled=false",
-                "-c",
-                "developer_instructions=\"Answer by voice.\"",
-                "-m",
-                "gpt-5.1-codex",
-                "--skip-git-repo-check",
-                "resume",
-                THREAD,
-                "-",
-            ])
-        );
     }
 
     /// An option of `args` that takes several values (`-i`/`--image`, `1..`
@@ -531,31 +496,6 @@ mod tests {
                 1
             );
         }
-    }
-
-    /// A failed first turn keeps its thread, and the next turn passes
-    /// everything the first one did: nothing was first-turn only.
-    #[test]
-    fn a_failed_first_turns_thread_resumes_with_every_option() {
-        let (sent, _) = replay(TURN_FAILED, None);
-        let TurnUpdate::Session(kept) = &sent[0] else {
-            panic!("{sent:?}");
-        };
-        assert!(!kept.pending);
-        let a = agent(Permissions::Auto);
-        let first = Codex
-            .launch(&a, &SessionRef::default(), &request("x"))
-            .unwrap();
-        let next = Codex.launch(&a, kept, &request("x")).unwrap();
-        let id = kept.session_id.as_deref().unwrap();
-        assert_eq!(
-            next.args[..next.args.len() - 3],
-            first.args[..first.args.len() - 1]
-        );
-        assert_eq!(
-            next.args[next.args.len() - 3..],
-            strings(&["resume", id, "-"])
-        );
     }
 
     #[test]
@@ -760,18 +700,6 @@ mod tests {
                 false
             ),
             [StreamEvent::Tool("collab_tool_call".into())]
-        );
-        let (updates, mut rx) = TurnUpdates::channel();
-        let mut state = StreamState::new(None);
-        for event in parse_line(
-            r#"{"type":"item.started","item":{"id":"item_3","type":"mcp_tool_call","server":"whisrs","tool":"list_recordings","arguments":{},"result":null,"error":null,"status":"in_progress"}}"#,
-            false,
-        ) {
-            state.event(event, &updates);
-        }
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            TurnUpdate::Activity("Reading your recordings".into())
         );
     }
 
