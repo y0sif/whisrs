@@ -545,104 +545,89 @@ mod tests {
         }
     }
 
+    /// The key `[asr-sidecar]` sends: a non-blank environment key wins,
+    /// else the config key; both trimmed, a blank one counts as none.
     #[test]
-    fn asr_sidecar_env_key_wins_over_config() {
-        let config = config_with_sidecar_key(Some("config-key"));
-        assert_eq!(
-            resolve_asr_sidecar_api_key_from(Some("env-key"), &config).as_deref(),
-            Some("env-key")
-        );
-    }
-
-    #[test]
-    fn asr_sidecar_config_key_used_when_env_is_absent() {
-        let config = config_with_sidecar_key(Some("config-key"));
-        assert_eq!(
-            resolve_asr_sidecar_api_key_from(None, &config).as_deref(),
-            Some("config-key")
-        );
-    }
-
-    #[test]
-    fn asr_sidecar_blank_env_key_falls_through_to_config() {
-        let config = config_with_sidecar_key(Some("config-key"));
-        assert_eq!(
-            resolve_asr_sidecar_api_key_from(Some("   "), &config).as_deref(),
-            Some("config-key")
-        );
-    }
-
-    #[test]
-    fn asr_sidecar_blank_config_key_resolves_to_none() {
-        let config = config_with_sidecar_key(Some("   "));
-        assert_eq!(resolve_asr_sidecar_api_key_from(Some(""), &config), None);
-        assert_eq!(resolve_asr_sidecar_api_key_from(None, &config), None);
-    }
-
-    #[test]
-    fn asr_sidecar_keys_are_trimmed_on_both_paths() {
-        let config = config_with_sidecar_key(Some("  config-key\n"));
-        assert_eq!(
-            resolve_asr_sidecar_api_key_from(Some("  env-key\n"), &config).as_deref(),
-            Some("env-key")
-        );
-        assert_eq!(
-            resolve_asr_sidecar_api_key_from(None, &config).as_deref(),
-            Some("config-key")
-        );
-    }
-
-    #[test]
-    fn asr_sidecar_missing_section_resolves_to_none() {
-        let mut config = config_with_sidecar_key(None);
-        config.asr_sidecar = None;
-        assert_eq!(resolve_asr_sidecar_api_key_from(None, &config), None);
+    fn asr_sidecar_key_resolution() {
+        // section: None is no [asr-sidecar] at all, Some(key) its api_key.
+        let config_key = Some(Some("config-key"));
+        let padded_config_key = Some(Some("  config-key\n"));
+        for (name, env, section, want) in [
+            ("env wins", Some("env-key"), config_key, Some("env-key")),
+            ("config without env", None, config_key, Some("config-key")),
+            (
+                "blank env falls through",
+                Some("   "),
+                config_key,
+                Some("config-key"),
+            ),
+            ("blank config, empty env", Some(""), Some(Some("   ")), None),
+            ("blank config, no env", None, Some(Some("   ")), None),
+            (
+                "env trimmed",
+                Some("  env-key\n"),
+                padded_config_key,
+                Some("env-key"),
+            ),
+            (
+                "config trimmed",
+                None,
+                padded_config_key,
+                Some("config-key"),
+            ),
+            ("no section", None, None, None),
+        ] {
+            let mut config = config_with_sidecar_key(section.flatten());
+            if section.is_none() {
+                config.asr_sidecar = None;
+            }
+            assert_eq!(
+                resolve_asr_sidecar_api_key_from(env, &config).as_deref(),
+                want,
+                "{name}"
+            );
+        }
     }
 
     /// Assert the constructed backend, not the resolver. `asr_sidecar_backend`
     /// is the single join between a resolved key and the thing that sends it,
-    /// so a refactor that dropped the key there would leave every
-    /// `resolve_*` test above green and only fail against a real sidecar.
+    /// so a refactor that dropped the key there would leave the resolver
+    /// table above green and only fail against a real sidecar. With no
+    /// `[asr-sidecar]` section at all the backend must still point at the
+    /// address the contrib sidecar recipes bind to.
     #[test]
-    fn asr_sidecar_backend_carries_the_configured_url_and_key() {
-        let mut config = config_with_sidecar_key(Some("sk-config-key"));
-        config.asr_sidecar.as_mut().unwrap().url = "http://sidecar.local:9000/asr".to_string();
+    fn asr_sidecar_backend_carries_the_url_and_key() {
+        let default_url = "http://127.0.0.1:8765/transcribe";
+        // section: None is no [asr-sidecar] at all, Some((url, api_key)) its keys.
+        for (name, env, section, want_url, want_key) in [
+            (
+                "configured url and key",
+                None,
+                Some(("http://sidecar.local:9000/asr", Some("sk-config-key"))),
+                "http://sidecar.local:9000/asr",
+                Some("sk-config-key"),
+            ),
+            (
+                "env key",
+                Some("sk-env-key"),
+                Some((default_url, None)),
+                default_url,
+                Some("sk-env-key"),
+            ),
+            ("no key", None, Some((default_url, None)), default_url, None),
+            ("no section", None, None, default_url, None),
+        ] {
+            let mut config = config_with_sidecar_key(section.and_then(|(_, key)| key));
+            match (section, config.asr_sidecar.as_mut()) {
+                (Some((url, _)), Some(sidecar)) => sidecar.url = url.to_string(),
+                _ => config.asr_sidecar = None,
+            }
 
-        let backend = asr_sidecar_backend_from(None, &config);
+            let backend = asr_sidecar_backend_from(env, &config);
 
-        assert_eq!(backend.url(), "http://sidecar.local:9000/asr");
-        assert_eq!(backend.api_key(), Some("sk-config-key"));
-    }
-
-    #[test]
-    fn asr_sidecar_backend_carries_the_env_key() {
-        let config = config_with_sidecar_key(None);
-
-        let backend = asr_sidecar_backend_from(Some("sk-env-key"), &config);
-
-        assert_eq!(backend.api_key(), Some("sk-env-key"));
-    }
-
-    #[test]
-    fn asr_sidecar_backend_is_unauthenticated_without_a_key() {
-        let config = config_with_sidecar_key(None);
-
-        let backend = asr_sidecar_backend_from(None, &config);
-
-        assert_eq!(backend.api_key(), None);
-    }
-
-    /// `[asr-sidecar]` is optional, so selecting the backend with no section at
-    /// all must still point at the address the contrib sidecar recipes bind to.
-    #[test]
-    fn asr_sidecar_backend_falls_back_to_the_default_url() {
-        let mut config = config_with_sidecar_key(None);
-        config.asr_sidecar = None;
-
-        let backend = asr_sidecar_backend_from(None, &config);
-
-        assert_eq!(backend.url(), "http://127.0.0.1:8765/transcribe");
-        assert_eq!(backend.api_key(), None);
+            assert_eq!(backend.url(), want_url, "{name}");
+            assert_eq!(backend.api_key(), want_key, "{name}");
+        }
     }
 
     /// On OpenRouter the local default model, which OpenRouter does not
@@ -707,38 +692,16 @@ mod tests {
 
     #[test]
     fn get_model_for_openai_compatible_realtime_backend() {
-        let config = Config {
-            general: crate::GeneralConfig {
-                backend: "openai-compatible-realtime".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: Some(crate::OpenAiCompatibleRealtimeConfig {
-                url: "ws://localhost:1234/realtime".to_string(),
-                model: "Whisper-Tiny".to_string(),
-                profile: "lemonade".to_string(),
-                turn_detection: "server-vad".to_string(),
-                api_key: None,
-            }),
-            llm: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: Default::default(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
+        let mut config = config_with_sidecar_key(None);
+        config.general.backend = "openai-compatible-realtime".to_string();
+        config.asr_sidecar = None;
+        config.openai_compatible_realtime = Some(crate::OpenAiCompatibleRealtimeConfig {
+            url: "ws://localhost:1234/realtime".to_string(),
+            model: "Whisper-Tiny".to_string(),
+            profile: "lemonade".to_string(),
+            turn_detection: "server-vad".to_string(),
+            api_key: None,
+        });
 
         assert_eq!(
             model_for_backend(&config.general.backend, &config),
