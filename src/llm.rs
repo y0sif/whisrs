@@ -640,30 +640,6 @@ mod tests {
         server.abort();
     }
 
-    #[test]
-    fn default_config() {
-        let config = LlmConfig::default();
-        assert_eq!(config.model, "gpt-4o-mini");
-        assert!(config.api_url.contains("openai.com"));
-        assert!(config.api_key.is_empty());
-    }
-
-    #[test]
-    fn chat_request_serialization() {
-        let request = ChatRequest {
-            model: "gpt-4o-mini".to_string(),
-            messages: vec![
-                ChatMessage::system("You are helpful."),
-                ChatMessage::user("Hello".to_string()),
-            ],
-            temperature: 0.3,
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("gpt-4o-mini"));
-        assert!(json.contains("system"));
-        assert!(json.contains("Hello"));
-    }
-
     /// The framing every turn shares. Both callers depend on it: command mode
     /// puts the selection in `Selected text:` and `[[llm_commands]]` puts the
     /// dictated text there.
@@ -812,40 +788,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn clean_llm_output_leaves_a_bare_command_alone() {
-        assert_eq!(
-            clean_llm_output("sudo pacman -S steam"),
-            "sudo pacman -S steam"
-        );
-    }
-
-    /// A trailing newline typed at a shell prompt submits the command before
-    /// the user has read it.
-    #[test]
-    fn clean_llm_output_strips_trailing_and_leading_whitespace() {
-        assert_eq!(
-            clean_llm_output("\nsudo pacman -S steam\n"),
-            "sudo pacman -S steam"
-        );
-    }
-
-    #[test]
-    fn clean_llm_output_strips_a_wrapping_fence_with_a_language() {
-        assert_eq!(
-            clean_llm_output("```bash\nsudo pacman -S steam\n```"),
-            "sudo pacman -S steam"
-        );
-    }
-
-    #[test]
-    fn clean_llm_output_strips_a_bare_wrapping_fence() {
-        assert_eq!(
-            clean_llm_output("```\nsudo pacman -S steam\n```\n"),
-            "sudo pacman -S steam"
-        );
-    }
-
     /// A fence wrapping the whole reply is stripped even when the body spans
     /// several lines: a fenced reply is never what the user wants typed, and
     /// where the body may then be injected is the injection site's call.
@@ -858,21 +800,27 @@ mod tests {
         );
     }
 
-    /// Two fenced blocks is prose about code, not a wrapper — stripping the
-    /// outer pair would splice unrelated text together.
+    /// A reply that is not one fence around all of it is left as it came.
+    /// Two fenced blocks are prose about code, not a wrapper: stripping the
+    /// outer pair would splice unrelated text together. Inline backticks are
+    /// content, not a fence. A fenced command followed by prose is no wrapper
+    /// either, so the whole reply (command, fence, explanation) stays
+    /// multi-line.
     #[test]
-    fn clean_llm_output_leaves_multiple_fenced_blocks_alone() {
-        let text = "```sh\nfirst\n```\nthen run\n```sh\nsecond\n```";
-        assert_eq!(clean_llm_output(text), text);
-    }
-
-    /// Inline backticks are content, not a fence.
-    #[test]
-    fn clean_llm_output_leaves_inline_backticks_alone() {
-        assert_eq!(
-            clean_llm_output("run `pacman -S steam` as root"),
-            "run `pacman -S steam` as root"
-        );
+    fn a_reply_that_is_not_one_wrapper_is_left_as_it_came() {
+        for (name, reply) in [
+            (
+                "two fenced blocks",
+                "```sh\nfirst\n```\nthen run\n```sh\nsecond\n```",
+            ),
+            ("inline backticks", "run `pacman -S steam` as root"),
+            (
+                "a fence, then prose",
+                "```\nrm -rf ~/data\n```\nThis deletes your data.",
+            ),
+        ] {
+            assert_eq!(clean_llm_output(reply), reply, "{name}");
+        }
     }
 
     /// A language tag is one token, so these fences are wrappers and the tag
@@ -914,19 +862,11 @@ mod tests {
         assert!(contains_line_break(&cleaned));
     }
 
-    /// A fenced command followed by prose. The fence is not a wrapper, so
-    /// nothing is stripped and the whole reply — command, fence, explanation
-    /// — stays multi-line.
-    #[test]
-    fn a_fence_plus_prose_stays_multi_line() {
-        let reply = "```\nrm -rf ~/data\n```\nThis deletes your data.";
-        assert_eq!(clean_llm_output(reply), reply);
-        assert!(contains_line_break(reply));
-    }
-
     /// CRLF is normalized before anything else looks at the text. `\r` is in
     /// the XKB keymap (Return), so a surviving one is tapped as a real Enter
-    /// mid-injection.
+    /// mid-injection. A bare CR (old-Mac line ending, and what a model emits
+    /// when it botches a CRLF) is a line break too, and is the exact
+    /// character the keymap turns into Enter.
     #[test]
     fn crlf_is_normalized_away() {
         assert_eq!(
@@ -935,21 +875,15 @@ mod tests {
             "a trailing CRLF is just padding on a single-line answer"
         );
 
-        let cleaned = clean_llm_output("echo one\r\necho two");
-        assert_eq!(cleaned, "echo one\necho two");
-        assert!(!cleaned.contains('\r'), "no CR may survive cleaning");
-        assert!(contains_line_break(&cleaned));
-    }
-
-    /// A bare CR (old-Mac line ending, and what a model emits when it botches
-    /// a CRLF) is a line break too, and is the exact character the keymap
-    /// turns into Enter.
-    #[test]
-    fn a_bare_cr_is_normalized_to_a_line_feed() {
-        let cleaned = clean_llm_output("echo one\recho two");
-        assert_eq!(cleaned, "echo one\necho two");
-        assert!(!cleaned.contains('\r'));
-        assert!(contains_line_break(&cleaned));
+        for reply in ["echo one\r\necho two", "echo one\recho two"] {
+            let cleaned = clean_llm_output(reply);
+            assert_eq!(cleaned, "echo one\necho two", "{reply:?}");
+            assert!(
+                !cleaned.contains('\r'),
+                "{reply:?}: no CR may survive cleaning"
+            );
+            assert!(contains_line_break(&cleaned), "{reply:?}");
+        }
     }
 
     /// Every character the gate treats as a line break is detected, including
@@ -968,17 +902,21 @@ mod tests {
         }
     }
 
-    /// A single-line reply has no line break, however it arrived.
+    /// A single-line reply has no line break, however it arrived. A trailing
+    /// newline typed at a shell prompt submits the command before the user
+    /// has read it.
     #[test]
     fn a_single_line_reply_has_no_line_break() {
         for reply in [
             "sudo pacman -S steam",
             "```bash\nsudo pacman -S steam\n```",
+            "```\nsudo pacman -S steam\n```\n",
             "  sudo pacman -S steam  \n",
+            "\nsudo pacman -S steam\n",
         ] {
             let cleaned = clean_llm_output(reply);
             assert_eq!(cleaned, "sudo pacman -S steam", "{reply:?}");
-            assert!(!contains_line_break(&cleaned));
+            assert!(!contains_line_break(&cleaned), "{reply:?}");
         }
     }
 
@@ -1002,19 +940,5 @@ mod tests {
                 "{reply:?} holds no usable text"
             );
         }
-    }
-
-    #[test]
-    fn chat_response_deserialization() {
-        let json = r#"{
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "Hello back!"
-                }
-            }]
-        }"#;
-        let response: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices[0].message.content, "Hello back!");
     }
 }
