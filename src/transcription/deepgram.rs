@@ -239,22 +239,15 @@ pub const DIARIZE_MODEL: &str = "latest";
 /// What `recording.json` records as `diarization` for Deepgram.
 pub const DIARIZATION_LABEL: &str = "deepgram:latest";
 
-/// The `[deepgram]` formatting flags one request carries.
-///
-/// Deepgram keeps these as independent query parameters whose defaults are not
-/// the same: smart formatting is on unless asked off, while numerals and
-/// paragraphs are off unless asked on. [`Default`] is exactly what every
-/// request carried before they were configurable — `smart_format=true` and the
-/// other two unset — so a config that never mentions them puts the same bytes
-/// on the wire as before, and the recording chunk cache keeps matching.
-#[derive(Debug, Clone, Copy)]
+/// The `[deepgram]` formatting flags one request carries. [`Default`] is
+/// what the config keys default to: `smart_format` on, the other two off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeepgramFormat {
-    /// `smart_format`: punctuation, capitalization and, where the language has
-    /// them, numerals.
+    /// `smart_format`: punctuation, capitals and formatted numbers.
     pub smart_format: bool,
-    /// `numerals`: numbers as digits, beyond what `smart_format` formats.
+    /// `numerals`: numbers as digits, ordinals and small ones too.
     pub numerals: bool,
-    /// `paragraphs`: break the pre-recorded transcript at pauses.
+    /// `paragraphs`: dictation typed broken into paragraphs.
     pub paragraphs: bool,
 }
 
@@ -265,17 +258,6 @@ impl Default for DeepgramFormat {
             numerals: false,
             paragraphs: false,
         }
-    }
-}
-
-impl DeepgramFormat {
-    /// Whether this is the pre-configuration request shape.
-    ///
-    /// `numerals` and `paragraphs` are left off the wire when unset (that is
-    /// Deepgram's own default for both), so only a non-default `smart_format`
-    /// or a flag that was asked for changes a request.
-    pub fn is_default(&self) -> bool {
-        !self.numerals && !self.paragraphs && self.smart_format
     }
 }
 
@@ -304,16 +286,13 @@ fn build_query_params<'a>(
     let mut params = vec![
         ("model", config.model.as_str()),
         ("language", map_language(&config.language)),
-        // Always sent: before `[deepgram] smart_format` existed this was a
-        // literal `true`, and the key's default keeps that, so only a config
-        // that asks for `false` changes here.
         (
             "smart_format",
             if format.smart_format { "true" } else { "false" },
         ),
     ];
-    // Off is the parameter left out, not `=false`: Deepgram defaults both to
-    // off, and a request that never set them stays byte for byte what it was.
+    // Off is left out: Deepgram's own default. `paragraphs` goes as an extra
+    // of the dictation request only.
     if format.numerals {
         params.push(("numerals", "true"));
     }
@@ -369,23 +348,16 @@ struct DeepgramChannel {
 struct DeepgramAlternative {
     #[serde(default)]
     transcript: String,
-    /// Present when the request asked for `paragraphs=true`; the flat
-    /// `transcript` is the same words without the breaks.
+    /// The same words broken into paragraphs, with a leading line break.
+    /// Deepgram sends it whenever `smart_format` or `paragraphs` is on.
     #[serde(default)]
     paragraphs: Option<DeepgramParagraphs>,
 }
 
 impl DeepgramAlternative {
-    /// The transcript to type: the paragraph-broken one when paragraph breaks
-    /// were asked for and the response carries them, the flat one otherwise.
-    ///
-    /// `paragraphs` is a property of the *request*, not of the response: a
-    /// request built with `smart_format=true` (the default) comes back with a
-    /// `paragraphs` object whether or not it asked for one, because smart
-    /// formatting applies paragraph breaks as a side effect. Preferring it
-    /// unconditionally would therefore start typing line breaks into the
-    /// dictation of every config that never asked for them, which is exactly
-    /// what the default has to keep from happening.
+    /// The transcript to type: the paragraph-broken one when `paragraphs` is
+    /// on and it came back with text, the flat one otherwise. Smart formatting alone
+    /// brings the paragraphs back too, so the flag decides, not the response.
     fn text(&self, paragraphs: bool) -> &str {
         if !paragraphs {
             return &self.transcript;
@@ -530,13 +502,7 @@ fn rest_url() -> String {
 /// group words into timed utterances at pauses.
 const SEGMENT_QUERY_EXTRA: &[(&str, &str)] = &[("utterances", "true")];
 
-/// Extra query params for a pre-recorded dictation that asks for paragraphs.
-///
-/// Nothing else needs to go with it: `paragraphs=true` is accepted on its own
-/// (checked against the API, not just the docs), and it enables punctuation
-/// by itself. `utterances=true` is not a prerequisite — an earlier draft of
-/// this change sent it too, on the belief that Deepgram rejected paragraphs
-/// without it, which the API does not do.
+/// Extra query params for a dictation with `[deepgram] paragraphs` on.
 const PARAGRAPH_QUERY_EXTRA: &[(&str, &str)] = &[("paragraphs", "true")];
 
 /// [`SEGMENT_QUERY_EXTRA`] for a track whose voices Deepgram tells apart:
@@ -694,9 +660,6 @@ impl TranscriptionBackend for DeepgramRestBackend {
             config.language
         );
 
-        // Ask for the paragraph breaks only when the config wants them typed:
-        // the response carries a `paragraphs` object whenever smart formatting
-        // is on, so the parameter is not what makes it exist.
         let extra = if self.format.paragraphs {
             PARAGRAPH_QUERY_EXTRA
         } else {
@@ -776,9 +739,8 @@ impl TranscriptionBackend for DeepgramRestBackend {
 /// results to avoid duplicates.
 pub struct DeepgramStreamingBackend {
     api_key: String,
-    /// `[deepgram]` formatting flags. `paragraphs` never rides the socket:
-    /// Deepgram has no paragraphs on the live endpoint, and the config warns
-    /// about that pairing at load.
+    /// `[deepgram]` formatting flags. The socket gets no `paragraphs`: the
+    /// live endpoint returns none, and the config warns about it at load.
     format: DeepgramFormat,
 }
 
@@ -1108,121 +1070,88 @@ mod tests {
         assert!(err.to_string().contains("empty audio"));
     }
 
-    /// Every request carries the model, smart formatting and the language,
-    /// `auto` going as Deepgram's `multi`.
+    /// Every request carries the model, the language (`auto` going as
+    /// Deepgram's `multi`) and `smart_format`; `numerals` only when on, and
+    /// never `paragraphs`, which only the dictation request adds.
     #[test]
-    fn build_query_params_carries_model_language_and_smart_format() {
-        for (language, want_language) in
-            [("en", "en"), ("fr", "fr"), ("ja", "ja"), ("auto", "multi")]
-        {
-            let mut config = query_config("nova-3", &[]);
-            config.language = language.to_string();
-            let params = build_query_params(&config, &DeepgramFormat::default(), &[]);
-            for want in [
-                ("model", "nova-3"),
-                ("smart_format", "true"),
-                ("language", want_language),
-            ] {
-                assert!(
-                    params.contains(&want),
-                    "{language}: {want:?} missing from {params:?}"
-                );
-            }
-        }
-    }
-
-    /// A config that never mentions `[deepgram] smart_format`, `numerals` or
-    /// `paragraphs` sends exactly the request it sent before those keys
-    /// existed: `smart_format=true` and no other formatting parameter. Every
-    /// option here is opt-in on the wire, so an upgrade changes no transcript
-    /// and no cached recording chunk.
-    #[test]
-    fn the_default_formatting_sends_the_pre_configuration_request() {
-        let config = query_config("nova-3", &[]);
-        let format = DeepgramFormat::default();
-        assert!(format.is_default());
-        let params = build_query_params(&config, &format, &[]);
-        assert!(params.contains(&("smart_format", "true")));
-        assert!(!params.iter().any(|(k, _)| *k == "numerals"));
-        assert!(!params.iter().any(|(k, _)| *k == "paragraphs"));
-        assert!(!params.iter().any(|(k, _)| *k == "utterances"));
-    }
-
-    /// Each flag reaches the wire when it is asked for, and `smart_format` is
-    /// the one parameter that is always sent — Deepgram's own default for it is
-    /// off, so leaving it out would silently unformat every transcript.
-    #[test]
-    fn the_requested_formatting_reaches_the_wire() {
-        let config = query_config("nova-3", &[]);
-        let format = DeepgramFormat {
+    fn build_query_params_carries_model_language_and_formatting() {
+        let default = DeepgramFormat::default();
+        let all_flipped = DeepgramFormat {
             smart_format: false,
             numerals: true,
             paragraphs: true,
         };
-        assert!(!format.is_default());
-        let params = build_query_params(&config, &format, &[]);
-        assert!(params.contains(&("smart_format", "false")));
-        assert!(params.contains(&("numerals", "true")));
-        // Paragraphs are not a `build_query_params` concern: they ride the
-        // request's extras, with the `utterances` they need.
-        assert!(!params.iter().any(|(k, _)| *k == "paragraphs"));
+        for (language, format, want_language, want_smart_format, want_numerals) in [
+            ("en", default, "en", "true", false),
+            ("fr", default, "fr", "true", false),
+            ("ja", default, "ja", "true", false),
+            ("auto", default, "multi", "true", false),
+            ("en", all_flipped, "en", "false", true),
+        ] {
+            let row = format!("{language}, {format:?}");
+            let mut config = query_config("nova-3", &[]);
+            config.language = language.to_string();
+            let params = build_query_params(&config, &format, &[]);
+            for want in [
+                ("model", "nova-3"),
+                ("smart_format", want_smart_format),
+                ("language", want_language),
+            ] {
+                assert!(
+                    params.contains(&want),
+                    "{row}: {want:?} missing from {params:?}"
+                );
+            }
+            let numerals = params.iter().find(|(k, _)| *k == "numerals");
+            assert_eq!(
+                numerals.map(|(_, v)| *v),
+                want_numerals.then_some("true"),
+                "{row}: {params:?}"
+            );
+            assert!(
+                !params.iter().any(|(k, _)| *k == "paragraphs"),
+                "{row}: paragraphs sent: {params:?}"
+            );
+        }
     }
 
-    /// `paragraphs=true` is accepted on its own — `utterances=true` is not a
-    /// prerequisite (checked against the API). The request asks only for
-    /// paragraphs, and the paragraph-broken `paragraphs.transcript` is the text
-    /// typed: the flat transcript has the same words with none of the breaks.
+    /// Dictation asks for paragraphs and types `paragraphs.transcript`
+    /// (trimmed of its leading line break) only with `paragraphs` on. Smart
+    /// formatting brings the paragraphs back anyway, and without the flag
+    /// the flat transcript is typed.
     #[tokio::test]
-    async fn a_paragraph_request_asks_for_paragraphs_and_types_the_broken_text() {
-        let config = query_config("nova-3", &[]);
+    async fn dictation_types_the_paragraphs_only_when_asked() {
         let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let backend = local_backend_with_format(
-            &listener,
-            DeepgramFormat {
-                paragraphs: true,
-                ..DeepgramFormat::default()
-            },
-        );
         let body = r#"{"results": {"channels": [{"alternatives": [{
             "transcript": "one two three four",
-            "paragraphs": {"transcript": "one two\n\nthree four"}
+            "paragraphs": {"transcript": "\none two\n\nthree four"}
         }]}]}}"#;
-        let server = tokio::spawn(serve_once(listener, body));
-
-        let text = backend.transcribe(&wav, &config).await.unwrap();
-        assert_eq!(text, "one two\n\nthree four");
-
-        let request = server.await.unwrap();
-        let line = request.head.lines().next().unwrap();
-        assert!(line.contains("paragraphs=true"), "{line}");
-        assert!(!line.contains("utterances=true"), "{line}");
-    }
-
-    /// The regression this guards: `smart_format=true` (the default) makes
-    /// Deepgram return a `paragraphs` object whether or not the request asked
-    /// for one, so preferring it unconditionally would start typing line breaks
-    /// into the dictation of every config that never asked for them.
-    #[tokio::test]
-    async fn the_default_format_types_the_flat_transcript_even_when_paragraphs_arrive() {
-        let config = query_config("nova-3", &[]);
-        let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let backend = local_backend(&listener);
-        let body = r#"{"results": {"channels": [{"alternatives": [{
-            "transcript": "one two three four",
-            "paragraphs": {"transcript": "one two\n\nthree four"}
-        }]}]}}"#;
-        let server = tokio::spawn(serve_once(listener, body));
-
-        assert_eq!(
-            backend.transcribe(&wav, &config).await.unwrap(),
-            "one two three four"
-        );
-        let request = server.await.unwrap();
-        let line = request.head.lines().next().unwrap();
-        assert!(!line.contains("paragraphs="), "{line}");
-        assert!(!line.contains("utterances=true"), "{line}");
+        for (paragraphs, want_text) in [
+            (false, "one two three four"),
+            (true, "one two\n\nthree four"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let backend = DeepgramRestBackend {
+                format: DeepgramFormat {
+                    paragraphs,
+                    ..DeepgramFormat::default()
+                },
+                ..local_backend(&listener)
+            };
+            let server = tokio::spawn(serve_once(listener, body));
+            let text = backend
+                .transcribe(&wav, &query_config("nova-3", &[]))
+                .await
+                .unwrap_or_else(|e| panic!("paragraphs = {paragraphs}: {e}"));
+            assert_eq!(text, want_text, "paragraphs = {paragraphs}");
+            let request = server.await.unwrap();
+            let line = request.head.lines().next().unwrap();
+            assert_eq!(
+                line.contains("paragraphs=true"),
+                paragraphs,
+                "paragraphs = {paragraphs}: {line}"
+            );
+        }
     }
 
     /// The vocabulary goes as one trimmed `keyterm` per usable entry, and not
@@ -1530,20 +1459,6 @@ mod tests {
             "test-key".to_string(),
             format!("http://{}/v1/listen", listener.local_addr().unwrap()),
         )
-    }
-
-    /// [`local_backend`] with the `[deepgram]` formatting flags a test asks for.
-    fn local_backend_with_format(
-        listener: &tokio::net::TcpListener,
-        format: DeepgramFormat,
-    ) -> DeepgramRestBackend {
-        DeepgramRestBackend {
-            format,
-            ..DeepgramRestBackend::with_url(
-                "test-key".to_string(),
-                format!("http://{}/v1/listen", listener.local_addr().unwrap()),
-            )
-        }
     }
 
     fn diarized(model: &str) -> TranscriptionConfig {

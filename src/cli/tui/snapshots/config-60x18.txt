@@ -3,11 +3,11 @@
    │                                                    │
    │   Backend & keys                                   │
    │                                                    │
-   │   backend                deepgram-streaming        │
-   │ ▌ deepgram api_key       set ****9f2c              │
-   │   deepgram model         nova-3                    │
-   │   deepgram smart_format  on                        │
-   │   deepgram numerals      off                       │
+   │   backend           deepgram-streaming             │
+   │ ▌ deepgram api_key  set ****9f2c                   │
+   │   deepgram model    nova-3                         │
+   │   smart format      on                             │
+   │   numerals          off                            │
    │                                                    │
    │   API key for the deepgram backends.               │
    │   WHISRS_DEEPGRAM_API_KEY wins over it.            │

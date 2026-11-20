@@ -531,25 +531,24 @@ const BACKEND: &[Field] = &[
     ),
     field(
         "deepgram.smart_format",
-        "deepgram smart_format",
+        "smart format",
         Kind::Bool,
-        "Deepgram's smart formatting: punctuation, capitalization and, where the language has \
-         them, numerals. On whether or not the key is written; turn it off for raw, \
-         unpunctuated text.",
+        "Punctuation, capitals and formatted numbers (\"200\", \"$900\"). Off, the text is \
+         lowercase with no punctuation, unless paragraphs is on.",
     ),
     field(
         "deepgram.numerals",
-        "deepgram numerals",
+        "numerals",
         Kind::Bool,
-        "Numbers as digits (\"900\", not \"nine hundred\"), beyond the languages smart \
-         formatting already formats. Off by default, Deepgram's own default.",
+        "Numbers as digits, ordinals and small ones too (\"1st\", \"3\").",
     ),
     field(
         "deepgram.paragraphs",
-        "deepgram paragraphs",
+        "paragraphs",
         Kind::Bool,
-        "Break the pre-recorded transcript at pauses. The streaming socket has no paragraphs, \
-         so backend = \"deepgram-streaming\" ignores it (and says so at load).",
+        "Type dictation broken into paragraphs, with backend = \"deepgram\" only: recordings \
+         and deepgram-streaming ignore it. A break is typed as a line break, or as a space in \
+         a terminal whisrs recognizes.",
     ),
     field(
         "groq.api_key",

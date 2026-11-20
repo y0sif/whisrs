@@ -935,29 +935,16 @@ pub struct DeepgramConfig {
     pub api_key: String,
     #[serde(default = "default_deepgram_model")]
     pub model: String,
-    /// Deepgram `smart_format`: punctuation, capitalization and, where the
-    /// language has them, numerals.
-    ///
-    /// `true` by default because that is what every request sent before this
-    /// key existed (`build_query_params` carried a literal). Defaulting it to
-    /// `false`, Deepgram's own default, would silently strip the punctuation
-    /// from every existing config on upgrade.
+    /// Deepgram `smart_format`: punctuation, capitals and formatted numbers.
+    /// Default true: off, the text has no punctuation or capitals unless
+    /// `paragraphs` is on.
     #[serde(default = "default_true")]
     pub smart_format: bool,
-    /// Deepgram `numerals`: numbers as digits (`900`, not `nine hundred`),
-    /// beyond the languages `smart_format` already formats.
-    ///
-    /// Off by default, as Deepgram defaults it, and left off the wire when
-    /// off, so a config that never sets it sends the request it always sent.
+    /// Deepgram `numerals`: numbers as digits, ordinals and small ones too.
     #[serde(default)]
     pub numerals: bool,
-    /// Deepgram `paragraphs`: break the pre-recorded transcript at pauses.
-    ///
-    /// A request-side flag, not a response one: `smart_format` already makes
-    /// Deepgram return a `paragraphs` object, so what this key decides is
-    /// whether the broken text is the text whisrs types. Only the
-    /// pre-recorded path can act on it — the live socket returns one trimmed
-    /// phrase per final result, with no paragraph object and no breaks.
+    /// Deepgram `paragraphs`: dictation on `backend = "deepgram"` is typed
+    /// broken into paragraphs. Recordings and `deepgram-streaming` ignore it.
     #[serde(default)]
     pub paragraphs: bool,
 }
@@ -975,11 +962,8 @@ impl DeepgramConfig {
 }
 
 impl Default for DeepgramConfig {
-    /// The same defaults serde applies to a section that leaves a key out.
-    ///
-    /// Written out rather than derived: `smart_format` defaults to `true` (the
-    /// value every request carried before the key existed), and a derive would
-    /// quietly turn it off.
+    /// The serde defaults: written out, since a derive would turn
+    /// `smart_format` off.
     fn default() -> Self {
         Self {
             api_key: String::new(),
@@ -2396,7 +2380,7 @@ impl Config {
         }
 
         warnings.extend(self.deepgram_keyterm_warnings(backend));
-        warnings.extend(self.deepgram_format_warnings(backend));
+        warnings.extend(self.deepgram_paragraphs_warning(backend));
         warnings.extend(self.inert_prompt_warnings(backend));
         warnings.extend(self.openrouter_prompt_warnings());
         warnings.extend(self.openai_languages_warnings(backend));
@@ -3066,15 +3050,8 @@ impl Config {
             .unwrap_or_else(default_deepgram_model)
     }
 
-    /// The `[deepgram]` formatting flags this config will actually send.
-    ///
-    /// Serde defaults only apply when the section exists, so the absent case
-    /// needs its own answer — and it must be [`DeepgramFormat::default`], not
-    /// a literal, for the same reason [`Config::deepgram_model`] is: the
-    /// daemon and `Config::validate` would otherwise answer differently. The
-    /// default is the pre-configuration request shape, so a config with no
-    /// `[deepgram]` section keeps sending `smart_format=true` and nothing
-    /// else.
+    /// The `[deepgram]` formatting flags this config sends. Without the
+    /// section, the defaults an empty one gets.
     pub fn deepgram_format(&self) -> deepgram::DeepgramFormat {
         self.deepgram
             .as_ref()
@@ -3203,35 +3180,17 @@ impl Config {
         warnings
     }
 
-    /// Load-time warnings about `[deepgram]` formatting flags reaching nothing.
-    ///
-    /// `paragraphs` can only change a pre-recorded transcript: the streaming
-    /// endpoint answers with one trimmed phrase per final result, carrying no
-    /// `paragraphs` object and no breaks (checked against the API), so
-    /// `backend = "deepgram-streaming"` builds its request without the
-    /// parameter. The flag is not a config error — one `config.toml` is used
-    /// with both backends — but silently dropping it is exactly the kind of
-    /// no-op this file already warns about for `prompt` and `vocabulary`.
-    fn deepgram_format_warnings(&self, backend: &str) -> Vec<ConfigWarning> {
-        let mut warnings = Vec::new();
-        // The backend gate matters for the same reason it does in
-        // `deepgram_keyterm_warnings`: `[deepgram]` outlives a switch away from
-        // the backend, and a stale section must not warn on someone else's.
-        if backend != "deepgram-streaming" {
-            return warnings;
-        }
+    /// The warning for `[deepgram] paragraphs` with
+    /// `backend = "deepgram-streaming"`, whose live socket returns no
+    /// paragraphs. A section left behind on another backend says nothing.
+    fn deepgram_paragraphs_warning(&self, backend: &str) -> Option<ConfigWarning> {
         let paragraphs = self.deepgram.as_ref().is_some_and(|d| d.paragraphs);
-        if paragraphs {
-            warnings.push(ConfigWarning {
-                message: "[deepgram] paragraphs is ignored with backend = \"deepgram-streaming\": \
-                          the live socket returns its transcript one phrase at a time, with no \
-                          paragraph object and no breaks, so there is nothing to break there. \
-                          Use backend = \"deepgram\" for paragraph breaks, or drop the key — it is \
-                          inert here."
-                    .to_string(),
-            });
-        }
-        warnings
+        (backend == "deepgram-streaming" && paragraphs).then(|| ConfigWarning {
+            message: "[deepgram] paragraphs does nothing with backend = \"deepgram-streaming\", \
+                      whose live socket returns no paragraphs. It applies with \
+                      backend = \"deepgram\"."
+                .to_string(),
+        })
     }
 
     /// Resolve [`DeepgramHintChannel`] for this config.
@@ -4375,73 +4334,36 @@ mod tests {
         config
     }
 
-    /// The formatting a config that never mentions the keys gets: exactly the
-    /// request every config sent before they existed. `smart_format` on (it was
-    /// a literal in the request builder) and the two Deepgram defaults off, so
-    /// upgrading changes no transcript.
+    /// `[deepgram] paragraphs` warns with `deepgram-streaming`, whose live
+    /// socket returns none, and nowhere else: the REST backend sends it, and
+    /// a section left behind on another backend is not that backend's.
     #[test]
-    fn deepgram_formatting_defaults_keep_the_request_every_config_sent() {
-        let config: Config = toml::from_str(
-            "[general]\nbackend = \"deepgram\"\n\n[deepgram]\napi_key = \"k\"\nmodel = \"nova-3\"\n",
-        )
-        .expect("a minimal deepgram config");
-        let format = config.deepgram_format();
-        assert!(format.smart_format, "smart_format was a literal true");
-        assert!(!format.numerals);
-        assert!(!format.paragraphs);
-        assert!(format.is_default());
-
-        // The section is optional, and its absence must answer the same.
-        let config: Config = toml::from_str("").expect("an empty config");
-        assert!(config.deepgram_format().is_default());
-    }
-
-    /// `paragraphs` is the one formatting flag a backend cannot honour: Deepgram
-    /// has no paragraphs on the live socket, so the streaming backend builds a
-    /// request without it. Say it once at load, the way the vocabulary drop is
-    /// said; the REST backend does send it, and a stale section on another
-    /// backend must stay quiet.
-    #[test]
-    fn config_validate_warns_paragraphs_with_the_streaming_backend() {
-        let mut config: Config = toml::from_str("").expect("an empty config");
-        config.general.backend = "deepgram-streaming".to_string();
-        config.deepgram = Some(DeepgramConfig {
-            api_key: "test-key".to_string(),
-            paragraphs: true,
-            ..Default::default()
-        });
-
-        let warnings = config.validate().expect("a keyed config is valid");
-        let warning = warnings
-            .iter()
-            .find(|w| w.message.contains("paragraphs"))
-            .unwrap_or_else(|| panic!("streaming + paragraphs must warn: {warnings:?}"));
-        assert!(
-            warning.message.contains("deepgram-streaming"),
-            "the warning must name the backend: {}",
-            warning.message
-        );
-
-        // The REST backend sends the parameter: nothing to report.
-        config.general.backend = "deepgram".to_string();
-        let warnings = config.validate().expect("a keyed config is valid");
-        assert!(
-            warnings.iter().all(|w| !w.message.contains("paragraphs")),
-            "deepgram sends paragraphs, so it must not warn: {warnings:?}"
-        );
-
-        // And the section outliving a switch to another backend is not a
-        // warning about that backend.
-        config.general.backend = "groq".to_string();
-        config.groq = Some(GroqConfig {
-            api_key: "test-key".to_string(),
-            model: default_groq_model(),
-        });
-        let warnings = config.validate().expect("a keyed config is valid");
-        assert!(
-            warnings.iter().all(|w| !w.message.contains("paragraphs")),
-            "a stale [deepgram] section must not warn on groq: {warnings:?}"
-        );
+    fn config_validate_warns_paragraphs_only_with_the_streaming_backend() {
+        for (backend, warns) in [
+            ("deepgram-streaming", true),
+            ("deepgram", false),
+            ("groq", false),
+        ] {
+            let mut config = keyed_groq_config();
+            config.general.backend = backend.to_string();
+            config.deepgram = Some(DeepgramConfig {
+                api_key: "test-key".to_string(),
+                paragraphs: true,
+                ..Default::default()
+            });
+            let warnings = config
+                .validate()
+                .unwrap_or_else(|e| panic!("{backend}: {e}"));
+            let warning = warnings.iter().find(|w| w.message.contains("paragraphs"));
+            assert_eq!(warning.is_some(), warns, "{backend}: {warnings:?}");
+            if let Some(warning) = warning {
+                assert!(
+                    warning.message.contains("deepgram-streaming"),
+                    "{backend}: the warning must name the backend: {}",
+                    warning.message
+                );
+            }
+        }
     }
 
     /// A pre-Nova-3 deepgram model takes no keyterm, so a vocabulary on it
@@ -4608,15 +4530,19 @@ mod tests {
     }
 
     #[test]
-    fn deepgram_keyterm_warnings_without_a_deepgram_section_use_the_default_model() {
-        // `[deepgram]` is optional; the section's serde default (nova-3)
-        // supports keyterm, so an absent section must not produce the
-        // "vocabulary is ignored" warning. Goes through the warning builder
-        // rather than `validate` because `validate` rejects a deepgram backend
-        // with no section and no `WHISRS_DEEPGRAM_API_KEY` before it gets here.
+    fn a_missing_deepgram_section_answers_like_an_empty_one() {
+        // `[deepgram]` is optional, and without it the model and the
+        // formatting are an empty section's serde defaults. The default model
+        // (nova-3) supports keyterm, so an absent section must not produce
+        // the "vocabulary is ignored" warning. Goes through the warning
+        // builder rather than `validate` because `validate` rejects a deepgram
+        // backend with no section and no `WHISRS_DEEPGRAM_API_KEY` before it
+        // gets here.
         let mut config = deepgram_config_with_vocabulary("nova-3", &["whisrs".to_string()]);
         config.deepgram = None;
+        let empty: Config = toml::from_str("[deepgram]\n").expect("an empty section parses");
         assert_eq!(config.deepgram_model(), default_deepgram_model());
+        assert_eq!(config.deepgram_format(), empty.deepgram_format());
         let warnings = config.deepgram_keyterm_warnings("deepgram");
         assert!(
             warnings.is_empty(),

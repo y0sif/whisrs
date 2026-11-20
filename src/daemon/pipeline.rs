@@ -1065,7 +1065,7 @@ pub(crate) async fn transcribe_batch_audio(
     let text = if opts.apply_filler && context.config.general.remove_filler_words {
         let filter = FillerFilter::new(&context.config.general.filler_words)
             .context("invalid custom filler word in configuration")?;
-        let cleaned = filter.apply(&text);
+        let cleaned = remove_fillers_by_line(&filter, &text);
         if cleaned != text {
             info!(
                 "filler removal: {} chars -> {} chars",
@@ -1102,6 +1102,14 @@ pub(crate) async fn transcribe_batch_audio(
     }
 
     Ok(text)
+}
+
+/// Run [`FillerFilter::apply`] on each line of `text`, so the breaks of a
+/// transcript in paragraphs survive: the filter rejoins words with single
+/// spaces. Text without a line break comes out as the filter alone makes it.
+fn remove_fillers_by_line(filter: &FillerFilter, text: &str) -> String {
+    let lines: Vec<String> = text.split('\n').map(|line| filter.apply(line)).collect();
+    lines.join("\n").trim_matches('\n').to_string()
 }
 
 /// Save a failed dictation's audio for `whisrs transcribe-recovery`, then
@@ -2765,40 +2773,49 @@ pub(crate) mod tests {
         assert_eq!(gate.reason, Some(audio_silence_gate::GateReason::NoSpeech));
     }
 
-    /// `[replacements]` is wired into the batch path, not just the streaming
-    /// batcher, and stays off for command mode, whose transcript is an
-    /// instruction for the LLM rather than text to type.
+    /// Filler removal and `[replacements]` are wired into the batch path,
+    /// not just the streaming batcher, keep a transcript's paragraph breaks,
+    /// and stay off for command mode, whose transcript is an instruction for
+    /// the LLM rather than text to type.
     #[tokio::test]
-    async fn batch_path_applies_replacements_to_dictation_only() {
-        const SPOKEN: &str = "edit the package build file";
-        let mut context = context_with_backend(StubBackend {
-            text: SPOKEN,
-            sends_prompt: false,
-        });
-        context
-            .config
-            .replacements
-            .insert("package build".to_string(), "PKGBUILD".to_string());
+    async fn batch_path_cleans_dictation_only_and_keeps_its_line_breaks() {
+        for (spoken, want) in [
+            ("edit the package build file", "edit the PKGBUILD file"),
+            (
+                "Um, edit the package build file.\n\nThen push it.",
+                "edit the PKGBUILD file.\n\nThen push it.",
+            ),
+        ] {
+            let mut context = context_with_backend(StubBackend {
+                text: spoken,
+                sends_prompt: false,
+            });
+            context.config.general.remove_filler_words = true;
+            context
+                .config
+                .replacements
+                .insert("package build".to_string(), "PKGBUILD".to_string());
 
-        let dictated = transcribe_batch_audio(
-            &audio_that_passes_the_gate(),
-            &context,
-            "en",
-            &BatchOptions::dictation(),
-        )
-        .await
-        .expect("the stub backend never fails");
-        assert_eq!(dictated, "edit the PKGBUILD file");
+            let dictated = transcribe_batch_audio(
+                &audio_that_passes_the_gate(),
+                &context,
+                "en",
+                &BatchOptions::dictation(),
+            )
+            .await
+            .expect("the stub backend never fails");
+            assert_eq!(dictated, want, "{spoken:?}");
 
-        let instruction = transcribe_batch_audio(
-            &audio_that_passes_the_gate(),
-            &context,
-            "en",
-            &BatchOptions::command_mode(),
-        )
-        .await
-        .expect("the stub backend never fails");
-        assert_eq!(instruction, SPOKEN);
+            let instruction = transcribe_batch_audio(
+                &audio_that_passes_the_gate(),
+                &context,
+                "en",
+                &BatchOptions::command_mode(),
+            )
+            .await
+            .expect("the stub backend never fails");
+            assert_eq!(instruction, spoken, "{spoken:?}");
+        }
     }
 
     // ── Toggle-path LLM post-processing ─────────────────────────────────
