@@ -24,7 +24,7 @@ impl KeyboardLayout {
         // Order matters: compositor IPC and X11 reflect the *currently active* session
         // layout (honoring runtime switches via xkb-switch and friends), so they win when
         // reachable. localectl is the systemd source-of-truth fallback for cases where
-        // X env vars aren't visible (e.g. running as a systemd --user service, issue #39).
+        // X env vars aren't visible (e.g. running as a systemd --user service).
         // Env vars come last as an explicit user override escape hatch.
         if let Some(kl) = Self::from_hyprland() {
             return kl;
@@ -244,8 +244,8 @@ fn parse_setxkbmap_query(output: &str) -> Option<KeyboardLayout> {
 /// leading spaces (3 or 4 in practice). Trim each line before splitting
 /// on the first `:` to be robust against that. Only `X11 Layout` and
 /// `X11 Variant` are extracted — other keys (`System Locale`,
-/// `VC Keymap`, `X11 Model`, `X11 Options`) are intentionally ignored
-/// to keep this patch tightly scoped to the layout-detection bug.
+/// `VC Keymap`, `X11 Model`, `X11 Options`) are intentionally ignored:
+/// only the layout is needed.
 fn parse_localectl_status(output: &str) -> Option<KeyboardLayout> {
     let mut layout = None;
     let mut variant = None;
@@ -846,10 +846,10 @@ mod tests {
             variant: "intl".to_string(),
         })
         .unwrap();
-        // Every character that previously had to fall back to clipboard
-        // paste (and was therefore broken in terminals like Alacritty)
-        // must now have a direct uinput route — either as a level 2/3
-        // AltGr key, or via the dead-key + Space fallback table.
+        // Every character here must have a direct uinput route, not the
+        // clipboard paste fallback (broken in terminals like Alacritty):
+        // either as a level 2/3 AltGr key, or via the dead-key + Space
+        // fallback table.
         for ch in [
             '\'', '"', '~', '`', '^', 'ç', 'á', 'é', 'í', 'ó', 'ú', 'ã', 'ñ',
         ] {
@@ -1010,14 +1010,14 @@ mod tests {
         assert_key(&km, 'z', 44, false, "Japanese");
     }
 
-    // --- Sway detection regression ---
+    // --- Sway detection ---
 
     /// `KeyboardLayout::from_sway` deliberately returns `None` because
     /// Sway's `xkb_layout_names` exposes display strings (e.g. `"German"`,
     /// `"English (US)"`) rather than XKB layout codes (`"de"`, `"us"`).
     /// Returning `Some(display_name)` would make the caller short-circuit
     /// the env-var fallback and silently compile against the *default*
-    /// layout, which is the bug this regression test guards against.
+    /// layout.
     #[test]
     fn from_sway_always_returns_none() {
         // `from_sway` shells out to `swaymsg`; on most CI machines that
@@ -1111,15 +1111,14 @@ System Locale: LANG=en_US.UTF-8
         assert_eq!(kl.variant, "dvorak");
     }
 
-    // --- localectl chain-gap regression ---
+    // --- localectl chain gap ---
 
-    /// Issue #39: detection must have at least one source that works
+    /// Detection must have at least one source that works
     /// without any X session env vars on a systemd host. `from_localectl`
     /// fills that gap. If `localectl` is installed (the case on every
     /// systemd distro), it must return `Some(layout)` with a non-empty
-    /// layout code — this is what prevents the US/QWERTY fallback that
-    /// produced garbled output for fr(bepo) users running under
-    /// `systemd --user`.
+    /// layout code. Without it, the US/QWERTY fallback garbles output for
+    /// fr(bepo) users running under `systemd --user`.
     #[test]
     fn from_localectl_returns_layout_when_available() {
         // Skip if the binary is unavailable (e.g. non-systemd CI image).
