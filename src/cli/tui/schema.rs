@@ -534,7 +534,7 @@ const BACKEND: &[Field] = &[
         "smart format",
         Kind::Bool,
         "Punctuation, capitals and formatted numbers (\"200\", \"$900\"). Off, the text is \
-         lowercase with no punctuation, unless paragraphs is on.",
+         lowercase with no punctuation, except in dictation with paragraphs on.",
     ),
     field(
         "deepgram.numerals",

@@ -1065,7 +1065,11 @@ pub(crate) async fn transcribe_batch_audio(
     let text = if opts.apply_filler && context.config.general.remove_filler_words {
         let filter = FillerFilter::new(&context.config.general.filler_words)
             .context("invalid custom filler word in configuration")?;
-        let cleaned = remove_fillers_by_line(&filter, &text);
+        let cleaned = if types_paragraphs(&context.config) {
+            remove_fillers_by_line(&filter, &text)
+        } else {
+            filter.apply(&text)
+        };
         if cleaned != text {
             info!(
                 "filler removal: {} chars -> {} chars",
@@ -1102,6 +1106,13 @@ pub(crate) async fn transcribe_batch_audio(
     }
 
     Ok(text)
+}
+
+/// Whether dictation arrives broken into paragraphs: `[deepgram] paragraphs`
+/// on the backend that sends it. Only then are line breaks part of the text.
+fn types_paragraphs(config: &Config) -> bool {
+    whisrs::transcription::factory::canonical_backend_name(&config.general.backend) == "deepgram"
+        && config.deepgram_format().paragraphs
 }
 
 /// Run [`FillerFilter::apply`] on each line of `text`, so the breaks of a
@@ -1384,8 +1395,9 @@ pub(crate) async fn process_recording_batch(
     };
 
     // No line break reaches a terminal, where it would be an Enter: a
-    // transcript never legitimately holds one, and with `llm_post_process` a
-    // steered model could otherwise add one on every dictation. The class is
+    // transcript holds one only when `[deepgram] paragraphs` asks for it, and
+    // with `llm_post_process` a steered model could otherwise add one on
+    // every dictation. The class is
     // only read for text that has a line break to fold (and reused when
     // `paste` already read it). Under `clipboard_only` nothing is typed, so
     // nothing is folded. `outcome.text` takes the sanitized, folded form so
@@ -1406,7 +1418,11 @@ pub(crate) async fn process_recording_batch(
             }
         };
         if let Some(folded) = owned(fold_line_breaks_at_terminal(&outcome.text, at_terminal)) {
-            warn!("folded line breaks in dictation: the focused window is a terminal");
+            if types_paragraphs(&context.config) {
+                debug!("folded paragraph breaks: the focused window is a terminal");
+            } else {
+                warn!("folded line breaks in dictation: the focused window is a terminal");
+            }
             outcome.text = folded;
         }
     }
@@ -2774,23 +2790,31 @@ pub(crate) mod tests {
     }
 
     /// Filler removal and `[replacements]` are wired into the batch path,
-    /// not just the streaming batcher, keep a transcript's paragraph breaks,
-    /// and stay off for command mode, whose transcript is an instruction for
-    /// the LLM rather than text to type.
+    /// not just the streaming batcher, keep the breaks of a transcript in
+    /// paragraphs (and only those), and stay off for command mode, whose
+    /// transcript is an instruction for the LLM rather than text to type.
     #[tokio::test]
     async fn batch_path_cleans_dictation_only_and_keeps_its_line_breaks() {
-        for (spoken, want) in [
-            ("edit the package build file", "edit the PKGBUILD file"),
+        const TWO: &str = "Um, edit the package build file.\n\nThen push it.";
+        for (spoken, paragraphs, want) in [
             (
-                "Um, edit the package build file.\n\nThen push it.",
-                "edit the PKGBUILD file.\n\nThen push it.",
+                "edit the package build file",
+                false,
+                "edit the PKGBUILD file",
             ),
+            (TWO, true, "edit the PKGBUILD file.\n\nThen push it."),
+            (TWO, false, "edit the PKGBUILD file. Then push it."),
         ] {
             let mut context = context_with_backend(StubBackend {
                 text: spoken,
                 sends_prompt: false,
             });
             context.config.general.remove_filler_words = true;
+            context.config.general.backend = "deepgram".to_string();
+            context.config.deepgram = Some(whisrs::config::DeepgramConfig {
+                paragraphs,
+                ..Default::default()
+            });
             context
                 .config
                 .replacements

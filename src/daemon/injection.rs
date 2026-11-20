@@ -146,9 +146,9 @@ pub(crate) fn sanitize_for_injection(text: &str) -> std::borrow::Cow<'_, str> {
 /// [`fold_line_breaks_at_terminal`]).
 ///
 /// Dictation folds rather than refuses, unlike the LLM gate in
-/// [`prepare_llm_injection`]: no spoken phrase produces a line break, so one in
-/// a transcript is either backend noise or something injected on purpose, and
-/// a space loses nothing the user said. Expects [`sanitize_for_injection`] to
+/// [`prepare_llm_injection`]: a line break in a transcript is a paragraph
+/// break, backend noise or something injected on purpose, and a space loses
+/// none of the words. Expects [`sanitize_for_injection`] to
 /// have run first.
 pub(crate) fn fold_line_breaks(text: &str) -> std::borrow::Cow<'_, str> {
     if !llm::contains_line_break(text) {

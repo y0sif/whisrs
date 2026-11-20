@@ -34,7 +34,7 @@ Guide: [Batch and streaming backends](configuration.md#batch-and-streaming-backe
 |---|---|---|---|---|
 | `api_key` | API key | unset | your key | API key for the deepgram backends. WHISRS_DEEPGRAM_API_KEY wins over it. |
 | `model` | string | `nova-3` | `nova-3`, `nova-3-medical`, `nova-3-pharma`, `nova-2`, `nova-2-meeting`, `nova-2-phonecall`, `nova-2-finance`, `nova-2-conversationalai`, `nova-2-voicemail`, `nova-2-video`, `nova-2-medical`, `nova-2-drivethru`, `nova-2-automotive`, `nova-2-atc`, or any other | The Deepgram model. Nova-3 models take your vocabulary as keyterms; older ones get none of it. |
-| `smart_format` | bool | `true` | `true`, `false` | Punctuation, capitals and formatted numbers ("200", "$900"). Off, the text is lowercase with no punctuation, unless paragraphs is on. |
+| `smart_format` | bool | `true` | `true`, `false` | Punctuation, capitals and formatted numbers ("200", "$900"). Off, the text is lowercase with no punctuation, except in dictation with paragraphs on. |
 | `numerals` | bool | `false` | `true`, `false` | Numbers as digits, ordinals and small ones too ("1st", "3"). |
 | `paragraphs` | bool | `false` | `true`, `false` | Type dictation broken into paragraphs, with backend = "deepgram" only: recordings and deepgram-streaming ignore it. A break is typed as a line break, or as a space in a terminal whisrs recognizes. |
 

@@ -346,7 +346,6 @@ struct DeepgramChannel {
 
 #[derive(Debug, Deserialize)]
 struct DeepgramAlternative {
-    #[serde(default)]
     transcript: String,
     /// The same words broken into paragraphs, with a leading line break.
     /// Deepgram sends it whenever `smart_format` or `paragraphs` is on.

@@ -936,8 +936,8 @@ pub struct DeepgramConfig {
     #[serde(default = "default_deepgram_model")]
     pub model: String,
     /// Deepgram `smart_format`: punctuation, capitals and formatted numbers.
-    /// Default true: off, the text has no punctuation or capitals unless
-    /// `paragraphs` is on.
+    /// Default true: off, the text has no punctuation or capitals, except in
+    /// dictation with `paragraphs` on.
     #[serde(default = "default_true")]
     pub smart_format: bool,
     /// Deepgram `numerals`: numbers as digits, ordinals and small ones too.
