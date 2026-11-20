@@ -79,7 +79,7 @@ pub(crate) enum LlmInjection {
 /// injection method, it is the absence of one — the gate is still
 /// target-shaped, and `clipboard_only` means there is no target. Refusing
 /// there would withhold the reply from the clipboard, the one place the user
-/// asked for it, to guard against a keystroke that is never sent (#121). The
+/// asked for it, to guard against a keystroke that is never sent. The
 /// caller must pass the same value it hands to [`inject_text`]: a multi-line
 /// [`LlmInjection::Inject`] decided under `clipboard_only` is only safe
 /// because it will be copied, not typed. Cleaning and
@@ -174,9 +174,9 @@ pub(crate) fn fold_line_breaks(text: &str) -> std::borrow::Cow<'_, str> {
 /// is an Enter that runs whatever came before it.
 ///
 /// `class` is `WindowTracker::get_focused_window_class()`. An unknown class
-/// (`None`) is not a terminal. That is every window on GNOME and KDE (#72,
-/// #127), so the terminal-aware behaviors, the line-break guards included,
-/// are inactive there.
+/// (`None`) is not a terminal. That is every window on GNOME and KDE, so
+/// the terminal-aware behaviors, the line-break guards included, are
+/// inactive there.
 pub(crate) fn is_terminal_window(class: Option<&str>, terminal_classes: &[String]) -> bool {
     class.is_some_and(|c| is_terminal_class(c, terminal_classes))
 }
@@ -206,8 +206,8 @@ pub(crate) struct KeystrokeSettings {
     /// `[input] backend`.
     pub(crate) backend: InjectorBackend,
     /// `[input] modifier_wait_ms`: the cap on each wait for held physical
-    /// modifiers in a batch or command-mode keystroke request (#154), checked
-    /// before every key (#171). Zero means don't wait: a held modifier sends
+    /// modifiers in a batch or command-mode keystroke request, checked
+    /// before every key. Zero means don't wait: a held modifier sends
     /// the untyped rest of the text straight to the clipboard. Streaming
     /// ignores it and always waits for the release (see
     /// [`deliver_streaming_delta`]).
@@ -227,7 +227,7 @@ impl KeystrokeSettings {
 /// What a keystroke request did.
 ///
 /// A held modifier is not an error: the keys were deliberately withheld, and
-/// the caller owes the text a clipboard copy instead (#154). Hence an `Ok`
+/// the caller owes the text a clipboard copy instead. Hence an `Ok`
 /// variant the caller must match, not an `Err` it could log and drop.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,7 +241,7 @@ pub(crate) enum KeystrokeOutcome {
 
 /// Where a batch injection's text ended up.
 ///
-/// The held-modifier copy (#154) is a success for the text, but the user
+/// The held-modifier copy is a success for the text, but the user
 /// expects it at the cursor, so the caller (which holds the notify config)
 /// owes them a toast; the injection code runs in `spawn_blocking` without it.
 #[must_use]
@@ -250,7 +250,7 @@ pub(crate) enum Injection {
     /// Typed, pasted, or (under `clipboard_only`) copied as configured.
     Delivered,
     /// A physical modifier was still held after `[input] modifier_wait_ms`,
-    /// before the first key or partway through the text (#171): the keys
+    /// before the first key or partway through the text: the keys
     /// stopped there, and the untyped rest of the text, carried here, was
     /// copied to the clipboard instead. What was typed before the hold stays
     /// where it landed. In paste mode no Ctrl+V went out, so this is all of
@@ -261,7 +261,7 @@ pub(crate) enum Injection {
 /// Toast summary for [`Injection::CopiedForHeldModifier`].
 pub(crate) const HELD_MODIFIER_TOAST: &str = "Modifier key held: text copied to clipboard";
 
-/// Tell the user their text went to the clipboard, not the cursor (#154).
+/// Tell the user their text went to the clipboard, not the cursor.
 /// `text` is what was copied (the untyped rest), so the preview matches the
 /// clipboard. The caller gates this on `notify_error()`: the `warn!` alone
 /// only reaches the journal, and a dictation that silently did not type looks
@@ -278,7 +278,7 @@ pub(crate) fn notify_copied_for_held_modifier(text: &str) {
 /// [`clear_line_best_effort`]).
 ///
 /// No key is sent while a physical modifier is held: the check runs before
-/// the clear and again before every key of the text (#171), and each hold is
+/// the clear and again before every key of the text, and each hold is
 /// waited out for up to `keys.modifier_wait`. A hold that outlasts it stops
 /// the typing there, and the result is [`Typed::StoppedAt`] the first untyped
 /// byte of `text`: 0 when no text was typed (nor the clear, if the hold came
@@ -309,7 +309,7 @@ fn untyped_rest(text: &str, typed: usize) -> &str {
 }
 
 /// Put `text`, the untyped rest, on the clipboard because a held modifier
-/// stopped it from being typed or pasted (#154, #171). A failed copy is an
+/// stopped it from being typed or pasted. A failed copy is an
 /// error: the copy is the only place that text went.
 fn copy_instead_of_keystrokes(
     clipboard: &dyn ClipboardBackend,
@@ -323,7 +323,7 @@ fn copy_instead_of_keystrokes(
     Ok(Injection::CopiedForHeldModifier(text.to_string()))
 }
 
-/// The one warning for "not typed, copied instead" (#154).
+/// The one warning for "not typed, copied instead".
 fn warn_copied_instead(modifier_wait: std::time::Duration, len: usize) {
     warn!(
         "a modifier key was still held after {} ms; copied {len} chars to the \
@@ -332,23 +332,23 @@ fn warn_copied_instead(modifier_wait: std::time::Duration, len: usize) {
     );
 }
 
-/// What happened to one streaming delta (#154).
+/// What happened to one streaming delta.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamingDelivery {
     /// The whole delta was typed at the cursor.
     Typed,
     /// The session was cancelled while the delta waited for a held modifier
-    /// to be released, before its first key or partway through (#171). The
+    /// to be released, before its first key or partway through. The
     /// first `typed` bytes of the (sanitized) delta were typed and stay; the
     /// rest is discarded, neither typed nor copied.
     Cancelled { typed: usize },
 }
 
-/// Streaming dictation's delivery of one typed delta (#154).
+/// Streaming dictation's delivery of one typed delta.
 ///
 /// Unlike the batch path, streaming never gives up on a held modifier and
-/// never switches to the clipboard: before every key (#171) it waits for
+/// never switches to the clipboard: before every key it waits for
 /// every physical modifier to be released, however long that takes, then
 /// types on. Deltas that arrive meanwhile queue in the typing batcher and are
 /// typed in order afterwards. `[input] modifier_wait_ms` does not apply here.
@@ -385,7 +385,7 @@ pub(crate) fn deliver_streaming_delta(
     })
 }
 
-/// Time streaming deliveries spend waiting on a held modifier (#154), shared
+/// Time streaming deliveries spend waiting on a held modifier, shared
 /// with the pipeline's drain after stop. The drain timeout guards against a
 /// stuck typing task, not a user holding Alt: while a delta waits, the drain
 /// must not abort it, and once the wait ends the drain gets its full budget
@@ -524,13 +524,13 @@ fn clear_line_best_effort(keyboard: &mut dyn xkb_type::KeyInjector) {
 /// Run `send` against the persistent virtual keyboard, creating it on first
 /// use, once no physical modifier is held (`policy` says how long to wait).
 ///
-/// The modifier wait (#154) is what keeps a `Super+W` stop hotkey from
+/// The modifier wait is what keeps a `Super+W` stop hotkey from
 /// turning the injected keys into compositor binds: the final text is ready
 /// while the user's finger is often still on Super. No key is ever sent while
 /// a modifier is held. The wait runs once before `send`, which covers combos
 /// (the line clear, the paste), and `send` gets `gate` for
 /// [`xkb_type::KeyInjector::type_text`], which runs the same wait before
-/// every key (#171): a modifier pressed while the text is being typed pauses
+/// every key: a modifier pressed while the text is being typed pauses
 /// it, and a wait that ends without a release stops it there. One probe
 /// serves the whole call, so with nothing held each check is one key-state
 /// read of the cached keyboards: no sleep, no event.
@@ -593,7 +593,7 @@ fn with_persistent_keyboard<T>(
     result.map(Some)
 }
 
-/// How a keystroke request waits out a held physical modifier (#154).
+/// How a keystroke request waits out a held physical modifier.
 #[derive(Debug, Clone, Copy)]
 enum ModifierPolicy<'a> {
     /// Batch and command mode: up to this cap (`[input] modifier_wait_ms`),
@@ -651,7 +651,7 @@ const OWN_DEVICE_NAMES: [&str; 2] = ["whisrs virtual keyboard", "whisrs command"
 /// Block until no physical keyboard holds a modifier, up to `cap`
 /// (`[input] modifier_wait_ms`): the batch wait, for a keystroke sent outside
 /// [`with_persistent_keyboard`] (the selection copy). Call before sending any
-/// synthetic keystroke (#154), and send nothing on
+/// synthetic keystroke, and send nothing on
 /// [`ModifierWait::TimedOut`]. A zero `cap` means "don't wait": one reading,
 /// and a held modifier is an immediate [`ModifierWait::TimedOut`]. Takes only
 /// the keyboard-cache lock, never [`KEYBOARD`], so callers may hold
@@ -722,7 +722,7 @@ fn wait_for_modifier_release(
     }
 }
 
-/// Keyboards the modifier probe reads, cached across waits (#154): opening
+/// Keyboards the modifier probe reads, cached across waits: opening
 /// every `/dev/input` node per injection costs 100+ ms, reading a cached
 /// device's key state costs microseconds.
 #[cfg(not(test))]
@@ -817,8 +817,8 @@ fn modifier_probe() -> impl FnMut() -> bool {
 /// (an image, a file list, ...) can't be captured and round-tripped at all.
 /// If the pre-paste read fails, this falls back to typing instead of pasting
 /// — overwriting the clipboard via `set_text` first and only then discovering
-/// there's nothing valid to restore would destroy that content permanently
-/// (see #69), which skipping the *restore* alone can't undo since the damage
+/// there's nothing valid to restore would destroy that content permanently,
+/// which skipping the *restore* alone can't undo since the damage
 /// already happened at `set_text`.
 ///
 /// The restore is otherwise skipped, rather than clobbering the clipboard,
@@ -845,8 +845,8 @@ fn modifier_probe() -> impl FnMut() -> bool {
 /// copy failure is a hard error — the copy is the entire feature, there is
 /// no injection to fall back to.
 ///
-/// No keystroke is sent while a physical modifier is held (#154): the check
-/// runs before the first key and, when typing, before every key (#171). A
+/// No keystroke is sent while a physical modifier is held: the check
+/// runs before the first key and, when typing, before every key. A
 /// modifier still down after `keys.modifier_wait` stops the keys there, and
 /// the untyped rest of the text (all of it when nothing was typed, and in
 /// paste mode, where the one Ctrl+V was withheld) is copied to the clipboard
@@ -939,7 +939,7 @@ fn inject_text_with_clipboard(
             warn!("clipboard unreadable as text, typing instead of pasting: {e:#}");
             return match type_text_with_clear(text, keys, clear_line)? {
                 Typed::All => Ok(Injection::Delivered),
-                // Overwrites the non-text clipboard (#69's concern), but the
+                // Overwrites the non-text clipboard, but the
                 // alternative is dropping the rest of the dictation, which is
                 // worse.
                 Typed::StoppedAt(typed) => copy_instead_of_keystrokes(
@@ -1005,10 +1005,10 @@ fn inject_text_with_clipboard(
 /// appended to it. `clipboard_only` is the caller's to rule out: that mode
 /// must never clear.
 ///
-/// The clear and the text share one hold of the keyboard lock (#154). A
+/// The clear and the text share one hold of the keyboard lock. A
 /// modifier held before the clear withholds both: at the cap `text` is copied
 /// to the clipboard instead, leaving the old line untouched. A modifier
-/// pressed after the clear pauses the text (#171), and at the cap the untyped
+/// pressed after the clear pauses the text, and at the cap the untyped
 /// rest goes to the clipboard: the line is then cleared, or holds the start
 /// of the rewrite, with the rest a paste away. (Paste mode checks once,
 /// before the clear: see [`paste_via_keyboard`].) A clear that fails outright
@@ -1153,9 +1153,9 @@ fn new_keyboard(
 /// WM_CLASS class form (`Alacritty`, `st-256color`) and the reverse-DNS
 /// Wayland app_id form (`org.gnome.Terminal`).
 ///
-/// Matching is exact, never substring: an unanchored `contains` on `"st"`
-/// false-positived on `steam`, `Postman` and `systemsettings`, and command
-/// mode then wiped the whole GUI text field with Ctrl+A/Ctrl+K (#70).
+/// Matching is exact, never substring: a substring match on `"st"` would
+/// hit `steam`, `Postman` and `systemsettings`, and command mode would then
+/// wipe the whole GUI text field with Ctrl+A/Ctrl+K.
 ///
 /// Provenance notes for the entries we could not capture at runtime:
 /// - `waveterm`, `tabby` — source-derived only, no runtime capture.
@@ -1270,8 +1270,8 @@ const TERMINAL_LEAF_CLASSES: &[&str] = &[
 ///
 /// `user_classes` is `[input] terminal_classes`: the opt-in escape hatch for
 /// the classes the built-in list cannot know about — an `st` build with a
-/// custom `termname`, and scratchpad/dropdown classes like `Alacritty-float`
-/// (#92). It is checked *alongside* the built-in list, and only as a whole
+/// custom `termname`, and scratchpad/dropdown classes like `Alacritty-float`.
+/// It is checked *alongside* the built-in list, and only as a whole
 /// identifier:
 ///
 /// - Case-insensitive, like the built-in path, because compositors disagree on
@@ -1376,7 +1376,7 @@ mod tests {
         );
     }
 
-    /// #121: `[input] clipboard_only` sends no keystroke at all, so a line
+    /// `[input] clipboard_only` sends no keystroke at all, so a line
     /// break has nothing to submit and refusing would only keep the reply out
     /// of the clipboard the user asked for. Not refused, at a terminal or
     /// anywhere else, and still cleaned: the fence goes and CRLF becomes `\n`
@@ -1526,7 +1526,6 @@ mod tests {
             "io.example.Ghostty",
             "Terminator",
             "Com.gexperts.Tilix",
-            // added after the #70 review
             "uxterm",
             "koi8rxterm",
             "lxterminal",
@@ -1713,7 +1712,7 @@ mod tests {
         }
     }
 
-    /// A user entry must not reintroduce the #70 substring bug. Someone who
+    /// A user entry is never matched as a substring. Someone who
     /// lists a short generic name gets exactly that window class, nothing
     /// that merely contains it.
     #[test]
@@ -2243,7 +2242,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Modifier release before injection (#154)
+    // Modifier release before injection
     // ---------------------------------------------------------------------
 
     /// A probe that reports "held" for its first `held_for` calls, then
@@ -2766,7 +2765,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Modifier check before every key (#171)
+    // Modifier check before every key
     // ---------------------------------------------------------------------
 
     /// A probe that answers reading `n` (1-based) with `held(n)`, logging
@@ -3048,7 +3047,7 @@ mod tests {
     }
 
     /// An unknown class is not a terminal, so GNOME and KDE (which never
-    /// report one) keep typing line breaks as on every release before this.
+    /// report one) keep typing line breaks.
     #[test]
     fn an_unknown_window_is_not_a_terminal() {
         let classes = user(&["alacritty-float"]);

@@ -71,11 +71,11 @@ fn refused_multi_line_message(label: Option<&str>, history: bool) -> String {
 /// [`claim_command_mode_session`] / [`claim_llm_command_session`] gate every
 /// neighbor take on a successful claim.
 ///
-/// Ordering matters: transitioning *before* checking the context was issues
-/// #81/#90 — from a post-cancel Idle, `Toggle` is a valid transition back
-/// into Recording, so the dead session ran to completion and its final
-/// `TranscriptionDone` (invalid from Recording) was swallowed, wedging the
-/// daemon in Recording until restart. Claiming first closes the race: both
+/// Ordering matters: from a post-cancel Idle, `Toggle` is a valid
+/// transition back into Recording, so transitioning *before* checking the
+/// context would run the dead session to completion and swallow its final
+/// `TranscriptionDone` (invalid from Recording), wedging the daemon in
+/// Recording until restart. Claiming first closes the race: both
 /// sides serialize on the daemon-state lock, so either cancel wins (context
 /// gone → bail, machine stays Idle) or the background wins (machine moves to
 /// Transcribing, from which `Cancel` is an invalid transition, so the
@@ -94,7 +94,7 @@ pub(crate) fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Optio
 /// auto-stop the capture is stopped here. `label` names the flow in the log.
 ///
 /// Auto-stop decides speech with `[audio] vad` (the close profile: one user
-/// near the mic). `silence_timeout_ms = 0` never fires (#178), so the
+/// near the mic). `silence_timeout_ms = 0` never fires, so the
 /// instruction records until the channel closes.
 ///
 /// Shared by command mode, `[[llm_commands]]` and agent voice turns, which
@@ -270,7 +270,7 @@ async fn command_mode_start(
     // and then almost never fires, since any clipboard content makes it
     // ambiguous — or types over text the user is still looking at. Writing
     // text with no selection is what an `[[llm_commands]]` entry with a
-    // generic "treat this as a request" instruction does (issue #91); it never
+    // generic "treat this as a request" instruction does; it never
     // captures a selection in the first place, so the question never comes up.
     info!("command mode: getting selected text");
     let selected_text = match capture_selection(&context).await {
@@ -361,7 +361,7 @@ async fn command_mode_background(
     // takes the context under this same lock, so whoever locks first wins:
     // if cancel got there first the context is gone and the machine is
     // already Idle — bail below without transcribing, calling the LLM,
-    // injecting, or transitioning (issues #81/#90). Every neighbor take
+    // injecting, or transitioning. Every neighbor take
     // (the capture handle) happens inside the helper, gated on a successful
     // claim, so a bail cannot strip state from a session that started after
     // the cancel. The lock is released before the slow transcribe/LLM
@@ -390,9 +390,8 @@ async fn command_mode_background(
     }
 
     // Single finalize path — success, benign skip, and error all land here.
-    // Deliberate improvement over the old per-site unwinds: the state
-    // broadcast + overlay reset now run on error paths too, so the tray can
-    // no longer be left showing a stale state after a failure.
+    // The state broadcast + overlay reset run on error paths too, so the
+    // tray is never left showing a stale state after a failure.
     // `claim_session` put the machine in Transcribing and no other action is
     // valid from there, so this TranscriptionDone cannot fail.
     let mut ds = daemon_state.lock().await;
@@ -445,10 +444,9 @@ async fn command_mode_background_inner(
     // `is_terminal` can only ever be true where
     // `WindowTracker::get_focused_window_class()` is implemented, which is
     // Hyprland, Niri, Sway and X11. It returns `None` on KWin and GNOME
-    // (`src/window/dbus.rs`: GNOME would need a Shell extension, #72; KWin the
-    // `org_kde_plasma_window_management` Wayland protocol, #127), so it stays
-    // false there and terminals fall back to plain
-    // injection at the
+    // (`src/window/dbus.rs`: GNOME would need a Shell extension, KWin the
+    // `org_kde_plasma_window_management` Wayland protocol), so it stays
+    // false there and terminals fall back to plain injection at the
     // cursor (and to plain Ctrl+V on the paste branch). The practical
     // consequence for the gate is that on those two desktops a multi-line reply
     // is typed into a terminal rather than refused, the same exposure the
@@ -539,10 +537,10 @@ async fn command_mode_background_inner(
     // mode, so clearing would wipe whatever the user had typed at the prompt
     // and put nothing in its place — destroying input to produce no output.
     //
-    // A physical modifier still held after `[input] modifier_wait_ms` (#154)
+    // A physical modifier still held after `[input] modifier_wait_ms`
     // withholds the clear *and* the injection: the rewrite is copied to the
     // clipboard instead. One pressed after the clear pauses the typing, and at
-    // the cap the untyped rest is copied (#171, see `clear_line_and_inject`).
+    // the cap the untyped rest is copied (see `clear_line_and_inject`).
     info!("command mode: injecting {} chars", result.len());
     let text_clone = result;
     let keys = KeystrokeSettings::from_config(&context.config.input);
@@ -872,7 +870,7 @@ async fn llm_command_background(
     // takes the context under this same lock, so whoever locks first wins:
     // if cancel got there first the context is gone and the machine is
     // already Idle — bail below without transcribing, calling the LLM,
-    // injecting, or transitioning (issues #81/#90). Every neighbor take
+    // injecting, or transitioning. Every neighbor take
     // (capture handle, source window, start time) happens inside the
     // helper, gated on a successful claim, so a bail cannot strip state
     // from a session that started after the cancel. The lock is released
@@ -909,8 +907,8 @@ async fn llm_command_background(
 
     // Single finalize path — success, benign skip, and error all land here.
     // As in `command_mode_background`, the state broadcast + overlay reset
-    // now deliberately run on error paths too (they used to be success-only),
-    // so the tray can no longer be left showing a stale state after a failure.
+    // run on error paths too, so the tray is never left showing a stale state
+    // after a failure.
     // `claim_session` put the machine in Transcribing and no other action is
     // valid from there, so this TranscriptionDone cannot fail.
     let mut ds = daemon_state.lock().await;
@@ -989,9 +987,9 @@ async fn llm_command_background_inner(
 
     // Resolved unconditionally, not just on the paste branch: the multi-line
     // gate needs it too. Same caveat as command mode: `get_focused_window_class()`
-    // returns `None` on GNOME (would need a Shell extension, #72) and on KWin
-    // (would need the `org_kde_plasma_window_management` Wayland protocol,
-    // #127), so this stays false there and a terminal is treated as an
+    // returns `None` on GNOME (would need a Shell extension) and on KWin
+    // (would need the `org_kde_plasma_window_management` Wayland protocol),
+    // so this stays false there and a terminal is treated as an
     // ordinary target.
     let is_terminal = context
         .window_tracker
@@ -1123,8 +1121,8 @@ mod tests {
 
     /// Cancel won the race: `handle_cancel` took the context and moved the
     /// machine to Idle before the background task got the lock. The claim
-    /// must bail and leave Idle untouched — the old blind Toggle re-entered
-    /// Recording here and wedged the daemon (issues #81/#90).
+    /// must bail and leave Idle untouched: a blind Toggle would re-enter
+    /// Recording here and wedge the daemon.
     #[test]
     fn claim_session_bails_after_cancel_without_touching_idle() {
         let mut sm = StateMachine::new(); // post-cancel: Idle
@@ -1463,7 +1461,7 @@ mod tests {
     }
 
     /// Command mode, `[[llm_commands]]` and agent turns auto-stop by
-    /// `[general] silence_timeout_ms`, and 0 turns auto-stop off (#178):
+    /// `[general] silence_timeout_ms`, and 0 turns auto-stop off:
     /// the instruction records through 10 s of silence until the channel
     /// closes.
     #[tokio::test]

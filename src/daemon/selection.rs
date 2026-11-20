@@ -54,7 +54,7 @@ pub(crate) enum CaptureError {
     #[error("no text selected — select some text first")]
     ClipboardUnchanged,
     /// A physical modifier was still held after `[input] modifier_wait_ms`,
-    /// so the Ctrl+C was never sent (#154) and the clipboard is untouched.
+    /// so the Ctrl+C was never sent and the clipboard is untouched.
     /// Says nothing about the selection either way.
     #[error("a modifier key was held, so the selection was not copied")]
     ModifierHeld,
@@ -70,7 +70,7 @@ pub(crate) enum CaptureError {
 }
 
 /// Wait out a still-held hotkey modifier (e.g. Super from the speak or
-/// command bind) so the copy is not Super+Ctrl+C (#154). Called before the
+/// command bind) so the copy is not Super+Ctrl+C. Called before the
 /// uinput device exists, so the probe never reads our own pressed Ctrl.
 /// `false` means a modifier was still held at `modifier_wait`: send nothing.
 fn modifiers_released(modifier_wait: Duration) -> bool {
@@ -85,7 +85,7 @@ fn modifiers_released(modifier_wait: Duration) -> bool {
 }
 
 /// Simulate a key combo (e.g. Ctrl+C, Ctrl+V) via a temporary uinput device.
-/// Sends nothing while a physical modifier is held (#154).
+/// Sends nothing while a physical modifier is held.
 fn simulate_key_combo(
     modifier: evdev::Key,
     key: evdev::Key,
@@ -130,7 +130,7 @@ fn simulate_key_combo(
 }
 
 /// Simulate a two-modifier + key combo (e.g. Ctrl+Shift+V) via a temporary
-/// uinput device. Sends nothing while a physical modifier is held (#154).
+/// uinput device. Sends nothing while a physical modifier is held.
 fn simulate_key_combo_2mod(
     mod1: evdev::Key,
     mod2: evdev::Key,
@@ -194,12 +194,11 @@ fn simulate_terminal_copy(modifier_wait: Duration) -> anyhow::Result<KeystrokeOu
 /// Capture the currently selected text for the `set_hotkey` reprogram path.
 ///
 /// Thin wrapper over [`capture_selection`]: same acquisition order (primary
-/// selection first, simulated-copy fallback) and — crucially — the same
-/// clipboard-restore policy. An earlier standalone implementation restored
-/// the clipboard unconditionally, outside the branch that decides whether a
-/// copy ever fired, so a clipboard holding non-text content (`get_text()`
-/// errors on an image or file list) was replaced with an empty string even
-/// when the primary selection was populated and no Ctrl+C ran (#80).
+/// selection first, simulated-copy fallback) and, crucially, the same
+/// clipboard-restore policy. A restore outside the branch that decides
+/// whether a copy ever fired would replace a non-text clipboard (`get_text()`
+/// errors on an image or file list) with an empty string even when the
+/// primary selection was populated and no Ctrl+C ran.
 ///
 /// Returns the trimmed selection, or `None` when nothing usable is selected
 /// (the caller surfaces that as a "select the instruction text first"
@@ -252,7 +251,7 @@ fn instruction_from_capture(text: &str) -> Option<String> {
 /// clipboard unchanged, so nothing is written when there was no selection to
 /// copy. A failed restore is logged, never fatal. When the original clipboard
 /// wasn't text, the fallback copy overwrites content that cannot be restored;
-/// a warning is logged before the copy fires (#80).
+/// a warning is logged before the copy fires.
 ///
 /// Returns `Ok(text)` on success, or a [`CaptureError`] saying why nothing was
 /// captured. Every caller today treats all variants alike, surfacing the
@@ -305,9 +304,9 @@ where
     // `None` means the clipboard held something that isn't text.
     let saved_clipboard = clipboard.get_text().ok();
     if saved_clipboard.is_none() {
-        // Post-#77 a non-text clipboard is a reliable `Err`, so this is
+        // A non-text clipboard is a reliable `Err`, so this is
         // detectable before the copy — but the copy is still the only way to
-        // capture the selection, so the overwrite is accepted (#80).
+        // capture the selection, so the overwrite is accepted.
         warn!(
             "clipboard holds non-text content (image, files, ...); \
              the simulated copy will overwrite it and it cannot be restored"
@@ -319,7 +318,7 @@ where
 
     match tokio::task::spawn_blocking(copy).await {
         Ok(Ok(KeystrokeOutcome::Sent)) => {}
-        // A held modifier withheld the Ctrl+C (#154). Returned straight
+        // A held modifier withheld the Ctrl+C. Returned straight
         // away with its own variant, so the user learns why: reading back a
         // clipboard no copy touched would claim "no text selected"
         // (`ClipboardUnchanged`, or `NothingSelected` on an empty one).
@@ -388,7 +387,7 @@ mod tests {
     ///
     /// `texts` is the sequence of `get_text` results — `Some(text)` for a
     /// text clipboard, `None` for non-text content (an image or a file list:
-    /// the real backends return `Err` for those post-#77). Each `get_text`
+    /// the real backends return `Err` for those). Each `get_text`
     /// call consumes the front entry; the last entry is sticky. `writes`
     /// records every `set_text`, so tests can assert the restore policy
     /// byte-for-byte — including that nothing is ever written.
@@ -446,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn held_modifier_skips_the_copy_and_says_so() {
-        // The copy reports a held modifier (#154): nothing was sent, so the
+        // The copy reports a held modifier: nothing was sent, so the
         // capture stops there with its own error. The clipboard is empty, so
         // a read-back would have said `NothingSelected`, a claim about the
         // user nobody checked. Nothing is written.
@@ -492,10 +491,9 @@ mod tests {
 
     #[tokio::test]
     async fn primary_selection_never_touches_the_clipboard() {
-        // The #80 repro: an image on the clipboard (non-text => scripted
-        // `None`), text in the primary selection. No copy fires and nothing
-        // is ever written back — the old set-path restore wrote "" here,
-        // destroying the image.
+        // An image on the clipboard (non-text => scripted `None`), text in
+        // the primary selection. No copy fires and nothing is ever written
+        // back, so the image survives.
         let clipboard = ScriptedClipboard::new("selected text", &[None]);
         let fired = Arc::new(AtomicBool::new(false));
 

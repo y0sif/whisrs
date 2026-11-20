@@ -220,7 +220,7 @@ pub(crate) async fn handle_toggle(
                     // pipeline drains and types the remaining text. It stays
                     // in the state until the pipeline ends, so `whisrs
                     // cancel` can still discard a delta that is waiting for a
-                    // held modifier key (#154); the pipeline's tail clears
+                    // held modifier key; the pipeline's tail clears
                     // it, and so does the await below if the pipeline exited
                     // early (error or panic) without reaching that tail.
                     let recording_started_at = ds.recording_started_at.take();
@@ -417,7 +417,7 @@ pub(crate) async fn handle_cancel(
             Response::Ok { state: new_state }
         }
         // Stopped streaming session still draining: the last deltas may be
-        // waiting for a held modifier key, uncapped (#154). The state stays
+        // waiting for a held modifier key, uncapped. The state stays
         // Transcribing (the machine has no Transcribing → Idle cancel); the
         // flag ends the wait, the pending text is discarded, and the
         // pipeline's own tail moves the state to Idle.
@@ -459,7 +459,7 @@ pub(crate) async fn handle_cancel(
 /// the background task. It wakes on the closed audio channel and re-checks
 /// under this same lock (`claim_session` in command_mode.rs) — context gone
 /// means cancelled, so it discards the recording instead of transcribing,
-/// calling the LLM, and injecting text the user threw away (issues #81/#90).
+/// calling the LLM, and injecting text the user threw away.
 /// No other cleanup is owed for command mode: `capture_selection` restores
 /// the clipboard before recording ever starts, so the context holds only
 /// owned strings.
@@ -574,8 +574,7 @@ mod tests {
     }
 
     /// Minimal config with a batch (non-streaming) backend and an `en` default
-    /// language, mirroring the setup where issue reviews caught the batch path
-    /// ignoring `-l`.
+    /// language, so a batch path that ignores `-l` shows up as `en`.
     fn batch_config() -> Config {
         toml::from_str(
             r#"
@@ -643,8 +642,8 @@ mod tests {
 
     /// Mirrors `handle_cancel` on an active command-mode / llm-command
     /// recording: after Cancel the session teardown must take BOTH command
-    /// contexts (that is the signal the background tasks bail on — issues
-    /// #81/#90), flip the streaming cancel flag, and clear every per-session
+    /// contexts (that is the signal the background tasks bail on), flip the
+    /// streaming cancel flag, and clear every per-session
     /// field, leaving the machine in Idle.
     #[test]
     fn cancel_discards_command_and_llm_command_sessions() {
@@ -689,10 +688,10 @@ mod tests {
         assert_eq!(ds.state_machine.state(), State::Idle);
     }
 
-    /// #154: a stopped streaming session is cancellable only while its flag
+    /// A stopped streaming session is cancellable only while its flag
     /// is still installed. Releasing it (pipeline tail, or `handle_toggle`
     /// after an early pipeline error/panic) must leave a later
-    /// `Transcribing` (e.g. command mode) on the old "cannot cancel" path,
+    /// `Transcribing` (e.g. command mode) on the plain "cannot cancel" path,
     /// and must never clear a newer session's flag.
     #[test]
     fn release_streaming_cancel_ends_post_stop_cancel_window() {

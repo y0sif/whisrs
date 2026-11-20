@@ -99,7 +99,7 @@ pub(crate) struct StreamingPipelineParams {
     pub(crate) audio_feedback: bool,
     pub(crate) audio_feedback_volume: f32,
     pub(crate) backend_name: String,
-    /// `[input]` key delay, backend and modifier wait (#154).
+    /// `[input]` key delay, backend and modifier wait.
     pub(crate) keys: KeystrokeSettings,
     /// `[input] clipboard_fallback`: leave the final transcript in the
     /// clipboard as a manual-fix fallback for silent injection failures.
@@ -183,7 +183,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     // batcher, and the clipboard write below still has to know whether the
     // run ended in a cancel.
     let clipboard_cancel = Arc::clone(&cancel_flag);
-    // Third handle: a delta waiting on a held modifier (#154) polls it, so
+    // Third handle: a delta waiting on a held modifier polls it, so
     // `whisrs cancel` ends that wait and discards the delta.
     let sink_cancel = Arc::clone(&cancel_flag);
     // Time deltas spend waiting on a held modifier, kept out of the drain
@@ -251,8 +251,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                         // paste`: partial deltas are typed as they arrive, and a
                         // paste per delta would thrash the clipboard. A held
                         // modifier pauses the delta before its next key, uncapped,
-                        // until it is released or the session is cancelled
-                        // (#154, #171).
+                        // until it is released or the session is cancelled.
                         let delta = text_to_type.clone();
                         match tokio::task::spawn_blocking(move || {
                             deliver_streaming_delta(&delta, keys, &cancel, &modifier_waits)
@@ -293,7 +292,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 
     // Forward audio from capture to backend, with auto-stop detection
     // (`[audio] vad`, the close profile: one user near the mic). A timeout of
-    // 0 never fires (#178).
+    // 0 never fires.
     let mut auto_stop = AutoStopDetector::with_vad(
         VadConfig::close(config.vad),
         silence_timeout_ms,
@@ -373,7 +372,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     // Wait for the typing side to observe the closed text channel and drain
     // any final batch. If that somehow gets stuck, abort it so the daemon can
     // return to Idle instead of staying in Transcribing forever. A delta
-    // waiting on a held modifier (#154) is not stuck: that time does not
+    // waiting on a held modifier is not stuck: that time does not
     // count, and the budget restarts once the modifier is released. Only
     // `whisrs cancel` ends such a wait early.
     debug!("waiting for typing task to finish");
@@ -420,7 +419,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         }
     };
 
-    // `whisrs cancel` after stop (#154): the session is discarded, like a
+    // `whisrs cancel` after stop: the session is discarded, like a
     // cancel during recording. No history entry, no done cue. Every writer of
     // the flag holds the daemon-state lock and first finds it in
     // `streaming_cancel`, so reading it and clearing that slot under one
@@ -522,7 +521,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 /// sink is busy (a held modifier, slow typing), so they often share a batch.
 /// `Fragments` verbatim, with a space before a batch only where the raw text
 /// had whitespace at that boundary, so a word split across two batches stays
-/// whole (issue #201).
+/// whole.
 ///
 /// Each batch is sanitized ([`sanitize_for_injection`]) before it reaches the
 /// sink. The sink returns the text it handed on, which can differ from what
@@ -656,8 +655,7 @@ where
 /// what `cancelled` carries in. The batch path already behaves that way for
 /// free (cancel throws the audio away and `process_recording_batch` never
 /// runs), so without that check the same keypress would leave text in the
-/// clipboard on a streaming backend and nothing on a batch one — the
-/// streaming/batch divergence class from #54.
+/// clipboard on a streaming backend and nothing on a batch one.
 ///
 /// Returns `()`: a copy failure is only warned about, never propagated. The
 /// caller is the typing task, whose value is the transcript itself.
@@ -1217,8 +1215,8 @@ pub(crate) fn history_backend_tag(backend: &str, post_processed: bool) -> String
 /// path (`llm_command_background_inner`), which propagates the LLM error and
 /// injects nothing. There the user pressed a hotkey to run *that command*, so
 /// a failure means the command did not happen; here they pressed plain
-/// dictate, and losing a whole dictation to a flaky endpoint would be a
-/// regression against `llm_post_process = false`.
+/// dictate, and losing a whole dictation to a flaky endpoint would make it
+/// worse than `llm_post_process = false`.
 /// The completion goes through [`llm::clean_llm_output`], the same cleaning
 /// the llm-command path uses: line endings normalized, a wrapping code fence
 /// stripped, the ends trimmed. A trailing newline typed at a shell prompt
@@ -1337,7 +1335,7 @@ pub(crate) async fn process_recording_batch(
     }
 
     // `[general] llm_post_process`: rewrite the finished transcript through
-    // the shared `[llm]` backend before it reaches the cursor (issue #85).
+    // the shared `[llm]` backend before it reaches the cursor.
     // Batch-only by design — the streaming pipeline types partials as they
     // arrive and never holds a whole transcript, so this must NOT be wired
     // into `run_streaming_pipeline`; the usual "wire it into both paths" rule
@@ -1813,11 +1811,11 @@ pub(crate) mod tests {
     }
 
     /// Deltas within one batch window are typed as one batch. Phrase backends
-    /// (Deepgram streaming, Groq, local whisper) send trimmed phrases, which
-    /// used to be glued ("itcopies"): they get a space between them, but none
-    /// before closing punctuation, and a space already at the boundary, on
-    /// either side, is not doubled. OpenAI realtime append deltas split words
-    /// and carry their own spaces, so fragments are glued as they come.
+    /// (Deepgram streaming, Groq, local whisper) send trimmed phrases: they
+    /// get a space between them, but none before closing punctuation, and a
+    /// space already at the boundary, on either side, is not doubled. OpenAI
+    /// realtime append deltas split words and carry their own spaces, so
+    /// fragments are glued as they come.
     #[tokio::test(start_paused = true)]
     async fn typing_batcher_spaces_phrases_within_a_batch() {
         let cases: [(&str, StreamText, &[&str], &str); 4] = [
@@ -1888,8 +1886,7 @@ pub(crate) mod tests {
 
     /// Fragments sent in separate batch windows get a space between batches
     /// only where the raw text had a word gap. A word whose append deltas land
-    /// in two batches stays whole (it was typed with a space inside it,
-    /// "П они ет"); a gap is kept, also when filler removal trimmed the
+    /// in two batches stays whole; a gap is kept, also when filler removal trimmed the
     /// whitespace off the batch. The first batch gets no space, nor does a
     /// batch that opens with closing punctuation, even where the raw text had
     /// a gap before it. `typed` is checked where the batches matter.
@@ -2440,10 +2437,10 @@ pub(crate) mod tests {
     ///
     /// The llm-command path (whose transcript is LLM input) checks, while
     /// command mode (which sends no prompt) never does. The backend gate is
-    /// issue #133: `config.prompt` is built for every backend, but Deepgram
+    /// there because `config.prompt` is built for every backend, but Deepgram
     /// and `openai-compatible-realtime` never put it on the wire, so without
     /// that condition genuine speech resembling the user's own
-    /// `[general] vocabulary` was discarded as an echo of something the model
+    /// `[general] vocabulary` would be discarded as an echo of something the model
     /// never saw. `openai-realtime` joins them on gpt-realtime-whisper, the
     /// one model that takes no prompt, which is why the flag is read per
     /// request rather than per backend.
@@ -2481,7 +2478,7 @@ pub(crate) mod tests {
                 false,
             ),
             (
-                "dictation: promptless backend, vocabulary-shaped speech passes (#133)",
+                "dictation: promptless backend, vocabulary-shaped speech passes",
                 BatchOptions::dictation(),
                 false,
                 Some(prompt),
@@ -2497,7 +2494,7 @@ pub(crate) mod tests {
                 true,
             ),
             (
-                "llm_command: promptless backend, echo-shaped text passes (#133)",
+                "llm_command: promptless backend, echo-shaped text passes",
                 BatchOptions::llm_command("proofread"),
                 false,
                 Some(prompt),
@@ -2522,13 +2519,13 @@ pub(crate) mod tests {
         }
     }
 
-    // ── The #133 gate is wired into the batch path ──────────────────────
+    // ── The backend prompt gate is wired into the batch path ────────────
     //
     // `should_drop_as_echo` is covered above and the per-backend answers are
     // covered next to each backend, but neither proves `transcribe_batch_audio`
-    // ever *asks* the backend. Hardcoding `true` at that call site — which
-    // disables the whole fix — left every one of those tests green. The table
-    // below drives the real function and flips nothing but `sends_prompt()`.
+    // ever *asks* the backend: with `true` hardcoded at that call site every
+    // one of those tests stays green. The table below drives the real
+    // function and flips nothing but `sends_prompt()`.
 
     /// A backend that returns a fixed transcript and answers `sends_prompt()`
     /// however the test asks it to. Nothing else about the batch path cares.
@@ -2610,8 +2607,7 @@ pub(crate) mod tests {
 
     /// Genuine speech that normalizes to a substring of the prompt built from
     /// `WIRING_VOCABULARY`, so `is_prompt_echo` flags it. Someone dictating a
-    /// run of their own vocabulary terms produces exactly this shape — which
-    /// is what issue #133 reported.
+    /// run of their own vocabulary terms produces exactly this shape.
     const VOCABULARY_SHAPED_SPEECH: &str = "Hyprland, whisrs, Wayland";
 
     /// `notify: false` keeps `send_notification` (which spawns a D-Bus thread)
@@ -2805,7 +2801,7 @@ pub(crate) mod tests {
         assert_eq!(instruction, SPOKEN);
     }
 
-    // ── Toggle-path LLM post-processing (issue #85) ─────────────────────
+    // ── Toggle-path LLM post-processing ─────────────────────────────────
 
     /// The instruction the toggle path sends. The flag is opt-in: an
     /// untouched config never post-processes, whatever the (defaulted)
@@ -2913,11 +2909,11 @@ pub(crate) mod tests {
 
     /// A post-processed dictation is tagged `<backend>+llm`, so `whisrs log`
     /// shows which entries hold the LLM's words rather than the microphone's.
-    /// One that was not keeps the bare backend name it has always been logged
-    /// under, byte for byte: anything else would shift the meaning of every
-    /// pre-existing history entry. The backend in front and the marker behind
-    /// keep the tag apart from the llm-command path's `llm:<name>` entries
-    /// (`command_mode.rs`), even for a command named after a backend.
+    /// One that was not keeps the bare backend name, byte for byte: anything
+    /// else would shift the meaning of every existing history entry. The
+    /// backend in front and the marker behind keep the tag apart from the
+    /// llm-command path's `llm:<name>` entries (`command_mode.rs`), even for a
+    /// command named after a backend.
     #[test]
     fn history_backend_tag_marks_only_post_processed_dictation() {
         for (backend, post_processed, want) in [
