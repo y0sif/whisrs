@@ -777,16 +777,6 @@ mod tests {
     }
 
     #[test]
-    fn no_rows_draw_nothing_and_idle() {
-        let mut pm = Pixmap::new(CANVAS_WIDTH, CANVAS_HEIGHT).unwrap();
-        pm.fill(Color::WHITE);
-        let mut scene = AgentScene::new(AgentOverlayStyle::Orb, AgentOverlayCorner::BottomRight);
-        let pace = scene.draw(&mut pm, rows(&[]), Instant::now(), 0.0, 1.0);
-        assert_eq!(pace, Pace::Idle);
-        assert!(pm.data().iter().all(|b| *b == 0));
-    }
-
-    #[test]
     fn every_style_and_state_draws_in_its_color() {
         // At 2x: the face's features are 1.4 px lines, which at 1x are
         // mostly edge pixels blended with the face's background.

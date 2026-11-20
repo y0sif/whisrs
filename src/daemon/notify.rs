@@ -89,8 +89,8 @@ mod tests {
     }
 
     #[test]
-    fn truncate_cyrillic_issue_repro() {
-        // Exact text from issue #4.
+    fn truncate_cyrillic_mid_char() {
+        // Cyrillic text whose 77-byte cut lands inside a character.
         let text = "Вот это рутина, блять, вы дешевые щели, блять.";
         let preview = truncate_preview(text, 77);
         // Must not panic and must be valid UTF-8.

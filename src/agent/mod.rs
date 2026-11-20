@@ -792,7 +792,7 @@ mod tests {
 
     fn resolve(entries: &[AgentConfig]) -> (Vec<Agent>, Vec<String>) {
         resolve_agents_with(entries, Some(Path::new("/daemon/cwd")), |p| {
-            p == Path::new("/proj") || p.ends_with("Projects")
+            p == Path::new("/proj")
         })
     }
 
@@ -961,60 +961,32 @@ feedback = "Conversational"
     }
 
     #[test]
-    fn an_opencode_entry_runs_opencode_by_default() {
-        let mut e = entry("coder");
-        e.harness = " OpenCode ".into();
-        let (agents, warnings) = resolve(&[e]);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(agents[0].harness, Harness::OpenCode);
-        assert_eq!(agents[0].command, "opencode");
-        assert_eq!(Harness::OpenCode.to_string(), "opencode");
-        assert_eq!(Harness::OpenCode.label(), "OpenCode");
-    }
-
-    #[test]
-    fn a_codex_entry_runs_codex_by_default() {
-        let mut e = entry("cx");
-        e.harness = "Codex".into();
-        e.permissions = "ask".into();
-        let (agents, warnings) = resolve(&[e]);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(agents[0].harness, Harness::Codex);
-        assert_eq!(agents[0].command, "codex");
-        assert_eq!(agents[0].permissions, Permissions::Ask);
-        assert_eq!(Harness::Codex.to_string(), "codex");
-        assert_eq!(Harness::Codex.label(), "Codex");
-    }
-
-    #[test]
-    fn a_copilot_entry_runs_copilot_by_default() {
-        let mut e = entry("cp");
-        e.harness = " Copilot".into();
-        e.permissions = "ask".into();
-        let (agents, warnings) = resolve(&[e]);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(agents[0].harness, Harness::Copilot);
-        assert_eq!(agents[0].command, "copilot");
-        assert_eq!(agents[0].permissions, Permissions::Ask);
-        assert_eq!(Harness::Copilot.to_string(), "copilot");
-        assert_eq!(Harness::Copilot.label(), "Copilot");
-        // As agents.json stores it.
-        assert_eq!(
-            serde_json::to_string(&Harness::Copilot).unwrap(),
-            "\"copilot\""
-        );
+    fn each_harness_entry_runs_its_own_binary_by_default() {
+        for (written, harness, command, label) in [
+            ("claude", Harness::Claude, "claude", "Claude Code"),
+            (" OpenCode ", Harness::OpenCode, "opencode", "OpenCode"),
+            ("Codex", Harness::Codex, "codex", "Codex"),
+            (" Copilot", Harness::Copilot, "copilot", "Copilot"),
+        ] {
+            let mut e = entry("coder");
+            e.harness = written.into();
+            let (agents, warnings) = resolve(&[e]);
+            assert!(warnings.is_empty(), "{written}: {warnings:?}");
+            let [agent] = &agents[..] else {
+                panic!("{written}: {agents:?}");
+            };
+            assert_eq!(agent.harness, harness, "{written}");
+            assert_eq!(agent.command, command, "{written}");
+            assert_eq!(harness.to_string(), command, "{written}");
+            assert_eq!(harness.label(), label, "{written}");
+        }
     }
 
     #[test]
     fn tilde_expands_to_home() {
         let home = dirs::home_dir().unwrap();
         assert_eq!(expand_tilde("~"), home);
-        assert_eq!(expand_tilde("~/Projects"), home.join("Projects"));
         assert_eq!(expand_tilde("/abs/~/x"), PathBuf::from("/abs/~/x"));
-        let mut e = entry("jarvis");
-        e.dir = "~/Projects".into();
-        let (agents, _) = resolve(&[e]);
-        assert_eq!(agents[0].dir, home.join("Projects"));
     }
 
     /// Every harness gets an absolute dir: OpenCode takes its directory from

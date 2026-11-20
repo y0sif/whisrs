@@ -28,7 +28,6 @@ include = [
     "/src/tray/icons/*.png",
     "/src/cli/tui/snapshots/*.txt",
     "/tests/**",
-    "/examples/**",
     "/docs/agents.md",
     "/docs/config-reference.md",
     "/docs/configuration.md",
@@ -57,18 +56,6 @@ path = "src/cli/main.rs"
 [[bin]]
 name = "whisrsd"
 path = "src/daemon/main.rs"
-
-[[example]]
-name = "issue55_stream_check"
-required-features = ["local-whisper"]
-
-[[example]]
-name = "issue208_batch_check"
-required-features = ["local-whisper"]
-
-[[example]]
-name = "agent_overlay_frames"
-required-features = ["overlay"]
 
 [features]
 default = ["local-whisper", "tray", "overlay", "hooks", "recording", "mcp"]
@@ -203,6 +190,3 @@ claxon = "0.4"
 tempfile = "3"
 # start_paused tests need tokio's paused clock ("test-util" is not in "full").
 tokio = { version = "1", features = ["test-util"] }
-# PNG output for examples/agent_overlay_frames.rs. Dev only, so the binaries
-# keep tiny-skia without its PNG encoder.
-tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }

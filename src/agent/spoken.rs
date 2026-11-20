@@ -487,107 +487,138 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_last_spoken_block_wins() {
-        let reply = "Working.\n<spoken>First draft.</spoken>\nMore notes.\n\
-                     <spoken>I fixed the failing test and pushed it.</spoken>\nDetails below.";
-        assert_eq!(
-            spoken_reply(reply),
-            "I fixed the failing test and pushed it."
-        );
+    fn a_reply_is_spoken_from_its_last_block_or_first_sentences() {
+        for (name, reply, want) in [
+            (
+                "the last block wins",
+                "Working.\n<spoken>First draft.</spoken>\nMore notes.\n\
+                 <spoken>I fixed the failing test and pushed it.</spoken>\nDetails below.",
+                "I fixed the failing test and pushed it.",
+            ),
+            (
+                "tags in any case",
+                "x <SPOKEN>All done.</Spoken> y",
+                "All done.",
+            ),
+            // A clause without an end mark gets one, which TTS reads as a stop.
+            (
+                "an unclosed block",
+                "notes <spoken>It builds now",
+                "It builds now.",
+            ),
+            (
+                "no block: the first two sentences",
+                "I renamed the function. Tests pass. I also updated the docs. Anything else?",
+                "I renamed the function. Tests pass.",
+            ),
+            (
+                "markdown, no block",
+                "## Summary\n\nFixed the **race** in `claim_session`:\n\n\
+                 - moved the check\n- added a test\n\n```rust\nfn x() {}\n```\n",
+                "Summary. Fixed the race in claim_session.",
+            ),
+            (
+                "a block is sanitized",
+                "<spoken>**Done.** I changed `main.rs` in src/main.rs.</spoken>",
+                "Done. I changed main.rs in.",
+            ),
+            (
+                "a stray closing tag",
+                "All good.</spoken> Next.",
+                "All good. Next.",
+            ),
+            // Nothing speakable says done.
+            ("empty", "", EMPTY_REPLY),
+            ("an empty block", "<spoken></spoken>", EMPTY_REPLY),
+            ("code only", "```\ncode only\n```", EMPTY_REPLY),
+            (
+                "a URL and a path",
+                "<spoken>https://x.io /a/b</spoken>",
+                EMPTY_REPLY,
+            ),
+            // Punctuation a dropped URL leaves behind is nothing to say.
+            (
+                "a URL's punctuation",
+                "<spoken>https://x.io!</spoken>",
+                EMPTY_REPLY,
+            ),
+            (
+                "a path's punctuation",
+                "<spoken>/a/b?</spoken>",
+                EMPTY_REPLY,
+            ),
+            (
+                "a URL's punctuation, then a sentence",
+                "<spoken>https://x.io! Then it built.</spoken>",
+                "Then it built.",
+            ),
+        ] {
+            assert_eq!(spoken_reply(reply), want, "{name}");
+        }
     }
 
     #[test]
-    fn tags_match_case_insensitively() {
-        assert_eq!(spoken_reply("x <SPOKEN>All done.</Spoken> y"), "All done.");
-    }
-
-    #[test]
-    fn an_unclosed_block_takes_the_rest() {
-        assert_eq!(
-            last_spoken_block("notes <spoken>It builds now"),
-            Some("It builds now")
-        );
-        // A clause without an end mark gets one, which TTS reads as a stop.
-        assert_eq!(
-            spoken_reply("notes <spoken>It builds now"),
-            "It builds now."
-        );
-    }
-
-    #[test]
-    fn without_a_block_the_first_two_sentences_are_kept() {
-        let reply = "I renamed the function. Tests pass. I also updated the docs. Anything else?";
-        assert_eq!(spoken_reply(reply), "I renamed the function. Tests pass.");
-    }
-
-    #[test]
-    fn markdown_without_a_block_is_read_as_sentences() {
-        let reply = "## Summary\n\nFixed the **race** in `claim_session`:\n\n\
-                     - moved the check\n- added a test\n\n```rust\nfn x() {}\n```\n";
-        assert_eq!(
-            spoken_reply(reply),
-            "Summary. Fixed the race in claim_session."
-        );
-    }
-
-    #[test]
-    fn fenced_code_is_dropped() {
-        let text = "Before.\n```bash\nrm -rf target\necho hi\n```\nAfter.";
-        assert_eq!(sanitize(text), "Before. After.");
-        // An unterminated fence drops the rest.
-        assert_eq!(sanitize("Run this:\n~~~\ncargo build\n"), "Run this.");
-    }
-
-    #[test]
-    fn short_inline_code_is_kept_long_is_dropped() {
-        assert_eq!(sanitize("Use `cargo test` here."), "Use cargo test here.");
-        assert_eq!(
-            sanitize("Run `cargo test --all-targets -- --nocapture` again."),
-            "Run again."
-        );
-    }
-
-    #[test]
-    fn links_become_their_text_and_urls_are_dropped() {
-        assert_eq!(
-            sanitize("See [the docs](https://example.com/docs) or https://x.io/a?b=c for more."),
-            "See the docs or for more."
-        );
-        assert_eq!(sanitize("Visit <https://example.com>."), "Visit.");
-        assert_eq!(sanitize("Go to www.example.com now."), "Go to now.");
-    }
-
-    #[test]
-    fn file_paths_are_dropped_but_keep_the_sentence_end() {
-        assert_eq!(
-            sanitize("I edited src/daemon/agent.rs and ~/notes.md."),
-            "I edited and."
-        );
-        assert_eq!(sanitize("Changed src/main.rs."), "Changed.");
-        assert_eq!(
-            sanitize("Wrote /tmp/out, then stopped."),
-            "Wrote, then stopped."
-        );
-        // Words with one slash and no extension stay.
-        assert_eq!(
-            sanitize("Use and/or TCP/IP, 1/2 of it."),
-            "Use and/or TCP/IP, 1/2 of it."
-        );
-    }
-
-    #[test]
-    fn markers_bullets_and_tables_are_stripped() {
-        let text = "# Title\n> quoted *text*\n1. first\n2) second\n* third\n\
-                    | a | b |\n|---|---|\n| 1 | 2 |\n---\n__done__";
-        assert_eq!(
-            sanitize(text),
-            "Title. quoted text. first. second. third. done."
-        );
-    }
-
-    #[test]
-    fn whitespace_is_collapsed() {
-        assert_eq!(sanitize("  a\t\tb  \n  c  "), "a b c.");
+    fn sanitize_reads_markdown_as_words() {
+        for (name, text, want) in [
+            (
+                "fenced code",
+                "Before.\n```bash\nrm -rf target\necho hi\n```\nAfter.",
+                "Before. After.",
+            ),
+            // An unterminated fence drops the rest.
+            (
+                "an unterminated fence",
+                "Run this:\n~~~\ncargo build\n",
+                "Run this.",
+            ),
+            (
+                "short inline code",
+                "Use `cargo test` here.",
+                "Use cargo test here.",
+            ),
+            (
+                "long inline code",
+                "Run `cargo test --all-targets -- --nocapture` again.",
+                "Run again.",
+            ),
+            (
+                "a link and a URL",
+                "See [the docs](https://example.com/docs) or https://x.io/a?b=c for more.",
+                "See the docs or for more.",
+            ),
+            ("an autolink", "Visit <https://example.com>.", "Visit."),
+            ("a www host", "Go to www.example.com now.", "Go to now."),
+            (
+                "paths",
+                "I edited src/daemon/agent.rs and ~/notes.md.",
+                "I edited and.",
+            ),
+            (
+                "a path at the sentence end",
+                "Changed src/main.rs.",
+                "Changed.",
+            ),
+            (
+                "an absolute path",
+                "Wrote /tmp/out, then stopped.",
+                "Wrote, then stopped.",
+            ),
+            // Words with one slash and no extension stay.
+            (
+                "one slash, no extension",
+                "Use and/or TCP/IP, 1/2 of it.",
+                "Use and/or TCP/IP, 1/2 of it.",
+            ),
+            (
+                "markers, bullets and tables",
+                "# Title\n> quoted *text*\n1. first\n2) second\n* third\n\
+                 | a | b |\n|---|---|\n| 1 | 2 |\n---\n__done__",
+                "Title. quoted text. first. second. third. done.",
+            ),
+            ("whitespace", "  a\t\tb  \n  c  ", "a b c."),
+        ] {
+            assert_eq!(sanitize(text), want, "{name}");
+        }
     }
 
     #[test]
@@ -623,25 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_speakable_says_done() {
-        assert_eq!(spoken_reply(""), EMPTY_REPLY);
-        assert_eq!(spoken_reply("<spoken></spoken>"), EMPTY_REPLY);
-        assert_eq!(spoken_reply("```\ncode only\n```"), EMPTY_REPLY);
-        assert_eq!(
-            spoken_reply("<spoken>https://x.io /a/b</spoken>"),
-            EMPTY_REPLY
-        );
-    }
-
-    #[test]
-    fn a_spoken_block_is_sanitized_too() {
-        assert_eq!(
-            spoken_reply("<spoken>**Done.** I changed `main.rs` in src/main.rs.</spoken>"),
-            "Done. I changed main.rs in."
-        );
-    }
-
-    #[test]
     fn sentences_split_on_marks_followed_by_space() {
         assert_eq!(
             sentences("One. Two! Three? Version 1.5 works. Tail"),
@@ -651,11 +663,6 @@ mod tests {
             sentences("He said \"stop.\" Then left."),
             vec!["He said \"stop.\"", "Then left."]
         );
-    }
-
-    #[test]
-    fn a_reply_with_no_tags_and_stray_closing_tag() {
-        assert_eq!(spoken_reply("All good.</spoken> Next."), "All good. Next.");
     }
 
     /// A tag the reply mentions after its block is not a block.
@@ -671,6 +678,11 @@ mod tests {
             last_spoken_block("<spoken>draft <spoken>final</spoken>"),
             Some("final")
         );
+        // An unclosed block runs to the end.
+        assert_eq!(
+            last_spoken_block("notes <spoken>It builds now"),
+            Some("It builds now")
+        );
         // Only a truncated block: everything after its first tag, the
         // mentioned tag stripped.
         assert_eq!(
@@ -681,17 +693,6 @@ mod tests {
         assert_eq!(
             spoken_reply("<spoken>Done with it.</spoken> more <spoken>cut off"),
             "Done with it."
-        );
-    }
-
-    /// Punctuation a dropped URL leaves behind is nothing to say.
-    #[test]
-    fn leftover_punctuation_says_done() {
-        assert_eq!(spoken_reply("<spoken>https://x.io!</spoken>"), EMPTY_REPLY);
-        assert_eq!(spoken_reply("<spoken>/a/b?</spoken>"), EMPTY_REPLY);
-        assert_eq!(
-            spoken_reply("<spoken>https://x.io! Then it built.</spoken>"),
-            "Then it built."
         );
     }
 

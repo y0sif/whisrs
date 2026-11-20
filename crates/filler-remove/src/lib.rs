@@ -621,8 +621,8 @@ mod tests {
     fn filter_builtin_caches_compiled_regexes() {
         // The built-in path holds zero custom regexes (it dispatches to the
         // module-level `LazyLock`). The compiled-regex count must stay at 0
-        // across many `apply` calls — any regression that re-introduced
-        // per-call `Regex::new` into the custom slot would push it above 0.
+        // across many `apply` calls: a per-call `Regex::new` in the custom
+        // slot would push it above 0.
         let filter = FillerFilter::builtin();
         assert_eq!(filter.compiled_regex_count(), 0);
         for _ in 0..100 {

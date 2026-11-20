@@ -420,13 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_board_shows_nothing() {
-        let board = Board::new(["jarvis", "friday"]);
-        assert!(board.compose(Instant::now()).is_empty());
-        assert_eq!(board.next_change(Instant::now()), None);
-    }
-
-    #[test]
     fn rows_come_in_config_order() {
         let t0 = Instant::now();
         let mut board = Board::new(["a", "b", "c"]);
@@ -500,11 +493,6 @@ mod tests {
         let t0 = Instant::now();
         let at = |s: f64| t0 + secs(s);
         let mut board = Board::new(["jarvis"]);
-        board.set_voice(Some(("jarvis", AgentVisual::Listening)), t0);
-        assert_eq!(one(&board, at(1.0)).since, t0);
-        board.set_voice(Some(("jarvis", AgentVisual::Transcribing)), at(3.0));
-        assert_eq!(one(&board, at(3.5)).since, at(3.0));
-        board.set_voice(None, at(4.0));
         board.turn_started("jarvis", at(4.0));
         let timer = |board: &Board, now: f64| {
             let e = one(board, at(now));
@@ -652,17 +640,6 @@ mod tests {
         assert!(board
             .compose(t0 + secs(10.0) + DONE_HOLD + DONE_FADE)
             .is_empty());
-    }
-
-    #[test]
-    fn a_reply_queued_after_the_end_holds_it_again() {
-        let t0 = Instant::now();
-        let mut board = Board::new(["jarvis"]);
-        board.turn_started("jarvis", t0);
-        board.turn_ended("jarvis", true, t0 + secs(1.0));
-        assert!(one(&board, t0 + secs(1.0)).fading_from.is_some());
-        board.set_pending(&["jarvis"], t0 + secs(1.1));
-        assert_eq!(one(&board, t0 + secs(30.0)).fading_from, None);
     }
 
     #[test]

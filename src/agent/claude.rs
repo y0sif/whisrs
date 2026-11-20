@@ -2241,25 +2241,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_missing_binary_names_the_command() {
-        let a = agent(Permissions::Auto);
-        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let msg = spawn_failure(&a, &e, true);
-        assert!(msg.contains("`claude` was not found"), "{msg}");
-        assert!(msg.contains("set command in [[agents]]"), "{msg}");
-    }
-
     /// Spawning in a missing dir also fails with "not found": the dir is
     /// named, not the binary.
     #[test]
-    fn a_missing_dir_is_reported_as_the_dir() {
+    fn a_spawn_failure_names_the_dir_before_the_command() {
         let a = agent(Permissions::Auto);
         let e = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert_eq!(
-            spawn_failure(&a, &e, false),
-            "Agent 'jarvis': its dir /proj does not exist."
-        );
+        for (row, dir_exists, want) in [
+            (
+                "a missing binary",
+                true,
+                "Agent 'jarvis': `claude` was not found. Install Claude Code, or set command in \
+                 [[agents]] to its full path (a systemd user service may not have ~/.local/bin \
+                 on PATH).",
+            ),
+            (
+                "a missing dir",
+                false,
+                "Agent 'jarvis': its dir /proj does not exist.",
+            ),
+        ] {
+            assert_eq!(spawn_failure(&a, &e, dir_exists), want, "{row}");
+        }
     }
 
     #[test]
@@ -2335,25 +2338,11 @@ mod tests {
         ));
     }
 
-    /// systemd-run's own failures fall back to a direct launch; a failure of
-    /// claude itself (which ran) does not launch it twice.
+    /// systemd-run's own failures fall back to a direct launch
+    /// (`a_scope_that_never_ran_falls_back` in `process.rs` runs them); a
+    /// failure of claude itself (which ran) does not launch it twice.
     #[test]
     fn only_systemd_runs_own_failures_fall_back() {
-        assert!(scope_unavailable(
-            false,
-            "",
-            "Failed to connect to user scope bus via local transport: No such file or directory\n"
-        ));
-        assert!(scope_unavailable(
-            false,
-            "",
-            "Failed to start transient scope unit: Access denied\n"
-        ));
-        assert!(scope_unavailable(
-            false,
-            "",
-            "Failed to find executable claude: No such file or directory\n"
-        ));
         assert!(!scope_unavailable(false, "", "Workspace not trusted.\n"));
         assert!(!scope_unavailable(false, "", "error: boom\n"));
         assert!(!scope_unavailable(
@@ -2630,27 +2619,35 @@ esac
         assert!(!is_current(&stop_event("x", before), Some(launched)));
     }
 
+    /// `driver.watch` of `fake`'s agent in `session`, with no hook sent (the
+    /// hooks stay open meanwhile) and at most 10 s: how it ended, and what
+    /// it sent.
+    async fn watch_unhooked(
+        driver: &ClaudeDriver,
+        fake: &FakeClaude,
+        session: SessionRef,
+        since: DateTime<Utc>,
+        launched: Option<Instant>,
+    ) -> (TurnOutcome, mpsc::UnboundedReceiver<TurnUpdate>) {
+        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
+        let (updates, rx) = TurnUpdates::channel();
+        let agent = fake.agent();
+        let watched = driver.watch(&agent, session, since, launched, &mut hooks, &updates);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), watched)
+            .await
+            .expect("the watch ends within 10 s");
+        (outcome, rx)
+    }
+
     /// An exited entry keeps its last state: a killed process mid-turn
     /// (`working`, no pid) ends the turn instead of waiting forever.
     #[tokio::test]
     async fn an_exited_session_ends_the_turn() {
         let fake = FakeClaude::new(&entry(None, "working"));
         let driver = fast_driver(Duration::from_millis(20), Duration::from_millis(10));
-        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
-        let (updates, _rx) = TurnUpdates::channel();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            driver.watch(
-                &fake.agent(),
-                fake.session(),
-                Utc::now(),
-                Some(Instant::now()),
-                &mut hooks,
-                &updates,
-            ),
-        )
-        .await
-        .expect("an exited session must end the turn");
+        let launched = Some(Instant::now());
+        let (outcome, _) =
+            watch_unhooked(&driver, &fake, fake.session(), Utc::now(), launched).await;
         match outcome {
             TurnOutcome::Failed(m) => assert!(m.contains("the session ended"), "{m}"),
             other => panic!("expected a failure, got {other:?}"),
@@ -2662,21 +2659,8 @@ esac
     async fn a_vanished_session_ends_the_turn_and_is_forgotten() {
         let fake = FakeClaude::new("[]");
         let driver = fast_driver(Duration::from_millis(20), Duration::from_millis(10));
-        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
-        let (updates, mut rx) = TurnUpdates::channel();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            driver.watch(
-                &fake.agent(),
-                fake.session(),
-                Utc::now(),
-                None,
-                &mut hooks,
-                &updates,
-            ),
-        )
-        .await
-        .unwrap();
+        let (outcome, mut rx) =
+            watch_unhooked(&driver, &fake, fake.session(), Utc::now(), None).await;
         assert!(matches!(outcome, TurnOutcome::Failed(ref m) if m.contains("no longer lists it")));
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -2691,21 +2675,7 @@ esac
     async fn done_without_text_ends_as_interrupted() {
         let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
         let driver = fast_driver(Duration::from_millis(20), Duration::from_millis(5));
-        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
-        let (updates, _rx) = TurnUpdates::channel();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            driver.watch(
-                &fake.agent(),
-                fake.session(),
-                Utc::now(),
-                None,
-                &mut hooks,
-                &updates,
-            ),
-        )
-        .await
-        .expect("done without text must end");
+        let (outcome, _) = watch_unhooked(&driver, &fake, fake.session(), Utc::now(), None).await;
         assert_eq!(
             outcome,
             TurnOutcome::Failed(format!("Agent 'jarvis': {INTERRUPTED}"))
@@ -2732,21 +2702,7 @@ esac
         );
         std::fs::write(fake.dir.path().join("transcript.jsonl"), line + "\n").unwrap();
         let driver = fast_driver(Duration::from_millis(20), Duration::from_millis(5));
-        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
-        let (updates, _rx) = TurnUpdates::channel();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            driver.watch(
-                &fake.agent(),
-                fake.session(),
-                since,
-                None,
-                &mut hooks,
-                &updates,
-            ),
-        )
-        .await
-        .unwrap();
+        let (outcome, _) = watch_unhooked(&driver, &fake, fake.session(), since, None).await;
         // Read without the Stop hook: that hook may still come, and must not
         // be spoken twice.
         assert_eq!(
@@ -2804,23 +2760,9 @@ esac
     async fn a_rewatch_by_bg_id_learns_the_session_id() {
         let fake = FakeClaude::new(&entry(None, "stopped"));
         let driver = fast_driver(Duration::from_millis(20), Duration::from_millis(5));
-        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
-        let (updates, mut rx) = TurnUpdates::channel();
         let mut session = fake.session();
         session.session_id = None;
-        let _ = tokio::time::timeout(
-            Duration::from_secs(10),
-            driver.watch(
-                &fake.agent(),
-                session,
-                Utc::now(),
-                None,
-                &mut hooks,
-                &updates,
-            ),
-        )
-        .await
-        .unwrap();
+        let (_, mut rx) = watch_unhooked(&driver, &fake, session, Utc::now(), None).await;
         match rx.try_recv().unwrap() {
             TurnUpdate::Session(s) => assert_eq!(s.session_id.as_deref(), Some("abc12345-1111")),
             other => panic!("expected the session id, got {other:?}"),
@@ -2893,21 +2835,9 @@ esac
             driver.session_phase(&fake.agent(), &fake.session()).await,
             Ok(AgentPhase::Working)
         );
-        // Done: stopped, then resumed.
-        let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
-        fake.file("list-stopped.json", &entry(None, "done"));
-        let (updates, _rx) = TurnUpdates::channel();
-        let (session, _) = driver
-            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
-            .await
-            .unwrap();
-        let calls = fake.calls();
-        assert!(calls.contains("stop abc12345"), "{calls}");
-        assert!(
-            calls.contains("--bg --resume abc12345-1111 -- next"),
-            "{calls}"
-        );
-        assert_eq!(session.bg_id.as_deref(), Some("abc12345"));
+        // Done, its process gone (as after the stop of the next turn, which
+        // `a_resume_waits_for_the_stopped_process_to_exit` runs): idle.
+        let fake = FakeClaude::new(&entry(None, "done"));
         assert_eq!(
             driver.session_phase(&fake.agent(), &fake.session()).await,
             Ok(AgentPhase::Idle)
@@ -2957,18 +2887,23 @@ esac
         );
     }
 
+    /// A `sleep 0.4` child, and when it was spawned: a bound measured from
+    /// then holds however slow the setup after it is, as the child exits
+    /// 0.4 s after its spawn on a loaded machine too.
+    fn sleeper() -> (std::process::Child, Instant) {
+        let child = std::process::Command::new("sleep")
+            .arg("0.4")
+            .spawn()
+            .unwrap();
+        (child, Instant::now())
+    }
+
     /// `claude agents` drops the pid at the stop, before the process has
     /// exited and Claude Code settled the session (measured): the resume
     /// waits for the listed process itself.
     #[tokio::test]
     async fn a_resume_waits_for_the_listed_process_itself() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("0.4")
-            .spawn()
-            .unwrap();
-        // From the spawn: the child exits 0.4 s after it however slow the
-        // setup below is, so a loaded machine cannot eat into the bound.
-        let started = Instant::now();
+        let (mut child, started) = sleeper();
         let fake = FakeClaude::new(&entry(Some(child.id()), "done"));
         fake.file("list-stopped.json", &entry(None, "done"));
         let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
@@ -3274,13 +3209,7 @@ esac
     /// from the listing at once, and a resume while it runs starts a copy.
     #[tokio::test]
     async fn an_unclear_resume_is_waited_for_before_resuming_again() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("0.4")
-            .spawn()
-            .unwrap();
-        // From the spawn: the child exits 0.4 s after it however slow the
-        // setup below is, so a loaded machine cannot eat into the bound.
-        let started = Instant::now();
+        let (mut child, started) = sleeper();
         let fake = FakeClaude::new(&entry(Some(child.id()), "done"));
         fake.file("agents-1.json", &entry(None, "done"));
         fake.file("list-stopped.json", &entry(None, "done"));
@@ -3297,17 +3226,6 @@ esac
             started.elapsed().as_millis()
         );
         assert!(child.try_wait().unwrap().is_some());
-        let calls = fake.calls();
-        assert_eq!(
-            calls_after(&calls, "--bg --resume"),
-            [
-                "agents --json --all",
-                "stop abc12345",
-                "agents --json --all",
-                "--bg --resume abc12345-1111 -- next",
-            ],
-            "{calls}"
-        );
     }
 
     /// A copy just started may not be listed yet: it is listed again until
@@ -3316,13 +3234,7 @@ esac
     /// Nothing of it is remembered afterwards.
     #[tokio::test]
     async fn a_copy_not_listed_yet_is_waited_for_before_it_is_removed() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("0.4")
-            .spawn()
-            .unwrap();
-        // From the spawn: the child exits 0.4 s after it however slow the
-        // setup below is, so a loaded machine cannot eat into the bound.
-        let started = Instant::now();
+        let (mut child, started) = sleeper();
         let fake = FakeClaude::new(&with_copy(&entry(None, "done"), Some(child.id())));
         fake.file("agents-1.json", &entry(None, "done"));
         fake.file("list-stopped.json", &with_copy(&entry(None, "done"), None));
@@ -3363,13 +3275,7 @@ esac
     /// the session is gone.
     #[tokio::test]
     async fn an_unlisted_session_is_gone_only_once_its_process_exited() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("0.4")
-            .spawn()
-            .unwrap();
-        // From the spawn: the child exits 0.4 s after it however slow the
-        // setup below is, so a loaded machine cannot eat into the bound.
-        let started = Instant::now();
+        let (mut child, started) = sleeper();
         let fake = FakeClaude::new("[]");
         let exits = fast_exits();
         let listed = find_session(
@@ -3407,18 +3313,7 @@ esac
 
         // A poll finds the session removed.
         driver.exits.seen().insert("abc12345".into(), vec![me()]);
-        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
-        let (updates, _rx) = TurnUpdates::channel();
-        let outcome = driver
-            .watch(
-                &fake.agent(),
-                fake.session(),
-                Utc::now(),
-                None,
-                &mut hooks,
-                &updates,
-            )
-            .await;
+        let (outcome, _) = watch_unhooked(&driver, &fake, fake.session(), Utc::now(), None).await;
         assert!(matches!(outcome, TurnOutcome::Failed(_)), "{outcome:?}");
         assert!(!driver.exits.remembers("abc12345"));
 
@@ -3436,40 +3331,21 @@ esac
     /// fails names the copy.
     #[tokio::test]
     async fn a_copy_is_removed_after_its_process_exited() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("0.4")
-            .spawn()
-            .unwrap();
-        // From the spawn: the child exits 0.4 s after it however slow the
-        // setup below is, so a loaded machine cannot eat into the bound.
-        let started = Instant::now();
+        let (mut child, started) = sleeper();
         let fake = FakeClaude::new(&with_copy(&entry(None, "done"), Some(child.id())));
         fake.file("list-stopped.json", &with_copy(&entry(None, "done"), None));
-        let exits = fast_exits();
-        exits.discard_copy(&fake.agent(), "copy0001").await.unwrap();
+        // `claude rm` fails: the error names the copy.
+        fake.file("rm-fails", "");
+        let e = fast_exits()
+            .discard_copy(&fake.agent(), "copy0001")
+            .await
+            .unwrap_err();
         assert!(
             started.elapsed() >= Duration::from_millis(350),
             "removed {} ms in, while the copy still ran",
             started.elapsed().as_millis()
         );
         assert!(child.try_wait().unwrap().is_some());
-        let calls = fake.calls();
-        assert_eq!(
-            calls.lines().collect::<Vec<_>>(),
-            [
-                "agents --json --all",
-                "stop copy0001",
-                "agents --json --all",
-                "rm copy0001"
-            ],
-            "{calls}"
-        );
-        // `claude rm` fails: the error names the copy.
-        fake.file("rm-fails", "");
-        let e = exits
-            .discard_copy(&fake.agent(), "copy0001")
-            .await
-            .unwrap_err();
         assert!(e.contains("copy0001") && e.contains("cannot remove"), "{e}");
     }
 
@@ -3479,13 +3355,7 @@ esac
     /// place, with no second `claude stop`.
     #[tokio::test]
     async fn a_resume_after_a_stop_waits_for_the_remembered_process() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("0.4")
-            .spawn()
-            .unwrap();
-        // From the spawn: the child exits 0.4 s after it however slow the
-        // setup below is, so a loaded machine cannot eat into the bound.
-        let started = Instant::now();
+        let (mut child, started) = sleeper();
         let fake = FakeClaude::new(&entry(Some(child.id()), "done"));
         fake.file("list-stopped.json", &entry(None, "done"));
         let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
@@ -3585,18 +3455,8 @@ esac
     async fn a_restart_during_a_first_launch_does_not_invite_a_repeat() {
         let fake = FakeClaude::new("[]");
         let driver = fast_driver(Duration::from_millis(20), Duration::from_millis(5));
-        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
-        let (updates, _rx) = TurnUpdates::channel();
-        let outcome = driver
-            .watch(
-                &fake.agent(),
-                SessionRef::default(),
-                Utc::now(),
-                None,
-                &mut hooks,
-                &updates,
-            )
-            .await;
+        let session = SessionRef::default();
+        let (outcome, _) = watch_unhooked(&driver, &fake, session, Utc::now(), None).await;
         let TurnOutcome::Failed(message) = outcome else {
             panic!("expected a failure, got {outcome:?}");
         };

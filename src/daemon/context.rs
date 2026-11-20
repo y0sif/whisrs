@@ -172,7 +172,7 @@ impl DaemonState {
         }
     }
 
-    /// A stopped streaming session is still draining its last deltas (#154).
+    /// A stopped streaming session is still draining its last deltas.
     /// `streaming_cancel` is `Some` only from a streaming session's start
     /// until it ends (see `release_streaming_cancel`), and command mode never
     /// installs one, so this cannot match a command-mode `Transcribing`.

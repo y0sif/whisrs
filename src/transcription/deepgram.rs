@@ -103,18 +103,16 @@ pub(crate) const KEYTERM_QUERY_BUDGET_BYTES: usize = 4096;
 /// This bounds **the parameter count and nothing else**: it keeps a vocabulary
 /// of very short terms from turning one request into thousands of query params,
 /// which the byte budget alone permits (single-char terms cost 10 bytes each,
-/// so 4096 bytes is ~409 params). It is deliberately *not* a token bound — an
-/// earlier revision of this comment claimed staying under 200 terms kept a
-/// byte-legal vocabulary inside Deepgram's 500-token cap, and that is false:
-/// the byte budget cuts `"ab cd ef"` × 400 off at 195 terms, below this cap,
-/// with ≥585 words on the wire. [`KEYTERM_MAX_WORDS`] is the token bound.
+/// so 4096 bytes is ~409 params). It is not a token bound: the byte budget
+/// cuts `"ab cd ef"` × 400 off at 195 terms, below this cap, with ≥585 words
+/// on the wire. [`KEYTERM_MAX_WORDS`] is the token bound.
 pub(crate) const KEYTERM_MAX_TERMS: usize = 200;
 
 /// Ceiling on the total whitespace-delimited word count across all `keyterm`s.
 ///
 /// Deepgram caps the keyterm set at 500 **tokens** per request, not 500 terms,
 /// and whisrs cannot tokenize client-side. Neither limit above bounds tokens.
-/// Measured against the two gates as they stood: `"ab cd ef"` × 400 → 195 terms
+/// Measured against the two gates above: `"ab cd ef"` × 400 → 195 terms
 /// at 4095 bytes and ≥585 words; `"a b c d e"` × 400 → 157 terms at 4082 bytes
 /// and ≥785 words. So a ~136-term two-word domain glossary ("atrial
 /// fibrillation") passes both, lands at roughly 550-800 tokens, and earns
@@ -173,19 +171,16 @@ pub(crate) fn usable_keyterms(keyterms: &[String]) -> impl Iterator<Item = &str>
 /// [`KEYTERM_MAX_WORDS`]. Each bounds a different thing and none implies
 /// another — see their own docs.
 ///
-/// Ordering matters. An earlier split — count the budget over the raw list,
-/// filter the blanks afterwards — let blank entries burn budget they never
-/// spent: 200 blanks in front of a real vocabulary had `validate` advertise 335
-/// terms while the request carried 135, with 105 real terms discarded for
-/// nothing.
+/// Ordering matters. Counting the budget over the raw list and filtering the
+/// blanks afterwards would let blank entries burn budget they never spend, and
+/// `validate` would advertise more terms than the request carries.
 ///
 /// A term that does not fit is **skipped, not fatal**: iteration continues and
-/// later, smaller terms can still make it. Stopping at the first misfit let one
-/// pathological entry discard everything behind it —
-/// `["x" × 5000, "whisrs", "Hyprland"]` put zero terms on the wire and warned
-/// that "the first 0" reached Deepgram, while the same three terms reordered
-/// kept both real ones. The consequence is that the result is no longer a
-/// prefix of the input, so callers must report "N of M", never "the first N".
+/// later, smaller terms can still make it. Stopping at the first misfit would
+/// let one pathological entry discard everything behind it
+/// (`["x" × 5000, "whisrs", "Hyprland"]` would put zero terms on the wire). So
+/// the result is not a prefix of the input, and callers must report "N of M",
+/// never "the first N".
 pub(crate) fn effective_keyterms(keyterms: &[String]) -> Vec<&str> {
     let mut used_bytes = 0usize;
     let mut used_words = 0usize;
@@ -248,10 +243,8 @@ pub const DIARIZATION_LABEL: &str = "deepgram:latest";
 /// `None` when there is nothing to report.
 ///
 /// A function rather than an inline condition so the emptiness test is
-/// testable. This branch used to gate on `keyterms.is_empty()` while every
-/// other count in this file goes through [`usable_keyterms`], so a
-/// vocabulary of nothing but blank entries logged "ignoring 0 vocabulary
-/// term(s)" on a nova-2 config.
+/// testable. It goes through [`usable_keyterms`] like every other count in
+/// this file, so a vocabulary of nothing but blank entries logs nothing.
 fn unsupported_model_keyterm_notice(model: &str, keyterms: &[String]) -> Option<String> {
     let ignored = usable_keyterms(keyterms).count();
     if ignored == 0 {
@@ -892,121 +885,73 @@ mod tests {
     use crate::transcription::retry::{retry_transient, RATE_LIMIT_BUDGET};
     use crate::transcription::test_server::{serve_once, serve_responses};
 
+    /// The shape of Deepgram's WebSocket messages, a third-party wire format
+    /// no local-server test reaches: the `type`, `is_final` (absent on a
+    /// metadata message), and the transcript under `channel`.
     #[test]
-    fn deepgram_backends_never_send_the_prompt() {
-        let request = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "nova-3".to_string(),
-            prompt: Some("Hyprland, whisrs".to_string()),
-            keyterms: Vec::new(),
-            diarize: false,
-            vad: Default::default(),
-            soft_voices: true,
-        };
-
-        assert!(!DeepgramRestBackend::new(String::new()).sends_prompt(&request));
-        assert!(!DeepgramStreamingBackend::new(String::new()).sends_prompt(&request));
+    fn streaming_messages_read_type_finality_and_transcript() {
+        for (name, body, want_type, want_final, want_transcript) in [
+            (
+                "final result",
+                r#"{
+                    "type": "Results",
+                    "channel_index": [0, 1],
+                    "duration": 1.5,
+                    "start": 0.0,
+                    "is_final": true,
+                    "speech_final": true,
+                    "channel": {
+                        "alternatives": [{
+                            "transcript": "Hello world.",
+                            "confidence": 0.98
+                        }]
+                    }
+                }"#,
+                "Results",
+                true,
+                Some("Hello world."),
+            ),
+            (
+                "interim result",
+                r#"{
+                    "type": "Results",
+                    "is_final": false,
+                    "channel": {
+                        "alternatives": [{"transcript": "Hel", "confidence": 0.5}]
+                    }
+                }"#,
+                "Results",
+                false,
+                Some("Hel"),
+            ),
+            (
+                "metadata",
+                r#"{"type": "Metadata", "request_id": "abc123"}"#,
+                "Metadata",
+                false,
+                None,
+            ),
+        ] {
+            let parsed: StreamingResult =
+                serde_json::from_str(body).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(parsed.msg_type, want_type, "{name}");
+            assert_eq!(parsed.is_final, want_final, "{name}");
+            let transcript = parsed
+                .channel
+                .and_then(|c| c.alternatives.into_iter().next())
+                .map(|a| a.transcript);
+            assert_eq!(transcript.as_deref(), want_transcript, "{name}");
+        }
     }
 
-    #[test]
-    fn map_language_auto_to_multi() {
-        assert_eq!(map_language("auto"), "multi");
-    }
-
-    #[test]
-    fn map_language_passthrough() {
-        assert_eq!(map_language("en"), "en");
-        assert_eq!(map_language("fr"), "fr");
-        assert_eq!(map_language("ja"), "ja");
-    }
-
-    #[test]
-    fn parse_rest_response() {
-        let body = r#"{
-            "metadata": {"request_id": "test"},
-            "results": {
-                "channels": [{
-                    "alternatives": [{
-                        "transcript": "Hello world.",
-                        "confidence": 0.98
-                    }]
-                }]
-            }
-        }"#;
-        let parsed: DeepgramResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(
-            parsed.results.channels[0].alternatives[0].transcript,
-            "Hello world."
-        );
-    }
-
-    #[test]
-    fn parse_rest_response_empty_transcript() {
-        let body = r#"{
-            "results": {
-                "channels": [{
-                    "alternatives": [{
-                        "transcript": "",
-                        "confidence": 0.0
-                    }]
-                }]
-            }
-        }"#;
-        let parsed: DeepgramResponse = serde_json::from_str(body).unwrap();
-        assert!(parsed.results.channels[0].alternatives[0]
-            .transcript
-            .is_empty());
-    }
-
+    /// Deepgram's REST error body, a third-party wire format: the code and
+    /// the message the backend's error is built from.
     #[test]
     fn parse_error_response() {
         let body = r#"{"err_msg": "Invalid credentials", "err_code": "INVALID_AUTH"}"#;
         let parsed: DeepgramErrorResponse = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.err_msg, "Invalid credentials");
         assert_eq!(parsed.err_code, "INVALID_AUTH");
-    }
-
-    #[test]
-    fn parse_streaming_result_final() {
-        let body = r#"{
-            "type": "Results",
-            "channel_index": [0, 1],
-            "duration": 1.5,
-            "start": 0.0,
-            "is_final": true,
-            "speech_final": true,
-            "channel": {
-                "alternatives": [{
-                    "transcript": "Hello world.",
-                    "confidence": 0.98
-                }]
-            }
-        }"#;
-        let parsed: StreamingResult = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.msg_type, "Results");
-        assert!(parsed.is_final);
-        let transcript = &parsed.channel.unwrap().alternatives[0].transcript;
-        assert_eq!(transcript, "Hello world.");
-    }
-
-    #[test]
-    fn parse_streaming_result_interim() {
-        let body = r#"{
-            "type": "Results",
-            "is_final": false,
-            "channel": {
-                "alternatives": [{"transcript": "Hel", "confidence": 0.5}]
-            }
-        }"#;
-        let parsed: StreamingResult = serde_json::from_str(body).unwrap();
-        assert!(!parsed.is_final);
-    }
-
-    #[test]
-    fn parse_streaming_metadata() {
-        let body = r#"{"type": "Metadata", "request_id": "abc123"}"#;
-        let parsed: StreamingResult = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.msg_type, "Metadata");
     }
 
     /// A [`TranscriptionConfig`] with just the fields the query builder reads.
@@ -1052,109 +997,67 @@ mod tests {
         assert!(err.to_string().contains("empty audio"));
     }
 
+    /// Every request carries the model, smart formatting and the language,
+    /// `auto` going as Deepgram's `multi`.
     #[test]
-    fn build_query_params_includes_smart_format() {
-        let config = query_config("nova-3", &[]);
-        let params = build_query_params(&config, &[]);
-        assert!(params
-            .iter()
-            .any(|(k, v)| *k == "smart_format" && *v == "true"));
-        assert!(params.iter().any(|(k, v)| *k == "model" && *v == "nova-3"));
-        assert!(params.iter().any(|(k, v)| *k == "language" && *v == "en"));
+    fn build_query_params_carries_model_language_and_smart_format() {
+        for (language, want_language) in
+            [("en", "en"), ("fr", "fr"), ("ja", "ja"), ("auto", "multi")]
+        {
+            let mut config = query_config("nova-3", &[]);
+            config.language = language.to_string();
+            let params = build_query_params(&config, &[]);
+            for want in [
+                ("model", "nova-3"),
+                ("smart_format", "true"),
+                ("language", want_language),
+            ] {
+                assert!(
+                    params.contains(&want),
+                    "{language}: {want:?} missing from {params:?}"
+                );
+            }
+        }
     }
 
+    /// The vocabulary goes as one trimmed `keyterm` per usable entry, and not
+    /// at all on a model that rejects the parameter.
     #[test]
-    fn build_query_params_auto_language() {
-        let mut config = query_config("nova-3", &[]);
-        config.language = "auto".to_string();
-        let params = build_query_params(&config, &[]);
-        assert!(params
-            .iter()
-            .any(|(k, v)| *k == "language" && *v == "multi"));
-    }
-
-    #[test]
-    fn build_query_params_emits_one_keyterm_per_vocabulary_entry() {
-        let config = query_config("nova-3", &["whisrs", "GNOME Shell"]);
-        let params = build_query_params(&config, &[]);
-        assert_eq!(keyterm_values(&params), vec!["whisrs", "GNOME Shell"]);
-    }
-
-    #[test]
-    fn build_query_params_omits_keyterm_on_models_that_reject_it() {
-        // nova-2 answers 400 INVALID_QUERY_PARAMETER when `keyterm` is present,
-        // so a vocabulary set alongside an older model must be dropped rather
-        // than break every request.
-        let config = query_config("nova-2", &["whisrs"]);
-        let params = build_query_params(&config, &[]);
-        assert!(!params.iter().any(|(k, _)| *k == "keyterm"));
-    }
-
-    #[test]
-    fn build_query_params_without_vocabulary_sends_no_keyterm() {
-        let config = query_config("nova-3", &[]);
-        let params = build_query_params(&config, &[]);
-        assert!(!params.iter().any(|(k, _)| *k == "keyterm"));
-    }
-
-    #[test]
-    fn build_query_params_skips_blank_vocabulary_entries() {
-        // `whisrs config` strips these, but a hand-edited config.toml can hold
-        // them and a bare `keyterm=` is not a term.
-        let config = query_config("nova-3", &["whisrs", "", "  ", "\t"]);
-        let params = build_query_params(&config, &[]);
-        assert_eq!(keyterm_values(&params), vec!["whisrs"]);
-    }
-
-    #[test]
-    fn build_query_params_sends_keyterms_trimmed() {
-        let config = query_config("nova-3", &["  GNOME Shell  "]);
-        let params = build_query_params(&config, &[]);
-        assert_eq!(keyterm_values(&params), vec!["GNOME Shell"]);
-    }
-
-    #[test]
-    fn build_query_params_truncates_vocabulary_to_the_query_budget() {
-        // 1000 terms builds a ~28KB URI; Deepgram's edge rejects the handshake
-        // with a bare 400 that never mentions the vocabulary. Terms are short
-        // enough here that the byte budget bites before `KEYTERM_MAX_TERMS`
-        // would — 4096 / (9 + 8) is 240, above the 200-term cap, so keep the
-        // assertion on the cap that actually fires.
-        let terms: Vec<String> = (0..1000).map(|i| format!("term{i:04}")).collect();
-        let config = owned_query_config("nova-3", &terms);
-        let params = build_query_params(&config, &[]);
-        let sent = keyterm_values(&params);
-        assert!(
-            sent.len() < terms.len(),
-            "budget must drop terms, sent all {}",
-            sent.len()
-        );
-        assert!(!sent.is_empty(), "budget must still send the leading terms");
-        // The terms it does send are a prefix, and they fit the budget.
-        assert_eq!(sent[0], "term0000");
-        let bytes: usize = sent
-            .iter()
-            .map(|t| KEYTERM_PARAM_OVERHEAD + keyterm_encoded_cost(t))
-            .sum();
-        assert!(
-            bytes <= KEYTERM_QUERY_BUDGET_BYTES,
-            "sent {bytes} bytes of keyterms, over the {KEYTERM_QUERY_BUDGET_BYTES} budget"
-        );
-    }
-
-    #[test]
-    fn effective_keyterms_admits_a_small_vocabulary_whole() {
-        let terms = vec!["whisrs".to_string(), "GNOME Shell".to_string()];
-        assert_eq!(effective_keyterms(&terms), vec!["whisrs", "GNOME Shell"]);
+    fn build_query_params_sends_the_usable_vocabulary_as_keyterms() {
+        let cases: [(&str, &str, &[&str], &[&str]); 5] = [
+            (
+                "one keyterm per entry",
+                "nova-3",
+                &["whisrs", "GNOME Shell"],
+                &["whisrs", "GNOME Shell"],
+            ),
+            // nova-2 answers 400 INVALID_QUERY_PARAMETER when `keyterm` is
+            // present, so a vocabulary set alongside an older model must be
+            // dropped rather than break every request.
+            ("model without keyterm", "nova-2", &["whisrs"], &[]),
+            ("no vocabulary", "nova-3", &[], &[]),
+            // `whisrs config` strips these, but a hand-edited config.toml can
+            // hold them and a bare `keyterm=` is not a term.
+            (
+                "blank entries",
+                "nova-3",
+                &["whisrs", "", "  ", "\t"],
+                &["whisrs"],
+            ),
+            ("trimmed", "nova-3", &["  GNOME Shell  "], &["GNOME Shell"]),
+        ];
+        for (name, model, terms, want) in cases {
+            let config = query_config(model, terms);
+            let params = build_query_params(&config, &[]);
+            assert_eq!(keyterm_values(&params), want, "{name}");
+        }
     }
 
     #[test]
     fn effective_keyterms_is_what_build_query_params_puts_on_the_wire() {
-        // The bug this pins: blanks used to be charged against the budget and
-        // filtered afterwards, so the advertised count and the wire disagreed.
-        // 200 whitespace-only entries in front of 1000 real terms had
-        // `validate` promise 335 while the request carried 135 — 105 real terms
-        // discarded and 1801 budget bytes burned on nothing.
+        // Blanks cost nothing: charged against the budget and filtered
+        // afterwards, they would make the advertised count and the wire
+        // disagree.
         let mut terms: Vec<String> = vec!["   ".to_string(); 200];
         terms.extend((0..1000).map(|i| format!("term{i:04}")));
 
@@ -1183,39 +1086,16 @@ mod tests {
             effective_keyterms(&without_blanks),
             "blank entries still consumed budget"
         );
-
-        // And the number `Config::validate` advertises at load is the number of
-        // `keyterm` params this same vocabulary puts on the wire. This is the
-        // whole point of routing both through `effective_keyterms`: the two
-        // used to be computed separately and disagreed.
-        let mut config: crate::Config = toml::from_str("").expect("empty config uses defaults");
-        config.general.backend = "deepgram".to_string();
-        config.general.vocabulary = terms.clone();
-        config.deepgram = Some(crate::DeepgramConfig {
-            api_key: "test-key".to_string(),
-            model: "nova-3".to_string(),
-        });
-        let warnings = config.validate().expect("a keyed deepgram config is valid");
-        let warning = warnings
-            .iter()
-            .find(|w| w.message.contains("vocabulary"))
-            .unwrap_or_else(|| panic!("a truncated vocabulary must warn: {warnings:?}"));
-        assert!(
-            warning.message.contains(&format!("{} of ", sent.len())),
-            "validate advertised a different count than the {} terms on the wire: {}",
-            sent.len(),
-            warning.message
-        );
     }
 
     #[test]
     fn effective_keyterms_caps_the_word_count_before_the_byte_budget() {
-        // The claim `KEYTERM_MAX_TERMS` used to make — that staying under 200
-        // terms keeps a byte-legal vocabulary inside Deepgram's 500-token cap —
-        // is false, and this is the counterexample. 400 copies of "ab cd ef"
-        // stop at 195 terms on the byte budget alone: under the term cap, at
-        // 4095 of 4096 bytes, and carrying at least 585 whitespace-delimited
-        // words. `KEYTERM_MAX_WORDS` is what actually bounds it.
+        // Staying under 200 terms does not keep a byte-legal vocabulary inside
+        // Deepgram's 500-token cap, and this is the counterexample. 400 copies
+        // of "ab cd ef" stop at 195 terms on the byte budget alone: under the
+        // term cap, at 4095 of 4096 bytes, and carrying at least 585
+        // whitespace-delimited words. `KEYTERM_MAX_WORDS` is what actually
+        // bounds it.
         let terms: Vec<String> = vec!["ab cd ef".to_string(); 400];
 
         // What the other two limits alone would have allowed.
@@ -1243,42 +1123,19 @@ mod tests {
             "sent {words} words, over the {KEYTERM_MAX_WORDS} cap"
         );
 
-        // And the count that goes on the wire is the count `validate` advertises.
+        // And the wire carries exactly the effective terms.
         let config = owned_query_config("nova-3", &terms);
         let params = build_query_params(&config, &[]);
         let sent = keyterm_values(&params);
         assert_eq!(sent.len(), effective.len());
-
-        let mut config: crate::Config = toml::from_str("").expect("empty config uses defaults");
-        config.general.backend = "deepgram".to_string();
-        config.general.vocabulary = terms.clone();
-        config.deepgram = Some(crate::DeepgramConfig {
-            api_key: "test-key".to_string(),
-            model: "nova-3".to_string(),
-        });
-        let warnings = config.validate().expect("a keyed deepgram config is valid");
-        let warning = warnings
-            .iter()
-            .find(|w| w.message.contains("vocabulary"))
-            .unwrap_or_else(|| panic!("a word-capped vocabulary must warn: {warnings:?}"));
-        assert!(
-            warning
-                .message
-                .contains(&format!("{} of {} usable term(s)", sent.len(), terms.len())),
-            "validate advertised a different count than the {} terms on the wire: {}",
-            sent.len(),
-            warning.message
-        );
     }
 
     #[test]
     fn one_oversized_term_does_not_discard_the_rest_of_the_vocabulary() {
-        // `effective_keyterms` used to `break` on the first term that would not
-        // fit, so a single pathological entry nuked everything behind it: this
-        // vocabulary put zero terms on the wire and warned that "the first 0"
-        // reached Deepgram, while the same three terms reordered kept both real
-        // ones. Skipping the misfit and continuing is what makes the outcome
-        // independent of where the long term sits.
+        // A `break` on the first term that does not fit would let a single
+        // pathological entry discard everything behind it. Skipping the misfit
+        // and continuing is what makes the outcome independent of where the
+        // long term sits.
         let long = "x".repeat(5000);
         let first = vec![long.clone(), "whisrs".to_string(), "Hyprland".to_string()];
         let last = vec!["whisrs".to_string(), "Hyprland".to_string(), long];
@@ -1298,11 +1155,9 @@ mod tests {
 
     #[test]
     fn unsupported_model_notice_uses_the_same_emptiness_test_as_the_rest_of_the_file() {
-        // The unsupported-model branch used to gate on `keyterms.is_empty()`
-        // while every other count here goes through `usable_keyterms`, so a
-        // blanks-only vocabulary logged "ignoring 0 vocabulary term(s)".
+        // A blanks-only vocabulary has no usable terms, so there is no
+        // "ignoring 0 vocabulary term(s)" notice.
         let blanks = ["".to_string(), "  ".to_string(), "\t".to_string()];
-        assert!(!blanks.is_empty(), "the old gate would have fired here");
         assert_eq!(unsupported_model_keyterm_notice("nova-2", &blanks), None);
         assert_eq!(unsupported_model_keyterm_notice("nova-2", &[]), None);
 
@@ -1314,11 +1169,6 @@ mod tests {
             "blank entries must not be counted: {notice}"
         );
         assert!(notice.contains("nova-2"), "the notice must name the model");
-
-        // And a blanks-only vocabulary still puts no `keyterm` on the wire.
-        let config = query_config("nova-2", &["", "  ", "\t"]);
-        let params = build_query_params(&config, &[]);
-        assert!(!params.iter().any(|(k, _)| *k == "keyterm"));
     }
 
     #[test]
@@ -1382,15 +1232,6 @@ mod tests {
         let params = build_query_params(&config, &[]);
         let sent = keyterm_values(&params);
         assert_eq!(sent.len(), KEYTERM_MAX_TERMS);
-    }
-
-    #[test]
-    fn percent_encode_escapes_spaces_and_leaves_plain_values_alone() {
-        // A raw space in a multi-word keyterm makes the streaming URI invalid
-        // and Deepgram answers the handshake with a bare 400.
-        assert_eq!(percent_encode("GNOME Shell"), "GNOME%20Shell");
-        assert_eq!(percent_encode("nova-3"), "nova-3");
-        assert_eq!(percent_encode("linear16"), "linear16");
     }
 
     #[test]

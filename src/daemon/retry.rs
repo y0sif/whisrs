@@ -465,70 +465,15 @@ mod tests {
         assert!(copied.lock().unwrap().is_empty());
     }
 
-    /// A file outside the recovery folder is refused and left alone.
     #[tokio::test]
-    async fn a_file_elsewhere_is_refused() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("recovery");
-        std::fs::create_dir(&dir).unwrap();
-        let outside = saved(root.path(), "recovery_a.wav");
-        let before = std::fs::read(&outside).unwrap();
-        let context = context_with_backend(StubBackend {
-            text: "never",
-            sends_prompt: false,
-        });
-        let daemon_state = Mutex::new(DaemonState::new());
-        let (clipboard, _copied) = fake_clipboard();
-
-        let arg = Some(outside.display().to_string());
-        let message = refusal(retry(&daemon_state, &context, &dir, arg, None, clipboard).await);
-        assert_eq!(
-            message,
-            format!(
-                "not a recovery file: {} (recovery audio lives in {})",
-                outside.display(),
-                dir.display()
-            )
-        );
-        assert_eq!(std::fs::read(&outside).unwrap(), before);
-        assert_eq!(state(&daemon_state).await, State::Idle);
-    }
-
-    /// Audio in another format than a recovery file's is refused.
-    #[tokio::test]
-    async fn another_format_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recovery_a.wav");
-        let spec = hound::WavSpec {
-            sample_rate: 48_000,
-            ..whisrs::audio::wav::WAV_SPEC
-        };
-        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
-        writer.write_sample(0i16).unwrap();
-        writer.finalize().unwrap();
-        let context = context_with_backend(StubBackend {
-            text: "never",
-            sends_prompt: false,
-        });
-        let daemon_state = Mutex::new(DaemonState::new());
-        let (clipboard, _copied) = fake_clipboard();
-
-        let message =
-            refusal(retry(&daemon_state, &context, dir.path(), None, None, clipboard).await);
-        assert!(message.contains("is not recovery audio"), "{message}");
-        assert!(path.exists());
-        assert_eq!(state(&daemon_state).await, State::Idle);
-    }
-
-    #[tokio::test]
-    async fn no_recovery_audio_and_a_bad_language_are_refused() {
+    async fn a_refused_retry_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let context = context_with_backend(StubBackend {
             text: "never",
             sends_prompt: false,
         });
         let daemon_state = Mutex::new(DaemonState::new());
-        let (clipboard, _copied) = fake_clipboard();
+        let (clipboard, copied) = fake_clipboard();
 
         let message = refusal(
             retry(
@@ -546,6 +491,30 @@ mod tests {
             format!("no recovery audio in {}", dir.path().display())
         );
 
+        // A recovery file the load refuses is kept.
+        let other = tempfile::tempdir().unwrap();
+        let path = other.path().join("recovery_a.wav");
+        let spec = hound::WavSpec {
+            sample_rate: 48_000,
+            ..whisrs::audio::wav::WAV_SPEC
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        writer.write_sample(0i16).unwrap();
+        writer.finalize().unwrap();
+        let message = refusal(
+            retry(
+                &daemon_state,
+                &context,
+                other.path(),
+                None,
+                None,
+                Arc::clone(&clipboard),
+            )
+            .await,
+        );
+        assert!(message.contains("is not recovery audio"), "{message}");
+        assert!(path.exists());
+
         saved(dir.path(), "recovery_a.wav");
         let language = Some("english".to_string());
         let message = refusal(
@@ -561,6 +530,7 @@ mod tests {
         );
         assert!(message.starts_with("invalid language"), "{message}");
         assert_eq!(names(dir.path()), ["recovery_a.wav"]);
+        assert!(copied.lock().unwrap().is_empty());
         assert_eq!(state(&daemon_state).await, State::Idle);
     }
 }

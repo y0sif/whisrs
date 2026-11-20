@@ -45,7 +45,7 @@ const TEXT_MIME_TYPES: &[&str] = &[
 /// (see [`pick_text_type`]). That type, not a fixed `text/plain`: `--type`
 /// with a slash is an exact match, and some offers have no bare `text/plain`
 /// (VTE terminals such as Ptyxis offer `text/plain;charset=utf-8`,
-/// `UTF8_STRING` and `TARGETS`), so a fixed type failed the read (#210).
+/// `UTF8_STRING` and `TARGETS`), so a fixed type fails the read.
 ///
 /// If the list is empty, the clipboard genuinely has no selection — a
 /// legitimate empty string. If it's non-empty but contains no text type, the
@@ -158,10 +158,10 @@ impl ClipboardBackend for WaylandClipboard {
 /// X11 has no clipboard store: the app that copied must keep serving the
 /// selection. arboard treats dropping its last handle as the app exiting, so
 /// it asks the clipboard manager to take the data (waiting at most 100 ms)
-/// and destroys its selection window. The old per-call handle therefore gave
-/// the selection away milliseconds after each copy, and the Ctrl+V that
-/// followed raced the clipboard manager or compositor, often pasting nothing
-/// (#193). This handle is opened on first use and never dropped.
+/// and destroys its selection window. A per-call handle would give the
+/// selection away milliseconds after each copy, and the Ctrl+V that follows
+/// would race the clipboard manager or compositor, often pasting nothing.
+/// This handle is opened on first use and never dropped.
 ///
 /// A failed open is returned, not cached, so a later call retries. The guard
 /// must not be held across another clipboard call: the lock is not reentrant.
@@ -189,8 +189,8 @@ fn x11_clipboard() -> anyhow::Result<std::sync::MutexGuard<'static, arboard::Cli
 /// arboard returns the same `ContentNotAvailable` error when nothing owns the
 /// selection, when the owner offers no text target, and when the owner times
 /// out. Only "no owner" means empty: a caller restoring a saved clipboard
-/// reads `Err` as "non-text, do not overwrite it", so `whisrs` typed every
-/// paste-mode dictation on an empty X11 clipboard (#79). Asking the X server
+/// reads `Err` as "non-text, do not overwrite it", so an empty X11 clipboard
+/// would turn every paste-mode dictation into typing. Asking the X server
 /// directly gives [`X11Clipboard`] the same contract as `run_wl_paste` on
 /// Wayland. Uses its own short-lived connection, not the arboard handle, and
 /// only runs after a read failed.
@@ -321,10 +321,9 @@ mod tests {
         assert!(is_empty_clipboard_message("nothing is copied\n"));
     }
 
-    /// A selection that exists but isn't text must NOT be treated as empty —
-    /// doing so is exactly the bug this fixes: a caller restoring a saved
-    /// clipboard value after a paste would silently overwrite an image or
-    /// file selection with `""`.
+    /// A selection that exists but isn't text must NOT be treated as empty:
+    /// a caller restoring a saved clipboard value after a paste would then
+    /// silently overwrite an image or file selection with `""`.
     #[test]
     fn does_not_treat_non_text_content_as_empty() {
         assert!(!is_empty_clipboard_message(
@@ -339,14 +338,14 @@ mod tests {
 
     #[test]
     fn does_not_match_stale_no_suitable_type_phrasing() {
-        // The old pattern this used to check for; confirm it alone (without
-        // "nothing is copied") is correctly treated as an error, not empty.
+        // This phrasing alone (without "nothing is copied") is an error,
+        // not empty.
         assert!(!is_empty_clipboard_message(
             "no suitable type of content copied"
         ));
     }
 
-    /// `pick_text_type` is what `get_text`/`get_primary_selection` now gate
+    /// `pick_text_type` is what `get_text`/`get_primary_selection` gate
     /// and read on (via `wl-paste --list-types`) instead of trusting
     /// wl-paste's own "inferred type" negotiation — that negotiation was
     /// observed, live, to sometimes return an image selection's raw bytes as
@@ -375,7 +374,7 @@ mod tests {
     }
 
     /// VTE terminals (Ptyxis, GNOME Console) offer no bare `text/plain`, so a
-    /// fixed `--type text/plain` read failed after the gate passed (#210).
+    /// fixed `--type text/plain` read would fail after the gate passed.
     #[test]
     fn pick_text_type_vte_offer_reads_utf8_plain() {
         assert_eq!(
@@ -429,7 +428,7 @@ mod tests {
     }
 
     /// `text_or_empty_if_unowned`: only a confirmed unowned CLIPBOARD may
-    /// turn `ContentNotAvailable` into `""` (#79).
+    /// turn `ContentNotAvailable` into `""`.
     #[cfg(feature = "arboard")]
     mod x11 {
         use super::super::text_or_empty_if_unowned;

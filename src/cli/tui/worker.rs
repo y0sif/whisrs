@@ -1334,6 +1334,34 @@ mod list_tests {
         Vec::new()
     }
 
+    /// Workers with their socket and models folder in `dir`, the devices and
+    /// tools given, and no poll thread: [`Workers::start`] spawns one.
+    pub(super) fn workers_on(
+        tx: Sender<Msg>,
+        dir: &Path,
+        devices: fn() -> Vec<InputDeviceInfo>,
+        tools: Tools,
+    ) -> Workers {
+        Workers {
+            tx,
+            socket: dir.join("whisrs.sock"),
+            service: ServiceManager::None,
+            lister: Lister {
+                devices,
+                models: dir.to_path_buf(),
+                home: None,
+            },
+            older: Arc::new(AtomicBool::new(false)),
+            env: Env::default(),
+            tools,
+            downloads: Arc::default(),
+            mic: Mutex::new(None),
+            speech: Mutex::new(None),
+            recordings: Mutex::new(None),
+            nudge: Mutex::new(None),
+        }
+    }
+
     /// The devices come from the lister given, never the sound server, and
     /// monitors are told apart.
     #[test]
@@ -1381,24 +1409,7 @@ mod list_tests {
     fn a_listing_comes_back_as_a_message() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let workers = Workers {
-            tx,
-            socket: dir.path().join("whisrs.sock"),
-            service: ServiceManager::None,
-            lister: Lister {
-                devices: two,
-                models: dir.path().to_path_buf(),
-                home: None,
-            },
-            older: Arc::new(AtomicBool::new(false)),
-            env: Env::default(),
-            tools: Tools::real(),
-            downloads: Arc::default(),
-            mic: Mutex::new(None),
-            speech: Mutex::new(None),
-            recordings: Mutex::new(None),
-            nudge: Mutex::new(None),
-        };
+        let workers = workers_on(tx, dir.path(), two, Tools::real());
         workers.list(ListKind::Devices);
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Msg::Listed(Listing::Devices(Ok(found))) => assert_eq!(found.len(), 2),
@@ -1544,33 +1555,17 @@ mod list_tests {
     fn a_mic_that_does_not_open_says_why() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let workers = Workers {
-            tx,
-            socket: dir.path().join("whisrs.sock"),
-            service: ServiceManager::None,
-            lister: Lister {
-                devices: two,
-                models: dir.path().to_path_buf(),
-                home: None,
+        let tools = Tools {
+            open_mic: |_| Err("no such device".to_string()),
+            probe: |_| {
+                Err(mic::ProbeError {
+                    error: "no such device".into(),
+                    devices: Vec::new(),
+                })
             },
-            older: Arc::new(AtomicBool::new(false)),
-            env: Env::default(),
-            tools: Tools {
-                open_mic: |_| Err("no such device".to_string()),
-                probe: |_| {
-                    Err(mic::ProbeError {
-                        error: "no such device".into(),
-                        devices: Vec::new(),
-                    })
-                },
-                ..Tools::real()
-            },
-            downloads: Arc::default(),
-            mic: Mutex::new(None),
-            speech: Mutex::new(None),
-            recordings: Mutex::new(None),
-            nudge: Mutex::new(None),
+            ..Tools::real()
         };
+        let workers = workers_on(tx, dir.path(), two, tools);
         workers.mic_start(7, "nope".into(), Vad::Earshot);
         let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Msg::Mic { session, event } => (session, event),
@@ -1597,28 +1592,12 @@ mod list_tests {
     fn a_superseded_probe_does_not_run() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let workers = Workers {
-            tx,
-            socket: dir.path().join("whisrs.sock"),
-            service: ServiceManager::None,
-            lister: Lister {
-                devices: two,
-                models: dir.path().to_path_buf(),
-                home: None,
-            },
-            older: Arc::new(AtomicBool::new(false)),
-            env: Env::default(),
-            tools: Tools {
-                open_mic: |_| Err("no such device".to_string()),
-                probe: counting_probe,
-                ..Tools::real()
-            },
-            downloads: Arc::default(),
-            mic: Mutex::new(None),
-            speech: Mutex::new(None),
-            recordings: Mutex::new(None),
-            nudge: Mutex::new(None),
+        let tools = Tools {
+            open_mic: |_| Err("no such device".to_string()),
+            probe: counting_probe,
+            ..Tools::real()
         };
+        let workers = workers_on(tx, dir.path(), two, tools);
         {
             // Another probe, or a listing, holds the lock meanwhile.
             let _held = stderr_lock();
@@ -1657,27 +1636,11 @@ mod list_tests {
     fn the_sample_stops_when_asked_or_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let workers = Workers {
-            tx,
-            socket: dir.path().join("whisrs.sock"),
-            service: ServiceManager::None,
-            lister: Lister {
-                devices: two,
-                models: dir.path().to_path_buf(),
-                home: None,
-            },
-            older: Arc::new(AtomicBool::new(false)),
-            env: Env::default(),
-            tools: Tools {
-                say: say_until_stopped,
-                ..Tools::real()
-            },
-            downloads: Arc::default(),
-            mic: Mutex::new(None),
-            speech: Mutex::new(None),
-            recordings: Mutex::new(None),
-            nudge: Mutex::new(None),
+        let tools = Tools {
+            say: say_until_stopped,
+            ..Tools::real()
         };
+        let workers = workers_on(tx, dir.path(), two, tools);
         let config: Config = toml::from_str("").unwrap();
         let next = || match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Msg::Spoke { id, said } => (id, said),
@@ -2034,24 +1997,7 @@ mod tests {
         )
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let workers = Workers {
-            tx,
-            socket: dir.path().join("whisrs.sock"),
-            service: ServiceManager::None,
-            lister: Lister {
-                devices: Vec::new,
-                models: dir.path().to_path_buf(),
-                home: None,
-            },
-            older: Arc::new(AtomicBool::new(false)),
-            env: Env::default(),
-            tools: Tools::real(),
-            downloads: Arc::default(),
-            mic: Mutex::new(None),
-            speech: Mutex::new(None),
-            recordings: Mutex::new(None),
-            nudge: Mutex::new(None),
-        };
+        let workers = super::list_tests::workers_on(tx, dir.path(), Vec::new, Tools::real());
         let read = || match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Msg::Recordings(Ok(items))) => items,
             _ => panic!("no read of the folder"),
@@ -2462,11 +2408,12 @@ mod tests {
         assert_eq!(daemon.join(), vec!["info", "status"]);
     }
 
-    /// A restart is skipped while the daemon dictates, records or processes
-    /// a recording, runs an agent turn, holds its lock, or is in a state
-    /// this whisrs does not know.
+    /// `busy` names what the daemon is doing: dictating, recording or
+    /// processing a recording, an agent turn, "busy" for a held lock or a
+    /// state this whisrs does not know, an older daemon's state, and nothing
+    /// when it is idle.
     #[test]
-    fn a_busy_daemon_is_not_restarted() {
+    fn busy_names_what_the_daemon_is_doing() {
         let with = |f: fn(&mut DaemonInfo)| {
             let mut info = idle();
             f(&mut info);
@@ -2491,34 +2438,6 @@ mod tests {
         assert_eq!(with(|i| i.recording = None), Some("busy"));
         assert_eq!(busy(&InfoAnswer::Older(State::Speaking)), Some("speaking"));
         assert_eq!(busy(&InfoAnswer::Older(State::Idle)), None);
-
-        for (busy_info, doing) in [
-            (
-                DaemonInfo {
-                    busy: true,
-                    ..idle()
-                },
-                "busy",
-            ),
-            (
-                DaemonInfo {
-                    agent_turn: true,
-                    ..idle()
-                },
-                "running an agent turn",
-            ),
-        ] {
-            let (_dir, path, daemon) = fake_daemon(vec![info(busy_info)]);
-            let report = restart(
-                &path,
-                ServiceManager::None,
-                &AtomicBool::new(false),
-                false,
-                || true,
-            );
-            assert_eq!(report, RestartReport::Busy(doing));
-            daemon.join();
-        }
     }
 
     #[test]

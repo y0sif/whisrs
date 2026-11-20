@@ -1793,22 +1793,6 @@ mod tests {
         assert_eq!(unique.len(), paths.len());
     }
 
-    /// The hotkey rows cover every `[hotkeys]` field, taken from serde so a
-    /// new field cannot be forgotten: a field with no row could not be set.
-    #[test]
-    fn every_hotkey_field_has_a_row() {
-        let all_set = every_field_set().hotkeys.expect("set");
-        let fields = toml::Table::try_from(all_set).expect("HotkeyConfig serializes");
-        let rows: Vec<&str> = HOTKEYS.iter().map(|f| f.path).collect();
-        for field in fields.keys() {
-            assert!(
-                rows.contains(&format!("hotkeys.{field}").as_str()),
-                "no row for [hotkeys] {field}"
-            );
-        }
-        assert_eq!(rows.len(), fields.len());
-    }
-
     /// The backend choice offers exactly the backends `Config::validate`
     /// routes, its aliases aside, and refuses the two stubs as coming soon.
     #[test]

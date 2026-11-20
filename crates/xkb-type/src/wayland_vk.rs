@@ -63,8 +63,8 @@
 //! **evdev** keycode, and the compositor adds `8` (XKB keycode = evdev + 8)
 //! before the keymap lookup. So the value transmitted on the wire is
 //! `xkb_keycode - 8` ([`xkb_to_evdev_keycode`], applied in
-//! [`WaylandVkKeyboard::emit_key`]). Sending the raw XKB keycode instead — the
-//! original bug — made the compositor look up `xkb_keycode + 8`, i.e. 8 keys
+//! [`WaylandVkKeyboard::emit_key`]). Sending the raw XKB keycode instead
+//! makes the compositor look up `xkb_keycode + 8`, i.e. 8 keys
 //! away, producing random glyphs and tripping unrelated keysym/keycode binds
 //! (notably the screenshot key). See [`EVDEV_XKB_OFFSET`] for citations.
 
@@ -113,8 +113,8 @@ const KEY_STATE_PRESSED: u32 = 1;
 /// On wlroots/sway that is sufficient — the headless streaming stress test
 /// passes 100% even at `0 ms` — because the keymap is applied synchronously and
 /// the roundtrip flushes the re-broadcast to the focused client. But on some
-/// compositors (notably Hyprland, where the original intermittent-drop bug was
-/// observed; cf. the analogous labwc virtual-keyboard re-broadcast race) the
+/// compositors (notably Hyprland, where keystrokes drop intermittently without
+/// this settle; cf. the analogous labwc virtual-keyboard re-broadcast race) the
 /// new keymap can lag behind key interpretation. This small, *bounded* settle
 /// closes that window with margin.
 ///
@@ -141,7 +141,7 @@ const KEYMAP_SETTLE: Duration = Duration::from_millis(20);
 /// Our keymap therefore defines every symbol at an XKB keycode, and every value
 /// handed to [`WaylandVkKeyboard::emit_key`] is an XKB keycode, but the value
 /// actually transmitted on the wire is `xkb_keycode - EVDEV_XKB_OFFSET`. Sending
-/// the raw XKB keycode (the original bug) made the compositor look up
+/// the raw XKB keycode makes the compositor look up
 /// `xkb_keycode + 8`, landing 8 keys away — producing garbage and tripping
 /// keysym/keycode binds (e.g. the screenshot key).
 const EVDEV_XKB_OFFSET: u32 = 8;
@@ -325,9 +325,9 @@ const PERMANENT_ASCII_KEYS: &[(u32, &str, &str)] = &[
 ///
 /// # Why not just "any high keycode"
 ///
-/// The original scheme used a dense high block (`DYNAMIC_BASE = 200`,
-/// XKB `200..=255` → evdev `192..=247`). Our uploaded keymap *did* map those
-/// keycodes to our glyphs, so the focused client received the right character.
+/// Take a dense high block (XKB `200..=255` → evdev `192..=247`). Our uploaded
+/// keymap maps those keycodes to our glyphs, so the focused client receives the
+/// right character.
 /// But a compositor does **not** evaluate its keybinds against our virtual
 /// keyboard's keymap. Hyprland resolves the bind keysym with
 /// `xkb_state_key_get_one_sym(m_xkbTranslationState, evdev + 8)`, where
@@ -339,8 +339,7 @@ const PERMANENT_ASCII_KEYS: &[(u32, &str, &str)] = &[
 /// evdev 192/193/194 → `F22`/`F23`/`F24`, and a long run of `XF86*` media keys.
 /// Keysym-configured binds match by keysym (`KeybindManager.cpp`
 /// `xkb_keysym_from_name(k->key) == key.keysym`), so the `Print`/screenshot
-/// bind fired on every keystroke that landed on evdev 210 — exactly the
-/// reported symptom.
+/// bind fires on every keystroke that lands on evdev 210.
 ///
 /// # The safe block
 ///
@@ -362,10 +361,8 @@ const PERMANENT_ASCII_KEYS: &[(u32, &str, &str)] = &[
 /// * `38..=48`  — `<AC01>..<AC11>` home row: `a s d f g h j k l ; '`
 /// * `52..=61`  — `<AB01>..<AB10>` bottom row: `z x c v b n m , . /`
 ///
-/// Keycodes already claimed by a [`base_keys`] entry (the combo letters
-/// `v c a k`, which live at their real `evdev + 8` positions inside this block)
-/// are filtered out by [`dynamic_keycode_pool`] so a glyph never collides with a
-/// base key.
+/// Dynamic glyphs take the AltGr level of these keycodes, so they never collide
+/// with the level-0 letters (the combo letters `v c a k` included).
 const SAFE_ALNUM_XKB_KEYCODES: &[u32] = &[
     // number row <AE01>..<AE12>
     10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, //
@@ -454,7 +451,7 @@ fn base_keys() -> Vec<BaseKey> {
     // (evdev key, keysym name) pairs. Keysym names are the canonical XKB
     // names accepted in an `xkb_symbols` block.
     //
-    // The combo letters (`v c a k`) are NOT here anymore: they are part of the
+    // The combo letters (`v c a k`) are not here: they are part of the
     // permanent ASCII layout ([`PERMANENT_ASCII_KEYS`]) at level 0, so
     // `send_combo` reaches them through their real `evdev + 8` keycodes just the
     // same. Shift and AltGr are the modifiers we press to reach levels 1 and 2.
@@ -905,11 +902,11 @@ impl WaylandVkKeyboard {
     /// modifier state the compositor uses to pick a keymap **level** for the
     /// subsequent key: the propagation of "Shift is down" to the focused
     /// client's key-interpretation state can lag the key press, so the letter
-    /// resolves at level 0 (e.g. the Arabic glyph at AltGr-level came out as the
-    /// base digit on its keycode — the symptom this fixes). `.modifiers`
-    /// declares the depressed-modifier *mask* directly and atomically, which is
-    /// exactly how `wtype` produces shifted/`AltGr` symbols. Level 0 needs no
-    /// mask; level 1 sets [`SHIFT_MOD_MASK`]; level 2 sets [`ALTGR_MOD_MASK`].
+    /// resolves at level 0 (e.g. the Arabic glyph at AltGr-level comes out as
+    /// the base digit on its keycode). `.modifiers` declares the
+    /// depressed-modifier *mask* directly and atomically, which is exactly how
+    /// `wtype` produces shifted/`AltGr` symbols. Level 0 needs no mask; level 1
+    /// sets [`SHIFT_MOD_MASK`]; level 2 sets [`ALTGR_MOD_MASK`].
     fn tap_char_key(&mut self, key: CharKey) -> anyhow::Result<()> {
         let mask = match key.level {
             Level::Base => 0,
@@ -1356,15 +1353,14 @@ mod tests {
         eprintln!("ascii-permanence OK: all 95 printable ASCII resolvable with zero dynamics");
     }
 
-    /// The streaming/re-upload regression test, fully offline and deterministic.
+    /// The streaming/re-upload test, fully offline and deterministic.
     ///
     /// Simulates the daemon's streaming accumulation: feed many small deltas
     /// (mixed EN + non-Latin) one at a time. After EACH delta, rebuild the
     /// keymap from the accumulated non-ASCII glyphs and assert that EVERY
-    /// character typed so far — all permanent ASCII PLUS every previously-seen
-    /// non-ASCII glyph — still resolves to itself. This is exactly the property
-    /// the intermittent bug violated: a freshly-introduced glyph or a space
-    /// becoming unresolvable across a re-upload.
+    /// character typed so far (all permanent ASCII plus every previously-seen
+    /// non-ASCII glyph) still resolves to itself, so no freshly-introduced
+    /// glyph or space becomes unresolvable across a re-upload.
     #[test]
     fn streaming_accumulation_keeps_all_chars_resolvable() {
         // EN + AR + RU interleaved, as a streaming transcription might deliver.
@@ -1583,7 +1579,6 @@ mod tests {
     /// OFFLINE GUARD: no keycode the backend ever puts on the wire as a printable
     /// key (permanent ASCII keys OR dynamic-glyph keycodes) falls in a dangerous
     /// range, and the dynamic keycodes all come from the safe alphanumeric block.
-    /// This is what prevented the screenshot-key regression; it must stay green.
     #[test]
     fn no_emitted_keycode_is_a_special_key() {
         let text = "Hello, мир! اهلا ω 1234567890 -=[];'/.,";
@@ -1817,7 +1812,7 @@ mod tests {
         assert_eq!(resolve_via_state(&keymap, m[&' ']), " ");
     }
 
-    /// Space — the prime drop victim in the bug — is a permanent base-level key
+    /// Space is a permanent base-level key
     /// (never dynamic), so it can never be lost to a re-upload race.
     #[test]
     fn space_is_permanent_base_level() {

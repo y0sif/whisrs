@@ -1069,17 +1069,12 @@ mod tests {
             let err = parse_final(reply, true).unwrap_err();
             assert!(err.contains(want), "{reply:?}: {err}");
         }
-        // A title that is too long or blank is dropped, the summary kept.
+        // A title that is too long is dropped, the summary kept.
         let long = format!(
             "{{\"title\": \"{}\", \"summary\": \"ok\"}}",
             "x".repeat(121)
         );
         assert_eq!(parse_final(&long, true), Ok(("ok".to_string(), None)));
-        assert_eq!(clean_title(" \"\" "), None);
-        assert_eq!(
-            clean_title("**Weekly   sync**"),
-            Some("Weekly sync".to_string())
-        );
     }
 
     /// A reply that tries to be the JSON asked for and is not, cut off or
@@ -1150,6 +1145,8 @@ mod tests {
             ("\u{201c}Curly\u{201d}", Some("Curly")),
             ("Wait for it...", Some("Wait for it...")),
             ("**\"\"**", None),
+            (" \"\" ", None),
+            ("**Weekly   sync**", Some("Weekly sync")),
         ] {
             assert_eq!(clean_title(raw).as_deref(), want, "{raw:?}");
         }
@@ -1359,26 +1356,37 @@ mod tests {
         assert!(tokens <= 8_192, "{tokens} tokens");
     }
 
-    /// A reply cut off at the model's output limit is an error, and the
-    /// first call that fails ends the summary: no later part is asked.
+    /// A reply cut off at the model's output limit is an error, an HTTP
+    /// error is noted (without the URL), and either keeps the summary the
+    /// recording had; the first call that fails ends the summary: no later
+    /// part is asked.
     #[tokio::test]
     async fn a_cut_off_reply_or_a_failed_part_ends_the_summary() {
         let cut = serde_json::json!({"choices": [{"message": {"role": "assistant",
             "content": "{\"summary\": \"TL;DR: all good.\"}"}, "finish_reason": "length"}]});
         let cut: &'static str = Box::leak(cut.to_string().into_boxed_str());
-        let (url, server) = llm_server(vec![(200, cut)]).await;
+        let (url, server) = llm_server(vec![(200, cut), (500, r#"{"error": "boom"}"#)]).await;
+        let config = config_with_llm(&url, "");
         let mut short = meta(None);
         short.summary = Some("Before.".into());
-        let err = apply(
-            &config_with_llm(&url, ""),
-            &mut short,
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
-        server.await.unwrap();
+        let err = apply(&config, &mut short, Duration::from_secs(10))
+            .await
+            .unwrap_err();
         assert!(err.contains("cut off at the model's output limit"), "{err}");
         assert_eq!(short.summary.as_deref(), Some("Before."));
+        let err = apply(&config, &mut short, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(
+            err.contains("LLM API error (500") && !err.contains("127.0.0.1"),
+            "{err}"
+        );
+        assert_eq!(short.errors, [err]);
+        assert_eq!(
+            (short.summary.as_deref(), short.title.as_deref()),
+            (Some("Before."), None)
+        );
 
         let (url, server) = llm_server(vec![(500, r#"{"error": "busy"}"#)]).await;
         let mut long = long_meta();
@@ -1395,28 +1403,6 @@ mod tests {
             "{err}"
         );
         assert_eq!(long.summary, None);
-    }
-
-    /// An HTTP error is noted (without the URL) and keeps the summary the
-    /// recording had.
-    #[tokio::test]
-    async fn a_failure_keeps_the_old_summary_and_is_noted() {
-        let (url, server) = llm_server(vec![(500, r#"{"error": "boom"}"#)]).await;
-        let mut meta = meta(None);
-        meta.summary = Some("Earlier summary.".into());
-        let err = apply(
-            &config_with_llm(&url, ""),
-            &mut meta,
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
-        server.await.unwrap();
-        assert!(err.contains("LLM API error (500"), "{err}");
-        assert!(!err.contains("127.0.0.1"), "no URL: {err}");
-        assert_eq!(meta.errors, [err]);
-        assert_eq!(meta.summary.as_deref(), Some("Earlier summary."));
-        assert_eq!(meta.title, None);
     }
 
     /// `summarize_recording` writes recording.json and the transcript at

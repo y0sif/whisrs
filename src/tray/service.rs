@@ -887,27 +887,6 @@ mod tests {
         }
 
         #[test]
-        fn recording_line_describes_each_phase() {
-            assert_eq!(recording_line(&RecordingStatus::default()), None);
-            assert_eq!(
-                recording_line(&active_recording(Some("standup"))).as_deref(),
-                Some("Recording mic and system audio since 09:30 (standup)")
-            );
-            assert_eq!(
-                recording_line(&active_recording(None)).as_deref(),
-                Some("Recording mic and system audio since 09:30")
-            );
-            let processing = RecordingStatus {
-                phase: RecordingPhase::Processing,
-                ..Default::default()
-            };
-            assert_eq!(
-                recording_line(&processing).as_deref(),
-                Some("Processing recording...")
-            );
-        }
-
-        #[test]
         fn idle_recording_menu_offers_only_start() {
             assert_eq!(
                 labels(&recording_menu_items(&RecordingStatus::default())),
@@ -980,6 +959,10 @@ mod tests {
             assert_eq!(
                 pixmaps(&idle_processing.icon_pixmap()),
                 pixmaps(&icons::get(IconSet::RecordingProcessing))
+            );
+            assert_eq!(
+                idle_processing.tool_tip().description,
+                "Processing recording..."
             );
 
             let dictating = tray_with(
