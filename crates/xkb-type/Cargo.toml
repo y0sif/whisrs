@@ -1,6 +1,6 @@
 [package]
 name = "xkb-type"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.74"
 description = "Virtual keyboard typing via evdev/uinput or X11 XTEST with XKB layout-aware key mapping"
@@ -21,7 +21,6 @@ xtest = ["dep:x11rb"]
 evdev = "0.12"
 xkbcommon = "0.8"
 anyhow = "1"
-thiserror = "2"
 serde_json = "1"
 log = { version = "0.4", optional = true }
 wayland-client = { version = "0.31", optional = true }
