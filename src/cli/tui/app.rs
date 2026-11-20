@@ -76,7 +76,7 @@ pub struct SetupLoad {
     pub answers: Loaded,
 }
 
-/// Read what setup opens on: an unreadable config is refused (#134).
+/// Read what setup opens on: an unreadable config is refused.
 pub fn setup_load(paths: &Paths) -> Result<SetupLoad, String> {
     let (disk, found) = config::load_for_setup(paths)?;
     let answers = config::loaded_from(paths, Setup::defaults())?;

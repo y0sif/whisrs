@@ -171,7 +171,7 @@ impl Paths {
 
 /// Open the TUI at `entry`. Refuses, touching nothing, when stdin or stdout
 /// is not a terminal or `TERM` is `dumb`, and before the TUI opens when the
-/// config cannot be used (#134).
+/// config cannot be used.
 pub fn run(entry: Entry) -> anyhow::Result<()> {
     let env = Env::capture();
     let paths = Paths::detect();

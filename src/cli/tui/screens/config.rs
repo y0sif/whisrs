@@ -130,7 +130,7 @@ pub enum SaveError {
 }
 
 /// Load config.toml (and `vocabulary.txt`) to edit. A file that cannot be
-/// used is refused with the text `whisrs config` exits with (#134): nothing
+/// used is refused with the text `whisrs config` exits with: nothing
 /// opens on defaults over a file the user has.
 pub fn load(paths: &Paths) -> Result<Loaded, String> {
     let mut loaded = read(paths)
@@ -170,13 +170,13 @@ pub enum Found {
     /// A config that loads.
     Usable,
     /// A file that does not deserialize, and why: setup starts fresh and
-    /// writes over it, keeping it as `.bak` (#134).
+    /// writes over it, keeping it as `.bak`.
     Broken(String),
 }
 
 /// [`load`] for `whisrs setup`: an unreadable file is refused as by
 /// `config`, but one that does not deserialize opens on the defaults, with
-/// what is wrong, for setup to write over (#134).
+/// what is wrong, for setup to write over.
 pub fn load_for_setup(paths: &Paths) -> Result<(Loaded, Found), String> {
     match read(paths) {
         Ok(loaded) => {
@@ -229,7 +229,7 @@ fn read(paths: &Paths) -> Result<Loaded, (write::UnusableKind, String)> {
         }
     };
     // At load, not at save: the keys are about to be shown back as a config
-    // that looks fine (#116).
+    // that looks fine.
     let mut notices: Vec<Notice> = unknown
         .iter()
         .map(|key| {
@@ -286,7 +286,7 @@ pub fn save(screen: &ConfigScreen, paths: &Paths, overwrite: bool) -> Result<Sav
 /// as it is. With `backup`, the file is first kept as `config.toml.bak`
 /// (0600). Unless `overwrite`, a file that changed since `answers` read it
 /// is left alone, as [`save`] does. A file that does not deserialize is
-/// written over from the defaults, and kept as `.bak` (#134).
+/// written over from the defaults, and kept as `.bak`.
 pub fn save_keys(
     answers: &ConfigScreen,
     keys: &[String],
@@ -2776,7 +2776,7 @@ fn color(screen: &ConfigScreen, path: &str, text: Option<&str>, ui: &Ui) -> Show
     }
 }
 
-/// Where a key row's key comes from, as the daemon would find it (#142).
+/// Where a key row's key comes from, as the daemon would find it.
 enum KeyFrom {
     /// In the file, masked as the row shows it.
     File(String),
@@ -2844,7 +2844,7 @@ fn key_from(screen: &ConfigScreen, path: &str, env: &Env) -> KeyFrom {
 }
 
 /// Where a key comes from: the env var, which wins as in the daemon, the
-/// file (masked), or nowhere (#142).
+/// file (masked), or nowhere.
 fn secret(screen: &ConfigScreen, path: &str, env: &Env) -> Shown {
     match key_from(screen, path, env) {
         KeyFrom::File(masked) => Shown::plain(format!("set {masked}")),
@@ -4683,7 +4683,7 @@ mod tests {
 
     // Opening.
 
-    /// #134: a file that cannot be read is refused before the TUI opens,
+    /// A file that cannot be read is refused before the TUI opens,
     /// with the hand fix, and nothing is written.
     #[test]
     fn an_unreadable_config_is_refused() {
@@ -4697,7 +4697,7 @@ mod tests {
         assert!(paths.config.is_dir());
     }
 
-    /// #134: a file that does not deserialize is refused by `config` (only
+    /// A file that does not deserialize is refused by `config` (only
     /// `setup` starts fresh), and left as it is.
     #[test]
     fn an_undeserializable_config_is_refused() {
@@ -4711,7 +4711,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), broken);
     }
 
-    /// #116: unknown keys are named at load, on Home and Config.
+    /// Unknown keys are named at load, on Home and Config.
     #[test]
     fn unknown_keys_are_named_at_load() {
         let fixture = app("[general]\nsilense_timeout_ms = 1\n[tts]\nvoise = \"x\"\n");

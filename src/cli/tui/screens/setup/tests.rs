@@ -1,6 +1,7 @@
 //! Setup, driven by keys through the pure update: the steps in order, back
 //! and skip, the optional modes, the questions before leaving, the model
-//! download, the read-aloud sample, the checks, and the #134 refusals.
+//! download, the read-aloud sample, the checks, and the unusable-config
+//! refusals.
 
 use std::path::PathBuf;
 
@@ -483,7 +484,7 @@ fn leaving_mid_download_cancels_it() {
 }
 
 /// A config that does not load is not refused: setup says so, Config
-/// refuses to save over it, and the write keeps it as `.bak` (#134).
+/// refuses to save over it, and the write keeps it as `.bak`.
 #[test]
 fn an_undeserializable_config_is_backed_up_by_the_write() {
     let broken = "[general]\nsilence_timeout_ms = \"soon\"\n";
@@ -515,7 +516,7 @@ fn an_undeserializable_config_is_backed_up_by_the_write() {
 }
 
 /// A config that cannot be read is refused before the TUI opens, with
-/// the hand fix (#134).
+/// the hand fix.
 #[test]
 fn an_unreadable_config_is_refused() {
     use std::os::unix::fs::PermissionsExt;
@@ -813,7 +814,7 @@ fn answers_changed_after_a_write_or_reached_back_are_asked_about() {
     assert_eq!(fixture.app.dialog, Some(Dialog::Unwritten { quit: false }));
 }
 
-/// Unknown keys are named as setup opens, before any question (#116).
+/// Unknown keys are named as setup opens, before any question.
 #[test]
 fn unknown_keys_are_named_before_the_first_question() {
     let fixture = setup_on(

@@ -2157,12 +2157,10 @@ mod tests {
         }
     }
 
-    /// Issue #84: `llm-command` and `llm-command-set` existed in the clap CLI
-    /// (`SubCmd` above) but were never added to the man page's SUBCOMMANDS
-    /// section, and nothing caught it. Rather than hand-maintain a mirror
-    /// list of subcommand names (which is exactly what went stale), this
-    /// walks the real `Cli` derive so a future subcommand that isn't
-    /// documented fails automatically.
+    /// Every clap subcommand (`SubCmd` above) has an entry in the man page's
+    /// SUBCOMMANDS section. Rather than hand-maintain a mirror list of
+    /// subcommand names, which goes stale, this walks the real `Cli` derive so
+    /// a subcommand that isn't documented fails automatically.
     #[test]
     fn man_page_documents_all_cli_subcommands() {
         let page_path = format!("{}/contrib/whisrs.1", env!("CARGO_MANIFEST_DIR"));
