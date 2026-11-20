@@ -13,5 +13,5 @@ categories = ["multimedia::audio"]
 [dependencies]
 # The learned detector (std only, no dependencies of its own). Patch releases
 # only: the thresholds in `vad.rs` are tuned to these weights, so a new minor
-# version must pass scripts/check-vad.sh before it is allowed in.
+# version must pass the maintainer's VAD check before it is allowed in.
 earshot = "~1.2.2"

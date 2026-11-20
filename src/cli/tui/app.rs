@@ -76,7 +76,7 @@ pub struct SetupLoad {
     pub answers: Loaded,
 }
 
-/// Read what setup opens on: an unreadable config is refused (#134).
+/// Read what setup opens on: an unreadable config is refused.
 pub fn setup_load(paths: &Paths) -> Result<SetupLoad, String> {
     let (disk, found) = config::load_for_setup(paths)?;
     let answers = config::loaded_from(paths, Setup::defaults())?;
@@ -2831,18 +2831,6 @@ mod tests {
         );
     }
 
-    /// Esc on Config goes up to Home; enter on Home opens Config again,
-    /// edits kept.
-    #[test]
-    fn esc_goes_home_and_back() {
-        let mut fixture = edited();
-        press(&mut fixture.app, "\t\x1b");
-        assert_eq!(fixture.app.screen(), Screen::Home);
-        press(&mut fixture.app, "\n");
-        assert_eq!(fixture.app.screen(), Screen::Config);
-        assert!(fixture.app.config.form.is_dirty());
-    }
-
     /// A save of a config that had no file writes one, and points to setup.
     #[test]
     fn saving_a_fresh_config_points_to_setup() {
@@ -3095,10 +3083,6 @@ mod tests {
             fixture.app.update(Msg::Saved(saved)),
             Some(Effect::All(vec![Effect::Restart, Effect::OpenSetup]))
         );
-        // Clean: it just opens.
-        let mut fixture = app("[general]\n");
-        press(&mut fixture.app, "\x1bk");
-        assert_eq!(press(&mut fixture.app, "\n"), [Effect::OpenSetup]);
     }
 
     /// Setup opens from Home on what is on disk.

@@ -5,9 +5,9 @@
 //! natural pauses (>= `phrase_silence_ms` of silence) and each phrase is
 //! decoded exactly once — no overlapping windows, no deduplication, and no
 //! feedback of prior output. Feeding each window's transcription back as
-//! `initial_prompt` was the root cause of the repetition/invented-text loops
-//! in issue #55, so the only prompt ever passed to the decoder is the static
-//! vocabulary prompt from the user's config.
+//! `initial_prompt` sets off repetition/invented-text loops, so the only prompt
+//! ever passed to the decoder is the static vocabulary prompt from the user's
+//! config.
 //!
 //! Pause-free speech is force-cut by the splitter before it outgrows
 //! whisper's 30 s context window (soft cap at a genuinely silent frame, hard
@@ -28,7 +28,7 @@
 //!
 //! Every [`transcribe`] call longer than one decode window (28 s) is cut at
 //! pauses (or at 28 s in continuous speech) and decoded a window at a time,
-//! so no window's text can set off a loop in the next (issue #208). That is
+//! so no window's text can set off a loop in the next. That is
 //! dictation in `"none"`, and command mode and `[[llm_commands]]` whatever
 //! `segmentation` says, since they always take the batch path.
 //!
@@ -408,7 +408,7 @@ impl LocalWhisperBackend {
     /// `segmentation` is not consulted: it picks how dictation streams, and
     /// `"none"` would hand whisper.cpp a whole chunk (up to ten minutes) in one
     /// `full()` call, where it carries text across its 30 s windows even with
-    /// `no_context(true)`: the repetition loop of #55. `phrase_silence_ms` is
+    /// `no_context(true)`, and that text loops. `phrase_silence_ms` is
     /// capped ([`super::recording_phrase_silence_ms`]), so every join between
     /// the chunk's speech regions ends a phrase. A long batch dictation is cut
     /// the same way ([`batch_windows`]). `cfg` is the track's open profile
@@ -499,7 +499,6 @@ fn batch_windows(samples: &[i16], phrase_silence_ms: u64, vad: Vad) -> Vec<Decod
 }
 
 /// Convert i16 PCM samples to f32 in the range [-1.0, 1.0].
-#[cfg(any(feature = "local-whisper", test))]
 fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
     samples
         .iter()
@@ -513,7 +512,6 @@ fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
 /// cut): whisper capitalizes each decode independently, so a continuation's
 /// leading capital is spurious mid-sentence. Char-safe for UTF-8;
 /// `char::to_lowercase` may expand to multiple chars.
-#[cfg(any(feature = "local-whisper", test))]
 fn decapitalize_first(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
@@ -618,7 +616,7 @@ async fn decode_phrase(
 ///   buffer independently.
 /// - `prompt`: the static vocabulary/context hint from the user's config.
 ///   Never prior transcription output — feeding decoded text back as the
-///   prompt caused the repetition loops of issue #55.
+///   prompt sets off repetition loops.
 fn run_whisper_inference(
     state: &mut whisper_rs::WhisperState,
     audio: &[f32],
@@ -674,7 +672,7 @@ fn full_params<'a>(
         }
     }
     // Decode every buffer independently: carrying decoder context across
-    // buffers amplified repetition/invented text (issue #55). The static
+    // buffers amplifies repetition/invented text. The static
     // initial_prompt above is still applied.
     // Reusing one state across decodes depends on this staying true: it is what
     // drops the previous decode's text context (see `create_state`).
@@ -715,7 +713,7 @@ struct RawSegment {
 /// pass: it seeks to the last timestamp it decoded and runs on over the
 /// rest, and that pass is conditioned on the first pass's text
 /// (`no_context` clears the carried text only when the call starts). That
-/// is the carried context of the #55 repetition loop. With `n_max_text_ctx`
+/// carried context is what sets off the repetition loop. With `n_max_text_ctx`
 /// 0 no pass takes any prompt; in this whisper.cpp that includes the
 /// initial prompt, so recordings send local whisper none (see
 /// `crate::transcription::factory::recording_transcription_config`).
@@ -806,7 +804,7 @@ fn place_window_segments(raw: Vec<RawSegment>, window: &DecodeWindow) -> Vec<Seg
 ///
 /// One `full()` call over the whole buffer conditions each 30 s mel window
 /// on the text decoded in the one before (`no_context` clears it only when
-/// the call starts), and on long dictations that text loops (issue #208).
+/// the call starts), and on long dictations that text loops.
 /// A window fits one mel window; a second pass over its tail can still take
 /// the first pass's text, since `n_max_text_ctx` 0 would drop the prompt too
 /// (see [`run_whisper_segments`]).
@@ -993,8 +991,8 @@ impl TranscriptionBackend for LocalWhisperBackend {
             .await?;
         }
 
-        // Longer, cut into windows that each fit one 30 s mel window
-        // (issue #208), in the blocking task: see `batch_windows`.
+        // Longer, cut into windows that each fit one 30 s mel window, in the
+        // blocking task: see `batch_windows`.
         let phrase_silence_ms = self.phrase_silence_ms;
         let vad = config.vad;
         tokio::task::spawn_blocking(move || {
@@ -1141,42 +1139,24 @@ mod tests {
     }
 
     #[test]
-    fn decapitalize_first_lowercases_ascii_uppercase() {
-        assert_eq!(decapitalize_first("Hello world"), "hello world");
-    }
-
-    #[test]
-    fn decapitalize_first_leaves_lowercase_unchanged() {
-        assert_eq!(decapitalize_first("hello World"), "hello World");
-    }
-
-    #[test]
-    fn decapitalize_first_leaves_digit_and_punct_unchanged() {
-        assert_eq!(decapitalize_first("42 things"), "42 things");
-        assert_eq!(decapitalize_first("...And then"), "...And then");
-    }
-
-    #[test]
-    fn decapitalize_first_handles_multibyte_uppercase() {
-        assert_eq!(decapitalize_first("École normale"), "école normale");
-    }
-
-    #[test]
-    fn decapitalize_first_handles_empty_string() {
-        assert_eq!(decapitalize_first(""), "");
-    }
-
-    #[test]
-    fn decapitalize_first_keeps_pronoun_i() {
-        assert_eq!(decapitalize_first("I think so"), "I think so");
-        assert_eq!(decapitalize_first("I'm here"), "I'm here");
-        assert_eq!(decapitalize_first("I"), "I");
-    }
-
-    #[test]
-    fn decapitalize_first_still_lowercases_i_words() {
-        assert_eq!(decapitalize_first("It works"), "it works");
-        assert_eq!(decapitalize_first("Instead of that"), "instead of that");
+    fn decapitalize_first_lowers_only_a_leading_capital() {
+        for (input, want) in [
+            ("Hello world", "hello world"),
+            ("hello World", "hello World"),
+            ("42 things", "42 things"),
+            ("...And then", "...And then"),
+            ("École normale", "école normale"),
+            ("", ""),
+            // The pronoun I stays, alone or in a contraction.
+            ("I think so", "I think so"),
+            ("I'm here", "I'm here"),
+            ("I", "I"),
+            // A word that only starts with I is lowered.
+            ("It works", "it works"),
+            ("Instead of that", "instead of that"),
+        ] {
+            assert_eq!(decapitalize_first(input), want, "{input:?}");
+        }
     }
 
     #[test]
@@ -1310,7 +1290,7 @@ mod tests {
 
     /// A batch dictation that fits one decode window keeps the single
     /// `full()` call; past that it is cut into windows of at most 28 s,
-    /// every phrase in exactly one, in order (issue #208).
+    /// every phrase in exactly one, in order.
     #[test]
     fn long_batch_dictations_decode_a_window_at_a_time() {
         // 2.5 s turns of speech, each followed by 1.5 s of room noise.
@@ -1477,7 +1457,7 @@ mod tests {
             window(100, false),
             window(120, false),
         ];
-        // The prompt of scripts/check-issue208.sh, typo included.
+        // A real user's prompt, typo included.
         let prompt = "make sure to spell out words like 'slash', 'question mark', etc, \
                       as pancuation marks, like '!', '/', etc, rather than actual text. \
                       whisrs, nvim, hyprland, claude code";

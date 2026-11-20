@@ -140,9 +140,8 @@ struct Overlay {
 
 impl Overlay {
     /// Swap in a fresh layer surface, at the start of a session on a
-    /// multi-output setup so the pill opens on the output focused now
-    /// (issue #198), or after the
-    /// compositor closed the old one. Dropping the old `LayerSurface`
+    /// multi-output setup so the pill opens on the output focused now, or after
+    /// the compositor closed the old one. Dropping the old `LayerSurface`
     /// destroys its role object and its `wl_surface`.
     fn recreate_layer(&mut self, qh: &QueueHandle<Self>) {
         self.layer = create_layer(

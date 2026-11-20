@@ -1,16 +1,24 @@
 # xkb-type
 
-Layout-aware text injection for Linux — types correct characters regardless of the user's active keyboard layout.
+Layout-aware text injection for Linux: types the right characters whatever keyboard layout the user has active.
 
 ## Problem
 
-Linux has no "type this text at the cursor" API. Every tool that injects text (wtype, ydotool, xdotool) sends fixed keycodes, which produce wrong characters when the user has a non-US keyboard layout. German users get "z" and "y" swapped; French users get "a" and "q" swapped; Russian users get complete gibberish.
+Linux has no "type this text at the cursor" API. A program that injects fixed keycodes, as a uinput device does, gets them read through the user's active layout, so a non-US layout produces wrong characters: German users get "z" and "y" swapped, French users "a" and "q", and Russian users gibberish.
 
-## Solution
+## Backends
 
-`xkb-type` uses `xkbcommon` to read the active XKB keyboard layout, builds a reverse mapping from every Unicode character to the physical key + modifiers needed to produce it, then injects the correct keystrokes via a Linux uinput virtual keyboard.
+All three implement the `KeyInjector` trait, so a caller can pick one at runtime and keep the same typing code.
 
-Characters not found in the keymap (emoji, rare symbols) are pasted via clipboard (Ctrl+V).
+| Backend | Type | Needs | Feature |
+|---|---|---|---|
+| uinput | `Keyboard::new` | Write access to `/dev/uinput` | none (always built) |
+| Wayland virtual keyboard | `wayland_vk::WaylandVkKeyboard::new` | A compositor that offers `zwp_virtual_keyboard_v1` | `wayland-vk` |
+| X11 XTEST | `Keyboard::new_xtest` | An X11 session (not Xwayland) | `xtest` |
+
+- **uinput** reads the active XKB layout with `xkbcommon`, maps every character to the physical key and modifiers that produce it (AltGr and dead keys included), and types through a virtual keyboard device. Characters the layout lacks (emoji, rare symbols) are pasted through the clipboard (Ctrl+V), and the clipboard is restored afterwards.
+- **Wayland virtual keyboard** uploads its own keymap to the compositor, so each character types correctly whatever layout is active, mixed scripts included. It needs no `/dev/uinput`. `new` fails when the compositor lacks the protocol, so a caller can fall back to uinput.
+- **XTEST** sends keys through the X server, which processes them in order, so a key delay of zero drops nothing. It needs no `/dev/uinput`, and refuses to start on Xwayland or when the server's keyboard layout differs from the detected one.
 
 ## Usage
 
@@ -18,14 +26,14 @@ Characters not found in the keymap (emoji, rare symbols) are pasted via clipboar
 use xkb_type::{Keyboard, Key};
 use std::time::Duration;
 
-// Auto-detect layout and clipboard backend.
+// uinput, with the detected layout and clipboard backend.
 let mut kb = Keyboard::new(Duration::from_millis(2))?;
-kb.type_text("Hello — こんにちは — €100 — 😀")?;
+kb.type_text("Hello, こんにちは, €100, 😀")?;
 kb.backspace(5)?;
 kb.send_combo(&[Key::KEY_LEFTCTRL, Key::KEY_C])?;
 ```
 
-To force a specific XKB layout (skips compositor probe):
+To force a specific XKB layout (skips the compositor probe):
 
 ```rust
 use xkb_type::Keyboard;
@@ -46,6 +54,19 @@ let keymap = XkbKeymap::from_layout(&layout)?;
 let mut kb = Keyboard::with_components(keymap, default_clipboard(), Duration::from_millis(5))?;
 ```
 
+To prefer the Wayland virtual keyboard and fall back to uinput (feature `wayland-vk`):
+
+```rust
+use std::time::Duration;
+use xkb_type::{wayland_vk::WaylandVkKeyboard, KeyInjector, Keyboard};
+
+let delay = Duration::from_millis(2);
+let kb: Box<dyn KeyInjector> = match WaylandVkKeyboard::new(delay) {
+    Ok(vk) => Box::new(vk),
+    Err(_) => Box::new(Keyboard::new(delay)?),
+};
+```
+
 To pause or stop between keys, type through the `KeyInjector` trait. Its `type_text` asks a gate before every key with the byte offset of the next character; the gate may block, and `ControlFlow::Break` stops before that character:
 
 ```rust
@@ -61,17 +82,31 @@ if let Typed::StoppedAt(at) = kb.type_text(text, &mut gate)? {
 }
 ```
 
+## Clipboard
+
+`default_clipboard()` picks the backend for the session: `WaylandClipboard` when `WAYLAND_DISPLAY` is set, which runs `wl-copy` and `wl-paste` (from `wl-clipboard`), else `X11Clipboard`, which needs the `arboard` feature. `NoopClipboard` does nothing. The `ClipboardBackend` trait also reads the primary selection.
+
+## Features
+
+| Feature | Adds |
+|---|---|
+| `arboard` | `X11Clipboard` through the `arboard` crate (without it, every call returns an error) |
+| `logging` | Debug and warning messages through the `log` crate |
+
+The backend features, `wayland-vk` and `xtest`, are in the [Backends](#backends) table. None is on by default.
+
 ## Requirements
 
-- Linux
-- Write access to `/dev/uinput` (user in `input` group or udev rule)
-- `libxkbcommon` (installed by default on most Linux desktops)
-- `wl-clipboard` for Wayland clipboard operations
+- Linux, Rust 1.74 or newer
+- `libxkbcommon` (installed on most Linux desktops)
+- The backend's own needs, from the table above
+- `wl-clipboard` for the Wayland clipboard
 
 ## Installation
 
-```fish
+```sh
 cargo add xkb-type
+cargo add xkb-type --features wayland-vk,xtest,arboard   # with every backend
 ```
 
 ## License

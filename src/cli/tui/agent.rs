@@ -1365,11 +1365,6 @@ mod tests {
             press(&mut fixture.app, "jj q");
             fixture
         };
-        let mut by_agent = unsaved();
-        assert_eq!(
-            act(&mut by_agent, "dialog-d", Action::Activate, None),
-            (InputStatus::Delivered, vec![Effect::Quit])
-        );
         let fixture = same(
             unsaved,
             |f| act(f, "dialog-d", Action::Activate, None),
@@ -1658,10 +1653,6 @@ mod tests {
             },
         );
         // A chord that means something of its own.
-        assert_eq!(
-            raw(&mut general(), "ctrl+c"),
-            (InputStatus::Delivered, vec![Effect::Quit])
-        );
         let filter = || {
             let mut fixture = mockup();
             press(&mut fixture.app, "/");

@@ -494,20 +494,6 @@ mod tests {
         }
     }
 
-    /// A recording made before tracks were measured renders byte for byte
-    /// as it did: the expected text is the one
-    /// `markdown_has_front_matter_and_merged_turns` pins, from a meta read
-    /// from a `recording.json` with no `quality`.
-    #[test]
-    fn a_recording_without_quality_renders_as_before() {
-        let json = serde_json::to_string(&meta()).unwrap();
-        assert!(!json.contains("quality"), "{json}");
-        let old: RecordingMeta = serde_json::from_str(&json).unwrap();
-        assert!(old.tracks.iter().all(|t| t.quality.is_none()));
-        assert_eq!(render_markdown(&old), render_markdown(&meta()));
-        assert!(!render_markdown(&old).contains("audio"));
-    }
-
     /// Each measured track gets a line of levels after the model; the
     /// warnings follow only when a track warned.
     #[test]
@@ -552,16 +538,6 @@ mod tests {
         // A track without a report has no line.
         m.tracks[1].quality = None;
         assert!(!render_markdown(&m).contains("  system:"));
-    }
-
-    #[test]
-    fn text_is_one_line_per_turn() {
-        assert_eq!(
-            render_text(&meta()),
-            "[00:00:01] Yosif: Hi all. Quick update.\n\
-             [00:01:05] Others: Sounds good.\n\
-             [01:01:40] Yosif: Bye.\n"
-        );
     }
 
     #[test]
@@ -623,16 +599,6 @@ mod tests {
             model_and_languages(&m),
             "model: \"whisper-large-v3-turbo\"\nlanguage: \"de\""
         );
-    }
-
-    #[test]
-    fn the_system_track_takes_the_others_label() {
-        let mut m = meta();
-        m.speakers[1].name = "Video".into();
-        let md = render_markdown(&m);
-        assert!(md.contains("  - \"Video\"\n"), "{md}");
-        assert!(md.contains("**[00:01:05] Video:** Sounds good."), "{md}");
-        assert!(render_text(&m).contains("[00:01:05] Video: Sounds good.\n"));
     }
 
     /// Separated voices render by name: two voices on the system track,

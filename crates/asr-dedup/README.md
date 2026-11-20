@@ -1,6 +1,6 @@
 # asr-dedup
 
-Deduplication strategies for chunked/sliding-window ASR transcription — eliminates
+Deduplication strategies for chunked/sliding-window ASR transcription. They eliminate
 duplicate words caused by overlapping audio windows in streaming speech-to-text.
 
 ## Installation
@@ -11,7 +11,7 @@ cargo add asr-dedup
 
 ## Usage
 
-The crate exposes two independent tracker types — pick the one that matches
+The crate exposes two independent tracker types: pick the one that matches
 the shape of your ASR output.
 
 ### Timestamp-based dedup (cloud APIs like Groq, Deepgram)
@@ -53,7 +53,7 @@ let tracker = TimestampDedup::new().with_overlap_tolerance_secs(0.01);
 
 ### Text-based anchor dedup (local whisper.cpp sliding window)
 
-Use [`TextDedup`] when you have no timestamps — just the full transcription
+Use [`TextDedup`] when you have no timestamps, just the full transcription
 string per window.
 
 ```rust

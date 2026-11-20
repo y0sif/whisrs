@@ -1,5 +1,5 @@
 {
-  description = "whisrs — Linux-first voice-to-text dictation tool";
+  description = "Voice for the Linux desktop: dictation, read-aloud, meeting transcription, voice-driven LLM commands and coding agents, with Groq, Deepgram, OpenAI or offline whisper.cpp.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -26,7 +26,7 @@
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "whisrs";
-          version = "0.2.0";
+          version = "0.2.1";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
@@ -51,7 +51,7 @@
           '';
 
           meta = with pkgs.lib; {
-            description = "Linux-first voice-to-text dictation tool";
+            description = "Voice for the Linux desktop: dictation, read-aloud, meeting transcription, voice-driven LLM commands and coding agents, with Groq, Deepgram, OpenAI or offline whisper.cpp.";
             homepage = "https://github.com/y0sif/whisrs";
             license = licenses.mit;
             platforms = platforms.linux;

@@ -254,9 +254,12 @@ impl AsrSidecarBackend {
 
         if !status.is_success() {
             let code = status.as_u16();
-            let message = match serde_json::from_str::<AsrSidecarErrorResponse>(&body) {
-                Ok(err_resp) => format!("ASR sidecar error ({code}): {}", err_resp.message()),
-                Err(_) => format!("ASR sidecar error ({code}): {body}"),
+            let message = match serde_json::from_str::<AsrSidecarErrorResponse>(&body)
+                .ok()
+                .and_then(|err_resp| err_resp.message())
+            {
+                Some(message) => format!("ASR sidecar error ({code}): {message}"),
+                None => format!("ASR sidecar error ({code}): {body}"),
             };
             // FastAPI answers a field it does not take with 422, others
             // with 400.
@@ -472,20 +475,32 @@ pub struct AsrSidecarResponse {
 
 #[derive(Debug, Deserialize)]
 struct AsrSidecarErrorResponse {
-    error: Option<String>,
+    /// `"..."`, or `{"message": "...", "code": 400}` as OpenRouter (and
+    /// OpenAI) send it.
+    error: Option<serde_json::Value>,
     detail: Option<serde_json::Value>,
 }
 
 impl AsrSidecarErrorResponse {
-    fn message(&self) -> String {
-        if let Some(error) = &self.error {
-            return error.clone();
+    /// What the body says, or `None` for an `error` of another shape (the
+    /// caller shows the body as it is).
+    fn message(&self) -> Option<String> {
+        match &self.error {
+            Some(serde_json::Value::String(error)) => return Some(error.clone()),
+            Some(serde_json::Value::Object(error)) => {
+                return error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            Some(_) => return None,
+            None => {}
         }
-        match &self.detail {
+        Some(match &self.detail {
             Some(serde_json::Value::String(detail)) => detail.clone(),
             Some(detail) => detail.to_string(),
             None => "unknown sidecar error".to_string(),
-        }
+        })
     }
 }
 
@@ -583,13 +598,13 @@ impl TranscriptionBackend for AsrSidecarBackend {
 mod tests {
     use super::*;
     use crate::transcription::retry::{
-        is_network_unavailable, is_transport_error, retry_transient, retry_with_backoff,
-        RATE_LIMIT_BUDGET,
+        is_network_unavailable, is_transport_error, retry_with_backoff, RATE_LIMIT_BUDGET,
     };
     use crate::transcription::test_server::{
-        accept_request, crash_after_request, serve_once, serve_responses, Request,
+        accept_request, crash_after_request, serve_responses, Request,
     };
     use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
 
     fn test_config() -> TranscriptionConfig {
         TranscriptionConfig {
@@ -603,24 +618,52 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn transcribe_sends_bearer_authorization_header() {
+    /// A backend posting to `path` of a test server that answers
+    /// `responses` in turn, and the server, which hands back the requests.
+    async fn sidecar_at(
+        path: &str,
+        api_key: Option<&str>,
+        responses: Vec<(u16, &'static str)>,
+    ) -> (AsrSidecarBackend, JoinHandle<Vec<Request>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_once(listener, r#"{"text": "ok"}"#));
+        let server = tokio::spawn(serve_responses(listener, responses));
+        let url = format!("http://{addr}{path}");
+        (
+            AsrSidecarBackend::new(url, api_key.map(str::to_string)),
+            server,
+        )
+    }
 
-        let backend = AsrSidecarBackend::new(
-            format!("http://{addr}/transcribe"),
-            Some("sk-test-key".to_string()),
-        );
-        let text = backend
-            .transcribe(&[1, 2, 3], &test_config())
-            .await
-            .unwrap();
-        assert_eq!(text, "ok");
+    /// [`sidecar_at`] `/transcribe`, without a key.
+    async fn sidecar(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (AsrSidecarBackend, JoinHandle<Vec<Request>>) {
+        sidecar_at("/transcribe", None, responses).await
+    }
+
+    /// `wav` transcribed as a recording chunk.
+    async fn chunk(
+        backend: &AsrSidecarBackend,
+        wav: &[u8],
+        config: &TranscriptionConfig,
+    ) -> Transcript {
+        backend.transcribe_segments(wav, config).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn transcribe_sends_bearer_authorization_header() {
+        let (backend, server) = sidecar_at(
+            "/transcribe",
+            Some("sk-test-key"),
+            vec![(200, r#"{"text": "ok"}"#)],
+        )
+        .await;
+        let text = backend.transcribe(&[1, 2, 3], &test_config()).await;
+        assert_eq!(text.unwrap(), "ok");
 
         // reqwest lowercases header names on the wire, so compare lowercased.
-        let head = server.await.unwrap().head.to_ascii_lowercase();
+        let head = server.await.unwrap()[0].head.to_ascii_lowercase();
         assert!(
             head.contains("authorization: bearer sk-test-key"),
             "request head is missing the bearer token: {head}"
@@ -629,18 +672,11 @@ mod tests {
 
     #[tokio::test]
     async fn transcribe_sends_no_authorization_header_without_key() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_once(listener, r#"{"text": "ok"}"#));
+        let (backend, server) = sidecar(vec![(200, r#"{"text": "ok"}"#)]).await;
+        let text = backend.transcribe(&[1, 2, 3], &test_config()).await;
+        assert_eq!(text.unwrap(), "ok");
 
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let text = backend
-            .transcribe(&[1, 2, 3], &test_config())
-            .await
-            .unwrap();
-        assert_eq!(text, "ok");
-
-        let head = server.await.unwrap().head.to_ascii_lowercase();
+        let head = server.await.unwrap()[0].head.to_ascii_lowercase();
         assert!(
             !head.contains("authorization:"),
             "unauthenticated request must not carry an authorization header: {head}"
@@ -649,244 +685,164 @@ mod tests {
 
     #[tokio::test]
     async fn transcribe_posts_to_the_trimmed_path() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_once(listener, r#"{"text": "ok"}"#));
-
         // A trailing slash makes some OpenAI-compatible servers 307-redirect,
         // which aborts the multipart POST; the request must go out trimmed.
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe/"), None);
-        let text = backend
-            .transcribe(&[1, 2, 3], &test_config())
-            .await
-            .unwrap();
-        assert_eq!(text, "ok");
+        let (backend, server) =
+            sidecar_at("/transcribe/", None, vec![(200, r#"{"text": "ok"}"#)]).await;
+        let text = backend.transcribe(&[1, 2, 3], &test_config()).await;
+        assert_eq!(text.unwrap(), "ok");
 
-        let head = server.await.unwrap().head;
+        let head = &server.await.unwrap()[0].head;
         assert!(
             head.starts_with("POST /transcribe HTTP/1.1\r\n"),
             "expected the trailing slash to be trimmed off the request line: {head}"
         );
     }
 
+    /// Trailing slashes come off the path alone.
     #[test]
-    fn effective_url_leaves_a_plain_url_alone() {
-        assert_eq!(
-            effective_url("http://127.0.0.1:8765/transcribe"),
-            "http://127.0.0.1:8765/transcribe"
-        );
-    }
-
-    #[test]
-    fn effective_url_trims_one_trailing_slash() {
-        assert_eq!(
-            effective_url("http://127.0.0.1:8765/transcribe/"),
-            "http://127.0.0.1:8765/transcribe"
-        );
-    }
-
-    #[test]
-    fn effective_url_trims_multiple_trailing_slashes() {
-        assert_eq!(
-            effective_url("http://127.0.0.1:8765/transcribe///"),
-            "http://127.0.0.1:8765/transcribe"
-        );
-    }
-
-    #[test]
-    fn effective_url_keeps_original_when_trimming_would_empty_it() {
-        // Trimming "/" to "" passes the empty-URL guard (which checks the
-        // configured value) and then dies inside reqwest with an opaque
-        // relative-URL error. Keep what the user configured instead.
-        assert_eq!(effective_url("/"), "/");
-        assert_eq!(effective_url("///"), "///");
-    }
-
-    #[test]
-    fn effective_url_leaves_a_query_alone() {
-        // The trailing slash belongs to the query value, not the path, so
-        // trimming it would post a different `x=` than the user configured.
-        assert_eq!(
-            effective_url("http://127.0.0.1:8765/transcribe?x=1/"),
-            "http://127.0.0.1:8765/transcribe?x=1/"
-        );
-        assert_eq!(
-            effective_url("http://127.0.0.1:8765/transcribe/?x=1"),
-            "http://127.0.0.1:8765/transcribe/?x=1"
-        );
-    }
-
-    #[test]
-    fn effective_url_leaves_a_fragment_alone() {
-        assert_eq!(
-            effective_url("http://127.0.0.1:8765/transcribe#frag/"),
-            "http://127.0.0.1:8765/transcribe#frag/"
-        );
+    fn effective_url_trims_only_the_paths_trailing_slashes() {
+        let plain = "http://127.0.0.1:8765/transcribe";
+        for (url, posted) in [
+            (plain, plain),
+            ("http://127.0.0.1:8765/transcribe/", plain),
+            ("http://127.0.0.1:8765/transcribe///", plain),
+            // Trimmed to "", it would pass the empty-URL guard (which checks
+            // the configured value) and die inside reqwest with an opaque
+            // relative-URL error.
+            ("/", "/"),
+            ("///", "///"),
+            // A query or a fragment keeps the URL as configured: its last
+            // slash can be the query value's, a different `x=` if trimmed.
+            (
+                "http://127.0.0.1:8765/transcribe?x=1/",
+                "http://127.0.0.1:8765/transcribe?x=1/",
+            ),
+            (
+                "http://127.0.0.1:8765/transcribe/?x=1",
+                "http://127.0.0.1:8765/transcribe/?x=1",
+            ),
+            (
+                "http://127.0.0.1:8765/transcribe#frag/",
+                "http://127.0.0.1:8765/transcribe#frag/",
+            ),
+        ] {
+            assert_eq!(effective_url(url), posted, "{url}");
+        }
     }
 
     #[tokio::test]
     async fn transcribe_rejects_empty_audio() {
         let backend = AsrSidecarBackend::new("http://127.0.0.1:8765/transcribe".to_string(), None);
-        let config = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "test-asr-model".to_string(),
-            prompt: None,
-            keyterms: Vec::new(),
-            diarize: false,
-            vad: Default::default(),
-            soft_voices: true,
-        };
-        let err = backend.transcribe(&[], &config).await.unwrap_err();
+        let err = backend.transcribe(&[], &test_config()).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
     }
 
     #[tokio::test]
     async fn transcribe_rejects_missing_url() {
         let backend = AsrSidecarBackend::new(String::new(), None);
-        let config = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "test-asr-model".to_string(),
-            prompt: None,
-            keyterms: Vec::new(),
-            diarize: false,
-            vad: Default::default(),
-            soft_voices: true,
-        };
-        let err = backend.transcribe(&[1, 2, 3], &config).await.unwrap_err();
-        assert!(err.to_string().contains("sidecar URL"));
+        let err = backend.transcribe(&[1, 2, 3], &test_config()).await;
+        assert!(err.unwrap_err().to_string().contains("sidecar URL"));
     }
 
+    /// The key is trimmed, and a blank one is no key.
     #[test]
-    fn empty_api_key_is_normalized_to_none() {
-        let backend = AsrSidecarBackend::new(
-            "http://127.0.0.1:8765/transcribe".to_string(),
-            Some(String::new()),
-        );
-        assert!(backend.api_key.is_none());
-    }
-
-    #[test]
-    fn api_key_is_stored_when_present() {
-        let backend = AsrSidecarBackend::new(
-            "http://127.0.0.1:8765/transcribe".to_string(),
-            Some("sk-test-key".to_string()),
-        );
-        assert_eq!(backend.api_key.as_deref(), Some("sk-test-key"));
-    }
-
-    #[test]
-    fn whitespace_only_api_key_is_normalized_to_none() {
-        let backend = AsrSidecarBackend::new(
-            "http://127.0.0.1:8765/transcribe".to_string(),
-            Some("   ".to_string()),
-        );
-        assert!(backend.api_key.is_none());
-    }
-
-    #[test]
-    fn api_key_whitespace_is_trimmed() {
-        let backend = AsrSidecarBackend::new(
-            "http://127.0.0.1:8765/transcribe".to_string(),
-            Some("  sk-test-key  ".to_string()),
-        );
-        assert_eq!(backend.api_key.as_deref(), Some("sk-test-key"));
-    }
-
-    #[test]
-    fn parse_asr_sidecar_response() {
-        let body = r#"{"text": "Hello world"}"#;
-        let parsed: AsrSidecarResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.text, "Hello world");
-    }
-
-    #[test]
-    fn parse_asr_sidecar_error() {
-        let body = r#"{"error": "model failed to load"}"#;
-        let parsed: AsrSidecarErrorResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.message(), "model failed to load");
-    }
-
-    #[test]
-    fn parse_fastapi_error_detail() {
-        let body = r#"{"detail": "request asked for wrong model"}"#;
-        let parsed: AsrSidecarErrorResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.message(), "request asked for wrong model");
-    }
-
-    #[test]
-    fn parse_sidecar_with_segments() {
-        let body = r#"{"text": "hi there. yes", "segments": [
-            {"start": 0.5, "end": 1.25, "text": " hi there.", "speaker": "SPEAKER_00"},
-            {"start": 2.0, "end": 2.4, "text": "yes", "speaker": 1},
-            {"start": 3.0, "end": 3.1, "text": "  "}
-        ]}"#;
-        let t = parse_sidecar_segments(body)
-            .unwrap()
-            .expect("segments present");
-        assert_eq!(t.segments.len(), 2);
-        assert_eq!((t.segments[0].start_ms, t.segments[0].end_ms), (500, 1250));
-        assert_eq!(t.segments[0].text, "hi there.");
-        assert_eq!(t.segments[0].speaker.as_deref(), Some("SPEAKER_00"));
-        assert_eq!(t.segments[1].speaker.as_deref(), Some("1"));
-    }
-
-    #[test]
-    fn parse_sidecar_without_segments_asks_for_the_fallback() {
-        assert!(parse_sidecar_segments(r#"{"text": "hello"}"#)
-            .unwrap()
-            .is_none());
-        let empty = parse_sidecar_segments(r#"{"text": "", "segments": []}"#).unwrap();
-        assert_eq!(empty, Some(Transcript::default()));
-        // Empty timing keys place no text.
-        let unplaced = r#"{"text": "hello", "segments": [], "words": []}"#;
-        assert!(parse_sidecar_segments(unplaced).unwrap().is_none());
-        // No text and no timing key: not a server that heard nothing.
-        assert!(parse_sidecar_segments("{}").unwrap().is_none());
-    }
-
-    /// Blank text with no timing key is a server that heard nothing, as is
-    /// blank text beside empty ones.
-    #[test]
-    fn parse_sidecar_blank_text_heard_nothing() {
-        for body in [
-            r#"{"text": ""}"#,
-            r#"{"text": "  \n"}"#,
-            r#"{"text": "", "segments": [], "words": []}"#,
+    fn api_key_is_trimmed_and_a_blank_one_is_none() {
+        for (given, kept) in [
+            ("", None),
+            ("   ", None),
+            ("  sk-test-key  ", Some("sk-test-key")),
         ] {
-            let parsed = parse_sidecar_segments(body).unwrap();
-            assert_eq!(parsed, Some(Transcript::default()), "{body}");
+            let url = "http://127.0.0.1:8765/transcribe".to_string();
+            let backend = AsrSidecarBackend::new(url, Some(given.to_string()));
+            assert_eq!(backend.api_key.as_deref(), kept, "{given:?}");
         }
     }
 
+    /// What an error body says: a string `error`, a FastAPI `detail`, or
+    /// OpenRouter's message nested in an object. Another `error` shape
+    /// leaves the message to the raw body.
     #[test]
-    fn parse_sidecar_words_need_a_word_or_silence() {
-        // A server that times words and heard nothing: no fallback.
-        let silent = parse_sidecar_segments(r#"{"text": "", "words": []}"#).unwrap();
-        assert_eq!(silent, Some(Transcript::default()));
-        // Text and no word: nothing places it.
-        assert!(parse_sidecar_segments(r#"{"text": "hello", "words": []}"#)
-            .unwrap()
-            .is_none());
+    fn parse_sidecar_error_bodies() {
+        let openrouter = r#"{"error":{"message":"The selected model does not support keyterms.","code":400},"user_id":"u"}"#;
+        for (body, message) in [
+            (
+                r#"{"error": "model failed to load"}"#,
+                Some("model failed to load"),
+            ),
+            (
+                r#"{"detail": "request asked for wrong model"}"#,
+                Some("request asked for wrong model"),
+            ),
+            (
+                openrouter,
+                Some("The selected model does not support keyterms."),
+            ),
+            (r#"{"error":{"code":400}}"#, None),
+            (r#"{"error": 5}"#, None),
+        ] {
+            let parsed: AsrSidecarErrorResponse = serde_json::from_str(body).unwrap();
+            assert_eq!(parsed.message().as_deref(), message, "{body}");
+        }
     }
 
-    /// `null` reads as a missing key: for `text`, `segments` and `words`.
+    /// The error a request fails with names OpenRouter's message, not its
+    /// JSON; a body that is no JSON is shown as it is.
+    #[tokio::test]
+    async fn an_openrouter_error_carries_its_message() {
+        let (backend, server) = sidecar(vec![
+            (
+                400,
+                r#"{"error":{"message":"The selected model does not support keyterms. Remove the field","code":400},"user_id":"u"}"#,
+            ),
+            (400, "Bad Request"),
+        ])
+        .await;
+        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
+        let err = backend.transcribe(&wav, &test_config()).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ASR sidecar error (400): The selected model does not support keyterms. Remove the field"
+        );
+        let err = backend.transcribe(&wav, &test_config()).await.unwrap_err();
+        assert_eq!(err.to_string(), "ASR sidecar error (400): Bad Request");
+        server.await.unwrap();
+    }
+
+    /// A body with no segment and no timed word: blank text, or none beside
+    /// an empty `segments` or `words`, is a server that heard nothing (an
+    /// empty transcript); text, or no text and no timing key, asks for the
+    /// fallback (`None`). `null` reads as a missing key.
+    #[test]
+    fn parse_sidecar_without_timings() {
+        for (body, heard_nothing) in [
+            (r#"{"text": "hello"}"#, false),
+            // Empty timing keys place no text.
+            (r#"{"text": "hello", "segments": [], "words": []}"#, false),
+            (r#"{"text": "hello", "words": []}"#, false),
+            ("{}", false),
+            (r#"{"text": ""}"#, true),
+            (r#"{"text": "  \n"}"#, true),
+            (r#"{"text": "", "segments": []}"#, true),
+            (r#"{"text": "", "words": []}"#, true),
+            (r#"{"text": "", "segments": [], "words": []}"#, true),
+            (
+                r#"{"text": "hello", "segments": null, "words": null}"#,
+                false,
+            ),
+            (r#"{"text": null}"#, false),
+            (r#"{"text": "", "segments": null, "words": null}"#, true),
+            (r#"{"text": null, "words": []}"#, true),
+        ] {
+            let parsed = parse_sidecar_segments(body).unwrap();
+            assert_eq!(parsed, heard_nothing.then(Transcript::default), "{body}");
+        }
+    }
+
+    /// `null` text reads as a missing key beside timings too: the segments'
+    /// text, or the words', joined.
     #[test]
     fn parse_sidecar_reads_nulls_as_missing_keys() {
-        let untimed = r#"{"text": "hello", "segments": null, "words": null}"#;
-        assert!(parse_sidecar_segments(untimed).unwrap().is_none());
-        assert!(parse_sidecar_segments(r#"{"text": null}"#)
-            .unwrap()
-            .is_none());
-        let silent = r#"{"text": "", "segments": null, "words": null}"#;
-        assert_eq!(
-            parse_sidecar_segments(silent).unwrap(),
-            Some(Transcript::default())
-        );
-        assert_eq!(
-            parse_sidecar_segments(r#"{"text": null, "words": []}"#).unwrap(),
-            Some(Transcript::default())
-        );
-
         let segmented = r#"{"text": null, "segments": [{"start": 0.5, "end": 1.0, "text": "hi"}]}"#;
         let t = parse_sidecar_segments(segmented).unwrap().unwrap();
         assert_eq!((t.segments[0].start_ms, t.segments[0].end_ms), (500, 1000));
@@ -1000,27 +956,6 @@ mod tests {
         assert_eq!(state.first_form(), None);
     }
 
-    #[tokio::test]
-    async fn transcribe_segments_uses_sidecar_segments() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_once(
-            listener,
-            r#"{"text": "ok", "segments": [{"start": 1.0, "end": 2.0, "text": "ok"}]}"#,
-        ));
-
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        let t = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
-        server.await.unwrap();
-        assert_eq!(t.segments.len(), 1);
-        assert_eq!(t.segments[0].start_ms, 1000);
-        assert_eq!(backend.timings.first_form(), Some(TimingForm::Words));
-    }
-
     /// The timing fields of a request, as `name=value`.
     fn timing_fields(request: &Request) -> Vec<String> {
         request
@@ -1073,87 +1008,57 @@ mod tests {
         {"start": 0.5, "end": 1.0, "text": " Hi."},
         {"start": 1.5, "end": 2.0, "text": " Bye."}]}"#;
 
-    /// A recording chunk asks for segment and word timings; dictation sends
-    /// only what it always sent.
-    #[tokio::test]
-    async fn recording_chunks_ask_for_timings_and_dictation_does_not() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![(200, SEGMENT_OK), (200, r#"{"text": "ok"}"#)],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
-        backend.transcribe(&wav, &test_config()).await.unwrap();
+    /// One wordless segment over a 45 s clip: too coarse to place its text.
+    const LONG_SEGMENT: &str = r#"{"text": "a long talk", "segments": [
+        {"id": 0, "start": 0.0, "end": 45.0, "text": "a long talk"}]}"#;
 
-        let requests = server.await.unwrap();
-        assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS);
-        assert_eq!(requests[1].text_fields(), plain_fields());
-    }
-
-    /// A 400 to the word timings (OpenRouter's voxtral) asks again with
-    /// verbose_json alone, and the next chunk starts there.
+    /// A 400 to the word timings (OpenRouter's voxtral), or a 422 (FastAPI
+    /// refusing a field), asks again with verbose_json alone, and the next
+    /// chunk starts there.
     #[tokio::test]
     async fn a_refused_timing_request_steps_down_and_the_form_is_kept() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (
-                    400,
-                    r#"{"error":{"message":"Provider returned 400","code":400}}"#,
-                ),
-                (200, TWO_SEGMENTS),
-                (200, SEGMENT_OK),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        let first = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
-        let texts: Vec<&str> = first.segments.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(texts, ["Hi.", "Bye."]);
-        let second = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
-        assert_eq!(second.segments[0].text, "ok");
+        let fastapi = r#"{"detail": [{"loc": ["body", "timestamp_granularities[]"],
+            "msg": "extra fields not permitted", "type": "value_error.extra"}]}"#;
+        for (status, body) in [
+            (
+                400,
+                r#"{"error":{"message":"Provider returned 400","code":400}}"#,
+            ),
+            (422, fastapi),
+        ] {
+            let (backend, server) =
+                sidecar(vec![(status, body), (200, TWO_SEGMENTS), (200, SEGMENT_OK)]).await;
+            let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
+            let first = chunk(&backend, &wav, &test_config()).await;
+            let texts: Vec<&str> = first.segments.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(texts, ["Hi.", "Bye."], "{status}");
+            let second = chunk(&backend, &wav, &test_config()).await;
+            assert_eq!(second.segments[0].text, "ok", "{status}");
 
-        let requests = server.await.unwrap();
-        assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS);
-        assert_eq!(timing_fields(&requests[1]), VERBOSE_FIELDS);
-        assert_eq!(timing_fields(&requests[2]), VERBOSE_FIELDS, "sticky");
-        assert_eq!(backend.timings.first_form(), Some(TimingForm::Verbose));
+            let requests = server.await.unwrap();
+            assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS, "{status}");
+            assert_eq!(timing_fields(&requests[1]), VERBOSE_FIELDS, "{status}");
+            assert_eq!(
+                timing_fields(&requests[2]),
+                VERBOSE_FIELDS,
+                "{status} sticky"
+            );
+            assert_eq!(backend.timings.first_form(), Some(TimingForm::Verbose));
+        }
     }
 
     /// Both verbose forms refused: the plain request goes out, and its
     /// text alone sends the chunk phrase by phrase, plain requests too.
     #[tokio::test]
     async fn refused_twice_the_plain_answer_falls_back_to_phrases() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (400, r#"{"detail": "unsupported response_format"}"#),
-                (400, r#"{"detail": "unsupported response_format"}"#),
-                (200, r#"{"text": "the whole chunk"}"#),
-                (200, r#"{"text": "hi"}"#),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let t = backend
-            .transcribe_segments(&one_phrase_wav(), &phrase_config())
-            .await
-            .unwrap();
+        let (backend, server) = sidecar(vec![
+            (400, r#"{"detail": "unsupported response_format"}"#),
+            (400, r#"{"detail": "unsupported response_format"}"#),
+            (200, r#"{"text": "the whole chunk"}"#),
+            (200, r#"{"text": "hi"}"#),
+        ])
+        .await;
+        let t = chunk(&backend, &one_phrase_wav(), &phrase_config()).await;
         let texts: Vec<&str> = t.segments.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["hi"]);
 
@@ -1169,14 +1074,8 @@ mod tests {
     /// and nothing is remembered.
     #[tokio::test]
     async fn a_400_to_the_plain_request_is_the_chunks_error() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let refused = r#"{"detail": "request asked for wrong model"}"#;
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![(400, refused), (400, refused), (400, refused)],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let (backend, server) = sidecar(vec![(400, refused), (400, refused), (400, refused)]).await;
         let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
         let err = backend
             .transcribe_segments(&wav, &test_config())
@@ -1196,39 +1095,12 @@ mod tests {
         );
     }
 
-    /// Only a 400 steps down: a 500 to the timing request is the chunk's
-    /// error, not asked again without timings.
-    #[tokio::test]
-    async fn a_500_to_the_timing_request_is_not_asked_again_plainer() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![(500, r#"{"detail": "CUDA out of memory"}"#)],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        let err = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().starts_with("ASR sidecar error (500)"),
-            "{err}"
-        );
-        let requests = server.await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS);
-    }
-
     /// nemo-speech (Nemotron, Parakeet) answers `words` alone, punctuation
     /// on the words: one segment per sentence or pause, timed in the chunk.
     #[tokio::test]
     async fn a_words_only_answer_becomes_sentence_segments() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_once(
-            listener,
+        let (backend, server) = sidecar(vec![(
+            200,
             r#"{"duration": 6.0, "language": "en", "task": "transcribe",
                 "text": "Everything looks normal. Next we ship it on Friday okay",
                 "words": [
@@ -1242,13 +1114,10 @@ mod tests {
                     {"word": "on", "start": 2.88, "end": 3.04, "confidence": 0.99},
                     {"word": "Friday", "start": 3.04, "end": 3.6, "confidence": 0.96},
                     {"word": "okay", "start": 5.2, "end": 5.6, "confidence": 0.9}]}"#,
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        )])
+        .await;
         let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        let t = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
+        let t = chunk(&backend, &wav, &test_config()).await;
         server.await.unwrap();
         let lines: Vec<(u64, u64, &str, usize)> = t
             .segments
@@ -1269,45 +1138,40 @@ mod tests {
         assert_eq!(backend.timings.first_form(), Some(TimingForm::Words));
     }
 
-    /// One segment over a long clip and no words (OpenRouter's
-    /// nemotron-3.5-transcribe) cannot place its text: as the first answer,
-    /// the chunk goes phrase by phrase, and so does the next one, without
-    /// asking again.
+    /// A first answer that cannot place its text sends the chunk phrase by
+    /// phrase, and the next one too, without asking for timings again.
     #[tokio::test]
-    async fn a_long_segment_without_words_falls_back_to_phrases_for_good() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (
-                    200,
-                    r#"{"text": "a long talk", "segments": [
-                        {"id": 0, "start": 0.0, "end": 45.0, "text": "a long talk"}]}"#,
-                ),
+    async fn an_unplaced_first_answer_falls_back_to_phrases_for_good() {
+        for body in [
+            // One segment over a long clip and no words (OpenRouter's
+            // nemotron-3.5-transcribe).
+            LONG_SEGMENT,
+            // Text alone: the bundled sidecars ignore the timing fields.
+            r#"{"text": "the whole chunk"}"#,
+            // Timings that do not parse (a time sent as a string) are no
+            // usable timings, not the chunk's error.
+            r#"{"text": "hi there", "segments": [
+                {"start": "0.0", "end": 1.0, "text": "hi there"}]}"#,
+        ] {
+            let (backend, server) = sidecar(vec![
+                (200, body),
                 (200, r#"{"text": "hi"}"#),
                 (200, r#"{"text": "hello"}"#),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let wav = one_phrase_wav();
-        let first = backend
-            .transcribe_segments(&wav, &phrase_config())
-            .await
-            .unwrap();
-        assert_eq!(first.segments.len(), 1);
-        assert_eq!(first.segments[0].text, "hi");
-        let second = backend
-            .transcribe_segments(&wav, &phrase_config())
-            .await
-            .unwrap();
-        assert_eq!(second.segments[0].text, "hello");
+            ])
+            .await;
+            let wav = one_phrase_wav();
+            let first = chunk(&backend, &wav, &phrase_config()).await;
+            let texts: Vec<&str> = first.segments.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(texts, ["hi"], "{body}");
+            let second = chunk(&backend, &wav, &phrase_config()).await;
+            assert_eq!(second.segments[0].text, "hello", "{body}");
 
-        let requests = server.await.unwrap();
-        assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS);
-        assert_eq!(requests[1].text_fields(), plain_fields());
-        assert_eq!(requests[2].text_fields(), plain_fields(), "sticky");
-        assert_eq!(backend.timings.first_form(), None);
+            let requests = server.await.unwrap();
+            assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS, "{body}");
+            assert_eq!(requests[1].text_fields(), plain_fields(), "{body}");
+            assert_eq!(requests[2].text_fields(), plain_fields(), "sticky: {body}");
+            assert_eq!(backend.timings.first_form(), None, "{body}");
+        }
     }
 
     /// A wordless segment of 30 s or less is used as returned, and so is a
@@ -1316,37 +1180,26 @@ mod tests {
     /// whole clip answers a short chunk the same way.
     #[tokio::test]
     async fn a_short_or_diarized_segment_without_words_is_used() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (
-                    200,
-                    r#"{"text": "short", "segments": [
-                        {"start": 0.0, "end": 30.0, "text": "short"}]}"#,
-                ),
-                (
-                    200,
-                    r#"{"text": "monologue", "segments": [
-                        {"start": 0.0, "end": 45.0, "text": "monologue", "speaker": "SPEAKER_00"}]}"#,
-                ),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let (backend, server) = sidecar(vec![
+            (
+                200,
+                r#"{"text": "short", "segments": [
+                    {"start": 0.0, "end": 30.0, "text": "short"}]}"#,
+            ),
+            (
+                200,
+                r#"{"text": "monologue", "segments": [
+                    {"start": 0.0, "end": 45.0, "text": "monologue", "speaker": "SPEAKER_00"}]}"#,
+            ),
+        ])
+        .await;
         let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        let short = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
+        let short = chunk(&backend, &wav, &test_config()).await;
         assert_eq!(
             (short.segments[0].start_ms, short.segments[0].end_ms),
             (0, 30_000)
         );
-        let turn = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
+        let turn = chunk(&backend, &wav, &test_config()).await;
         assert_eq!(turn.segments[0].end_ms, 45_000);
         assert_eq!(turn.segments[0].speaker.as_deref(), Some("SPEAKER_00"));
         assert_eq!(server.await.unwrap().len(), 2);
@@ -1362,27 +1215,15 @@ mod tests {
     /// after it skips the whole-chunk request.
     #[tokio::test]
     async fn after_a_short_wordless_segment_a_long_one_still_falls_back_for_good() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (200, SEGMENT_OK),
-                (
-                    200,
-                    r#"{"text": "a long talk", "segments": [
-                        {"id": 0, "start": 0.0, "end": 45.0, "text": "a long talk"}]}"#,
-                ),
-                (200, r#"{"text": "hi"}"#),
-                (200, r#"{"text": "hello"}"#),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let (backend, server) = sidecar(vec![
+            (200, SEGMENT_OK),
+            (200, LONG_SEGMENT),
+            (200, r#"{"text": "hi"}"#),
+            (200, r#"{"text": "hello"}"#),
+        ])
+        .await;
         let wav = one_phrase_wav();
-        let short = backend
-            .transcribe_segments(&wav, &phrase_config())
-            .await
-            .unwrap();
+        let short = chunk(&backend, &wav, &phrase_config()).await;
         assert_eq!(short.segments[0].text, "ok");
         assert_eq!(
             backend.timings.0.load(Ordering::Relaxed),
@@ -1390,10 +1231,7 @@ mod tests {
         );
         let mut texts = Vec::new();
         for _ in 0..2 {
-            let t = backend
-                .transcribe_segments(&wav, &phrase_config())
-                .await
-                .unwrap();
+            let t = chunk(&backend, &wav, &phrase_config()).await;
             texts.push(t.segments[0].text.clone());
         }
         assert_eq!(texts, ["hi", "hello"]);
@@ -1410,100 +1248,27 @@ mod tests {
         assert_eq!(backend.timings.first_form(), None);
     }
 
-    /// The bundled sidecars ignore the timing fields and answer `text`:
-    /// phrase by phrase from the first chunk on.
-    #[tokio::test]
-    async fn a_text_only_answer_falls_back_to_phrases_for_good() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (200, r#"{"text": "the whole chunk"}"#),
-                (200, r#"{"text": "hi"}"#),
-                (200, r#"{"text": "hello"}"#),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let wav = one_phrase_wav();
-        let first = backend
-            .transcribe_segments(&wav, &phrase_config())
-            .await
-            .unwrap();
-        assert_eq!(first.segments[0].text, "hi");
-        let second = backend
-            .transcribe_segments(&wav, &phrase_config())
-            .await
-            .unwrap();
-        assert_eq!(second.segments[0].text, "hello");
-        let requests = server.await.unwrap();
-        assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS);
-        assert_eq!(requests[1].text_fields(), plain_fields());
-        assert_eq!(requests[2].text_fields(), plain_fields());
-        assert_eq!(backend.timings.first_form(), None);
-    }
-
-    /// A 422 (FastAPI refusing a field) steps down like a 400.
-    #[tokio::test]
-    async fn a_422_steps_down_like_a_400() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (
-                    422,
-                    r#"{"detail": [{"loc": ["body", "timestamp_granularities[]"],
-                        "msg": "extra fields not permitted", "type": "value_error.extra"}]}"#,
-                ),
-                (200, TWO_SEGMENTS),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        let t = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
-        assert_eq!(t.segments[0].text, "Hi.");
-        let requests = server.await.unwrap();
-        assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS);
-        assert_eq!(timing_fields(&requests[1]), VERBOSE_FIELDS);
-        assert_eq!(backend.timings.first_form(), Some(TimingForm::Verbose));
-    }
-
     /// A blank answer heard nothing, which says nothing about timings: an
     /// empty transcript, no phrase fallback, and the next chunk asks as
     /// before.
     #[tokio::test]
     async fn a_blank_answer_is_heard_nothing_and_settles_nothing() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (200, r#"{"text": " "}"#),
-                (200, r#"{"text": "", "segments": [], "words": []}"#),
-                (200, TWO_SEGMENTS),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let (backend, server) = sidecar(vec![
+            (200, r#"{"text": " "}"#),
+            (200, r#"{"text": "", "segments": [], "words": []}"#),
+            (200, TWO_SEGMENTS),
+        ])
+        .await;
         let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
         for _ in 0..2 {
-            let t = backend
-                .transcribe_segments(&wav, &test_config())
-                .await
-                .unwrap();
+            let t = chunk(&backend, &wav, &test_config()).await;
             assert_eq!(t, Transcript::default());
             assert_eq!(
                 backend.timings.0.load(Ordering::Relaxed),
                 TimingState::UNSETTLED
             );
         }
-        let t = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
+        let t = chunk(&backend, &wav, &test_config()).await;
         assert_eq!(t.segments[0].text, "Hi.");
 
         let requests = server.await.unwrap();
@@ -1522,31 +1287,19 @@ mod tests {
     /// phrase by phrase, and the next chunk asks with the form again.
     #[tokio::test]
     async fn once_settled_an_unplaced_answer_falls_back_for_its_chunk_only() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (200, TWO_SEGMENTS),
-                (
-                    200,
-                    r#"{"text": "a long talk", "segments": [
-                        {"id": 0, "start": 0.0, "end": 45.0, "text": "a long talk"}]}"#,
-                ),
-                (200, r#"{"text": "hi"}"#),
-                (200, r#"{"text": "the whole chunk"}"#),
-                (200, r#"{"text": "hello"}"#),
-                (200, SEGMENT_OK),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let (backend, server) = sidecar(vec![
+            (200, TWO_SEGMENTS),
+            (200, LONG_SEGMENT),
+            (200, r#"{"text": "hi"}"#),
+            (200, r#"{"text": "the whole chunk"}"#),
+            (200, r#"{"text": "hello"}"#),
+            (200, SEGMENT_OK),
+        ])
+        .await;
         let wav = one_phrase_wav();
         let mut texts = Vec::new();
         for _ in 0..4 {
-            let t = backend
-                .transcribe_segments(&wav, &phrase_config())
-                .await
-                .unwrap();
+            let t = chunk(&backend, &wav, &phrase_config()).await;
             texts.push(t.segments[0].text.clone());
             assert_eq!(backend.timings.first_form(), Some(TimingForm::Words));
         }
@@ -1565,37 +1318,23 @@ mod tests {
     /// chunk alone: the next chunk asks with the remembered form again.
     #[tokio::test]
     async fn once_settled_a_refusal_steps_down_for_its_chunk_only() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (200, TWO_SEGMENTS),
-                (
-                    400,
-                    r#"{"detail": "timestamp_granularities not supported"}"#,
-                ),
-                (200, TWO_SEGMENTS),
-                (200, SEGMENT_OK),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let (backend, server) = sidecar(vec![
+            (200, TWO_SEGMENTS),
+            (
+                400,
+                r#"{"detail": "timestamp_granularities not supported"}"#,
+            ),
+            (200, TWO_SEGMENTS),
+            (200, SEGMENT_OK),
+        ])
+        .await;
         let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
-        let refused = backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
+        chunk(&backend, &wav, &test_config()).await;
+        let refused = chunk(&backend, &wav, &test_config()).await;
         let texts: Vec<&str> = refused.segments.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["Hi.", "Bye."]);
         assert_eq!(backend.timings.first_form(), Some(TimingForm::Words));
-        backend
-            .transcribe_segments(&wav, &test_config())
-            .await
-            .unwrap();
+        chunk(&backend, &wav, &test_config()).await;
 
         let requests = server.await.unwrap();
         assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS);
@@ -1604,65 +1343,6 @@ mod tests {
         assert_eq!(timing_fields(&requests[3]), WORDS_FIELDS, "not moved down");
     }
 
-    /// Timings that do not parse (a time sent as a string) are no usable
-    /// timings, not the chunk's error: the first answer falls back to
-    /// phrases, as one with none would.
-    #[tokio::test]
-    async fn unreadable_timings_fall_back_to_phrases() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (
-                    200,
-                    r#"{"text": "hi there", "segments": [
-                        {"start": "0.0", "end": 1.0, "text": "hi there"}]}"#,
-                ),
-                (200, r#"{"text": "hi"}"#),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let t = backend
-            .transcribe_segments(&one_phrase_wav(), &phrase_config())
-            .await
-            .unwrap();
-        let texts: Vec<&str> = t.segments.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(texts, ["hi"]);
-        let requests = server.await.unwrap();
-        assert_eq!(timing_fields(&requests[0]), WORDS_FIELDS);
-        assert_eq!(requests[1].text_fields(), plain_fields());
-        assert_eq!(backend.timings.first_form(), None);
-    }
-
-    /// A Cloudflare origin timeout (524) on a recording chunk is retried on the
-    /// server-error schedule, here with short stand-ins for its waits.
-    #[tokio::test]
-    async fn a_524_is_retried_until_the_chunk_goes_through() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (524, "error code: 524"),
-                (
-                    200,
-                    r#"{"text": "ok", "segments": [{"start": 1.0, "end": 2.0, "text": "ok"}]}"#,
-                ),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        let quick = [std::time::Duration::from_millis(1); 3];
-        let config = test_config();
-        let t = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
-            backend.transcribe_segments(&wav, &config)
-        })
-        .await
-        .unwrap();
-        assert_eq!(t.segments[0].text, "ok");
-        assert_eq!(server.await.unwrap().len(), 2);
-    }
     /// A 500 from the sidecar (an exception in its own code) is not
     /// retried; a 502 from a proxy in front of it is.
     #[tokio::test]
@@ -1671,14 +1351,19 @@ mod tests {
         let config = test_config();
         let quick = [std::time::Duration::from_millis(1); 3];
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![(500, r#"{"detail": "CUDA out of memory"}"#)],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let err = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
+        // The 502 first, and quick network waits: a 500 retried by mistake
+        // fails at once against the closed server instead of waiting it out.
+        let (backend, server) = sidecar(vec![(502, "Bad Gateway"), (200, SEGMENT_OK)]).await;
+        let t = retry_with_backoff(RATE_LIMIT_BUDGET, &quick, &quick, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap();
+        assert_eq!(t.segments[0].text, "ok");
+        assert_eq!(server.await.unwrap().len(), 2);
+
+        let (backend, server) = sidecar(vec![(500, r#"{"detail": "CUDA out of memory"}"#)]).await;
+        let err = retry_with_backoff(RATE_LIMIT_BUDGET, &quick, &quick, || {
             backend.transcribe_segments(&wav, &config)
         })
         .await
@@ -1691,27 +1376,6 @@ mod tests {
         assert!(err
             .downcast_ref::<crate::transcription::RetryableHttpError>()
             .is_none());
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_responses(
-            listener,
-            vec![
-                (502, "Bad Gateway"),
-                (
-                    200,
-                    r#"{"text": "ok", "segments": [{"start": 1.0, "end": 2.0, "text": "ok"}]}"#,
-                ),
-            ],
-        ));
-        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
-        let t = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
-            backend.transcribe_segments(&wav, &config)
-        })
-        .await
-        .unwrap();
-        assert_eq!(t.segments[0].text, "ok");
-        assert_eq!(server.await.unwrap().len(), 2);
     }
 
     /// A sidecar that is not running refuses the connection: retried on the

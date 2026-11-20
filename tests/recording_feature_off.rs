@@ -32,6 +32,7 @@ fn recording_exits_1_and_says_how_to_get_it() {
         (var, dir)
     })
     .collect();
+    // Any arguments parse, bad ones too: clap's own refusal would exit 2.
     for args in [
         &["recording"][..],
         &[
@@ -43,10 +44,13 @@ fn recording_exits_1_and_says_how_to_get_it() {
             "Sarah, Omar",
         ],
         &["recording", "toggle"],
+        &["recording", "toggle", "--num-speakers", "99"],
         &["recording", "list", "--json"],
         &["recording", "show", "last"],
+        &["recording", "show", "last", "-f", "txt"],
         &["recording", "summarize", "last"],
         &["recording", "delete", "2026-10-27_1402_standup", "--yes"],
+        &["recording", "bogus", "--flag"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_whisrs"))
             .args(args)

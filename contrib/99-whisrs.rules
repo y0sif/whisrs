@@ -15,6 +15,6 @@
 # root:root 0600, and since the module only autoloads when the node is opened,
 # a non-root open is refused and the module never loads, so the rule never fires.
 #
-# Installation instructions live in README.md and docs/troubleshooting.md.
+# Setup steps for this rule live in docs/troubleshooting.md.
 KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", TAG+="uaccess", OPTIONS+="static_node=uinput"
 KERNEL=="uinput", SUBSYSTEM=="misc", TEST=="/usr/bin/setfacl", RUN+="/usr/bin/setfacl -m g:input:rw /dev/$name"

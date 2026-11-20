@@ -1,12 +1,9 @@
 //! Recording-lifecycle hooks: MPRIS pause + shell commands.
 
-#[cfg(feature = "hooks")]
 use whisrs::hooks::{hook_event_for, run_hook, HookEvent, MediaPauseTracker};
-#[cfg(feature = "hooks")]
 use whisrs::{HooksConfig, State};
 
 /// Watches daemon state broadcasts and fires recording-lifecycle hooks.
-#[cfg(feature = "hooks")]
 pub(crate) async fn hook_dispatch_loop(
     mut state_rx: tokio::sync::watch::Receiver<State>,
     hooks: HooksConfig,

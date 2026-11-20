@@ -13,7 +13,5 @@ How was this tested? (compositor, distro, steps to reproduce)
 
 ## Checklist
 
-- [ ] `cargo fmt` passes
-- [ ] `cargo clippy --all-targets -- -D warnings` passes
-- [ ] `cargo test` passes
+- [ ] The [checks in CONTRIBUTING.md](https://github.com/y0sif/whisrs/blob/main/CONTRIBUTING.md#checks) pass
 - [ ] Tested on at least one compositor

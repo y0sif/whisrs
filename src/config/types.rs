@@ -641,9 +641,9 @@ pub struct GeneralConfig {
     /// [`Self::llm_instruction`], before the text is injected. Off by default,
     /// so existing setups keep typing the raw transcript.
     ///
-    /// Unlike `[[llm_commands]]` — which does the same rewrite but needs a
-    /// dedicated hotkey per entry — this is simply on for `whisrs toggle`
-    /// (issue #85). Batch path only, and that is not an oversight: streaming
+    /// Unlike `[[llm_commands]]`, which does the same rewrite but needs a
+    /// dedicated hotkey per entry, this is simply on for `whisrs toggle`.
+    /// Batch path only, and that is not an oversight: streaming
     /// backends type partials at the cursor as they arrive, so there is never
     /// a whole transcript to hand the LLM. [`Config::validate`] warns when
     /// this is paired with one of them.
@@ -732,7 +732,7 @@ fn default_vad() -> String {
 /// between two keyboard layouts) gets garbled — characters absent from the
 /// active layout cannot be produced. The Wayland virtual-keyboard backend
 /// (`zwp_virtual_keyboard_v1`) ships its own keymap and types
-/// layout-independently, fixing that class of bugs (see issue #44).
+/// layout-independently, so that class of bugs cannot happen.
 ///
 /// On X11, uinput keys pass through the kernel's evdev queue to the X
 /// server, and a fast burst overflows it: the server drops the rest of the
@@ -776,9 +776,9 @@ pub struct InputConfig {
     ///
     /// A keystroke sent while a modifier is held becomes a shortcut: stopping
     /// a dictation with `Super+W` and keeping Super down would otherwise turn
-    /// the typed text into `Super+<letter>` compositor binds (#154). whisrs
+    /// the typed text into `Super+<letter>` compositor binds. whisrs
     /// never types while a modifier is held. The check runs before every
-    /// typed key (#171), so a modifier pressed while the text is being typed
+    /// typed key, so a modifier pressed while the text is being typed
     /// pauses the typing, and the cap applies to each such wait. If one is
     /// still down when the cap runs out, typing stops there: the rest of the
     /// text (all of it if nothing was typed yet) is copied to the clipboard
@@ -798,7 +798,7 @@ pub struct InputConfig {
     /// Keyboard-injection backend. `auto` (the recommended default) prefers
     /// the Wayland virtual keyboard when available and otherwise falls back
     /// to uinput. Set this to `wayland-vk` to fix garbled bilingual /
-    /// code-switching dictation on Wayland (issue #44), where the uinput
+    /// code-switching dictation on Wayland, where the uinput
     /// backend can only emit characters present in the active XKB layout.
     /// On X11, `xtest` types through the X server instead of uinput, so
     /// `key_delay_ms = 0` drops no keys.
@@ -859,7 +859,7 @@ pub struct InputConfig {
     /// paste mode a non-text clipboard (an image, a file list) is still
     /// protected: an unreadable clipboard makes the paste path fall back to
     /// typing without touching the clipboard, since overwriting content that
-    /// can never be restored is worse than losing the fallback (issue #69).
+    /// can never be restored is worse than losing the fallback.
     #[serde(default)]
     pub clipboard_fallback: bool,
     /// Copy-only mode: the final text is written to the system clipboard
@@ -882,11 +882,11 @@ pub struct InputConfig {
     /// Terminal detection picks Ctrl+Shift+C / Ctrl+Shift+V over Ctrl+C /
     /// Ctrl+V and, in command mode, sends Ctrl+A then Ctrl+K to clear the
     /// prompt line before injecting. That last one *empties the field* if it
-    /// fires in a GUI text input (#70), so the built-in list stays
+    /// fires in a GUI text input, so the built-in list stays
     /// conservative and this is the explicit, opt-in escape hatch for the two
     /// cases it cannot know about: an `st` build with a custom `termname` in
     /// `config.h`, and scratchpad/dropdown classes such as `Alacritty-float`,
-    /// `kitty-dropdown` or `wezterm-quake` (#92).
+    /// `kitty-dropdown` or `wezterm-quake`.
     ///
     /// Entries are compared case-insensitively against the *whole* focused
     /// window class. They are never substring-matched, and they never go
@@ -1043,7 +1043,10 @@ pub struct TtsConfig {
     /// voice is used.
     #[serde(default)]
     pub voice: Option<String>,
-    /// Audio response format requested from the API (we decode WAV).
+    /// Audio response format requested from the API: `"wav"` (default), or
+    /// `"pcm"` (raw 16-bit samples, which get a WAV header before playback).
+    /// On OpenRouter, which refuses `"wav"`, the `tts-sidecar` backend asks
+    /// for `"pcm"` instead.
     #[serde(default = "default_tts_response_format")]
     pub response_format: String,
     /// Optional dedicated API key; falls back to the backend's key when absent.
@@ -1226,7 +1229,8 @@ mod missing_key_tests {
             }
             let config: Config =
                 toml::from_str(&format!("[general]\nbackend = \"{backend}\"\n")).unwrap();
-            assert!(config.validate().is_err(), "{backend}");
+            let err = config.validate().expect_err(backend).to_string();
+            assert!(err.contains("no API key"), "{backend}: {err}");
             let warnings = config.validate_to_write().expect("written with a warning");
             assert!(
                 warnings.iter().any(|w| w
@@ -1338,7 +1342,7 @@ pub(crate) fn default_phrase_silence_ms() -> u64 {
 fn default_asr_sidecar_url() -> String {
     "http://127.0.0.1:8765/transcribe".to_string()
 }
-fn default_asr_sidecar_model() -> String {
+pub(crate) fn default_asr_sidecar_model() -> String {
     "microsoft/VibeVoice-ASR-HF".to_string()
 }
 fn default_openai_compatible_realtime_model() -> String {
@@ -1443,7 +1447,7 @@ struct UnknownKeyScan {
 ///
 /// Every variant means the same thing to a caller about to rewrite the file:
 /// there is no preserve set for these bytes, so merging the reserialized struct
-/// into them would delete every key the schema does not carry — issue #134. The
+/// into them would delete every key the schema does not carry. The
 /// [`Self::summary`] completes the sentence "existing config at `<path>` ...",
 /// which is how `write_config_to` reports the divert. There is no `Display`,
 /// and `Debug` names only the variant: the errors' own text quotes the file,
@@ -1554,7 +1558,7 @@ fn unknown_config_key_paths(contents: &str) -> Vec<Vec<Seg>> {
 
 /// The one message the user gets about unknown config keys, shared by every
 /// path that loads a config: the daemon at startup, `whisrs setup`, and
-/// `whisrs config` (issue #116 — only the daemon used to say anything).
+/// `whisrs config`.
 ///
 /// Returns `None` when there is nothing to report: the running binary does not
 /// read these keys. `write_config` keeps almost all of them in the file rather
@@ -1577,9 +1581,9 @@ pub fn unknown_keys_warning(config_path: &Path, unknown: &[String]) -> Option<St
 /// the format-preserving writer can look them up as it walks it.
 ///
 /// `write_config` rebuilds the on-disk file to mirror the [`Config`] struct,
-/// which used to delete every key the struct never knew about — including the
-/// very typo the load-time warning had just told the user to fix (issue #116).
-/// Keys named here survive that rewrite instead.
+/// which would delete every key the struct does not know about, including the
+/// very typo the load-time warning just told the user to fix. Keys named here
+/// survive that rewrite.
 ///
 /// Build this from the *on-disk* text on every write, never from the fresh
 /// serialization and never cached: it describes bytes that are already in the
@@ -1617,8 +1621,8 @@ impl PreservedKeys {
     ///
     /// Fails rather than returning an empty set when the file cannot be
     /// described at all, so a caller that is about to merge into those bytes
-    /// cannot mistake "nothing to preserve" for "nothing describable here"
-    /// (issue #134). The empty set means the file was understood and has no
+    /// cannot mistake "nothing to preserve" for "nothing describable here".
+    /// The empty set means the file was understood and has no
     /// unknown keys; [`UndescribableConfig`] means the merge must not run.
     pub(crate) fn from_config_str(contents: &str) -> Result<Self, UndescribableConfig> {
         let scan = scan_unknown_keys(contents)?;
@@ -1689,16 +1693,16 @@ impl PreservedKeys {
     /// `[asr-sidecar]`. `asr` is a serde *alias* for that section, so the file
     /// then fails to deserialize with `duplicate field`, the daemon falls back
     /// to defaults, and the user's whole config is discarded: strictly worse
-    /// than the missing-warning bug. `[asr]` does not prune cleanly, so the
+    /// than a missing warning. `[asr]` does not prune cleanly, so the
     /// flag says so and the writer drops it.
     ///
     /// This only *records* the answer; nothing is dropped here. Acting on it
-    /// eagerly deleted the nodes for `[hooks]`, `[hotkeys]`, `[overlay]` and
-    /// `[llm]` too, because those sections are all-optional structs whose
+    /// eagerly would delete the nodes for `[hooks]`, `[hotkeys]`, `[overlay]`
+    /// and `[llm]` too, because those sections are all-optional structs whose
     /// removal also changes the parse (`Some(default)` becomes `None`) — and
-    /// they are the exact typo'd sections this feature exists to protect.
-    /// The difference the writer can see, and this module cannot, is whether
-    /// the fresh serialization already carries the key: see
+    /// they are the exact typo'd sections this feature exists to protect. The
+    /// difference the writer can see, and this module cannot, is whether the
+    /// fresh serialization already carries the key: see
     /// [`PreservedKeys::table_prunable`].
     ///
     /// Costs one extra prune-and-reparse per fully-unknown table, and nothing
@@ -1721,7 +1725,7 @@ impl PreservedKeys {
     /// aliased spelling *and* writes the canonical one, serde rejects the
     /// result with `duplicate field`, and the daemon falls back to defaults —
     /// the user's entire config, silently discarded. That is strictly worse
-    /// than the key-eating bug this module exists to fix. Demonstrated by
+    /// than the key loss this module exists to prevent. Demonstrated by
     /// adding `alias = "in"` to the non-`Option` `Config::input`: `[in] bogus =
     /// 1` rewrites to a file holding both `[in]` and `[input]`.
     ///
@@ -1803,11 +1807,11 @@ impl PreservedKeys {
     /// A sub-table with *no leaves at all* (`t = {}`, `a = { b = {} }`, a bare
     /// `[bogus.emptysub]` header) satisfies that vacuously, and it has no node
     /// here — there was no leaf to build one from. Reading a missing node as
-    /// "not covered" is what let a single stray `{}` anywhere inside `[bogus]`
-    /// delete the entire section, comments and real keys included: issue #116's
-    /// own symptom, in the code written to fix it. Hence [`has_no_leaves`]
-    /// rather than `is_some_and`, and no `!doc.is_empty()` guard — an empty
-    /// table covers nothing, which is not the same as failing to cover.
+    /// "not covered" would let a single stray `{}` anywhere inside `[bogus]`
+    /// delete the entire section, comments and real keys included. Hence
+    /// [`has_no_leaves`] rather than `is_some_and`, and no `!doc.is_empty()`
+    /// guard: an empty table covers nothing, which is not the same as failing
+    /// to cover.
     fn covers(&self, doc: &toml::Table) -> bool {
         doc.iter().all(|(key, value)| match value {
             toml::Value::Table(inner) => match self.tables.get(key) {
@@ -2000,9 +2004,8 @@ struct BackendName {
 /// cannot reach a user without the inert-prompt gate being taught about it.
 ///
 /// That chain is the whole reason this is a const rather than three hand-kept
-/// lists. The test used to enumerate its own cases: a reviewer added a
-/// promptless `acme-realtime` to `validate` and to `create_backend`, touched
-/// neither the gate nor the test, and all 663 tests stayed green.
+/// lists: a test that enumerates its own cases stays green when a promptless
+/// backend is added to `validate` and `create_backend` but not to the gate.
 const BACKEND_NAMES: &[BackendName] = &[
     BackendName {
         name: "deepgram",
@@ -2315,9 +2318,9 @@ impl Config {
                         "OpenAI-compatible realtime profile is invalid: {e}"
                     ))
                 })?;
-                if config.profile.trim() != "lemonade" {
+                if !matches!(config.profile.trim(), "lemonade" | "llamacpp") {
                     return Err(WhisrsError::Config(
-                        "OpenAI-compatible realtime backend currently supports only profile 'lemonade'."
+                        "OpenAI-compatible realtime backend supports only the 'lemonade' and 'llamacpp' profiles."
                             .to_string(),
                     ));
                 }
@@ -2395,6 +2398,7 @@ impl Config {
         warnings.extend(self.deepgram_keyterm_warnings(backend));
         warnings.extend(self.deepgram_format_warnings(backend));
         warnings.extend(self.inert_prompt_warnings(backend));
+        warnings.extend(self.openrouter_prompt_warnings());
         warnings.extend(self.openai_languages_warnings(backend));
 
         // Streaming backends (including local-whisper, unless its
@@ -2451,7 +2455,7 @@ impl Config {
             });
         }
 
-        // Toggle-path LLM post-processing (issue #85). Same shape as the
+        // Toggle-path LLM post-processing. Same shape as the
         // llm_commands block below — missing [llm] section, empty instruction,
         // streaming backend — but the failure modes differ, so the wording
         // does too.
@@ -3051,11 +3055,10 @@ impl Config {
     ///
     /// `pub`, not private, because the model that actually goes on the wire is
     /// resolved by the daemon's `get_model_for_backend`, and the daemon is a
-    /// separate binary crate. It used to carry its own `"nova-3"` literal, and
-    /// that literal was unpinned: flipping it to `"nova-2"` left the whole test
-    /// suite green while every request would have 400'd with `validate` silent,
-    /// because the gate here inspected a different string than the wire used.
-    /// One function, one answer.
+    /// separate binary crate. A literal of its own there would be unpinned:
+    /// flipping it would leave the test suite green while every request 400s
+    /// with `validate` silent, because the gate here would inspect a different
+    /// string than the wire uses. One function, one answer.
     pub fn deepgram_model(&self) -> String {
         self.deepgram
             .as_ref()
@@ -3303,9 +3306,61 @@ impl Config {
         vec![ConfigWarning { message }]
     }
 
+    /// Load-time warning that OpenRouter drops `[general] prompt` and
+    /// `[general] vocabulary`. The asr-sidecar backend sends them (as
+    /// `hotwords`), and OpenRouter takes the field and ignores it on every one
+    /// of its speech-to-text models, so nothing at run time says they are
+    /// lost. Said once, when dictation (`[general] backend`) or recordings
+    /// (`[recording] backend`) use the asr-sidecar backend on an OpenRouter
+    /// `[asr-sidecar] url`, naming only what those paths send: dictation
+    /// both, recordings only the vocabulary (`recording_transcription_config`
+    /// sends no prompt). Blank is absent, as in
+    /// [`Config::inert_prompt_warnings`].
+    fn openrouter_prompt_warnings(&self) -> Vec<ConfigWarning> {
+        let sidecar = |backend: &str| matches!(backend.trim(), "asr-sidecar" | "asr" | "vibevoice");
+        let recording = cfg!(feature = "recording")
+            && self
+                .recording
+                .as_ref()
+                .and_then(|r| r.backend.as_deref())
+                .is_some_and(sidecar);
+        let dictation = sidecar(&self.general.backend);
+        let on_openrouter = self
+            .asr_sidecar
+            .as_ref()
+            .is_some_and(|a| crate::config::catalog::is_openrouter(&a.url));
+        if !on_openrouter || !(dictation || recording) {
+            return Vec::new();
+        }
+        let has_prompt = dictation
+            && self
+                .general
+                .prompt
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty());
+        let has_terms = self
+            .general
+            .vocabulary
+            .iter()
+            .any(|term| !term.trim().is_empty());
+        let ignored = match (has_prompt, has_terms) {
+            (false, false) => return Vec::new(),
+            (true, false) => "[general] prompt is",
+            (false, true) => "[general] vocabulary is",
+            (true, true) => "[general] prompt and vocabulary are",
+        };
+        vec![ConfigWarning {
+            message: format!(
+                "{ignored} ignored on OpenRouter ([asr-sidecar] url): none of its \
+                 speech-to-text models takes a prompt or vocabulary. [replacements] still \
+                 fixes words after transcription."
+            ),
+        }]
+    }
+
     /// Load-time warning that `[tts] backend = "openai"` stops working on
     /// 2027-01-06, when OpenAI shuts down its speech models. The backend
-    /// itself goes in a later release (#220).
+    /// itself goes in a later release.
     ///
     /// Gated on `enabled`: with TTS off no backend is built (`tts_backend` in
     /// `daemon/speak.rs` refuses, and agent replies go through it too), and
@@ -3349,7 +3404,7 @@ impl Config {
     }
 
     /// Load-time warnings about `[general] prompt` and `[general] vocabulary`
-    /// being discarded by a backend that puts no prompt on the wire (#140).
+    /// being discarded by a backend that puts no prompt on the wire.
     ///
     /// Both keys are documented as hints to the transcription backend, and on
     /// Deepgram and the two realtime backends the hint is built, handed to the
@@ -3546,10 +3601,10 @@ impl Config {
                          a nova-3 model to get a hint channel back."
                     ),
                     InertPromptCase::Lemonade => format!(
-                        "[general] prompt is ignored with backend = \"{backend}\": the Lemonade \
-                         session.update carries no prompt field, so the hint never reaches the \
-                         wire. Switch to a backend that sends it (groq, openai, asr-sidecar) to \
-                         use a prompt."
+                        "[general] prompt is ignored with backend = \"{backend}\": the realtime \
+                         server's session.update carries no prompt field, so the hint never \
+                         reaches the wire. Switch to a backend that sends it (groq, openai, \
+                         asr-sidecar) to use a prompt."
                     ),
                     InertPromptCase::OpenAiRealtimePromptless { model } => format!(
                         "[general] prompt is ignored with backend = \"{backend}\" on [openai] \
@@ -3595,7 +3650,8 @@ impl Config {
                     Some(format!(
                         "[general] vocabulary is ignored with backend = \"{backend}\": the \
                          {terms} term(s) are folded into the transcription prompt, and the \
-                         Lemonade session.update carries no prompt field, so they reach nothing. \
+                         realtime server's session.update carries no prompt field, so they \
+                         reach nothing. \
                          Switch to a backend that sends the prompt (groq, openai, \
                          asr-sidecar){deepgram_clause}."
                     ))
@@ -3699,7 +3755,7 @@ mod tests {
         assert_eq!(parse_hex_color("#11223380"), Some([0x80, 0x11, 0x22, 0x33]));
     }
 
-    /// A multi-byte character used to panic the byte slicing; it is not a
+    /// A multi-byte character must not panic the byte slicing; it is not a
     /// color, and neither is a sign `from_str_radix` would take.
     #[test]
     fn a_hex_color_with_a_non_hex_character_is_none() {
@@ -3709,35 +3765,11 @@ mod tests {
     }
 
     #[test]
-    fn config_input_clipboard_fallback_roundtrip() {
-        // Opt-in: an `[input]` table written before the key existed (or
-        // without it) keeps the current behavior.
-        let absent: InputConfig = toml::from_str("").unwrap();
-        assert!(!absent.clipboard_fallback);
-        assert!(!absent.clipboard_only);
-
-        let cfg: InputConfig =
-            toml::from_str("clipboard_fallback = true\nclipboard_only = true").unwrap();
-        assert!(cfg.clipboard_fallback);
-        assert!(cfg.clipboard_only);
-
-        // Round-trips back out and parses again identically.
-        let serialized = toml::to_string(&cfg).unwrap();
-        assert!(serialized.contains("clipboard_fallback = true"));
-        assert!(serialized.contains("clipboard_only = true"));
-        let reparsed: InputConfig = toml::from_str(&serialized).unwrap();
-        assert!(reparsed.clipboard_fallback);
-        assert!(reparsed.clipboard_only);
-    }
-
-    #[test]
     fn cloud_backend_sections_parse_without_api_key() {
-        // Regression: `api_key` used to be a required field, so a `[groq]`
-        // section kept for its `model` (with the key supplied via the
-        // WHISRS_GROQ_API_KEY env var) was a TOML parse error, and the daemon
-        // discarded the *whole* config: backend, hotkeys and every other
-        // section silently reverted to defaults. The key is optional now; an
-        // empty value means "resolve from the environment".
+        // `api_key` is optional: a `[groq]` section kept for its `model`
+        // (with the key supplied via the WHISRS_GROQ_API_KEY env var) must
+        // parse, or the daemon discards the *whole* config. An empty value
+        // means "resolve from the environment".
         let cfg: Config =
             toml::from_str("[general]\nbackend = \"groq\"\n[groq]\nmodel = \"whisper-large-v3\"\n")
                 .unwrap();
@@ -3752,26 +3784,6 @@ mod tests {
                 .unwrap();
         assert_eq!(cfg.deepgram.unwrap().api_key, "");
         assert_eq!(cfg.openai.unwrap().api_key, "");
-    }
-
-    #[test]
-    fn local_whisper_section_parses_without_model_path() {
-        // Same whole-config-discard trap as the cloud `api_key` fields: a
-        // `[local-whisper]` section kept only to pin `segmentation` used to
-        // be a TOML parse error. `model_path` defaults to the path `whisrs
-        // setup` downloads to, never to the empty string, which would reach
-        // `LocalWhisperBackend::new("")`.
-        let cfg: Config = toml::from_str(
-            "[general]\nbackend = \"deepgram\"\n[local-whisper]\nsegmentation = \"silence\"\n",
-        )
-        .unwrap();
-        let local = cfg
-            .local_whisper
-            .expect("local-whisper section should deserialize");
-        assert_eq!(local.model_path, default_whisper_model_path());
-        assert!(!local.model_path.is_empty());
-        assert_eq!(local.segmentation, "silence");
-        assert_eq!(local.phrase_silence_ms, default_phrase_silence_ms());
     }
 
     #[test]
@@ -3799,10 +3811,9 @@ mod tests {
 
     #[test]
     fn openai_compatible_realtime_without_url_reaches_validate() {
-        // `url` used to be required, so omitting it failed the whole-config
-        // parse and `validate`'s dedicated error was unreachable from a
-        // config file. Now the section deserializes and the user gets the
-        // error that names the key to add.
+        // Without `url` the section still deserializes, so the user gets
+        // `validate`'s error that names the key to add, not a whole-config
+        // parse failure.
         let cfg: Config = toml::from_str(
             "[general]\nbackend = \"openai-compatible-realtime\"\n\
              [openai-compatible-realtime]\nmodel = \"Whisper-Tiny\"\n",
@@ -3848,10 +3859,52 @@ mod tests {
         assert!(!from_default.flash_attn);
     }
 
+    /// The keys the load-time warning names: each unknown leaf by its full
+    /// path, a serde alias as known, and nothing for a file that is not a
+    /// config.
     #[test]
-    fn unknown_top_level_key_is_reported() {
-        let unknown = unknown_config_keys("bogus = 1\n[general]\nbackend = \"groq\"\n");
-        assert_eq!(unknown, vec!["bogus"]);
+    fn unknown_config_keys_reports_exactly_the_unknown_leaves() {
+        let rows: [(&str, &[&str]); 9] = [
+            ("bogus = 1\n[general]\nbackend = \"groq\"\n", &["bogus"]),
+            // `[local]` aliases `[local-whisper]`, `[asr]` aliases `[asr-sidecar]`.
+            ("[local]\nmodel_path = \"/models/ggml.bin\"\n", &[]),
+            ("[asr]\nurl = \"http://127.0.0.1:9999/transcribe\"\n", &[]),
+            // `read` aliases `speak`, so it is known; the typo beside it is
+            // still reported, as is one beside an alias section's real key.
+            (
+                "[hotkeys]\nread = \"Super+Shift+R\"\nbogus = \"Super+X\"\n",
+                &["hotkeys.bogus"],
+            ),
+            (
+                "[local]\nmodel_path = \"/models/ggml.bin\"\nbogus = 1\n",
+                &["local.bogus"],
+            ),
+            (
+                "[general]\nbackend = \"groq\"\n[input]\npaste = true\n",
+                &[],
+            ),
+            ("not [valid toml", &[]),
+            // Valid TOML that does not deserialize: nothing, rather than every
+            // key in it. The scan returns `Err` for it, and this swallows it.
+            (
+                "[general]\nbackend = \"groq\"\nsilence_timeout_ms = \"2000\"\nbogus = 1\n",
+                &[],
+            ),
+            // `nan != nan`, so comparing parsed values directly would silence
+            // every warning in the file, not just the one in this section.
+            (
+                "[general]\naudio_feedback_volume = nan\nbogus = 1\n[input]\npast = true\n",
+                &["general.bogus", "input.past"],
+            ),
+        ];
+        for (contents, want) in rows {
+            assert_eq!(unknown_config_keys(contents), want, "{contents:?}");
+            // The preserve set holds exactly these keys: empty exactly when
+            // none is unknown.
+            if let Ok(preserved) = PreservedKeys::from_config_str(contents) {
+                assert_eq!(preserved.is_empty(), want.is_empty(), "{contents:?}");
+            }
+        }
     }
 
     #[test]
@@ -3880,111 +3933,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_nested_key_reports_full_path() {
-        // The live case from #99: `past` is a typo for `paste`.
-        let unknown = unknown_config_keys("[input]\npast = true\n");
-        assert_eq!(unknown, vec!["input.past"]);
-    }
-
-    #[test]
-    fn unknown_key_in_option_section_is_reported() {
-        let unknown = unknown_config_keys("[deepgram]\napi_key = \"k\"\nbogus = 2\n");
-        assert_eq!(unknown, vec!["deepgram.bogus"]);
-    }
-
-    #[test]
-    fn section_with_only_unknown_keys_reports_leaves() {
-        // A whole section the schema never heard of: every leaf inside it is
-        // reported, nested ones included, so the user sees which key to fix.
-        let unknown = unknown_config_keys("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n");
-        assert_eq!(unknown, vec!["bogus.foo", "bogus.nested.bar"]);
-    }
-
-    #[test]
-    fn hotkey_alias_key_is_not_reported() {
-        // `read` is a serde alias for `speak`, so it works (see
-        // `hotkey_speak_read_alias`) but reserializes as `speak`. The
-        // confirmation pass must clear it instead of warning on every start.
-        let unknown = unknown_config_keys("[hotkeys]\nread = \"Super+Shift+R\"\n");
-        assert!(unknown.is_empty(), "alias key reported: {unknown:?}");
-    }
-
-    #[test]
-    fn alias_sections_are_not_reported() {
-        // `[local]` aliases `[local-whisper]`, `[asr]` aliases `[asr-sidecar]`.
-        let unknown = unknown_config_keys("[local]\nmodel_path = \"/models/ggml.bin\"\n");
-        assert!(unknown.is_empty(), "[local] reported: {unknown:?}");
-
-        let unknown = unknown_config_keys("[asr]\nurl = \"http://127.0.0.1:9999/transcribe\"\n");
-        assert!(unknown.is_empty(), "[asr] reported: {unknown:?}");
-    }
-
-    #[test]
-    fn alias_key_alongside_typo_reports_only_the_typo() {
-        // The confirmation pass must not swallow real unknowns that sit next
-        // to an alias.
-        let unknown =
-            unknown_config_keys("[hotkeys]\nread = \"Super+Shift+R\"\nbogus = \"Super+X\"\n");
-        assert_eq!(unknown, vec!["hotkeys.bogus"]);
-
-        let unknown =
-            unknown_config_keys("[local]\nmodel_path = \"/models/ggml.bin\"\nbogus = 1\n");
-        assert_eq!(unknown, vec!["local.bogus"]);
-    }
-
-    #[test]
-    fn unknown_key_in_llm_command_array_element_is_reported() {
-        let unknown = unknown_config_keys(
-            "[[llm_commands]]\nname = \"x\"\nhotkey = \"Super+T\"\ninstruction = \"y\"\nbogus = 1\n",
-        );
-        assert_eq!(unknown, vec!["llm_commands[0].bogus"]);
-    }
-
-    #[test]
-    fn valid_config_reports_nothing() {
-        let unknown = unknown_config_keys("[general]\nbackend = \"groq\"\n[input]\npaste = true\n");
-        assert!(unknown.is_empty());
-    }
-
-    #[test]
-    fn invalid_toml_reports_nothing() {
-        let unknown = unknown_config_keys("not [valid toml");
-        assert!(unknown.is_empty());
-    }
-
-    /// The other half of that contract, and the one #116/#117 actually rest on:
-    /// a file that is valid TOML but does not deserialize reports no unknown
-    /// keys rather than warning about every key in it. `scan_unknown_keys`
-    /// returns `Err` for it since issue #134 made the failure visible to
-    /// `write_config_to`, so this pins that `unknown_config_keys` still swallows
-    /// that error into an empty list instead of propagating or panicking.
-    #[test]
-    fn valid_toml_that_is_not_a_config_reports_nothing() {
-        let unknown = unknown_config_keys(
-            "[general]\nbackend = \"groq\"\nsilence_timeout_ms = \"2000\"\nbogus = 1\n",
-        );
-        assert!(unknown.is_empty(), "{unknown:?}");
-    }
-
-    #[test]
-    fn non_finite_float_does_not_silence_the_report() {
-        // `nan != nan`, so comparing parsed values directly would suppress every
-        // warning in the file, not just the one in this section.
-        let unknown = unknown_config_keys(
-            "[general]\naudio_feedback_volume = nan\nbogus = 1\n[input]\npast = true\n",
-        );
-        assert_eq!(unknown, vec!["general.bogus", "input.past"]);
-    }
-
-    #[test]
     fn unknown_keys_warning_is_none_when_nothing_is_unknown() {
         assert!(unknown_keys_warning(Path::new("/tmp/config.toml"), &[]).is_none());
     }
 
     #[test]
     fn unknown_keys_warning_is_the_one_message_every_path_prints() {
-        // Byte-identical to what the daemon logged before this literal was
-        // shared with the two interactive flows (issue #116).
         let warning = unknown_keys_warning(
             Path::new("/home/u/.config/whisrs/config.toml"),
             &["input.past".to_string(), "deepgram.bogus".to_string()],
@@ -3995,186 +3949,6 @@ mod tests {
                 "Unknown keys in config at /home/u/.config/whisrs/config.toml ignored: \
                  input.past, deepgram.bogus"
             )
-        );
-    }
-
-    #[test]
-    fn a_clean_config_preserves_nothing() {
-        let preserved = PreservedKeys::from_config_str(
-            "[general]\nbackend = \"groq\"\n[input]\npaste = true\n",
-        )
-        .expect("fixture is a config the preserve set can describe");
-        assert!(preserved.is_empty());
-    }
-
-    #[test]
-    fn preserved_keys_name_a_confirmed_typo() {
-        let preserved = PreservedKeys::from_config_str("[input]\npast = true\n")
-            .expect("fixture is a config the preserve set can describe");
-        assert!(preserved.table("input").contains_leaf("past"));
-        assert!(!preserved.contains_leaf("input"));
-    }
-
-    #[test]
-    fn preserved_keys_cover_a_wholly_unknown_nested_section() {
-        // Both leaves are confirmed-unknown and pruning `[bogus]` as a whole
-        // changes nothing, so the writer may keep the entire section.
-        let preserved =
-            PreservedKeys::from_config_str("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n")
-                .expect("fixture is a config the preserve set can describe");
-        let bogus = preserved.table("bogus");
-        assert!(bogus.contains_leaf("foo"));
-        assert!(bogus.table("nested").contains_leaf("bar"));
-    }
-
-    #[test]
-    fn preserved_keys_exclude_a_known_sibling() {
-        // The subtree rule's whole point: `model_path` really drives a field
-        // (through the `local` -> `local-whisper` alias), so `[local]` is a
-        // *mixed* subtree and the writer must drop it rather than emit it
-        // beside the canonical section.
-        let preserved = PreservedKeys::from_config_str(
-            "[general]\nbackend = \"local\"\n[local]\nmodel_path = \"/m.bin\"\nbogus = 1\n",
-        )
-        .expect("fixture is a config the preserve set can describe");
-        let local = preserved.table("local");
-        assert!(local.contains_leaf("bogus"));
-        assert!(!local.contains_leaf("model_path"));
-    }
-
-    #[test]
-    fn a_wholly_unknown_alias_section_is_not_prunable() {
-        for section in ["asr", "vibevoice"] {
-            let contents = format!("[general]\nbackend = \"groq\"\n[{section}]\nbogus = 1\n");
-
-            // Every leaf of the section is confirmed-unknown — pruning `bogus`
-            // leaves an empty table that still deserializes to a default
-            // `asr-sidecar` section — so the leaf rule alone would keep it.
-            assert_eq!(
-                unknown_config_keys(&contents),
-                vec![format!("{section}.bogus")],
-                "fixture no longer exercises the whole-table guard"
-            );
-
-            // But the name is a serde alias for `asr-sidecar`, which the writer
-            // also emits: keeping both makes the file fail to deserialize
-            // outright. The leaf still has to be *named* (the warning quotes
-            // it); it is the whole-table flag that stops the writer keeping it.
-            let preserved = PreservedKeys::from_config_str(&contents)
-                .expect("fixture is a config the preserve set can describe");
-            assert!(preserved.table(section).contains_leaf("bogus"));
-            assert!(
-                !preserved.table(section).table_prunable(),
-                "`[{section}]` marked prunable, so the rewrite would carry both spellings"
-            );
-        }
-    }
-
-    #[test]
-    fn a_wholly_unknown_root_inline_alias_is_not_prunable() {
-        // Same section, spelled as a root inline table. `toml` parses it to the
-        // same `Value::Table`, so the guard must reach it too.
-        let preserved =
-            PreservedKeys::from_config_str("asr = { bogus = 1 }\n[general]\nbackend = \"groq\"\n")
-                .expect("fixture is a config the preserve set can describe");
-        assert!(preserved.table("asr").contains_leaf("bogus"));
-        assert!(!preserved.table("asr").table_prunable());
-    }
-
-    #[test]
-    fn a_wholly_unknown_section_is_prunable() {
-        // The other side of the same flag: `[bogus]` is not an alias for
-        // anything, so deleting it changes nothing and the writer may keep it.
-        let preserved =
-            PreservedKeys::from_config_str("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n")
-                .expect("fixture is a config the preserve set can describe");
-        assert!(preserved.table("bogus").table_prunable());
-        assert!(
-            preserved.table("bogus").table("nested").table_prunable(),
-            "the flag must be recorded below a covered table too"
-        );
-    }
-
-    #[test]
-    fn an_all_optional_section_keeps_its_only_key_when_that_key_is_a_typo() {
-        // The class of config the whole feature exists for, and the one the
-        // eager version of the guard deleted: a section the schema *knows*
-        // whose fields are all optional, holding nothing but a typo. Removing
-        // such a section changes the parse (`Some(default)` -> `None`), so it
-        // is not prunable — but its name is in the fresh serialization, so the
-        // writer never asks, and the leaf must survive to be preserved there.
-        for (section, key) in [
-            ("hotkeys", "speek"),
-            ("hooks", "media_autopause"),
-            ("llm", "bogus"),
-            ("tts", "bogus"),
-        ] {
-            let contents = format!("[general]\nbackend = \"groq\"\n[{section}]\n{key} = 1\n");
-            let preserved = PreservedKeys::from_config_str(&contents)
-                .expect("fixture is a config the preserve set can describe");
-            assert!(
-                preserved.table(section).contains_leaf(key),
-                "`{section}.{key}` dropped from the preserve set"
-            );
-        }
-    }
-
-    #[test]
-    fn an_empty_table_is_covered_vacuously_and_keeps_its_section_prunable() {
-        // An empty table has no leaves, so "every leaf of this subtree is
-        // confirmed-unknown" is trivially true of it — but it contributes no
-        // path, so there is no node for it and `covers` used to read the
-        // missing node as a failure. One `{}` then made `[bogus]` unprunable
-        // and the writer deleted the section around it.
-        for shape in [
-            "empty_table = {}",
-            "a = { b = {} }",
-            "a = { b = { c = {} } }",
-        ] {
-            let contents =
-                format!("[general]\nbackend = \"groq\"\n[bogus]\nimportant = 1\n{shape}\n");
-
-            // The empty table names nothing, so it is not in the warning.
-            assert_eq!(
-                unknown_config_keys(&contents),
-                vec!["bogus.important".to_string()],
-                "fixture no longer exercises the leafless-table rule ({shape})"
-            );
-
-            let preserved = PreservedKeys::from_config_str(&contents)
-                .expect("fixture is a config the preserve set can describe");
-            assert!(preserved.table("bogus").contains_leaf("important"));
-            assert!(
-                preserved.table("bogus").table_prunable(),
-                "`{shape}` vetoed `[bogus]`, so the writer would delete the section"
-            );
-        }
-    }
-
-    #[test]
-    fn a_bare_empty_subtable_header_keeps_its_section_prunable() {
-        // Same rule, spelled as a header rather than an inline `{}`.
-        let preserved = PreservedKeys::from_config_str(
-            "[general]\nbackend = \"groq\"\n[bogus]\nimportant = 1\n[bogus.emptysub]\n",
-        )
-        .expect("fixture is a config the preserve set can describe");
-        assert!(preserved.table("bogus").table_prunable());
-    }
-
-    #[test]
-    fn an_empty_subtable_does_not_make_an_alias_section_prunable() {
-        // The vacuous rule makes `[asr]` *cover* itself, so the whole-table
-        // question now gets asked where it previously was skipped. The answer
-        // must still be no: `asr` is a serde alias for the `asr-sidecar`
-        // section the writer emits, and keeping both is a `duplicate field`
-        // error, i.e. the daemon discards the user's entire config.
-        let contents = "[general]\nbackend = \"groq\"\n[asr]\nbogus = 1\n[asr.empty]\n";
-        let preserved = PreservedKeys::from_config_str(contents)
-            .expect("fixture is a config the preserve set can describe");
-        assert!(preserved.table("asr").contains_leaf("bogus"));
-        assert!(
-            !preserved.table("asr").table_prunable(),
-            "`[asr]` marked prunable, so the rewrite would carry both spellings"
         );
     }
 
@@ -4249,12 +4023,11 @@ mod tests {
             );
         }
 
-        // The section aliases (`read` is a key alias, covered by
-        // `a_hotkey_alias_is_recanonicalized_while_the_typo_beside_it_survives`)
-        // are the ones the guard has to drop whole. `local` joined the loop
-        // when #137 gave `LocalWhisperConfig::model_path` a serde default:
-        // `[local] bogus = 1` deserializes now, so `[local]` can be wholly
-        // unknown exactly like `[asr]`.
+        // The section aliases (`read` is a key alias, covered by the hotkey
+        // alias rows of `the_preserve_matrix_holds_and_every_rewrite_still_loads`)
+        // are the ones the guard has to drop whole. The serde default on
+        // `LocalWhisperConfig::model_path` lets `[local] bogus = 1` deserialize,
+        // so `[local]` can be wholly unknown exactly like `[asr]`.
         for section in ["asr", "vibevoice", "local"] {
             let contents = format!("[general]\nbackend = \"groq\"\n[{section}]\nbogus = 1\n");
             // Without this the row can pass for the wrong reason: a fixture
@@ -4265,57 +4038,15 @@ mod tests {
                 vec![format!("{section}.bogus")],
                 "fixture no longer exercises the whole-table guard"
             );
+            let preserved = PreservedKeys::from_config_str(&contents)
+                .expect("fixture is a config the preserve set can describe");
             assert!(
-                !PreservedKeys::from_config_str(&contents)
-                    .expect("fixture is a config the preserve set can describe")
-                    .table(section)
-                    .table_prunable(),
+                !preserved.table(section).table_prunable(),
                 "`[{section}]` marked prunable, so the rewrite would carry both spellings"
             );
+            // The section holding the unknown key is not a leaf itself.
+            assert!(!preserved.contains_leaf(section), "{section}");
         }
-    }
-
-    #[test]
-    fn a_nested_all_optional_section_keeps_its_typo() {
-        // `[overlay.colors]`: both levels are all-optional, so the eager guard
-        // pruned the `overlay` node and took `colors` down with it.
-        let preserved = PreservedKeys::from_config_str(
-            "[general]\nbackend = \"groq\"\n[overlay.colors]\nbogos = 1\n",
-        )
-        .expect("fixture is a config the preserve set can describe");
-        assert!(preserved
-            .table("overlay")
-            .table("colors")
-            .contains_leaf("bogos"));
-    }
-
-    #[test]
-    fn config_tts_section_roundtrip() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-
-            [tts]
-            enabled = true
-            model = "canopylabs/orpheus-v1-english"
-            voice = "autumn"
-            response_format = "wav"
-            "#,
-        )
-        .unwrap();
-
-        let tts = config.tts.as_ref().expect("tts section parsed");
-        assert!(tts.enabled);
-        assert_eq!(tts.model.as_deref(), Some("canopylabs/orpheus-v1-english"));
-        assert_eq!(tts.voice.as_deref(), Some("autumn"));
-        assert_eq!(tts.response_format, "wav");
-        assert!(tts.api_key.is_none());
-
-        // Round-trips back out and parses again identically.
-        let serialized = toml::to_string(&config).unwrap();
-        let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert!(reparsed.tts.unwrap().enabled);
     }
 
     #[test]
@@ -4334,198 +4065,8 @@ mod tests {
     }
 
     #[test]
-    fn config_tts_backend_and_url_roundtrip() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-
-            [tts]
-            enabled = true
-            backend = "tts-sidecar"
-            model = "kokoro"
-            voice = "af_heart"
-            url = "http://127.0.0.1:8880/v1/audio/speech"
-            "#,
-        )
-        .unwrap();
-
-        let tts = config.tts.as_ref().expect("tts section parsed");
-        assert_eq!(tts.backend, "tts-sidecar");
-        assert_eq!(
-            tts.url.as_deref(),
-            Some("http://127.0.0.1:8880/v1/audio/speech")
-        );
-
-        // Round-trips back out and parses again identically.
-        let serialized = toml::to_string(&config).unwrap();
-        let reparsed: Config = toml::from_str(&serialized).unwrap();
-        let tts = reparsed.tts.unwrap();
-        assert_eq!(tts.backend, "tts-sidecar");
-        assert_eq!(
-            tts.url.as_deref(),
-            Some("http://127.0.0.1:8880/v1/audio/speech")
-        );
-    }
-
-    #[test]
-    fn config_tts_backend_defaults_to_groq() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-
-            [tts]
-            enabled = true
-            "#,
-        )
-        .unwrap();
-        assert_eq!(config.tts.unwrap().backend, "groq");
-    }
-
-    #[test]
-    fn config_tts_defaults_when_minimal() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-
-            [tts]
-            enabled = true
-            "#,
-        )
-        .unwrap();
-
-        let tts = config.tts.unwrap();
-        assert!(tts.enabled);
-        // model/voice are left unset in config — each backend supplies its own
-        // default at build time (see tts::create_backend), so switching backend
-        // doesn't require also overriding the model.
-        assert!(tts.model.is_none());
-        assert!(tts.voice.is_none());
-        assert_eq!(tts.response_format, "wav");
-    }
-
-    #[test]
-    fn config_without_tts_is_none() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-            "#,
-        )
-        .unwrap();
-        assert!(config.tts.is_none());
-    }
-
-    #[test]
-    fn hotkey_speak_read_alias() {
-        let hotkeys: HotkeyConfig = toml::from_str(r#"read = "Super+Shift+R""#).unwrap();
-        assert_eq!(hotkeys.speak.as_deref(), Some("Super+Shift+R"));
-    }
-
-    #[test]
-    fn injector_backend_toml_roundtrip() {
-        // Each variant serializes to its kebab-case string and parses back.
-        for (variant, name) in [
-            (InjectorBackend::Auto, "auto"),
-            (InjectorBackend::Uinput, "uinput"),
-            (InjectorBackend::WaylandVk, "wayland-vk"),
-            (InjectorBackend::Xtest, "xtest"),
-        ] {
-            #[derive(Serialize, Deserialize)]
-            struct Wrap {
-                backend: InjectorBackend,
-            }
-            let toml_str = toml::to_string(&Wrap { backend: variant }).unwrap();
-            assert_eq!(toml_str.trim(), format!("backend = \"{name}\""));
-            let parsed: Wrap = toml::from_str(&format!("backend = \"{name}\"")).unwrap();
-            assert_eq!(parsed.backend, variant);
-        }
-    }
-
-    #[test]
-    fn input_config_backend_defaults_to_auto_when_absent() {
-        // An [input] table without a `backend` key must default to Auto
-        // (back-compat for configs written before the field existed).
-        let input: InputConfig = toml::from_str(
-            r#"
-            key_delay_ms = 5
-            "#,
-        )
-        .unwrap();
-        assert_eq!(input.backend, InjectorBackend::Auto);
-
-        // And an explicit value is honoured.
-        let input: InputConfig = toml::from_str(
-            r#"
-            backend = "wayland-vk"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(input.backend, InjectorBackend::WaylandVk);
-    }
-
-    #[test]
-    fn input_config_paste_defaults_false_and_parses() {
-        // Omitted → false (back-compat for configs written before the field).
-        let input: InputConfig = toml::from_str("key_delay_ms = 5").unwrap();
-        assert!(!input.paste);
-
-        // Explicit value honoured.
-        let input: InputConfig = toml::from_str("paste = true").unwrap();
-        assert!(input.paste);
-    }
-
-    #[test]
-    fn config_input_backend_back_compat() {
-        // A full config whose [input] table omits `backend` parses with the
-        // Auto default.
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "local-whisper"
-
-            [audio]
-            device = "default"
-
-            [input]
-            key_delay_ms = 8
-            "#,
-        )
-        .unwrap();
-        assert_eq!(config.input.backend, InjectorBackend::Auto);
-    }
-
-    #[test]
     fn config_validate_unknown_backend() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "nonexistent".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: None,
-            tts: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-        };
-        let err = config.validate().unwrap_err();
+        let err = bare_config("nonexistent").validate().unwrap_err();
         assert!(err.to_string().contains("Unknown backend"));
         assert!(err.to_string().contains("openai-compatible-realtime"));
     }
@@ -4555,14 +4096,6 @@ mod tests {
         ] {
             assert_eq!(OverlayPosition::parse(p.as_str()), Some(p));
         }
-    }
-
-    #[test]
-    fn overlay_position_defaults_to_bottom_center() {
-        let config: Config = toml::from_str("[overlay]\ntheme = \"ember\"\n").unwrap();
-        let overlay = config.overlay.unwrap();
-        assert_eq!(overlay.position, "bottom-center");
-        assert_eq!(overlay.position(), OverlayPosition::BottomCenter);
     }
 
     #[test]
@@ -4599,124 +4132,9 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_overlay_off_for_old_configs() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "local-whisper"
-
-            [audio]
-            device = "default"
-            "#,
-        )
-        .unwrap();
-
-        assert!(!config.general.overlay);
-    }
-
-    #[test]
-    fn config_validate_groq_no_key() {
-        // Clear env var in case it's set.
-        std::env::remove_var("WHISRS_GROQ_API_KEY");
-        let config = Config {
-            general: GeneralConfig {
-                backend: "groq".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: None,
-            tts: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-        };
-        let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("no API key"));
-    }
-
-    #[test]
-    fn config_validate_groq_with_key() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "groq".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: Some(GroqConfig {
-                api_key: "test-key".to_string(),
-                model: "whisper-large-v3-turbo".to_string(),
-            }),
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: None,
-            tts: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-        };
-        let result = config.validate();
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn config_validate_paste_with_non_streaming_backend_no_warning() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "groq".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: InputConfig {
-                paste: true,
-                ..Default::default()
-            },
-            deepgram: None,
-            groq: Some(GroqConfig {
-                api_key: "test-key".to_string(),
-                model: "whisper-large-v3-turbo".to_string(),
-            }),
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: None,
-            tts: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-        };
+        let mut config = keyed_groq_config();
+        config.input.paste = true;
         let warnings = config.validate().unwrap();
         assert!(
             warnings.iter().all(|w| !w.message.contains("paste")),
@@ -4727,43 +4145,18 @@ mod tests {
     #[test]
     fn config_validate_paste_with_streaming_backend_warns() {
         for backend in ["deepgram-streaming", "openai-realtime", "local-whisper"] {
-            let config = Config {
-                general: GeneralConfig {
-                    backend: backend.to_string(),
-                    ..Default::default()
-                },
-                audio: Default::default(),
-                input: InputConfig {
-                    paste: true,
-                    ..Default::default()
-                },
-                deepgram: Some(DeepgramConfig {
-                    api_key: "test-key".to_string(),
-                    model: default_deepgram_model(),
-                    ..Default::default()
-                }),
-                groq: None,
-                openai: Some(OpenAiConfig {
-                    api_key: "test-key".to_string(),
-                    model: default_openai_model(),
-                    languages: Vec::new(),
-                }),
-                local_whisper: None,
-                local_vosk: None,
-                local_parakeet: None,
-                asr_sidecar: None,
-                openai_compatible_realtime: None,
-                llm: None,
-                tts: None,
-                hotkeys: None,
-                hooks: None,
-                llm_commands: Vec::new(),
-                agents: Vec::new(),
-                agent_overlay: None,
-                replacements: BTreeMap::new(),
-                recording: None,
-                overlay: None,
-            };
+            let mut config = bare_config(backend);
+            config.input.paste = true;
+            config.deepgram = Some(DeepgramConfig {
+                api_key: "test-key".to_string(),
+                model: default_deepgram_model(),
+                ..Default::default()
+            });
+            config.openai = Some(OpenAiConfig {
+                api_key: "test-key".to_string(),
+                model: default_openai_model(),
+                languages: Vec::new(),
+            });
             let warnings = config.validate().unwrap();
             let warning = warnings
                 .iter()
@@ -4789,129 +4182,58 @@ mod tests {
         }
     }
 
+    /// `clipboard_only` never types or pastes, so `paste` and
+    /// `clipboard_fallback` beside it do nothing, and each warns naming the
+    /// key that overrode it. On its own it overrides nothing and stays quiet:
+    /// these warnings are about ignored keys, not about the mode.
     #[test]
-    fn modifier_wait_defaults_to_ten_seconds() {
-        assert_eq!(InputConfig::default().modifier_wait_ms, 10_000);
-        let parsed: InputConfig = toml::from_str("key_delay_ms = 2\n").unwrap();
-        assert_eq!(
-            parsed.modifier_wait_ms, 10_000,
-            "an absent key gets the default"
-        );
-    }
-
-    #[test]
-    fn modifier_wait_round_trips_and_is_a_known_key() {
-        let input = InputConfig {
-            modifier_wait_ms: 0,
-            ..Default::default()
-        };
-        let text = toml::to_string(&input).unwrap();
-        let back: InputConfig = toml::from_str(&text).unwrap();
-        assert_eq!(back.modifier_wait_ms, 0);
-        assert!(
-            unknown_config_keys("[input]\nmodifier_wait_ms = 2500\n").is_empty(),
-            "modifier_wait_ms must not trip the unknown-key warning"
-        );
-    }
-
-    /// Build a groq (non-streaming, so no paste/streaming warning of its own)
-    /// config with the given `[input]` section, for the copy-only warnings.
-    fn config_with_input(input: InputConfig) -> Config {
-        Config {
-            general: GeneralConfig {
-                backend: "groq".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input,
-            deepgram: None,
-            groq: Some(GroqConfig {
-                api_key: "test-key".to_string(),
-                model: "whisper-large-v3-turbo".to_string(),
-            }),
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: None,
-            tts: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
+    fn config_validate_warns_about_keys_clipboard_only_ignores() {
+        for (input, ignored) in [
+            (
+                InputConfig {
+                    paste: true,
+                    clipboard_only: true,
+                    ..Default::default()
+                },
+                Some("[input] paste = true is ignored"),
+            ),
+            (
+                InputConfig {
+                    clipboard_fallback: true,
+                    clipboard_only: true,
+                    ..Default::default()
+                },
+                Some("[input] clipboard_fallback = true is ignored"),
+            ),
+            (
+                InputConfig {
+                    clipboard_only: true,
+                    ..Default::default()
+                },
+                None,
+            ),
+        ] {
+            // Groq does not stream, so no paste warning of its own.
+            let mut config = keyed_groq_config();
+            config.input = input;
+            let warnings = config.validate().unwrap();
+            let Some(ignored) = ignored else {
+                assert!(
+                    warnings.iter().all(|w| !w.message.contains("is ignored")),
+                    "clipboard_only alone overrides nothing and must not warn: {warnings:?}"
+                );
+                continue;
+            };
+            let warning = warnings
+                .iter()
+                .find(|w| w.message.contains(ignored))
+                .unwrap_or_else(|| panic!("expected {ignored:?}, got: {warnings:?}"));
+            assert!(
+                warning.message.contains("clipboard_only = true"),
+                "the warning must name the key that overrode it: {}",
+                warning.message
+            );
         }
-    }
-
-    #[test]
-    fn config_validate_clipboard_only_with_paste_warns() {
-        let config = config_with_input(InputConfig {
-            paste: true,
-            clipboard_only: true,
-            ..Default::default()
-        });
-        let warnings = config.validate().unwrap();
-        let warning = warnings
-            .iter()
-            .find(|w| w.message.contains("[input] paste = true is ignored"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "clipboard_only never injects, so paste is a silent no-op; \
-                     expected a warning, got: {warnings:?}"
-                )
-            });
-        assert!(
-            warning.message.contains("clipboard_only = true"),
-            "the warning must name the key that overrode paste: {}",
-            warning.message
-        );
-    }
-
-    #[test]
-    fn config_validate_clipboard_only_with_fallback_warns() {
-        let config = config_with_input(InputConfig {
-            clipboard_fallback: true,
-            clipboard_only: true,
-            ..Default::default()
-        });
-        let warnings = config.validate().unwrap();
-        let warning = warnings
-            .iter()
-            .find(|w| {
-                w.message
-                    .contains("[input] clipboard_fallback = true is ignored")
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "clipboard_only already copies and never injects, so the fallback is a \
-                     silent no-op; expected a warning, got: {warnings:?}"
-                )
-            });
-        assert!(
-            warning.message.contains("clipboard_only = true"),
-            "the warning must name the key that overrode clipboard_fallback: {}",
-            warning.message
-        );
-    }
-
-    #[test]
-    fn config_validate_clipboard_only_alone_no_warning() {
-        // Copy-only on its own overrides nothing, so it must stay quiet —
-        // these warnings are about *ignored* keys, not about the mode.
-        let config = config_with_input(InputConfig {
-            clipboard_only: true,
-            ..Default::default()
-        });
-        let warnings = config.validate().unwrap();
-        assert!(
-            warnings.iter().all(|w| !w.message.contains("is ignored")),
-            "clipboard_only alone overrides nothing and must not warn: {warnings:?}"
-        );
     }
 
     /// The sentences of `message` that tell the user where to go.
@@ -4952,9 +4274,7 @@ mod tests {
     /// `.github/workflows/release.yml`), and in those binaries the stub that
     /// stands in for it bails with "local-whisper feature not enabled". Half
     /// the artifacts this project ships cannot act on the advice, and the
-    /// warning has no way to tell which binary it is running in. `origin/main`
-    /// never named it as a destination; the #140 warnings were the first to,
-    /// which is what this check stops coming back.
+    /// warning has no way to tell which binary it is running in.
     ///
     /// Checked per recommendation sentence rather than over the whole message,
     /// because unlike the two stubs, local-whisper is legitimately *described*
@@ -5022,59 +4342,6 @@ mod tests {
              not enabled\" for half the users we ship to. Name groq, openai or asr-sidecar \
              instead: {message}"
         );
-    }
-
-    #[test]
-    fn config_parse_asr_sidecar_defaults() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "asr-sidecar"
-
-            [asr-sidecar]
-            "#,
-        )
-        .unwrap();
-
-        let asr_sidecar = config.asr_sidecar.unwrap();
-        assert_eq!(asr_sidecar.url, "http://127.0.0.1:8765/transcribe");
-        assert_eq!(asr_sidecar.model, "microsoft/VibeVoice-ASR-HF");
-    }
-
-    #[test]
-    fn config_validate_asr_sidecar_with_url() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "asr-sidecar".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: Some(AsrSidecarConfig {
-                url: "http://127.0.0.1:8765/transcribe".to_string(),
-                model: "microsoft/VibeVoice-ASR-HF".to_string(),
-                api_key: None,
-            }),
-            openai_compatible_realtime: None,
-            llm: None,
-            tts: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-        };
-
-        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -5177,48 +4444,52 @@ mod tests {
         );
     }
 
+    /// A pre-Nova-3 deepgram model takes no keyterm, so a vocabulary on it
+    /// warns, naming the model: the backend drops the terms at `debug!`,
+    /// which the daemon's default `info` filter hides, so it is said once at
+    /// load. Nova-3, an empty vocabulary, and a `[deepgram]` section left
+    /// behind on another backend (`whisrs setup` writes one, and it stays
+    /// when the user switches) have nothing to warn about.
     #[test]
-    fn config_validate_warns_vocabulary_ignored_on_pre_nova3_deepgram_model() {
-        // The backend drops the terms at `debug!`, which the daemon's default
-        // `info` filter hides — so this has to be said once at load.
-        let vocabulary = vec!["whisrs".to_string(), "Hyprland".to_string()];
-        let config = deepgram_config_with_vocabulary("nova-2", &vocabulary);
-        let warnings = config.validate().unwrap();
-        let warning = warnings
-            .iter()
-            .find(|w| w.message.contains("vocabulary"))
-            .unwrap_or_else(|| panic!("nova-2 + vocabulary must warn: {warnings:?}"));
-        assert!(
-            warning.message.contains("nova-2"),
-            "the warning must name the model: {}",
-            warning.message
-        );
-        assert!(
-            warning.message.contains("ignored") || warning.message.contains("dropped"),
-            "the warning must say the terms do not reach Deepgram: {}",
-            warning.message
-        );
-    }
-
-    #[test]
-    fn config_validate_does_not_warn_about_vocabulary_on_nova3() {
-        let vocabulary = vec!["whisrs".to_string()];
-        let config = deepgram_config_with_vocabulary("nova-3", &vocabulary);
-        let warnings = config.validate().unwrap();
-        assert!(
-            warnings.iter().all(|w| !w.message.contains("vocabulary")),
-            "nova-3 supports keyterm; nothing to warn about: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn config_validate_does_not_warn_without_vocabulary() {
-        let config = deepgram_config_with_vocabulary("nova-2", &[]);
-        let warnings = config.validate().unwrap();
-        assert!(
-            warnings.iter().all(|w| !w.message.contains("vocabulary")),
-            "no vocabulary means nothing is being dropped: {warnings:?}"
-        );
+    fn config_validate_warns_vocabulary_ignored_only_on_a_pre_nova3_deepgram_model() {
+        let rows: [(&str, &str, &[&str], bool); 4] = [
+            ("deepgram", "nova-2", &["whisrs", "Hyprland"], true),
+            ("deepgram", "nova-3", &["whisrs"], false),
+            ("deepgram", "nova-2", &[], false),
+            ("groq", "nova-2", &["whisrs", "Hyprland"], false),
+        ];
+        for (backend, model, vocabulary, warns) in rows {
+            let vocabulary: Vec<String> = vocabulary.iter().map(|t| t.to_string()).collect();
+            let mut config = deepgram_config_with_vocabulary(model, &vocabulary);
+            if backend == "groq" {
+                config.general.backend = backend.to_string();
+                config.groq = Some(GroqConfig {
+                    api_key: "test-key".to_string(),
+                    model: default_groq_model(),
+                });
+            }
+            let row = format!("{backend} on {model} with {vocabulary:?}");
+            let warnings = config.validate().unwrap_or_else(|e| panic!("{row}: {e}"));
+            let warning = warnings.iter().find(|w| w.message.contains("vocabulary"));
+            if !warns {
+                assert!(
+                    warning.is_none(),
+                    "{row}: nothing to warn about: {warnings:?}"
+                );
+                continue;
+            }
+            let warning = warning.unwrap_or_else(|| panic!("{row} must warn: {warnings:?}"));
+            assert!(
+                warning.message.contains(model),
+                "{row}: the warning must name the model: {}",
+                warning.message
+            );
+            assert!(
+                warning.message.contains("ignored") || warning.message.contains("dropped"),
+                "{row}: the warning must say the terms do not reach Deepgram: {}",
+                warning.message
+            );
+        }
     }
 
     #[test]
@@ -5291,14 +4562,12 @@ mod tests {
     #[test]
     fn config_validate_advertises_the_count_that_goes_on_the_wire() {
         // The no-drift invariant, in every shape that trips a different limit.
-        // This broke once already: blanks were charged against the byte budget
-        // and filtered afterwards, so `validate` promised 335 while the request
-        // carried 135.
         let cases: Vec<(&str, Vec<String>)> = vec![
-            // Byte-budget-bound: 1000 short single-word terms.
+            // Byte-budget-bound: 12-byte terms cost 21 B each on the wire, so
+            // the 4096-byte budget stops them at 195, before the term cap.
             (
                 "byte budget",
-                (0..1000).map(|i| format!("term{i:04}")).collect(),
+                (0..1000).map(|i| format!("term{i:08}")).collect(),
             ),
             // Term-cap-bound: terms short enough that 200 of them use barely
             // half the byte budget.
@@ -5339,28 +4608,6 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_does_not_warn_about_deepgram_vocabulary_on_another_backend() {
-        // `whisrs setup` writes a [deepgram] section, and people leave it
-        // behind when they switch backends. Without the backend gate, this
-        // groq user gets a "vocabulary is ignored" warning on every daemon
-        // start about a backend they are not using.
-        let mut config = deepgram_config_with_vocabulary(
-            "nova-2",
-            &["whisrs".to_string(), "Hyprland".to_string()],
-        );
-        config.general.backend = "groq".to_string();
-        config.groq = Some(GroqConfig {
-            api_key: "test-key".to_string(),
-            model: default_groq_model(),
-        });
-        let warnings = config.validate().unwrap();
-        assert!(
-            warnings.iter().all(|w| !w.message.contains("vocabulary")),
-            "a stale [deepgram] section must not warn on another backend: {warnings:?}"
-        );
-    }
-
-    #[test]
     fn deepgram_keyterm_warnings_without_a_deepgram_section_use_the_default_model() {
         // `[deepgram]` is optional; the section's serde default (nova-3)
         // supports keyterm, so an absent section must not produce the
@@ -5379,43 +4626,15 @@ mod tests {
 
     #[test]
     fn config_validate_zero_silence_timeout() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "groq".to_string(),
-                silence_timeout_ms: 0,
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: Some(GroqConfig {
-                api_key: "test-key".to_string(),
-                model: "whisper-large-v3-turbo".to_string(),
-            }),
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: None,
-            tts: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-        };
+        let mut config = keyed_groq_config();
+        config.general.silence_timeout_ms = 0;
         let warnings = config.validate().unwrap();
         let zero: Vec<&str> = warnings
             .iter()
             .map(|w| w.message.as_str())
             .filter(|m| m.contains("silence_timeout_ms"))
             .collect();
-        // #178: 0 turns auto-stop off, and the warning says so.
+        // 0 turns auto-stop off, and the warning says so.
         assert_eq!(
             zero,
             [
@@ -5466,502 +4685,87 @@ mod tests {
         assert_eq!(AudioConfig::default().vad(), Vad::Earshot);
     }
 
+    /// `[openai-compatible-realtime]` is checked whole: a URL that is set and
+    /// ws:// or wss://, a known profile and a known turn detection.
     #[test]
-    fn config_parse_openai_compatible_realtime_defaults() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "openai-compatible-realtime"
-
-            [openai-compatible-realtime]
-            url = "ws://localhost:1234/realtime"
-            "#,
-        )
-        .unwrap();
-
-        let realtime = config.openai_compatible_realtime.unwrap();
-        assert_eq!(realtime.url, "ws://localhost:1234/realtime");
-        assert_eq!(realtime.model, "Whisper-Tiny");
-        assert_eq!(realtime.profile, "lemonade");
-        assert_eq!(realtime.turn_detection, "server-vad");
-        assert!(realtime.api_key.is_none());
-    }
-
-    #[test]
-    fn config_validate_openai_compatible_realtime_with_valid_config() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "openai-compatible-realtime".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
-                url: "ws://localhost:1234/realtime".to_string(),
+    fn config_validate_checks_the_openai_compatible_realtime_section() {
+        const WS: &str = "ws://localhost:1234/realtime";
+        for (url, profile, turn_detection, error) in [
+            (WS, "lemonade", "server-vad", None),
+            (WS, "llamacpp", "server-vad", None),
+            (" ", "lemonade", "server-vad", Some("WebSocket URL")),
+            (
+                "http://localhost:1234/realtime",
+                "lemonade",
+                "server-vad",
+                Some("ws:// or wss://"),
+            ),
+            (WS, "bogus", "server-vad", Some("profile is invalid")),
+            (WS, "lemonade", "bogus", Some("turn detection is invalid")),
+        ] {
+            let mut config = bare_config("openai-compatible-realtime");
+            config.openai_compatible_realtime = Some(OpenAiCompatibleRealtimeConfig {
+                url: url.to_string(),
                 model: "Whisper-Tiny".to_string(),
-                profile: "lemonade".to_string(),
-                turn_detection: "server-vad".to_string(),
+                profile: profile.to_string(),
+                turn_detection: turn_detection.to_string(),
                 api_key: None,
-            }),
-            llm: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn config_validate_openai_compatible_realtime_rejects_missing_url() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "openai-compatible-realtime".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
-                url: " ".to_string(),
-                model: "Whisper-Tiny".to_string(),
-                profile: "lemonade".to_string(),
-                turn_detection: "server-vad".to_string(),
-                api_key: None,
-            }),
-            llm: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-
-        let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("WebSocket URL"));
-    }
-
-    #[test]
-    fn config_validate_openai_compatible_realtime_rejects_non_websocket_url() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "openai-compatible-realtime".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
-                url: "http://localhost:1234/realtime".to_string(),
-                model: "Whisper-Tiny".to_string(),
-                profile: "lemonade".to_string(),
-                turn_detection: "server-vad".to_string(),
-                api_key: None,
-            }),
-            llm: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-
-        let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("ws:// or wss://"));
-    }
-
-    #[test]
-    fn config_validate_openai_compatible_realtime_rejects_unknown_profile() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "openai-compatible-realtime".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
-                url: "ws://localhost:1234/realtime".to_string(),
-                model: "Whisper-Tiny".to_string(),
-                profile: "bogus".to_string(),
-                turn_detection: "server-vad".to_string(),
-                api_key: None,
-            }),
-            llm: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-
-        let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("profile is invalid"));
-    }
-
-    #[test]
-    fn config_validate_openai_compatible_realtime_rejects_unsupported_turn_detection() {
-        let config = Config {
-            general: GeneralConfig {
-                backend: "openai-compatible-realtime".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
-                url: "ws://localhost:1234/realtime".to_string(),
-                model: "Whisper-Tiny".to_string(),
-                profile: "lemonade".to_string(),
-                turn_detection: "bogus".to_string(),
-                api_key: None,
-            }),
-            llm: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-
-        let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("turn detection is invalid"));
+            });
+            let row = format!("url {url:?}, profile {profile}, turn_detection {turn_detection}");
+            match error {
+                None => {
+                    config.validate().unwrap_or_else(|e| panic!("{row}: {e}"));
+                }
+                Some(needle) => {
+                    let err = config.validate().expect_err(&row).to_string();
+                    assert!(err.contains(needle), "{row}: {err}");
+                }
+            }
+        }
     }
 
     #[test]
     fn has_any_backend_configured_counts_openai_compatible_realtime_url() {
-        let config = Config {
-            general: Default::default(),
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: None,
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: Some(OpenAiCompatibleRealtimeConfig {
-                url: "ws://localhost:1234/realtime".to_string(),
-                model: "Whisper-Tiny".to_string(),
-                profile: "lemonade".to_string(),
-                turn_detection: "server-vad".to_string(),
-                api_key: None,
-            }),
-            llm: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-
+        let config: Config = toml::from_str(
+            "[openai-compatible-realtime]\nurl = \"ws://localhost:1234/realtime\"\n",
+        )
+        .unwrap();
         assert!(config.has_any_backend_configured());
     }
 
+    /// Each mistake in `[[llm_commands]]` warns: entries with no `[llm]` to
+    /// run them, two entries with one name, a hotkey that does not parse.
     #[test]
-    fn config_parses_llm_commands_array() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-
-            [[llm_commands]]
-            name = "translate-de"
-            hotkey = "Super+Shift+T"
-            instruction = "Translate the following into German, informal tone."
-
-            [[llm_commands]]
-            name = "summarize"
-            hotkey = "Super+Shift+S"
-            instruction = "Summarize the following in one sentence."
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(config.llm_commands.len(), 2);
-        assert_eq!(config.llm_commands[0].name, "translate-de");
-        assert_eq!(config.llm_commands[0].hotkey, "Super+Shift+T");
-        assert_eq!(config.llm_commands[1].name, "summarize");
-
-        // Round-trips back out and parses again identically.
-        let serialized = toml::to_string(&config).unwrap();
-        let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.llm_commands.len(), 2);
-    }
-
-    #[test]
-    fn config_without_llm_commands_defaults_empty() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-            "#,
-        )
-        .unwrap();
-        assert!(config.llm_commands.is_empty());
-    }
-
-    #[test]
-    fn config_validate_warns_llm_commands_without_llm_section() {
-        let mut config = Config {
-            general: GeneralConfig {
-                backend: "groq".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: Some(GroqConfig {
-                api_key: "test-key".to_string(),
-                model: "whisper-large-v3-turbo".to_string(),
-            }),
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: None,
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-        config.llm_commands.push(llm::LlmCommandConfig {
-            name: "translate-de".to_string(),
-            hotkey: "Super+Shift+T".to_string(),
-            set_hotkey: None,
-            instruction: "Translate to German.".to_string(),
-        });
-
-        let warnings = config.validate().unwrap();
-        assert!(warnings
-            .iter()
-            .any(|w| w.message.contains("no [llm] section")));
-    }
-
-    #[test]
-    fn config_validate_rejects_duplicate_llm_command_names() {
-        let mut config = Config {
-            general: GeneralConfig {
-                backend: "groq".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: Some(GroqConfig {
-                api_key: "test-key".to_string(),
-                model: "whisper-large-v3-turbo".to_string(),
-            }),
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: Some(llm::LlmConfig::default()),
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-        for _ in 0..2 {
-            config.llm_commands.push(llm::LlmCommandConfig {
-                name: "dup".to_string(),
-                hotkey: "Super+Shift+T".to_string(),
-                set_hotkey: None,
-                instruction: "Translate to German.".to_string(),
-            });
+    fn config_validate_warns_about_each_llm_command_mistake() {
+        for (llm, llm_commands, needle) in [
+            (
+                None,
+                vec![llm_command("translate-de", "Super+Shift+T")],
+                "no [llm] section",
+            ),
+            (
+                Some(llm::LlmConfig::default()),
+                vec![
+                    llm_command("dup", "Super+Shift+T"),
+                    llm_command("dup", "Super+Shift+T"),
+                ],
+                "duplicate name",
+            ),
+            (
+                Some(llm::LlmConfig::default()),
+                vec![llm_command("translate-de", "NotAKey")],
+                "invalid hotkey",
+            ),
+        ] {
+            let mut config = keyed_groq_config();
+            config.llm = llm;
+            config.llm_commands = llm_commands;
+            let warnings = config.validate().unwrap();
+            assert!(
+                warnings.iter().any(|w| w.message.contains(needle)),
+                "expected {needle:?}, got: {warnings:?}"
+            );
         }
-
-        let warnings = config.validate().unwrap();
-        assert!(warnings
-            .iter()
-            .any(|w| w.message.contains("duplicate name")));
-    }
-
-    #[test]
-    fn config_validate_rejects_invalid_llm_command_hotkey() {
-        let mut config = Config {
-            general: GeneralConfig {
-                backend: "groq".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: Some(GroqConfig {
-                api_key: "test-key".to_string(),
-                model: "whisper-large-v3-turbo".to_string(),
-            }),
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: Some(llm::LlmConfig::default()),
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-        config.llm_commands.push(llm::LlmCommandConfig {
-            name: "translate-de".to_string(),
-            hotkey: "NotAKey".to_string(),
-            set_hotkey: None,
-            instruction: "Translate to German.".to_string(),
-        });
-
-        let warnings = config.validate().unwrap();
-        assert!(warnings
-            .iter()
-            .any(|w| w.message.contains("invalid hotkey")));
-    }
-
-    #[test]
-    fn llm_command_set_hotkey_defaults_none_and_parses() {
-        let cfg: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-
-            [[llm_commands]]
-            name = "no-set"
-            hotkey = "Super+Shift+T"
-            instruction = "Translate to German."
-
-            [[llm_commands]]
-            name = "with-set"
-            hotkey = "Super+Shift+U"
-            set_hotkey = "Super+Shift+Alt+U"
-            instruction = "Summarize."
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.llm_commands[0].set_hotkey, None);
-        assert_eq!(
-            cfg.llm_commands[1].set_hotkey.as_deref(),
-            Some("Super+Shift+Alt+U")
-        );
-    }
-
-    #[test]
-    fn config_validate_warns_set_hotkey_equal_to_hotkey() {
-        let mut config = Config {
-            general: GeneralConfig {
-                backend: "groq".to_string(),
-                ..Default::default()
-            },
-            audio: Default::default(),
-            input: Default::default(),
-            deepgram: None,
-            groq: Some(GroqConfig {
-                api_key: "test-key".to_string(),
-                model: "whisper-large-v3-turbo".to_string(),
-            }),
-            openai: None,
-            local_whisper: None,
-            local_vosk: None,
-            local_parakeet: None,
-            asr_sidecar: None,
-            openai_compatible_realtime: None,
-            llm: Some(llm::LlmConfig::default()),
-            hotkeys: None,
-            hooks: None,
-            llm_commands: Vec::new(),
-            agents: Vec::new(),
-            agent_overlay: None,
-            replacements: BTreeMap::new(),
-            recording: None,
-            overlay: None,
-            tts: None,
-        };
-        config.llm_commands.push(llm::LlmCommandConfig {
-            name: "translate-de".to_string(),
-            hotkey: "Super+Shift+T".to_string(),
-            set_hotkey: Some("Super+Shift+T".to_string()),
-            instruction: "Translate to German.".to_string(),
-        });
-
-        let warnings = config.validate().unwrap();
-        assert!(warnings
-            .iter()
-            .any(|w| w.message.contains("set_hotkey equal to hotkey")));
     }
 
     /// Minimal valid config for the given backend, with every backend
@@ -6013,6 +4817,25 @@ mod tests {
         }
     }
 
+    /// The config a file with no sections loads to, on `backend`: every
+    /// section at its default or absent.
+    fn bare_config(backend: &str) -> Config {
+        let mut config: Config = toml::from_str("").expect("empty config uses defaults");
+        config.general.backend = backend.to_string();
+        config
+    }
+
+    /// [`bare_config`] on groq with a `[groq]` key, so validation passes:
+    /// a groq config with nothing else in it.
+    fn keyed_groq_config() -> Config {
+        let mut config = bare_config("groq");
+        config.groq = Some(GroqConfig {
+            api_key: "test-key".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+        });
+        config
+    }
+
     fn llm_command(name: &str, hotkey: &str) -> llm::LlmCommandConfig {
         llm::LlmCommandConfig {
             name: name.to_string(),
@@ -6022,95 +4845,75 @@ mod tests {
         }
     }
 
+    /// Two bindings of one combo warn once, naming both sides: across
+    /// sections, between entries spelled differently (the listener matches
+    /// parsed bindings, not strings), within `[hotkeys]` ("Meta" is "Super"),
+    /// and against an agent.
     #[test]
-    fn config_validate_warns_hotkey_collision_across_sections() {
-        let mut config = validatable_config("groq");
-        config.hotkeys = Some(HotkeyConfig {
-            toggle: Some("Super+Shift+T".to_string()),
-            cancel: None,
-            command: None,
-            speak: None,
-            recording: None,
-            next_profile: None,
-        });
-        config
-            .llm_commands
-            .push(llm_command("german", "Super+Shift+T"));
-
-        let warnings = config.validate().unwrap();
-        let warning = warnings
-            .iter()
-            .find(|w| w.message.contains("duplicate hotkey binding"))
-            .unwrap_or_else(|| {
-                panic!("hotkeys.toggle and llm_commands share a combo; expected a warning, got: {warnings:?}")
-            });
-        assert!(
-            warning.message.contains("[hotkeys] toggle"),
-            "the warning must name the [hotkeys] side: {}",
-            warning.message
-        );
-        assert!(
-            warning.message.contains("llm_commands 'german' hotkey"),
-            "the warning must name the llm_commands side: {}",
-            warning.message
-        );
-    }
-
-    #[test]
-    fn config_validate_warns_hotkey_collision_between_llm_commands_normalized() {
-        // Different spelling (case + modifier order) of the same combo must
-        // still collide: the listener matches parsed bindings, not strings.
-        let mut config = validatable_config("groq");
-        config
-            .llm_commands
-            .push(llm_command("german", "Super+Shift+T"));
-        config
-            .llm_commands
-            .push(llm_command("summarize", "shift+super+t"));
-
-        let warnings = config.validate().unwrap();
-        let warning = warnings
-            .iter()
-            .find(|w| w.message.contains("duplicate hotkey binding"))
-            .unwrap_or_else(|| {
-                panic!("both entries bind the same combo; expected a warning, got: {warnings:?}")
-            });
-        assert!(
-            warning.message.contains("llm_commands 'german' hotkey")
-                && warning.message.contains("llm_commands 'summarize' hotkey"),
-            "the warning must name both entries: {}",
-            warning.message
-        );
-    }
-
-    #[test]
-    fn config_validate_warns_duplicate_bindings_within_hotkeys_section() {
-        // "Meta" is an alias for "Super", so these are the same binding.
-        let mut config = validatable_config("groq");
-        config.hotkeys = Some(HotkeyConfig {
-            toggle: Some("Super+D".to_string()),
-            cancel: None,
-            command: None,
-            speak: Some("Meta+D".to_string()),
-            recording: None,
-            next_profile: None,
-        });
-
-        let warnings = config.validate().unwrap();
-        let warning = warnings
-            .iter()
-            .find(|w| w.message.contains("duplicate hotkey binding"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "toggle and speak bind the same combo; expected a warning, got: {warnings:?}"
-                )
-            });
-        assert!(
-            warning.message.contains("[hotkeys] toggle")
-                && warning.message.contains("[hotkeys] speak"),
-            "the warning must name both fields: {}",
-            warning.message
-        );
+    fn config_validate_warns_hotkey_collisions_naming_both_sides() {
+        for (what, hotkeys, llm_commands, agents, sides) in [
+            (
+                "across sections",
+                Some(HotkeyConfig {
+                    toggle: Some("Super+Shift+T".to_string()),
+                    ..Default::default()
+                }),
+                vec![llm_command("german", "Super+Shift+T")],
+                vec![],
+                ["[hotkeys] toggle", "llm_commands 'german' hotkey"],
+            ),
+            (
+                "between llm_commands, case and order differing",
+                None,
+                vec![
+                    llm_command("german", "Super+Shift+T"),
+                    llm_command("summarize", "shift+super+t"),
+                ],
+                vec![],
+                [
+                    "llm_commands 'german' hotkey",
+                    "llm_commands 'summarize' hotkey",
+                ],
+            ),
+            (
+                "within [hotkeys], Meta for Super",
+                Some(HotkeyConfig {
+                    toggle: Some("Super+D".to_string()),
+                    speak: Some("Meta+D".to_string()),
+                    ..Default::default()
+                }),
+                vec![],
+                vec![],
+                ["[hotkeys] toggle", "[hotkeys] speak"],
+            ),
+            (
+                "against an agent",
+                Some(HotkeyConfig {
+                    toggle: Some("Super+Shift+J".to_string()),
+                    ..Default::default()
+                }),
+                vec![],
+                vec![agent_entry("jarvis", Some("shift+super+j"))],
+                ["[hotkeys] toggle", "agents 'jarvis' hotkey"],
+            ),
+        ] {
+            let mut config = validatable_config("groq");
+            config.hotkeys = hotkeys;
+            config.llm_commands = llm_commands;
+            config.agents = agents;
+            let warnings = config.validate().unwrap();
+            let warning = warnings
+                .iter()
+                .find(|w| w.message.contains("duplicate hotkey binding"))
+                .unwrap_or_else(|| panic!("{what}: expected a warning, got: {warnings:?}"));
+            for side in sides {
+                assert!(
+                    warning.message.contains(side),
+                    "{what}: the warning must name {side}: {}",
+                    warning.message
+                );
+            }
+        }
     }
 
     /// An `[[agents]]` entry in a dir that exists (the crate root).
@@ -6127,27 +4930,6 @@ mod tests {
             reply_instruction: None,
             feedback: "brief".to_string(),
         }
-    }
-
-    #[test]
-    fn config_validate_warns_agent_hotkey_clashes() {
-        let mut config = validatable_config("groq");
-        config.hotkeys = Some(HotkeyConfig {
-            toggle: Some("Super+Shift+J".to_string()),
-            ..Default::default()
-        });
-        config.agents = vec![agent_entry("jarvis", Some("shift+super+j"))];
-        let warnings = config.validate().unwrap();
-        let warning = warnings
-            .iter()
-            .find(|w| w.message.contains("duplicate hotkey binding"))
-            .unwrap_or_else(|| panic!("expected a clash warning, got: {warnings:?}"));
-        assert!(
-            warning.message.contains("[hotkeys] toggle")
-                && warning.message.contains("agents 'jarvis' hotkey"),
-            "{}",
-            warning.message
-        );
     }
 
     /// `new_session_hotkey` takes part in the clash check: against another
@@ -6490,6 +5272,165 @@ mod tests {
         assert!(matching(&config, "is skipped").is_empty());
     }
 
+    /// The OpenRouter warnings `validate` gives `toml`.
+    fn openrouter_warnings(toml: &str) -> Vec<String> {
+        let config: Config = toml::from_str(toml).unwrap();
+        config
+            .validate()
+            .expect("config validates")
+            .into_iter()
+            .map(|w| w.message)
+            .filter(|m| m.contains("OpenRouter"))
+            .collect()
+    }
+
+    /// The asr-sidecar backend on OpenRouter, which ignores the prompt and
+    /// the vocabulary: one warning naming what is set.
+    #[test]
+    fn openrouter_ignores_the_prompt_and_vocabulary() {
+        let warnings = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr-sidecar"
+            prompt = "Arch Linux"
+            vocabulary = ["PKGBUILD"]
+
+            [asr-sidecar]
+            url = "https://openrouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("[general] prompt and vocabulary are ignored on OpenRouter"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].contains(['\u{2013}', '\u{2014}']));
+
+        // The alias, with only a prompt; then only a term among blanks.
+        let warnings = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr"
+            prompt = "Arch Linux"
+
+            [asr-sidecar]
+            url = "HTTPS://OpenRouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("[general] prompt is ignored"));
+        let warnings = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr-sidecar"
+            vocabulary = ["  ", "PKGBUILD"]
+
+            [asr-sidecar]
+            url = "https://openrouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("[general] vocabulary is ignored"));
+    }
+
+    /// A sidecar elsewhere sends both, and with nothing set there is
+    /// nothing to lose.
+    #[test]
+    fn openrouter_warning_needs_openrouter_and_a_hint() {
+        let elsewhere = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr-sidecar"
+            prompt = "Arch Linux"
+            vocabulary = ["PKGBUILD"]
+
+            [asr-sidecar]
+            url = "http://127.0.0.1:8765/transcribe"
+            "#,
+        );
+        assert!(elsewhere.is_empty(), "{elsewhere:?}");
+        let blank = openrouter_warnings(
+            r#"
+            [general]
+            backend = "asr-sidecar"
+            prompt = "   "
+            vocabulary = ["", " "]
+
+            [asr-sidecar]
+            url = "https://openrouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert!(blank.is_empty(), "{blank:?}");
+        // An OpenRouter [asr-sidecar] url no backend uses.
+        let unused = openrouter_warnings(
+            r#"
+            [general]
+            backend = "groq"
+            prompt = "Arch Linux"
+
+            [groq]
+            api_key = "k"
+
+            [asr-sidecar]
+            url = "https://openrouter.ai/api/v1/audio/transcriptions"
+            "#,
+        );
+        assert!(unused.is_empty(), "{unused:?}");
+    }
+
+    /// Recordings on OpenRouter warn too, once with dictation there as well,
+    /// naming only what the paths in use send: a recording sends the
+    /// vocabulary and never `[general] prompt`, so a prompt alone is lost
+    /// only to dictation there.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn openrouter_warning_covers_recordings() {
+        let config = |general: &str, hints: &str| {
+            format!(
+                r#"
+                [general]
+                backend = "{general}"
+                {hints}
+
+                [groq]
+                api_key = "k"
+
+                [asr-sidecar]
+                url = "https://openrouter.ai/api/v1/audio/transcriptions"
+
+                [recording]
+                backend = "asr-sidecar"
+                "#
+            )
+        };
+        let both = "prompt = \"Arch Linux\"\nvocabulary = [\"PKGBUILD\"]";
+        for (general, hints, want) in [
+            ("groq", both, Some("[general] vocabulary is ignored")),
+            ("groq", "prompt = \"Arch Linux\"", None),
+            (
+                "asr-sidecar",
+                both,
+                Some("[general] prompt and vocabulary are"),
+            ),
+            (
+                "asr-sidecar",
+                "prompt = \"Arch Linux\"",
+                Some("[general] prompt is"),
+            ),
+        ] {
+            let warnings = openrouter_warnings(&config(general, hints));
+            match want {
+                Some(start) => {
+                    assert_eq!(warnings.len(), 1, "{general}: {warnings:?}");
+                    assert!(warnings[0].starts_with(start), "{general}: {warnings:?}");
+                    // A date in the message would only age.
+                    assert!(!warnings[0].contains("checked"), "{warnings:?}");
+                }
+                None => assert!(warnings.is_empty(), "{general}: {warnings:?}"),
+            }
+        }
+    }
+
     /// The recording checks, in a build with the feature.
     #[cfg(feature = "recording")]
     mod recording {
@@ -6796,39 +5737,41 @@ mod tests {
             }
         }
 
+        /// `[recording] backend` has to take a file: a realtime one is an
+        /// error naming the ones that do, an unknown or stub one an error,
+        /// and each batch one is accepted with no warning.
         #[test]
-        fn explicit_realtime_recording_backend_is_an_error() {
-            for backend in ["openai-realtime", "openai-compatible-realtime"] {
-                let mut config = validatable_config("groq");
+        fn a_recording_backend_must_take_a_file() {
+            const BATCH: &str = "groq, openai, deepgram";
+            let rows: [(&str, &str, Option<&[&str]>); 8] = [
+                ("groq", "openai-realtime", Some(&["openai-realtime", BATCH])),
+                (
+                    "groq",
+                    "openai-compatible-realtime",
+                    Some(&["openai-compatible-realtime", BATCH]),
+                ),
+                ("groq", "nope", Some(&[])),
+                ("groq", "local-vosk", Some(&[])),
+                ("openai-realtime", "groq", None),
+                ("openai-realtime", "openai", None),
+                ("openai-realtime", "deepgram", None),
+                ("openai-realtime", "deepgram-streaming", None),
+            ];
+            for (dictation, backend, error) in rows {
+                let mut config = validatable_config(dictation);
                 config.recording = recording_config(|m| m.backend = Some(backend.to_string()));
-                let err = config.validate().expect_err("realtime recording backend");
-                let msg = err.to_string();
-                assert!(
-                    msg.contains(backend) && msg.contains("groq, openai, deepgram"),
-                    "{msg}"
-                );
-            }
-        }
-
-        #[test]
-        fn unknown_or_stub_recording_backend_is_an_error() {
-            for backend in ["nope", "local-vosk"] {
-                let mut config = validatable_config("groq");
-                config.recording = recording_config(|m| m.backend = Some(backend.to_string()));
-                assert!(config.validate().is_err(), "{backend} must be rejected");
-            }
-        }
-
-        #[test]
-        fn batch_recording_backends_are_accepted() {
-            for backend in ["groq", "openai", "deepgram", "deepgram-streaming"] {
-                let mut config = validatable_config("openai-realtime");
-                config.recording = recording_config(|m| m.backend = Some(backend.to_string()));
-                assert!(
-                    recording_warnings(&config).is_empty(),
-                    "{backend}: {:?}",
-                    recording_warnings(&config)
-                );
+                let Some(needles) = error else {
+                    let warnings = recording_warnings(&config);
+                    assert!(warnings.is_empty(), "{backend}: {warnings:?}");
+                    continue;
+                };
+                let msg = config
+                    .validate()
+                    .expect_err(&format!("{backend} must be rejected"))
+                    .to_string();
+                for needle in needles {
+                    assert!(msg.contains(needle), "{backend}: {msg}");
+                }
             }
         }
 
@@ -6865,43 +5808,36 @@ mod tests {
             );
         }
 
+        /// `[recording] system_device` warns when it is the mic itself, or a
+        /// source that is not a monitor; the presets and a monitor do not.
         #[test]
-        fn recording_system_device_equal_to_mic_warns() {
-            let mut config = validatable_config("groq");
-            config.audio.device = "alsa_input.usb-mic".to_string();
-            config.recording =
-                recording_config(|m| m.system_device = Some("alsa_input.usb-mic".to_string()));
-            let warnings = recording_warnings(&config);
-            assert_eq!(warnings.len(), 1, "{warnings:?}");
-            assert!(warnings[0].contains("same source"), "{warnings:?}");
-        }
-
-        #[test]
-        fn recording_system_device_that_is_not_a_monitor_warns() {
-            let mut config = validatable_config("groq");
-            config.recording =
-                recording_config(|m| m.system_device = Some("alsa_input.webcam".to_string()));
-            let warnings = recording_warnings(&config);
-            assert!(
-                warnings.iter().any(|w| w.contains(".monitor")),
-                "{warnings:?}"
-            );
-        }
-
-        #[test]
-        fn recording_system_device_presets_and_monitors_do_not_warn() {
-            for system in [
-                "default",
-                "none",
-                "alsa_output.pci-0000.analog-stereo.monitor",
+        fn a_recording_system_device_is_a_monitor_other_than_the_mic() {
+            for (mic, system, warning) in [
+                (
+                    "alsa_input.usb-mic",
+                    "alsa_input.usb-mic",
+                    Some("same source"),
+                ),
+                ("default", "alsa_input.webcam", Some(".monitor")),
+                ("default", "default", None),
+                ("default", "none", None),
+                (
+                    "default",
+                    "alsa_output.pci-0000.analog-stereo.monitor",
+                    None,
+                ),
             ] {
                 let mut config = validatable_config("groq");
+                config.audio.device = mic.to_string();
                 config.recording = recording_config(|m| m.system_device = Some(system.to_string()));
-                assert!(
-                    recording_warnings(&config).is_empty(),
-                    "{system}: {:?}",
-                    recording_warnings(&config)
-                );
+                let warnings = recording_warnings(&config);
+                match warning {
+                    Some(needle) => {
+                        assert_eq!(warnings.len(), 1, "{system}: {warnings:?}");
+                        assert!(warnings[0].contains(needle), "{system}: {warnings:?}");
+                    }
+                    None => assert!(warnings.is_empty(), "{system}: {warnings:?}"),
+                }
             }
         }
 
@@ -7038,47 +5974,46 @@ mod tests {
         }
     }
 
+    /// Distinct bindings, an entry's own `hotkey` and `set_hotkey`, and
+    /// empty hotkeys (which never fire) collide with nothing.
     #[test]
-    fn config_validate_no_collision_warning_for_distinct_bindings() {
-        let mut config = validatable_config("groq");
-        config.hotkeys = Some(HotkeyConfig {
-            toggle: Some("Super+Shift+D".to_string()),
-            cancel: Some("Super+Shift+Escape".to_string()),
-            command: Some("Super+Shift+C".to_string()),
-            speak: Some("Super+Shift+R".to_string()),
-            recording: Some("Super+Shift+M".to_string()),
-            next_profile: None,
-        });
-        config
-            .llm_commands
-            .push(llm_command("german", "Super+Shift+T"));
-        config
-            .llm_commands
-            .push(llm_command("summarize", "Super+Shift+S"));
-
-        let warnings = config.validate().unwrap();
-        assert!(
-            warnings
-                .iter()
-                .all(|w| !w.message.contains("duplicate hotkey binding")),
-            "all bindings are distinct; no collision warning expected: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn config_validate_no_collision_warning_for_entry_own_set_hotkey() {
-        let mut config = validatable_config("groq");
-        let mut entry = llm_command("german", "Super+Shift+U");
-        entry.set_hotkey = Some("Super+Shift+Alt+U".to_string());
-        config.llm_commands.push(entry);
-
-        let warnings = config.validate().unwrap();
-        assert!(
-            warnings
-                .iter()
-                .all(|w| !w.message.contains("duplicate hotkey binding")),
-            "an entry's own distinct hotkey/set_hotkey pair is not a collision: {warnings:?}"
-        );
+    fn config_validate_no_collision_warning_without_a_shared_combo() {
+        let mut own_set_hotkey = llm_command("german", "Super+Shift+U");
+        own_set_hotkey.set_hotkey = Some("Super+Shift+Alt+U".to_string());
+        for (what, hotkeys, llm_commands) in [
+            (
+                "distinct bindings",
+                Some(HotkeyConfig {
+                    toggle: Some("Super+Shift+D".to_string()),
+                    cancel: Some("Super+Shift+Escape".to_string()),
+                    command: Some("Super+Shift+C".to_string()),
+                    speak: Some("Super+Shift+R".to_string()),
+                    recording: Some("Super+Shift+M".to_string()),
+                    next_profile: None,
+                }),
+                vec![
+                    llm_command("german", "Super+Shift+T"),
+                    llm_command("summarize", "Super+Shift+S"),
+                ],
+            ),
+            ("an entry's own set_hotkey", None, vec![own_set_hotkey]),
+            (
+                "empty hotkeys",
+                None,
+                vec![llm_command("german", ""), llm_command("summarize", "")],
+            ),
+        ] {
+            let mut config = validatable_config("groq");
+            config.hotkeys = hotkeys;
+            config.llm_commands = llm_commands;
+            let warnings = config.validate().unwrap();
+            assert!(
+                warnings
+                    .iter()
+                    .all(|w| !w.message.contains("duplicate hotkey binding")),
+                "{what}: no collision warning expected: {warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -7102,21 +6037,6 @@ mod tests {
                 .iter()
                 .all(|w| !w.message.contains("duplicate hotkey binding")),
             "the generic collision warning would be redundant here: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn config_validate_empty_llm_command_hotkeys_do_not_collide() {
-        let mut config = validatable_config("groq");
-        config.llm_commands.push(llm_command("german", ""));
-        config.llm_commands.push(llm_command("summarize", ""));
-
-        let warnings = config.validate().unwrap();
-        assert!(
-            warnings
-                .iter()
-                .all(|w| !w.message.contains("duplicate hotkey binding")),
-            "empty hotkeys never fire and must not collide with each other: {warnings:?}"
         );
     }
 
@@ -7157,53 +6077,7 @@ mod tests {
         }
     }
 
-    // ── Toggle-path LLM post-processing (issue #85) ─────────────────────
-
-    #[test]
-    fn general_llm_post_process_defaults_off_with_a_usable_instruction() {
-        // Configs written before the keys existed keep the old behavior.
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-            "#,
-        )
-        .unwrap();
-        assert!(!config.general.llm_post_process);
-        // The instruction still defaults to something usable, so turning the
-        // flag on alone is a working configuration.
-        assert!(config
-            .general
-            .llm_instruction
-            .contains("Return only the corrected text"));
-    }
-
-    #[test]
-    fn general_llm_post_process_parses_and_roundtrips() {
-        let config: Config = toml::from_str(
-            r#"
-            [general]
-            backend = "groq"
-            llm_post_process = true
-            llm_instruction = "Translate the following text into German. Return only the translation."
-            "#,
-        )
-        .unwrap();
-        assert!(config.general.llm_post_process);
-        assert_eq!(
-            config.general.llm_instruction,
-            "Translate the following text into German. Return only the translation."
-        );
-
-        // Round-trips back out and parses again identically.
-        let serialized = toml::to_string(&config).unwrap();
-        let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert!(reparsed.general.llm_post_process);
-        assert_eq!(
-            reparsed.general.llm_instruction,
-            config.general.llm_instruction
-        );
-    }
+    // ── Toggle-path LLM post-processing ─────────────────────────────────
 
     #[test]
     fn config_validate_warns_llm_post_process_with_streaming_backend() {
@@ -7410,7 +6284,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Inert [general] prompt / vocabulary (#140)
+    // Inert [general] prompt / vocabulary
     // -----------------------------------------------------------------------
 
     /// The backends whose `sends_prompt` is false for a reason that matters:
@@ -7454,7 +6328,7 @@ mod tests {
 
     /// Every "[general] prompt is ignored" message has to end somewhere the
     /// user can actually go. Telling them a key they set does nothing and
-    /// stopping there leaves them exactly where #140 found them.
+    /// stopping there leaves them stuck.
     ///
     /// Asserted per shape rather than as "one of these words appears": the
     /// message shapes offer different escape hatches, and a check that
@@ -7687,7 +6561,7 @@ mod tests {
         // "none of the 205 term(s) in [general] vocabulary fit the keyterm
         // limits" directly beneath `deepgram_keyterm_warnings`' "200 of 205
         // usable term(s) reach Deepgram": the same contradiction the
-        // three-state channel was introduced to remove, with the numbers
+        // three-state channel exists to prevent, with the numbers
         // swapped. The two warnings are built from one pair of functions
         // precisely so they cannot disagree about a number, and a partial drop
         // is the only shape where the wrong test disagrees.
@@ -7823,23 +6697,8 @@ mod tests {
     }
 
     #[test]
-    fn config_inert_prompt_silent_for_backends_that_send_the_prompt() {
-        // The helper directly, not validate(): asr-sidecar's hard URL check
-        // rejects validatable_config outright, and the gate under test is the
-        // backend match, not the API-key plumbing.
-        for backend in ["groq", "openai", "asr-sidecar", "local-whisper"] {
-            let config = inert_prompt_config(backend);
-            let warnings = config.inert_prompt_warnings(backend);
-            assert!(
-                warnings.is_empty(),
-                "backend {backend} sends the prompt, so neither key is inert: {warnings:?}"
-            );
-        }
-    }
-
-    #[test]
     fn config_inert_prompt_never_warns_about_vocabulary_on_deepgram() {
-        // The regression guard for this change. Deepgram is promptless, so
+        // Deepgram is promptless, so
         // warning A fires — but the vocabulary rides as `keyterm` query params
         // and really does bias transcription, so warning B must not. Telling a
         // Deepgram user their vocabulary is ignored would push them off the one
@@ -7902,23 +6761,6 @@ mod tests {
                 warning.message
             );
             assert_inert_prompt_advice_is_reachable(&warning.message);
-        }
-    }
-
-    #[test]
-    fn config_inert_prompt_silent_for_prompt_taking_openai_realtime_models() {
-        // gpt-live-transcribe is manual-commit like gpt-realtime-whisper, and
-        // still takes the prompt.
-        for model in ["gpt-4o-transcribe", "gpt-live-transcribe"] {
-            let mut config = inert_prompt_config("openai-realtime");
-            config.openai.as_mut().unwrap().model = model.to_string();
-
-            let warnings = config.inert_prompt_warnings("openai-realtime");
-            assert!(
-                warnings.is_empty(),
-                "{model} gets a real prompt in the session.update; nothing is inert: \
-                 {warnings:?}"
-            );
         }
     }
 
@@ -8253,8 +7095,8 @@ mod tests {
                 "the request must carry a prompt, or neither side has anything to answer about"
             );
 
-            let warned = config
-                .inert_prompt_warnings(case.name)
+            let warnings = config.inert_prompt_warnings(case.name);
+            let warned = warnings
                 .iter()
                 .any(|w| w.message.contains("[general] prompt is ignored"));
             assert_eq!(
@@ -8267,6 +7109,17 @@ mod tests {
                 case.model,
                 case.backend.sends_prompt(&request)
             );
+            // The vocabulary rides in the prompt, so a backend that sends the
+            // prompt loses neither key.
+            if case.backend.sends_prompt(&request) {
+                assert!(
+                    warnings.is_empty(),
+                    "backend {} on model {:?} sends the prompt, so neither key is inert: \
+                     {warnings:?}",
+                    case.name,
+                    case.model
+                );
+            }
         }
     }
 }

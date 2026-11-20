@@ -279,7 +279,6 @@ fn flac_error(e: impl std::fmt::Display) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::audio::wav::encode_wav;
-    use crate::transcription::decode_wav_samples;
 
     /// FLAC of `samples`, through the WAV a recording chunk arrives as.
     fn flac_of(samples: &[i16]) -> Vec<u8> {
@@ -528,38 +527,5 @@ mod tests {
         let upload = recording_upload(&[]).await;
         assert_eq!(upload.format, UploadFormat::WAV);
         assert!(upload.bytes.is_empty());
-    }
-
-    /// Encode a real recording and report time, size and peak memory:
-    ///
-    /// ```text
-    /// WHISRS_FLAC_BENCH_WAV=/path/to/copy.wav cargo test --release --lib \
-    ///     transcription::flac::tests::real_recording -- --ignored --nocapture
-    /// ```
-    ///
-    /// Point it at a copy, never at a file inside the recordings folder.
-    #[tokio::test]
-    #[ignore = "needs WHISRS_FLAC_BENCH_WAV"]
-    async fn real_recording() {
-        let path = std::env::var("WHISRS_FLAC_BENCH_WAV").expect("WHISRS_FLAC_BENCH_WAV");
-        let wav = std::fs::read(&path).unwrap();
-        let started = std::time::Instant::now();
-        let upload = recording_upload(&wav).await;
-        let elapsed = started.elapsed();
-        let peak = std::fs::read_to_string("/proc/self/status")
-            .unwrap()
-            .lines()
-            .find(|l| l.starts_with("VmHWM:"))
-            .map(str::to_string)
-            .unwrap_or_default();
-        assert_eq!(upload.format, UploadFormat::FLAC);
-        println!(
-            "{} bytes of WAV -> {} bytes of FLAC ({:.1}%) in {:.2?}; {peak}",
-            wav.len(),
-            upload.bytes.len(),
-            upload.bytes.len() as f64 * 100.0 / wav.len() as f64,
-            elapsed
-        );
-        assert_eq!(decode(&upload.bytes), decode_wav_samples(&wav).unwrap());
     }
 }

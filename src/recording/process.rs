@@ -1597,13 +1597,23 @@ mod tests {
     }
 
     async fn run(dir: &Path, backend: Arc<FakeBackend>) -> RecordingMeta {
-        process_recording(
-            dir,
-            &config(),
-            Some(backend as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap()
+        run_with(dir, &config(), backend).await.unwrap()
+    }
+
+    /// [`process_recording`] of `dir` with `config` and `backend`.
+    async fn run_with(
+        dir: &Path,
+        config: &Config,
+        backend: Arc<impl TranscriptionBackend + 'static>,
+    ) -> anyhow::Result<RecordingMeta> {
+        process_recording(dir, config, Some(backend as Arc<dyn TranscriptionBackend>)).await
+    }
+
+    /// Rewrite `dir`'s `recording.json` through `edit`.
+    fn edit_meta(dir: &Path, edit: impl FnOnce(&mut RecordingMeta)) {
+        let mut meta = store::read_meta(dir).unwrap();
+        edit(&mut meta);
+        store::write_meta(dir, &meta).unwrap();
     }
 
     /// Sixty words, more than a summary needs.
@@ -1634,13 +1644,9 @@ mod tests {
         let config = summary_config("http://127.0.0.1:1/v1/chat/completions", true);
         let backend = FakeBackend::new(&[(3000, LONG_SPEECH)], None);
         let tmp = one_speech_recording();
-        let meta = process_recording(
-            tmp.path(),
-            &config,
-            Some(backend.clone() as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap();
+        let meta = run_with(tmp.path(), &config, backend.clone())
+            .await
+            .unwrap();
         assert_eq!(meta.status, RecordingState::Done);
         assert_eq!(meta.summary, None);
         assert!(!meta.summary_stale);
@@ -1650,17 +1656,11 @@ mod tests {
             meta.errors
         );
 
-        let mut summarized = store::read_meta(tmp.path()).unwrap();
-        summarized.summary = Some("From the first transcript.".into());
-        summarized.summary_pending = Some(crate::recording::SummaryRequest::Asked);
-        store::write_meta(tmp.path(), &summarized).unwrap();
-        let meta = process_recording(
-            tmp.path(),
-            &config,
-            Some(backend as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap();
+        edit_meta(tmp.path(), |summarized| {
+            summarized.summary = Some("From the first transcript.".into());
+            summarized.summary_pending = Some(crate::recording::SummaryRequest::Asked);
+        });
+        let meta = run_with(tmp.path(), &config, backend).await.unwrap();
         assert_eq!(meta.summary.as_deref(), Some("From the first transcript."));
         assert!(meta.summary_stale);
         assert_eq!(
@@ -1743,13 +1743,7 @@ mod tests {
             ("drop me".to_string(), String::new()),
         ]
         .into();
-        let meta = process_recording(
-            tmp.path(),
-            &cfg,
-            Some(backend as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap();
+        let meta = run_with(tmp.path(), &cfg, backend).await.unwrap();
 
         let lines: Vec<_> = meta
             .segments
@@ -1874,13 +1868,9 @@ mod tests {
     #[tokio::test]
     async fn no_audio_at_all_is_an_error() {
         let (tmp, _) = recording(&[(TrackKind::Mic, 0, None)]);
-        let err = process_recording(
-            tmp.path(),
-            &config(),
-            Some(FakeBackend::new(&[], None) as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap_err();
+        let err = run_with(tmp.path(), &config(), FakeBackend::new(&[], None))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("no recorded audio"));
         // Left as processing for the caller to mark failed.
         assert_eq!(
@@ -1896,13 +1886,9 @@ mod tests {
         cfg.general.backend = "openai-realtime".into();
         cfg.recording = None;
         let backend = FakeBackend::new(&[], None);
-        let err = process_recording(
-            tmp.path(),
-            &cfg,
-            Some(backend.clone() as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap_err();
+        let err = run_with(tmp.path(), &cfg, backend.clone())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("batch backend"), "{err}");
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     }
@@ -1919,13 +1905,9 @@ mod tests {
         // One chunk per burst at a 3 s cap. The third chunk's request fails:
         // the first two are cached.
         let failing = FakeBackend::with_failures(&texts, Some(3), Some(2), 0);
-        let err = process_recording(
-            tmp.path(),
-            &config(),
-            Some(failing.clone() as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap_err();
+        let err = run_with(tmp.path(), &config(), failing.clone())
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("network is down"), "{err:#}");
         let cache_dir = tmp.path().join(CACHE_DIR);
         assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 2);
@@ -1990,8 +1972,7 @@ mod tests {
         dir: &Path,
         backend: &Arc<RecordingBackend>,
     ) -> anyhow::Result<RecordingMeta> {
-        let backend = backend.clone() as Arc<dyn TranscriptionBackend>;
-        process_recording(dir, &config(), Some(backend)).await
+        run_with(dir, &config(), backend.clone()).await
     }
 
     /// A chunk of `(original start, len)` pieces, packed as
@@ -2289,13 +2270,9 @@ mod tests {
         let fake = FakeBackend::new(&[(3000, "First."), (4000, "Second.")], Some(600));
         let samples = track(120.0, &[(30.0, 1.0, 3000), (90.0, 1.0, 4000)]);
         let (tmp, _) = recording(&[(TrackKind::Mic, 250, Some(samples))]);
-        let meta = process_recording(
-            tmp.path(),
-            &config(),
-            Some(Arc::new(OneSentence(fake.clone())) as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap();
+        let meta = run_with(tmp.path(), &config(), Arc::new(OneSentence(fake.clone())))
+            .await
+            .unwrap();
         assert_eq!(fake.calls.load(Ordering::Relaxed), 1);
         let lines: Vec<_> = meta
             .segments
@@ -2368,31 +2345,48 @@ mod tests {
             .sum()
     }
 
-    /// The cancelled track is reused only with its mask: without the mask
-    /// both are made again.
+    /// A cached cancelled track is reused only with its mask and at the
+    /// mic's length: without the mask, or of another length (another
+    /// recording, or a stray file), it is cancelled again rather than sent.
     #[tokio::test]
-    async fn a_cached_track_without_its_mask_is_redone() {
+    async fn a_stale_cached_track_is_redone() {
         let (mic, system) = speaker_call();
-        let (tmp, _) = recording(&[
-            (TrackKind::Mic, 0, Some(mic.clone())),
-            (TrackKind::System, 0, Some(system)),
-        ]);
-        let failing = Arc::new(RecordingBackend {
-            fail_from: Some(0),
-            ..Default::default()
-        });
-        run_recording(tmp.path(), &failing).await.unwrap_err();
-        let cache = tmp.path().join(CACHE_DIR);
-        write_wav(&cache.join(ECHO_CANCELLED_MIC), &vec![1234i16; mic.len()]);
-        fs::remove_file(cache.join(ECHO_CANCELLED_MASK)).unwrap();
+        for (case, without_its_mask) in [("without its mask", true), ("of the wrong length", false)]
+        {
+            let (tmp, _) = recording(&[
+                (TrackKind::Mic, 0, Some(mic.clone())),
+                (TrackKind::System, 0, Some(system.clone())),
+            ]);
+            let cache = tmp.path().join(CACHE_DIR);
+            if without_its_mask {
+                let failing = Arc::new(RecordingBackend {
+                    fail_from: Some(0),
+                    ..Default::default()
+                });
+                run_recording(tmp.path(), &failing).await.expect_err(case);
+                write_wav(&cache.join(ECHO_CANCELLED_MIC), &vec![1234i16; mic.len()]);
+                fs::remove_file(cache.join(ECHO_CANCELLED_MASK))
+                    .unwrap_or_else(|e| panic!("{case}: {e}"));
+            } else {
+                write_wav(
+                    &cache.join(ECHO_CANCELLED_MIC),
+                    &vec![1234i16; mic.len() - 1],
+                );
+            }
 
-        let working = Arc::new(RecordingBackend::default());
-        run_recording(tmp.path(), &working).await.unwrap();
-        let sent = &working.sent.lock().unwrap()[0];
-        assert!(
-            *sent == expected_mic(tmp.path(), 0),
-            "stale cached track sent"
-        );
+            let working = Arc::new(RecordingBackend::default());
+            run_recording(tmp.path(), &working)
+                .await
+                .unwrap_or_else(|e| panic!("{case}: {e:#}"));
+            let sent = working.sent.lock().unwrap();
+            let sent = sent
+                .first()
+                .unwrap_or_else(|| panic!("{case}: nothing sent"));
+            assert!(
+                *sent == expected_mic(tmp.path(), 0),
+                "{case}: stale cached track sent"
+            );
+        }
     }
 
     /// The system track started 400 ms after the mic, so system sample `v`
@@ -2499,26 +2493,6 @@ mod tests {
         assert!(!tmp.path().join(CACHE_DIR).exists());
     }
 
-    /// A cached cancelled track whose length is not the mic's (another
-    /// recording, or a stray file) is cancelled again rather than sent.
-    #[tokio::test]
-    async fn a_cached_track_of_the_wrong_length_is_redone() {
-        let (mic, system) = speaker_call();
-        let (tmp, _) = recording(&[
-            (TrackKind::Mic, 0, Some(mic.clone())),
-            (TrackKind::System, 0, Some(system)),
-        ]);
-        let cached = tmp.path().join(CACHE_DIR).join(ECHO_CANCELLED_MIC);
-        write_wav(&cached, &vec![1234i16; mic.len() - 1]);
-        let backend = Arc::new(RecordingBackend::default());
-        run_recording(tmp.path(), &backend).await.unwrap();
-        let sent = &backend.sent.lock().unwrap()[0];
-        assert!(
-            *sent == expected_mic(tmp.path(), 0),
-            "stale cached track sent"
-        );
-    }
-
     #[test]
     fn cancelled_mic_chunks_are_cached_apart_from_raw_ones() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2571,142 +2545,6 @@ mod tests {
         let mut moved = chunk.clone();
         moved.pieces[1].condensed += 1;
         assert_eq!(cache("groq", "m1").load(TrackKind::System, &moved), None);
-    }
-
-    /// Real-data check of what gets sent, run by hand on copies of a
-    /// real recording (never in the recording folder itself):
-    ///
-    /// ```text
-    /// WHISRS_ECHO_MIC=mic.wav WHISRS_ECHO_SYSTEM=system.wav \
-    /// WHISRS_ECHO_OUT=cancelled.wav WHISRS_ECHO_LAG=<(system - mic offset_ms) * 16> \
-    /// WHISRS_SPEECH_LABELS=deepgram.json \
-    /// cargo test --release --lib speech_on_a_real_recording -- --ignored --nocapture
-    /// ```
-    ///
-    /// The labels are a Deepgram response for the cancelled mic: the words
-    /// in `results.utterances[].words[]` are the user's. Prints the share of
-    /// STFT frames (256-sample hop, as the prototype counted them) inside
-    /// those words that are sent, and of all other frames, both for the
-    /// padded near-end mask alone and for the final regions, and how long
-    /// each track is once condensed.
-    #[test]
-    #[ignore = "needs a real recording, see the doc comment"]
-    fn speech_on_a_real_recording() {
-        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
-        let (mic, system, out) = (
-            PathBuf::from(var("WHISRS_ECHO_MIC")),
-            PathBuf::from(var("WHISRS_ECHO_SYSTEM")),
-            PathBuf::from(var("WHISRS_ECHO_OUT")),
-        );
-        let lag: i64 = var("WHISRS_ECHO_LAG").parse().unwrap();
-        let labels: serde_json::Value =
-            serde_json::from_slice(&fs::read(var("WHISRS_SPEECH_LABELS")).unwrap()).unwrap();
-        let started = std::time::Instant::now();
-        let EchoOutcome::Cancelled(done) = cancel_echo(&mic, &system, lag, &out).unwrap() else {
-            panic!("no echo cancelled");
-        };
-        println!("{done:?} in {:.2?}", started.elapsed());
-
-        let scan = scan_track(&out, TrackKind::Mic.vad_config(Vad::Earshot)).unwrap();
-        let active = speech_activity(Some(&done.near_end), &scan.speech, "mic");
-        let regions = speech::regions(&active, scan.len);
-        let mut words: Vec<(f64, f64)> = labels["results"]["utterances"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|u| u["words"].as_array().unwrap().iter())
-            .map(|w| (w["start"].as_f64().unwrap(), w["end"].as_f64().unwrap()))
-            .collect();
-        words.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let hop = 256;
-        let frames = (scan.len - 512) / hop + 1;
-        let mut next_word = 0;
-        let mut labelled = vec![false; frames];
-        for (i, label) in labelled.iter_mut().enumerate() {
-            let t = (i * hop) as f64 / f64::from(SAMPLE_RATE);
-            while next_word < words.len() && words[next_word].1 < t {
-                next_word += 1;
-            }
-            *label = words[next_word..]
-                .iter()
-                .take_while(|w| w.0 <= t)
-                .any(|w| t <= w.1);
-        }
-        let padded = |mask: &[bool], at: usize| {
-            let f = at / speech::FRAME;
-            mask[f.saturating_sub(3)..(f + 4).min(mask.len())]
-                .iter()
-                .any(|&a| a)
-        };
-        let detector_alone = |at: usize| padded(&done.near_end, at);
-        let with_speech = |at: usize| padded(&active, at);
-        let in_regions = |at: usize| regions.iter().any(|r| r.contains(&at));
-        let share = |kept: &dyn Fn(usize) -> bool, want: bool| {
-            let picked: Vec<usize> = (0..frames).filter(|&i| labelled[i] == want).collect();
-            let n = picked.iter().filter(|&&i| kept(i * hop)).count();
-            100.0 * n as f64 / picked.len() as f64
-        };
-        println!(
-            "label frames {} of {frames}",
-            labelled.iter().filter(|&&l| l).count()
-        );
-        for (name, kept) in [
-            (
-                "near-end mask alone, padded",
-                &detector_alone as &dyn Fn(usize) -> bool,
-            ),
-            ("near-end and speech mask, padded", &with_speech),
-            ("final regions", &in_regions),
-        ] {
-            println!(
-                "{name}: user's word frames kept {:.1}%, other frames kept {:.1}%",
-                share(kept, true),
-                share(kept, false)
-            );
-        }
-
-        // The user over the far side: word frames where the system track,
-        // shifted by the lag, holds speech.
-        let system_scan = scan_track(&system, TrackKind::System.vad_config(Vad::Earshot)).unwrap();
-        let far_active = |at: usize| {
-            let at = at as i64 - done.report.lag;
-            at >= 0
-                && system_scan
-                    .speech
-                    .get(at as usize / speech::FRAME)
-                    .is_some_and(|&s| s)
-        };
-        let over: Vec<usize> = (0..frames)
-            .filter(|&i| labelled[i] && far_active(i * hop))
-            .collect();
-        let kept = over.iter().filter(|&&i| in_regions(i * hop)).count();
-        println!(
-            "user's word frames over far-end audio: {}, kept {:.1}%",
-            over.len(),
-            100.0 * kept as f64 / over.len().max(1) as f64
-        );
-
-        let secs = |samples: usize| samples as f64 / f64::from(SAMPLE_RATE);
-        let report = |name: &str, len: usize, regions: &[Range<usize>], scan: &TrackScan| {
-            let speech_len: usize = regions.iter().map(|r| r.len()).sum();
-            let one: usize = speech::pack(regions, &scan.energies, &scan.speech, None)
-                .iter()
-                .map(TimeMap::condensed_len)
-                .sum();
-            let groq = speech::pack(regions, &scan.energies, &scan.speech, Some(600));
-            println!(
-                "{name}: {:.1} s track, {} region(s), {:.1} s of speech, condensed {:.1} s \
-                 ({} chunk(s) at a 600 s cap)",
-                secs(len),
-                regions.len(),
-                secs(speech_len),
-                secs(one),
-                groq.len()
-            );
-        };
-        report("mic", scan.len, &regions, &scan);
-        let system_regions = speech::regions(&system_scan.speech, system_scan.len);
-        report("system", system_scan.len, &system_regions, &system_scan);
     }
 
     /// [`FakeBackend`] with a voice label on every segment and its one
@@ -2772,13 +2610,7 @@ mod tests {
     }
 
     async fn run_labelled(dir: &Path, backend: Labelled, config: &Config) -> RecordingMeta {
-        process_recording(
-            dir,
-            config,
-            Some(Arc::new(backend) as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap()
+        run_with(dir, config, Arc::new(backend)).await.unwrap()
     }
 
     fn speaker_lines(meta: &RecordingMeta) -> Vec<(&str, &str)> {
@@ -2920,10 +2752,10 @@ mod tests {
         let process = |extra: &'static str| async move {
             let (tmp, _) =
                 recording(&[(TrackKind::System, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
-            let meta = process_recording(
+            let meta = run_with(
                 tmp.path(),
                 &speaker_config(extra),
-                Some(Arc::new(TwoVoicesInOneLine) as Arc<dyn TranscriptionBackend>),
+                Arc::new(TwoVoicesInOneLine),
             )
             .await
             .unwrap();
@@ -2998,56 +2830,42 @@ mod tests {
         );
     }
 
-    /// One remote voice keeps the others label (here `--others Video`).
+    /// One remote voice keeps the others label (here `--others Video`), or,
+    /// `--with` one person, is them, in the transcript and its front matter.
     #[tokio::test]
-    async fn one_remote_voice_keeps_the_others_label() {
-        let (tmp, _) = call();
-        let mut meta = store::read_meta(tmp.path()).unwrap();
-        meta.others_label = Some("Video".into());
-        store::write_meta(tmp.path(), &meta).unwrap();
-        let mut backend = call_voices();
-        backend.voices = vec![
-            ("hi all", "0"),
-            ("hello there", "1"),
-            ("good morning", "1"),
-            ("so the plan", "1"),
+    async fn one_remote_voice_is_the_others_label_or_the_one_participant() {
+        let video: fn(&mut RecordingMeta) = |meta| meta.others_label = Some("Video".into());
+        let sarah: fn(&mut RecordingMeta) = |meta| meta.participants = vec!["Sarah".into()];
+        let video_lines = ["**[00:00:04] Video:** hello there good morning so the plan\n"];
+        let sarah_lines = [
+            "speakers:\n  - \"Tester\"\n  - \"Sarah\"\n",
+            "**[00:00:04] Sarah:** hello there",
         ];
-        let config = speaker_config("diarization = \"backend\"\n");
-        let meta = run_labelled(tmp.path(), backend, &config).await;
-        assert_eq!(speaker_names(&meta), [("me", "Tester"), ("S1", "Video")]);
-        assert_eq!(meta.speakers[1].source, "channel");
-        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
-        assert!(
-            md.contains("**[00:00:04] Video:** hello there good morning so the plan\n"),
-            "{md}"
-        );
-    }
-
-    /// `--with` one person and one remote voice: the voice is them, in the
-    /// transcript and its front matter.
-    #[tokio::test]
-    async fn the_one_participant_names_the_one_remote_voice() {
-        let (tmp, _) = call();
-        let mut meta = store::read_meta(tmp.path()).unwrap();
-        meta.participants = vec!["Sarah".into()];
-        store::write_meta(tmp.path(), &meta).unwrap();
-        let mut backend = call_voices();
-        backend.voices = vec![
-            ("hi all", "0"),
-            ("hello there", "1"),
-            ("good morning", "1"),
-            ("so the plan", "1"),
-        ];
-        let config = speaker_config("diarization = \"backend\"\n");
-        let meta = run_labelled(tmp.path(), backend, &config).await;
-        assert_eq!(speaker_names(&meta), [("me", "Tester"), ("S1", "Sarah")]);
-        assert_eq!(meta.speakers[1].source, "with");
-        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
-        assert!(
-            md.contains("speakers:\n  - \"Tester\"\n  - \"Sarah\"\n"),
-            "{md}"
-        );
-        assert!(md.contains("**[00:00:04] Sarah:** hello there"), "{md}");
+        for (edit, name, source, lines) in [
+            (video, "Video", "channel", &video_lines[..]),
+            (sarah, "Sarah", "with", &sarah_lines[..]),
+        ] {
+            let (tmp, _) = call();
+            edit_meta(tmp.path(), edit);
+            let mut backend = call_voices();
+            backend.voices = vec![
+                ("hi all", "0"),
+                ("hello there", "1"),
+                ("good morning", "1"),
+                ("so the plan", "1"),
+            ];
+            let config = speaker_config("diarization = \"backend\"\n");
+            let meta = run_with(tmp.path(), &config, Arc::new(backend))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(speaker_names(&meta), [("me", "Tester"), ("S1", name)]);
+            assert_eq!(meta.speakers[1].source, source, "{name}");
+            let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            for line in lines {
+                assert!(md.contains(line), "{name}: {line:?} missing from:\n{md}");
+            }
+        }
     }
 
     /// The names the user gave are kept by processing, which names the
@@ -3055,14 +2873,14 @@ mod tests {
     #[tokio::test]
     async fn the_users_names_are_kept_and_the_last_voice_named() {
         let (tmp, _) = call();
-        let mut meta = store::read_meta(tmp.path()).unwrap();
-        meta.participants = vec!["Sarah".into(), "Omar".into()];
-        meta.speaker_names = [(
-            "S1".to_string(),
-            crate::recording::SpeakerName::plain("Sarah"),
-        )]
-        .into();
-        store::write_meta(tmp.path(), &meta).unwrap();
+        edit_meta(tmp.path(), |meta| {
+            meta.participants = vec!["Sarah".into(), "Omar".into()];
+            meta.speaker_names = [(
+                "S1".to_string(),
+                crate::recording::SpeakerName::plain("Sarah"),
+            )]
+            .into();
+        });
         let config = speaker_config("diarization = \"backend\"\n");
         let meta = run_labelled(tmp.path(), call_voices(), &config).await;
         let sources: Vec<(&str, &str, &str)> = meta
@@ -3090,13 +2908,7 @@ mod tests {
         let config = speaker_config("diarization = \"backend\"\n");
         let (tmp, _) = call();
         let backend = FakeBackend::new(&[(3000, "hi all"), (5000, "hello there")], None);
-        let meta = process_recording(
-            tmp.path(),
-            &config,
-            Some(backend as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap();
+        let meta = run_with(tmp.path(), &config, backend).await.unwrap();
         assert_eq!(meta.diarization.as_deref(), Some("off"));
         assert_eq!(
             speaker_names(&meta),
@@ -3252,9 +3064,9 @@ mod tests {
                "{\"S1\": {\"name\": \"Sarah\", \"evidence\": \"i'm sarah\"}, \"S2\": null}"}}]}"#,
         ));
         let (tmp, _) = call();
-        let mut meta = store::read_meta(tmp.path()).unwrap();
-        meta.participants = vec!["Sarah".into(), "Omar".into()];
-        store::write_meta(tmp.path(), &meta).unwrap();
+        edit_meta(tmp.path(), |meta| {
+            meta.participants = vec!["Sarah".into(), "Omar".into()]
+        });
         let config = speaker_config(&format!(
             "diarization = \"backend\"\nname_speakers = true\n\
              [llm]\napi_key = \"k\"\napi_url = \"{url}\"\n"
@@ -3451,9 +3263,7 @@ mod tests {
 
         // A recording that stored `shared_mic` keeps it over the config.
         let (tmp, _) = two_on_the_mic();
-        let mut stored = store::read_meta(tmp.path()).unwrap();
-        stored.shared_mic = Some(true);
-        store::write_meta(tmp.path(), &stored).unwrap();
+        edit_meta(tmp.path(), |stored| stored.shared_mic = Some(true));
         let meta = run_labelled(tmp.path(), mic_voices(), &config).await;
         assert_eq!(speaker_lines(&meta), [("M1", "one"), ("M2", "two")]);
     }
@@ -3811,16 +3621,12 @@ mod tests {
         assert!(again.errors.is_empty(), "{:?}", again.errors);
 
         // Another number of voices is another request, and it fails.
-        let mut meta = store::read_meta(tmp.path()).unwrap();
-        meta.num_speakers = Some(3);
-        store::write_meta(tmp.path(), &meta).unwrap();
+        edit_meta(tmp.path(), |meta| meta.num_speakers = Some(3));
         let failed = process_call(tmp.path(), &sidecar_config(&url, "")).await;
         assert!(speakers::separation_failure(&failed).is_some());
 
         // Back to the cached request: separated again, the note gone.
-        let mut meta = store::read_meta(tmp.path()).unwrap();
-        meta.num_speakers = Some(0);
-        store::write_meta(tmp.path(), &meta).unwrap();
+        edit_meta(tmp.path(), |meta| meta.num_speakers = Some(0));
         let healed = process_call(tmp.path(), &sidecar_config(&url, "")).await;
         assert_eq!(speaker_lines(&healed), speaker_lines(&first));
         assert!(healed.errors.is_empty(), "{:?}", healed.errors);
@@ -4007,58 +3813,48 @@ mod tests {
         assert_eq!(fp, fingerprint_of(&streaming));
     }
 
-    /// The fingerprint as it was before the ASR sidecar asked for timings:
-    /// [`cache_fingerprint`]'s key without `sidecar_timings`.
-    fn fingerprint_before_sidecar_timings(toml_text: &str) -> String {
-        let config: Config = toml::from_str(toml_text).unwrap();
-        let name = recording_backend_name(&config).unwrap();
-        let tcfg = recording_transcription_config(&name, &config, &config.general.language);
-        let mut key = serde_json::json!({
-            "chunking": 2,
-            "backend": canonical_backend_name(&name),
-            "identity": backend_identity(&name, &config),
-            "language": tcfg.language,
-            "model": tcfg.model,
-            "prompt": tcfg.prompt,
-            "keyterms": tcfg.keyterms,
-        });
-        if tcfg.vad != Vad::Rms {
-            key["vad"] = serde_json::json!(crate::vad_name(tcfg.vad));
-            if !tcfg.soft_voices {
-                key["soft_voices"] = serde_json::json!(false);
-            }
-        }
-        format!("{:016x}", fnv1a64(key.to_string().as_bytes()))
-    }
-
     /// Only the ASR sidecar's chunks changed with its timings: every other
-    /// backend's fingerprint is the one it had, so the chunks it cached
-    /// still match, and the sidecar's is new, so its phrase-by-phrase
-    /// chunks are transcribed again.
+    /// backend's fingerprint is the one it had before them, pinned here, so
+    /// the chunks it cached still match, and the sidecar's is not (it is
+    /// pinned at its value with them), so its phrase-by-phrase chunks are
+    /// transcribed again. Every input a row's
+    /// fingerprint reads is written out, so the values pin the key format
+    /// alone and a changed default leaves them as they are.
     #[test]
     fn sidecar_timings_change_only_the_sidecar_fingerprint() {
-        for unchanged in [
-            "[general]\nbackend = \"groq\"\nlanguage = \"en\"\n",
-            "[general]\nbackend = \"deepgram\"\nvocabulary = [\"whisrs\"]\n",
-            "[general]\nbackend = \"openai\"\n[audio]\nvad = \"rms\"\n",
-            "[general]\nbackend = \"local-whisper\"\n\
-             [local-whisper]\nmodel_path = \"/m/base.en.bin\"\n",
+        for (unchanged, before) in [
+            (
+                "[general]\nbackend = \"groq\"\nlanguage = \"en\"\nvocabulary = []\n\
+                 [groq]\nmodel = \"whisper-large-v3-turbo\"\n[audio]\nvad = \"earshot\"\n",
+                "eecea86d5a484830",
+            ),
+            (
+                "[general]\nbackend = \"deepgram\"\nlanguage = \"en\"\n\
+                 vocabulary = [\"whisrs\"]\n[deepgram]\nmodel = \"nova-3\"\n\
+                 [audio]\nvad = \"earshot\"\n",
+                "96b4c178bf9b8984",
+            ),
+            (
+                "[general]\nbackend = \"openai\"\nlanguage = \"en\"\nvocabulary = []\n\
+                 [openai]\nmodel = \"gpt-4o-mini-transcribe\"\n[audio]\nvad = \"rms\"\n",
+                "137e2d4e68b864be",
+            ),
+            (
+                "[general]\nbackend = \"local-whisper\"\nlanguage = \"en\"\nvocabulary = []\n\
+                 [local-whisper]\nmodel_path = \"/m/base.en.bin\"\n\
+                 phrase_silence_ms = 400\nflash_attn = false\n[audio]\nvad = \"earshot\"\n",
+                "35dedd8af09c2adf",
+            ),
         ] {
-            assert_eq!(
-                fingerprint_of(unchanged),
-                fingerprint_before_sidecar_timings(unchanged),
-                "{unchanged}"
-            );
+            assert_eq!(fingerprint_of(unchanged), before, "{unchanged}");
         }
-        let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\
-                       [asr-sidecar]\nurl = \"http://127.0.0.1:1/t\"\n";
-        let vibevoice = sidecar.replace("\"asr-sidecar\"\n[", "\"vibevoice\"\n[");
+        let sidecar = "[general]\nbackend = \"asr-sidecar\"\nlanguage = \"en\"\nvocabulary = []\n\
+                       [asr-sidecar]\nurl = \"http://127.0.0.1:1/t\"\n\
+                       model = \"microsoft/VibeVoice-ASR-HF\"\n[audio]\nvad = \"earshot\"\n";
+        let vibevoice = sidecar.replace("backend = \"asr-sidecar\"", "backend = \"vibevoice\"");
         for sidecar in [sidecar, vibevoice.as_str()] {
-            assert_ne!(
-                fingerprint_of(sidecar),
-                fingerprint_before_sidecar_timings(sidecar),
-                "{sidecar}"
-            );
+            assert_ne!(fingerprint_of(sidecar), "439d0e07e69c82fa", "{sidecar}");
+            assert_eq!(fingerprint_of(sidecar), "e5611112abb0d53a", "{sidecar}");
         }
     }
 
@@ -4069,31 +3865,11 @@ mod tests {
         let samples = track(17.0, &[(2.0, 1.0, 3000), (12.0, 1.0, 4000)]);
         let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(samples))]);
         let failing = FakeBackend::with_failures(&texts, Some(3), Some(1), 0);
-        process_recording(
-            tmp.path(),
-            &config(),
-            Some(failing as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap_err();
+        run_with(tmp.path(), &config(), failing).await.unwrap_err();
         assert_eq!(fs::read_dir(tmp.path().join(CACHE_DIR)).unwrap().count(), 1);
         let meta = store::read_meta(tmp.path()).unwrap();
         assert_eq!(meta.mic_language.as_deref(), Some("en"), "stored");
         (tmp, texts)
-    }
-
-    /// A retry that changes the language (`retry -l` rewrites the stored
-    /// one) sends every chunk again.
-    #[tokio::test]
-    async fn a_language_change_retranscribes_cached_chunks() {
-        let (tmp, texts) = english_chunk_cached().await;
-        let mut meta = store::read_meta(tmp.path()).unwrap();
-        meta.mic_language = Some("de".into());
-        store::write_meta(tmp.path(), &meta).unwrap();
-        let working = FakeBackend::new(&texts, Some(3));
-        run(tmp.path(), working.clone()).await;
-        // Both chunks sent again: nothing English is reused.
-        assert_eq!(*working.languages.lock().unwrap(), ["de", "de"]);
     }
 
     /// A recording keeps the language it started with: a config change
@@ -4105,13 +3881,9 @@ mod tests {
         german.general.language = "de".into();
         german.recording.as_mut().unwrap().language = Some("de".into());
         let working = FakeBackend::new(&texts, Some(3));
-        let meta = process_recording(
-            tmp.path(),
-            &german,
-            Some(working.clone() as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap();
+        let meta = run_with(tmp.path(), &german, working.clone())
+            .await
+            .unwrap();
         assert_eq!(
             *working.languages.lock().unwrap(),
             ["en"],
@@ -4135,27 +3907,23 @@ mod tests {
                 Some(track(17.0, &[(1.0, 1.0, 6000), (12.0, 1.0, 7000)])),
             ),
         ]);
-        let mut meta = store::read_meta(tmp.path()).unwrap();
-        meta.mic_language = Some("de".into());
-        meta.system_language = Some("en".into());
-        meta.others_label = Some("Video".into());
-        store::write_meta(tmp.path(), &meta).unwrap();
+        edit_meta(tmp.path(), |meta| {
+            meta.mic_language = Some("de".into());
+            meta.system_language = Some("en".into());
+            meta.others_label = Some("Video".into());
+        });
 
         // One chunk for the mic, two for the system track; the last fails.
         let failing = FakeBackend::with_failures(&texts, Some(3), Some(2), 0);
-        process_recording(
-            tmp.path(),
-            &config(),
-            Some(failing.clone() as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap_err();
+        run_with(tmp.path(), &config(), failing.clone())
+            .await
+            .unwrap_err();
         assert_eq!(*failing.languages.lock().unwrap(), ["de", "en"]);
 
         // A retry with the system track in another language.
-        let mut meta = store::read_meta(tmp.path()).unwrap();
-        meta.system_language = Some("auto".into());
-        store::write_meta(tmp.path(), &meta).unwrap();
+        edit_meta(tmp.path(), |meta| {
+            meta.system_language = Some("auto".into())
+        });
         let working = FakeBackend::new(&texts, Some(3));
         let meta = run(tmp.path(), working.clone()).await;
         assert_eq!(
@@ -4212,13 +3980,7 @@ mod tests {
         let mut cfg = config();
         cfg.recording.as_mut().unwrap().language = Some("de".into());
         let backend = FakeBackend::new(&[(3000, "ich"), (6000, "them")], None);
-        let meta = process_recording(
-            tmp.path(),
-            &cfg,
-            Some(backend.clone() as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap();
+        let meta = run_with(tmp.path(), &cfg, backend.clone()).await.unwrap();
         assert_eq!(*backend.languages.lock().unwrap(), ["de", "de"]);
         assert_eq!(meta.mic_language.as_deref(), Some("de"));
         assert_eq!(meta.system_language.as_deref(), Some("de"));
@@ -4266,33 +4028,49 @@ mod tests {
         }
     }
 
+    /// Endless rate limits give up within one budget, whichever layer
+    /// retries: a phrase backend retries each phrase inside
+    /// `transcribe_segments` and this layer passes its give-up through; a
+    /// backend that returns the 429 itself is retried and given up here.
     #[tokio::test(start_paused = true)]
     async fn phrase_backend_rate_limits_are_not_retried_twice() {
-        let backend = Arc::new(LimitedPhrases {
+        let phrases = Arc::new(LimitedPhrases {
             calls: AtomicUsize::new(0),
         });
-        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
-        let started = tokio::time::Instant::now();
-        let err = process_recording(
-            tmp.path(),
-            &config(),
-            Some(backend.clone() as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap_err();
-        // One phrase budget (300 s at 7 s a wait is 43 retries), not one
-        // per chunk-level retry on top.
-        assert!(
-            started.elapsed() <= RATE_LIMIT_BUDGET,
-            "{:?}",
-            started.elapsed()
-        );
-        assert_eq!(backend.calls.load(Ordering::Relaxed), 43);
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("HTTP 429") && text.contains("retry resumes from the failed chunk"),
-            "{text}"
-        );
+        let segments = FakeBackend::with_failures(&[(3000, "never")], None, None, usize::MAX);
+        let rows: [(&str, Arc<dyn TranscriptionBackend>, &AtomicUsize); 2] = [
+            ("phrase backend", phrases.clone(), &phrases.calls),
+            ("segment backend", segments.clone(), &segments.calls),
+        ];
+        for (case, backend, calls) in rows {
+            let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
+            let started = tokio::time::Instant::now();
+            // Bounded, so a retry that never gives up fails here instead of
+            // hanging the paused clock.
+            let err = tokio::time::timeout(
+                2 * RATE_LIMIT_BUDGET,
+                process_recording(tmp.path(), &config(), Some(backend)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: still retrying after two budgets"))
+            .unwrap_err();
+            // One budget (300 s at 7 s a wait is 43 calls), not one per
+            // chunk-level retry on top.
+            assert!(
+                started.elapsed() <= RATE_LIMIT_BUDGET,
+                "{case}: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 43, "{case}");
+            // The server's own words reach the error too.
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("HTTP 429")
+                    && text.contains("slow down")
+                    && text.contains("retry resumes from the failed chunk"),
+                "{case}: {text}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -4305,24 +4083,6 @@ mod tests {
         assert_eq!(meta.segments[0].text, "patience");
         // Two 7 s Retry-After waits on the paused clock.
         assert!(started.elapsed() >= Duration::from_secs(14));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn endless_rate_limits_fail_with_a_clear_error() {
-        let backend = FakeBackend::with_failures(&[(3000, "never")], None, None, usize::MAX);
-        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
-        let err = process_recording(
-            tmp.path(),
-            &config(),
-            Some(backend as Arc<dyn TranscriptionBackend>),
-        )
-        .await
-        .unwrap_err();
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("HTTP 429") && text.contains("slow down"),
-            "{text}"
-        );
     }
 
     #[test]

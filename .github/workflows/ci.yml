@@ -19,6 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check docs
+        run: ./scripts/check-docs.sh
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
 
@@ -59,8 +62,7 @@ jobs:
       - name: Test xkb-type
         run: cargo test -p xkb-type --all-features -- --skip from_localectl_returns_layout_when_available
 
-      # Likewise for audio-silence-gate: its detector tests and the vad_check
-      # example (which reads fixtures only at run time, so it builds here).
+      # Likewise for audio-silence-gate: its detector tests.
       - name: Clippy audio-silence-gate
         run: cargo clippy -p audio-silence-gate --all-targets -- -D warnings
 

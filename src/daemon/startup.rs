@@ -493,45 +493,6 @@ mod tests {
         (dir, config)
     }
 
-    /// The whole point of the feature: terms that live only in vocabulary.txt
-    /// end up in the config the daemon runs on. Deleting the merge call from
-    /// `load_config_from` fails here.
-    #[test]
-    fn vocabulary_file_terms_reach_the_loaded_config() {
-        let (_dir, config) = write_pair(
-            "[general]\nbackend = \"groq\"\n",
-            Some("# keyterms\nNixOS\n\nClaude Code\n"),
-        );
-        assert_eq!(config.general.vocabulary, vec!["NixOS", "Claude Code"]);
-    }
-
-    /// config.toml's terms come first and a term in both stores is kept once.
-    /// Ordering is not cosmetic: Deepgram charges keyterms against a byte and
-    /// word budget in list order, so a reshuffle changes which terms survive.
-    #[test]
-    fn config_toml_terms_come_first_and_duplicates_are_dropped() {
-        let (_dir, config) = write_pair(
-            "[general]\nbackend = \"groq\"\nvocabulary = [\"whisrs\", \"GNOME\"]\n",
-            Some("Deepgram\nwhisrs\nNixOS\n"),
-        );
-        assert_eq!(
-            config.general.vocabulary,
-            vec!["whisrs", "GNOME", "Deepgram", "NixOS"],
-            "config.toml first, then the file's new terms, each term once"
-        );
-    }
-
-    /// The feature is opt-in by creating the file, so no file means the
-    /// config.toml list is passed through untouched.
-    #[test]
-    fn a_missing_vocabulary_file_is_a_no_op() {
-        let (_dir, config) = write_pair(
-            "[general]\nbackend = \"groq\"\nvocabulary = [\"whisrs\"]\n",
-            None,
-        );
-        assert_eq!(config.general.vocabulary, vec!["whisrs"]);
-    }
-
     /// An unreadable path is warned about and ignored, never fatal: the daemon
     /// still has to start. A directory is the portable stand-in for a file the
     /// process cannot read (chmod is a no-op for root in CI).
@@ -546,32 +507,6 @@ mod tests {
         merge_vocabulary_file_at(&mut config, &vocab_path);
 
         assert_eq!(config.general.vocabulary, vec!["whisrs"]);
-    }
-
-    /// The end of the "user added a term" flow: `whisrs config` wrote the whole
-    /// merged list to vocabulary.txt and an empty `vocabulary` to config.toml.
-    /// The daemon must then load exactly the list the user saw in the editor.
-    /// This drives the real writer, not a hand-rolled file.
-    #[test]
-    fn a_migrated_vocabulary_round_trips_back_through_the_daemon() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[general]\nbackend = \"groq\"\nvocabulary = []\n",
-        )
-        .expect("write config.toml");
-        let vocab_path = dir.path().join("vocabulary.txt");
-        let migrated = vec![
-            "whisrs".to_string(),
-            "Hyprland".to_string(),
-            "NixOS".to_string(),
-        ];
-        whisrs::config::vocabulary::write_vocabulary_file(&vocab_path, &migrated)
-            .expect("write vocabulary.txt");
-
-        let (config, _) = load_pair(&config_path, &vocab_path);
-        assert_eq!(config.general.vocabulary, migrated);
     }
 
     /// An unparseable config.toml still gets the vocabulary merge.

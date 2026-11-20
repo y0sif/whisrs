@@ -298,7 +298,7 @@ impl ksni::Tray for WhisrsTray {
             // Non-interactive status line: version + current state.
             MenuItem::Standard(StandardItem {
                 label: format!(
-                    "whisrs v{} — {}",
+                    "whisrs v{}: {}",
                     env!("CARGO_PKG_VERSION"),
                     state_word(state)
                 ),
@@ -625,7 +625,7 @@ mod tests {
             for text in [
                 tray.title(),
                 tray.tool_tip().description,
-                state_word(state).to_string(),
+                status_line(&tray),
             ] {
                 assert!(!text.to_lowercase().contains("record"), "{state:?}: {text}");
                 assert!(!text.contains('\u{2014}'), "{state:?}: {text}");
@@ -634,6 +634,18 @@ mod tests {
         let dictating = tray_with(cmd_tx, State::Recording);
         assert_eq!(dictating.tool_tip().description, "Dictating...");
         assert_eq!(dictating.title(), "whisrs: dictating");
+        assert_eq!(
+            status_line(&dictating),
+            format!("whisrs v{}: dictating", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// The menu's first item: the grayed-out version and state line.
+    fn status_line(tray: &WhisrsTray) -> String {
+        match &tray.menu()[0] {
+            MenuItem::Standard(s) => s.label.clone(),
+            _ => panic!("the menu starts with the status line"),
+        }
     }
 
     /// No two icon sets share a pixmap at any size, so a recording never looks
@@ -887,27 +899,6 @@ mod tests {
         }
 
         #[test]
-        fn recording_line_describes_each_phase() {
-            assert_eq!(recording_line(&RecordingStatus::default()), None);
-            assert_eq!(
-                recording_line(&active_recording(Some("standup"))).as_deref(),
-                Some("Recording mic and system audio since 09:30 (standup)")
-            );
-            assert_eq!(
-                recording_line(&active_recording(None)).as_deref(),
-                Some("Recording mic and system audio since 09:30")
-            );
-            let processing = RecordingStatus {
-                phase: RecordingPhase::Processing,
-                ..Default::default()
-            };
-            assert_eq!(
-                recording_line(&processing).as_deref(),
-                Some("Processing recording...")
-            );
-        }
-
-        #[test]
         fn idle_recording_menu_offers_only_start() {
             assert_eq!(
                 labels(&recording_menu_items(&RecordingStatus::default())),
@@ -980,6 +971,10 @@ mod tests {
             assert_eq!(
                 pixmaps(&idle_processing.icon_pixmap()),
                 pixmaps(&icons::get(IconSet::RecordingProcessing))
+            );
+            assert_eq!(
+                idle_processing.tool_tip().description,
+                "Processing recording..."
             );
 
             let dictating = tray_with(

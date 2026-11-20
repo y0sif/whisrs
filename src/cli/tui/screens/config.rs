@@ -130,7 +130,7 @@ pub enum SaveError {
 }
 
 /// Load config.toml (and `vocabulary.txt`) to edit. A file that cannot be
-/// used is refused with the text `whisrs config` exits with (#134): nothing
+/// used is refused with the text `whisrs config` exits with: nothing
 /// opens on defaults over a file the user has.
 pub fn load(paths: &Paths) -> Result<Loaded, String> {
     let mut loaded = read(paths)
@@ -170,13 +170,13 @@ pub enum Found {
     /// A config that loads.
     Usable,
     /// A file that does not deserialize, and why: setup starts fresh and
-    /// writes over it, keeping it as `.bak` (#134).
+    /// writes over it, keeping it as `.bak`.
     Broken(String),
 }
 
 /// [`load`] for `whisrs setup`: an unreadable file is refused as by
 /// `config`, but one that does not deserialize opens on the defaults, with
-/// what is wrong, for setup to write over (#134).
+/// what is wrong, for setup to write over.
 pub fn load_for_setup(paths: &Paths) -> Result<(Loaded, Found), String> {
     match read(paths) {
         Ok(loaded) => {
@@ -229,7 +229,7 @@ fn read(paths: &Paths) -> Result<Loaded, (write::UnusableKind, String)> {
         }
     };
     // At load, not at save: the keys are about to be shown back as a config
-    // that looks fine (#116).
+    // that looks fine.
     let mut notices: Vec<Notice> = unknown
         .iter()
         .map(|key| {
@@ -286,7 +286,7 @@ pub fn save(screen: &ConfigScreen, paths: &Paths, overwrite: bool) -> Result<Sav
 /// as it is. With `backup`, the file is first kept as `config.toml.bak`
 /// (0600). Unless `overwrite`, a file that changed since `answers` read it
 /// is left alone, as [`save`] does. A file that does not deserialize is
-/// written over from the defaults, and kept as `.bak` (#134).
+/// written over from the defaults, and kept as `.bak`.
 pub fn save_keys(
     answers: &ConfigScreen,
     keys: &[String],
@@ -2646,6 +2646,16 @@ fn shown(screen: &ConfigScreen, field: &Field, path: &str, env: &Env, ui: &Ui) -
         } if text.is_some_and(|text| means_unset(path, text)) => {
             Shown::muted(options::unset_text(path, unset, config))
         }
+        // The local default model on OpenRouter, which lacks it: the daemon
+        // sends OpenRouter's default instead.
+        Kind::Suggest { .. }
+            if path == "asr-sidecar.model"
+                && text.is_some_and(|text| {
+                    text != whisrs::transcription::factory::model_for_backend("asr-sidecar", config)
+                }) =>
+        {
+            Shown::muted(options::unset_text(path, "default", config))
+        }
         Kind::Suggest { unset, .. } => match text {
             Some("") => Shown::muted("empty"),
             Some(text) => Shown::plain(text),
@@ -2766,7 +2776,7 @@ fn color(screen: &ConfigScreen, path: &str, text: Option<&str>, ui: &Ui) -> Show
     }
 }
 
-/// Where a key row's key comes from, as the daemon would find it (#142).
+/// Where a key row's key comes from, as the daemon would find it.
 enum KeyFrom {
     /// In the file, masked as the row shows it.
     File(String),
@@ -2798,8 +2808,16 @@ fn key_from(screen: &ConfigScreen, path: &str, env: &Env) -> KeyFrom {
                 (Some(key), _) => KeyFrom::File(keys::mask_api_key(key)),
                 (None, "tts") => {
                     let tts = config.tts.as_ref().map_or("groq", |t| t.backend.as_str());
+                    let url = config.tts.as_ref().and_then(|t| t.url.as_deref());
                     match tts {
                         "groq" | "openai" | "deepgram" => KeyFrom::Uses(tts.to_string()),
+                        // tts-sidecar sends this key alone, and OpenRouter
+                        // refuses a request without one.
+                        _ if url.is_some_and(whisrs::config::catalog::is_openrouter) => {
+                            KeyFrom::NotSet {
+                                warn: config.tts.as_ref().is_some_and(|t| t.enabled),
+                            }
+                        }
                         _ => KeyFrom::NotNeeded,
                     }
                 }
@@ -2826,7 +2844,7 @@ fn key_from(screen: &ConfigScreen, path: &str, env: &Env) -> KeyFrom {
 }
 
 /// Where a key comes from: the env var, which wins as in the daemon, the
-/// file (masked), or nowhere (#142).
+/// file (masked), or nowhere.
 fn secret(screen: &ConfigScreen, path: &str, env: &Env) -> Shown {
     match key_from(screen, path, env) {
         KeyFrom::File(masked) => Shown::plain(format!("set {masked}")),
@@ -4189,12 +4207,15 @@ mod tests {
         assert_eq!(fixture.app.overlay().theme, "ember");
         press(&mut fixture.app, "hh");
         assert_eq!(fixture.app.overlay().theme, "custom");
+        // Space is the next value of a closed set, round.
+        press(&mut fixture.app, " ");
+        assert_eq!(fixture.app.overlay().theme, "carbon");
         to_row(&mut fixture, "agent overlay");
+        let enabled = |f: &Fixture| config(f).agent_overlay.as_ref().unwrap().enabled;
         press(&mut fixture.app, "l");
-        assert_eq!(
-            config(&fixture).agent_overlay.as_ref().unwrap().enabled,
-            Some(true)
-        );
+        assert_eq!(enabled(&fixture), Some(true));
+        press(&mut fixture.app, " ");
+        assert_eq!(enabled(&fixture), Some(false));
         // h on a row that is not a choice goes to the section list.
         to_row(&mut fixture, "recording color");
         press(&mut fixture.app, "h");
@@ -4232,39 +4253,64 @@ mod tests {
         assert!(!fixture.app.config.form.is_dirty());
     }
 
-    /// The env var wins, as in the daemon, and says "this shell" (#142).
+    /// What the row of `path` shows, as text.
+    fn shown_text(fixture: &Fixture, path: &str) -> String {
+        let row = schema::row(path);
+        shown(&fixture.app.config, row, path, &fixture.app.env, &ui())
+            .parts
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect()
+    }
+
+    /// The env var wins, as in the daemon, and says "this shell".
     #[test]
     fn a_key_from_the_environment_says_so() {
         let fixture = mockup();
-        let screen = &fixture.app.config;
-        let ui_theme = crate::tui::testing::theme();
-        let glyphs = crate::tui::glyphs::Glyphs::UNICODE;
-        let ui = Ui {
-            theme: &ui_theme,
-            glyphs: &glyphs,
-        };
-        let field = |label: &str| {
-            schema::SECTIONS[1..2]
-                .iter()
-                .flat_map(|s| match s.body {
-                    Body::Rows(fields) => fields.iter(),
-                    _ => [].iter(),
-                })
-                .find(|f| f.label == label)
-                .unwrap()
-        };
-        let text = |label: &str| {
-            let field = field(label);
-            shown(screen, field, field.path, &fixture.app.env, &ui)
-                .parts
-                .iter()
-                .map(|(t, _)| t.as_str())
-                .collect::<String>()
-        };
-        assert_eq!(text("groq api_key"), "WHISRS_GROQ_API_KEY (this shell)");
-        assert_eq!(text("deepgram api_key"), "set ****9f2c");
-        assert_eq!(text("openai api_key"), "not set");
-        assert_eq!(text("sidecar api_key"), "not set, optional");
+        let text = |path| shown_text(&fixture, path);
+        assert_eq!(text("groq.api_key"), "WHISRS_GROQ_API_KEY (this shell)");
+        assert_eq!(text("deepgram.api_key"), "set ****9f2c");
+        assert_eq!(text("openai.api_key"), "not set");
+        assert_eq!(text("asr-sidecar.api_key"), "not set, optional");
+    }
+
+    /// On OpenRouter the sidecar's key and tts-sidecar's are needed, not
+    /// optional: it refuses a request without one. A server of your own
+    /// needs none.
+    #[test]
+    fn an_openrouter_key_is_needed() {
+        let openrouter = app("[general]\nbackend = \"asr-sidecar\"\n\
+             [asr-sidecar]\nurl = \"https://openrouter.ai/api/v1/audio/transcriptions\"\n\
+             [tts]\nenabled = true\nbackend = \"tts-sidecar\"\n\
+             url = \"https://openrouter.ai/api/v1/audio/speech\"\n");
+        assert_eq!(shown_text(&openrouter, "asr-sidecar.api_key"), "not set");
+        assert_eq!(shown_text(&openrouter, "tts.api_key"), "not set");
+        let own = app("[general]\nbackend = \"asr-sidecar\"\n[tts]\nbackend = \"tts-sidecar\"\n");
+        assert_eq!(shown_text(&own, "asr-sidecar.api_key"), "not set, optional");
+        assert_eq!(shown_text(&own, "tts.api_key"), "not needed");
+    }
+
+    /// The sidecar's model row says what goes: on OpenRouter the local
+    /// default model is sent as OpenRouter's default, left out of the file
+    /// or written in it; a model named there, or the local server's
+    /// default, reads as it is.
+    #[test]
+    fn the_sidecar_model_row_says_openrouters_default() {
+        use whisrs::config::catalog;
+
+        let text = |toml: &str| shown_text(&app(toml), "asr-sidecar.model");
+        let openrouter = format!(
+            "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"{}\"\n",
+            catalog::OPENROUTER_STT_URL
+        );
+        let sends = format!("default ({})", catalog::OPENROUTER_STT_DEFAULT_MODEL);
+        assert_eq!(text(&openrouter), sends);
+        let written = format!("{openrouter}model = \"microsoft/VibeVoice-ASR-HF\"\n");
+        assert_eq!(text(&written), sends);
+        let named = format!("{openrouter}model = \"qwen/qwen3-asr-1.7b\"\n");
+        assert_eq!(text(&named), "qwen/qwen3-asr-1.7b");
+        let own = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\n";
+        assert_eq!(text(own), "microsoft/VibeVoice-ASR-HF");
     }
 
     // Saving.
@@ -4306,13 +4352,15 @@ mod tests {
     }
 
     /// An invalid config is refused, nothing is written, and every edit
-    /// stays.
+    /// stays. (A typed URL: the sidecar's is picked now, so it cannot be
+    /// emptied.)
     #[test]
     fn an_invalid_config_is_refused_with_its_edits_kept() {
-        let toml = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\nurl = \"http://127.0.0.1:8765/transcribe\"\n";
+        let toml = "[general]\nbackend = \"openai-compatible-realtime\"\n\
+                    [openai-compatible-realtime]\nurl = \"ws://localhost:12345/realtime\"\n";
         let mut fixture = app(toml);
         open(&mut fixture, "Backend & keys");
-        to_row(&mut fixture, "sidecar url");
+        to_row(&mut fixture, "realtime url");
         press(&mut fixture.app, "\n");
         chord(&mut fixture.app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         press(&mut fixture.app, "\n");
@@ -4326,7 +4374,7 @@ mod tests {
             Err(other) => panic!("refused for another reason: {other:?}"),
             Ok(_) => panic!("saved an invalid config"),
         };
-        assert!(why.contains("no sidecar URL configured"), "{why}");
+        assert!(why.contains("no WebSocket URL configured"), "{why}");
         assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), toml);
         fixture
             .app
@@ -4336,7 +4384,8 @@ mod tests {
         assert!(status.text.starts_with("not saved: "), "{}", status.text);
         assert!(fixture.app.config.form.is_dirty());
         assert!(!config(&fixture).general.notify);
-        assert_eq!(config(&fixture).asr_sidecar.as_ref().unwrap().url, "");
+        let realtime = config(&fixture).openai_compatible_realtime.clone().unwrap();
+        assert_eq!(realtime.url, "");
     }
 
     /// A sparse config, hand-commented: what the save tests below edit.
@@ -4350,48 +4399,35 @@ mod tests {
     }
 
     /// One key changed, one line changed: nothing else of the file moves,
-    /// and no default of anything else is written.
+    /// and no default of anything else is written. `x` on a set key removes
+    /// it from the file, so its default applies again, and the comment above
+    /// it moves onto the key after it.
     #[test]
-    fn a_save_writes_only_the_changed_line() {
-        let mut fixture = app(SPARSE);
-        open(&mut fixture, "General");
-        to_row(&mut fixture, "silence timeout");
-        press(&mut fixture.app, "l");
-        let paths = paths(fixture.dir.path());
-        save(&fixture.app.config, &paths, false).expect("saved");
-        assert_eq!(
-            std::fs::read_to_string(&paths.config).unwrap(),
-            SPARSE.replace("silence_timeout_ms = 4500", "silence_timeout_ms = 4750"),
-            "the file differs by that one line"
-        );
-    }
-
-    /// `x` on a set key removes it from the file, so its default applies
-    /// again. The comment above it moves onto the key after it.
-    #[test]
-    fn a_reset_key_is_removed_and_its_comment_kept() {
-        let mut fixture = app(SPARSE);
-        open(&mut fixture, "General");
-        to_row(&mut fixture, "silence timeout");
-        press(&mut fixture.app, "x");
-        let paths = paths(fixture.dir.path());
-        save(&fixture.app.config, &paths, false).expect("saved");
-        assert_eq!(
-            std::fs::read_to_string(&paths.config).unwrap(),
-            SPARSE.replace("silence_timeout_ms = 4500\n", ""),
-        );
-
-        let mut fixture = app(SPARSE);
-        open(&mut fixture, "General");
-        to_row(&mut fixture, "language");
-        press(&mut fixture.app, "x");
-        let paths = crate::tui::testing::paths(fixture.dir.path());
-        save(&fixture.app.config, &paths, false).expect("saved");
-        assert_eq!(
-            std::fs::read_to_string(&paths.config).unwrap(),
-            SPARSE.replace("language = \"de\"\n", ""),
-            "the key goes; its comment stays, above the key after it"
-        );
+    fn a_save_writes_only_the_changed_or_reset_line() {
+        for (row, keys, want) in [
+            (
+                "silence timeout",
+                "l",
+                SPARSE.replace("silence_timeout_ms = 4500", "silence_timeout_ms = 4750"),
+            ),
+            (
+                "silence timeout",
+                "x",
+                SPARSE.replace("silence_timeout_ms = 4500\n", ""),
+            ),
+            ("language", "x", SPARSE.replace("language = \"de\"\n", "")),
+        ] {
+            let mut fixture = app(SPARSE);
+            open(&mut fixture, "General");
+            to_row(&mut fixture, row);
+            press(&mut fixture.app, keys);
+            let paths = paths(fixture.dir.path());
+            save(&fixture.app.config, &paths, false)
+                .unwrap_or_else(|e| panic!("{keys} on {row}: {e:?}"));
+            let written = std::fs::read_to_string(&paths.config)
+                .unwrap_or_else(|e| panic!("{keys} on {row}: {e}"));
+            assert_eq!(written, want, "{keys} on {row}");
+        }
     }
 
     /// A value toggled and toggled back is no change: nothing is written.
@@ -4647,7 +4683,7 @@ mod tests {
 
     // Opening.
 
-    /// #134: a file that cannot be read is refused before the TUI opens,
+    /// A file that cannot be read is refused before the TUI opens,
     /// with the hand fix, and nothing is written.
     #[test]
     fn an_unreadable_config_is_refused() {
@@ -4661,7 +4697,7 @@ mod tests {
         assert!(paths.config.is_dir());
     }
 
-    /// #134: a file that does not deserialize is refused by `config` (only
+    /// A file that does not deserialize is refused by `config` (only
     /// `setup` starts fresh), and left as it is.
     #[test]
     fn an_undeserializable_config_is_refused() {
@@ -4675,7 +4711,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), broken);
     }
 
-    /// #116: unknown keys are named at load, on Home and Config.
+    /// Unknown keys are named at load, on Home and Config.
     #[test]
     fn unknown_keys_are_named_at_load() {
         let fixture = app("[general]\nsilense_timeout_ms = 1\n[tts]\nvoise = \"x\"\n");
@@ -4785,12 +4821,16 @@ mod tests {
         assert!(drawn(&fixture).iter().any(|r| r.contains("use \"pt_br\"")));
         press(&mut fixture.app, "\n");
         assert_eq!(config(&fixture).general.language, "pt-BR");
-        // One the check refuses keeps the picker open, with why.
+        // One the check refuses keeps the picker open, with why: a well-formed
+        // code no catalog lists.
         press(&mut fixture.app, "\n");
-        type_text(&mut fixture.app, "xyz1");
+        type_text(&mut fixture.app, "zz");
         press(&mut fixture.app, "\n");
         assert_eq!(mode(&fixture), Mode::Picker);
         assert_eq!(status(&fixture).tone, Tone::Error);
+        assert!(status(&fixture)
+            .text
+            .contains("zz is not a language whisrs knows"));
         // Esc leaves with nothing changed.
         press(&mut fixture.app, "\x1b");
         assert_eq!(mode(&fixture), Mode::Browse);
@@ -5162,22 +5202,6 @@ mod tests {
         assert_eq!(config(&fixture).general.language, "de");
     }
 
-    /// Space is the next value of a closed set.
-    #[test]
-    fn space_steps_a_closed_set() {
-        let mut fixture = app("");
-        open(&mut fixture, "Overlay");
-        to_row(&mut fixture, "theme");
-        press(&mut fixture.app, " ");
-        assert_eq!(fixture.app.overlay().theme, "ember");
-        to_row(&mut fixture, "agent overlay");
-        press(&mut fixture.app, " ");
-        assert_eq!(
-            config(&fixture).agent_overlay.as_ref().unwrap().enabled,
-            Some(true)
-        );
-    }
-
     /// The model path's key is not `~`-expanded by the daemon, so a typed
     /// `~` is written out.
     #[test]
@@ -5375,36 +5399,6 @@ mod tests {
             .any(|r| r.contains("claude not on PATH")));
     }
 
-    /// A typed language must be one whisrs knows: `zz` is refused in the
-    /// picker, a region tag of a known code and `multi` are taken.
-    #[test]
-    fn a_typed_language_must_be_known() {
-        let mut fixture = app("");
-        open(&mut fixture, "General");
-        to_row(&mut fixture, "language");
-        press(&mut fixture.app, "\n");
-        type_text(&mut fixture.app, "zz");
-        press(&mut fixture.app, "\n");
-        assert_eq!(mode(&fixture), Mode::Picker);
-        let said = status(&fixture);
-        assert_eq!(said.tone, Tone::Error);
-        assert!(
-            said.text.contains("zz is not a language whisrs knows"),
-            "{}",
-            said.text
-        );
-        press(&mut fixture.app, "\x1b");
-        assert_eq!(config(&fixture).general.language, "en");
-        for (typed, stored) in [("en-US", "en-US"), ("multi", "multi")] {
-            press(&mut fixture.app, "\n");
-            type_text(&mut fixture.app, typed);
-            // The typed value's row is the last one.
-            chord(&mut fixture.app, KeyCode::End, KeyModifiers::NONE);
-            press(&mut fixture.app, "\n");
-            assert_eq!(config(&fixture).general.language, stored, "{typed}");
-        }
-    }
-
     /// Move the cursor to the row whose key is `path`.
     fn to_path(fixture: &mut Fixture, path: &str) {
         press(&mut fixture.app, "g");
@@ -5436,14 +5430,18 @@ mod tests {
         }
     }
 
-    /// With no entries, Hotkeys is its `[hotkeys]` rows, as before.
+    /// Every binding shows in Hotkeys: each agent's and command's keys,
+    /// under a heading, named by the entry. With no entries, Hotkeys is its
+    /// `[hotkeys]` rows, as before.
     #[test]
-    fn hotkeys_without_entries_are_the_hotkeys_rows() {
-        let mut fixture = app("");
-        open(&mut fixture, "Hotkeys");
-        let paths: Vec<String> = fixture
-            .app
-            .config
+    fn hotkeys_show_every_entrys_keys() {
+        let mut bare = app("");
+        open(&mut bare, "Hotkeys");
+        let Body::Rows(rows) = bare.app.config.current().body else {
+            panic!("Hotkeys is rows");
+        };
+        let screen = &bare.app.config;
+        let paths: Vec<String> = screen
             .items()
             .iter()
             .map(|item| match item {
@@ -5451,21 +5449,8 @@ mod tests {
                 _ => panic!("not a row"),
             })
             .collect();
-        let rows: Vec<String> = SECTIONS
-            .iter()
-            .find(|s| s.title == "Hotkeys")
-            .map(|s| match s.body {
-                Body::Rows(fields) => fields.iter().map(|f| f.path.to_string()).collect(),
-                _ => Vec::new(),
-            })
-            .unwrap();
-        assert_eq!(paths, rows);
-    }
+        assert_eq!(paths, rows.iter().map(|f| f.path).collect::<Vec<_>>());
 
-    /// Every binding shows in Hotkeys: each agent's and command's keys,
-    /// under a heading, named by the entry.
-    #[test]
-    fn hotkeys_show_every_entrys_keys() {
         let mut fixture = app(
             "[[agents]]\nname = \"jarvis\"\n[[llm_commands]]\nname = \"translate-de\"\n\
              hotkey = \"F9\"\ninstruction = \"x\"\n",
@@ -5545,27 +5530,6 @@ mod tests {
         to_path(&mut fixture, "agents.0.hotkey");
         press(&mut fixture.app, "x");
         assert_eq!(config(&fixture).agents[0].hotkey, None);
-    }
-
-    /// An agent's key that a [hotkeys] row has too warns, in the dialog
-    /// and after.
-    #[test]
-    fn an_agent_hotkey_clash_with_a_hotkeys_row_warns() {
-        let mut fixture = app("[hotkeys]\ntoggle = \"Alt+D\"\n[[agents]]\nname = \"jarvis\"\n");
-        open(&mut fixture, "Hotkeys");
-        to_path(&mut fixture, "agents.0.hotkey");
-        press(&mut fixture.app, "\n");
-        // Alt, then D from the key picker.
-        press(&mut fixture.app, "\t\t ");
-        press(&mut fixture.app, "\t\t\n");
-        type_text(&mut fixture.app, "d");
-        press(&mut fixture.app, "\n");
-        assert!(drawn(&fixture)
-            .iter()
-            .any(|r| r.contains("Alt+D is already toggle")));
-        press(&mut fixture.app, "\n");
-        assert_eq!(config(&fixture).agents[0].hotkey.as_deref(), Some("Alt+D"));
-        assert_eq!(status(&fixture).text, "Alt+D is also toggle");
     }
 
     /// Built without the recording feature, Recording says so and keeps

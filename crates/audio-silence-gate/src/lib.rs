@@ -171,7 +171,7 @@ enum StopMode {
     },
 }
 
-/// The timeout in samples; `None` for 0, which turns auto-stop off (#178).
+/// The timeout in samples; `None` for 0, which turns auto-stop off.
 fn timeout_samples(timeout_ms: u64, sample_rate: u32) -> Option<u64> {
     if timeout_ms == 0 {
         return None;
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn auto_stop_handles_zero_timeout() {
-        // timeout_ms = 0 turns auto-stop off (#178): speech then any amount
+        // timeout_ms = 0 turns auto-stop off: speech then any amount
         // of silence never fires, in both constructors.
         let loud: Vec<i16> = vec![10_000; 1_600];
         let silence = vec![0i16; 16_000];

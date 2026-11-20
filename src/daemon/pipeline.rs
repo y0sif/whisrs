@@ -1,3 +1,25 @@
+//! The two transcription paths. [`run_streaming_pipeline`] types text while
+//! the user talks (a backend that `supports_streaming`); [`transcribe_batch_audio`]
+//! sends one recorded buffer: batch dictation, command mode, `[[llm_commands]]`,
+//! agent voice turns and recovery retries, told apart by [`BatchOrigin`] and
+//! [`BatchOptions`]. A dictation feature belongs on both paths.
+//!
+//! Every speech decision goes through `audio-silence-gate` with `[audio] vad`:
+//!
+//! - The close profile (one user near the mic) for dictation, command mode,
+//!   `[[llm_commands]]` and agent turns: auto-stop while recording (here, and
+//!   `collect_instruction_audio` for the instruction flows), the speech gate
+//!   that skips the backend on a batch buffer with no speech (not on a
+//!   recovery retry), and local whisper's streaming phrase splits.
+//!   `silence_timeout_ms = 0` turns auto-stop off on every path.
+//! - The open profile (any voice counts) for recording tracks and their chunk
+//!   cuts (`TrackKind::vad_config`, `TranscriptionConfig::open_vad`). The
+//!   system track goes without the soft threshold, since it carries music.
+//!
+//! A skipped turn's toast names its reason with a level
+//! (`quality::skip_label`). Each turn logs one line of levels ending in
+//! [`heard_label`], a diagnostic that decides nothing.
+
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -77,7 +99,7 @@ pub(crate) struct StreamingPipelineParams {
     pub(crate) audio_feedback: bool,
     pub(crate) audio_feedback_volume: f32,
     pub(crate) backend_name: String,
-    /// `[input]` key delay, backend and modifier wait (#154).
+    /// `[input]` key delay, backend and modifier wait.
     pub(crate) keys: KeystrokeSettings,
     /// `[input] clipboard_fallback`: leave the final transcript in the
     /// clipboard as a manual-fix fallback for silent injection failures.
@@ -161,7 +183,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     // batcher, and the clipboard write below still has to know whether the
     // run ended in a cancel.
     let clipboard_cancel = Arc::clone(&cancel_flag);
-    // Third handle: a delta waiting on a held modifier (#154) polls it, so
+    // Third handle: a delta waiting on a held modifier polls it, so
     // `whisrs cancel` ends that wait and discards the delta.
     let sink_cancel = Arc::clone(&cancel_flag);
     // Time deltas spend waiting on a held modifier, kept out of the drain
@@ -229,8 +251,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                         // paste`: partial deltas are typed as they arrive, and a
                         // paste per delta would thrash the clipboard. A held
                         // modifier pauses the delta before its next key, uncapped,
-                        // until it is released or the session is cancelled
-                        // (#154, #171).
+                        // until it is released or the session is cancelled.
                         let delta = text_to_type.clone();
                         match tokio::task::spawn_blocking(move || {
                             deliver_streaming_delta(&delta, keys, &cancel, &modifier_waits)
@@ -271,7 +292,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 
     // Forward audio from capture to backend, with auto-stop detection
     // (`[audio] vad`, the close profile: one user near the mic). A timeout of
-    // 0 never fires (#178).
+    // 0 never fires.
     let mut auto_stop = AutoStopDetector::with_vad(
         VadConfig::close(config.vad),
         silence_timeout_ms,
@@ -351,7 +372,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     // Wait for the typing side to observe the closed text channel and drain
     // any final batch. If that somehow gets stuck, abort it so the daemon can
     // return to Idle instead of staying in Transcribing forever. A delta
-    // waiting on a held modifier (#154) is not stuck: that time does not
+    // waiting on a held modifier is not stuck: that time does not
     // count, and the budget restarts once the modifier is released. Only
     // `whisrs cancel` ends such a wait early.
     debug!("waiting for typing task to finish");
@@ -398,7 +419,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         }
     };
 
-    // `whisrs cancel` after stop (#154): the session is discarded, like a
+    // `whisrs cancel` after stop: the session is discarded, like a
     // cancel during recording. No history entry, no done cue. Every writer of
     // the flag holds the daemon-state lock and first finds it in
     // `streaming_cancel`, so reading it and clearing that slot under one
@@ -500,7 +521,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 /// sink is busy (a held modifier, slow typing), so they often share a batch.
 /// `Fragments` verbatim, with a space before a batch only where the raw text
 /// had whitespace at that boundary, so a word split across two batches stays
-/// whole (issue #201).
+/// whole.
 ///
 /// Each batch is sanitized ([`sanitize_for_injection`]) before it reaches the
 /// sink. The sink returns the text it handed on, which can differ from what
@@ -518,9 +539,10 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 /// The daemon text channel is intentionally append-only. For OpenAI realtime
 /// this still feels token-by-token because the backend emits stable append
 /// deltas (`Fragments`, with a space the engine puts where one utterance
-/// follows another). For Lemonade-compatible profiles, the protocol layer
-/// only forwards completed utterances (`Phrases`), so this loop naturally
-/// types phrase-sized chunks without needing any replacement semantics.
+/// follows another). `openai-compatible-realtime` follows its profile's
+/// `stream_text()`: `lemonade` forwards only completed utterances (`Phrases`),
+/// so this loop types phrase-sized chunks without any replacement semantics,
+/// and `llamacpp` forwards append deltas (`Fragments`).
 pub(crate) async fn run_typing_batcher<F, Fut>(
     mut text_rx: tokio::sync::mpsc::Receiver<String>,
     stream_text: StreamText,
@@ -633,8 +655,7 @@ where
 /// what `cancelled` carries in. The batch path already behaves that way for
 /// free (cancel throws the audio away and `process_recording_batch` never
 /// runs), so without that check the same keypress would leave text in the
-/// clipboard on a streaming backend and nothing on a batch one — the
-/// streaming/batch divergence class from #54.
+/// clipboard on a streaming backend and nothing on a batch one.
 ///
 /// Returns `()`: a copy failure is only warned about, never propagated. The
 /// caller is the typing task, whose value is the transcript itself.
@@ -1194,8 +1215,8 @@ pub(crate) fn history_backend_tag(backend: &str, post_processed: bool) -> String
 /// path (`llm_command_background_inner`), which propagates the LLM error and
 /// injects nothing. There the user pressed a hotkey to run *that command*, so
 /// a failure means the command did not happen; here they pressed plain
-/// dictate, and losing a whole dictation to a flaky endpoint would be a
-/// regression against `llm_post_process = false`.
+/// dictate, and losing a whole dictation to a flaky endpoint would make it
+/// worse than `llm_post_process = false`.
 /// The completion goes through [`llm::clean_llm_output`], the same cleaning
 /// the llm-command path uses: line endings normalized, a wrapping code fence
 /// stripped, the ends trimmed. A trailing newline typed at a shell prompt
@@ -1314,7 +1335,7 @@ pub(crate) async fn process_recording_batch(
     }
 
     // `[general] llm_post_process`: rewrite the finished transcript through
-    // the shared `[llm]` backend before it reaches the cursor (issue #85).
+    // the shared `[llm]` backend before it reaches the cursor.
     // Batch-only by design — the streaming pipeline types partials as they
     // arrive and never holds a whole transcript, so this must NOT be wired
     // into `run_streaming_pipeline`; the usual "wire it into both paths" rule
@@ -1578,52 +1599,6 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    #[test]
-    fn transcription_prompt_neither() {
-        assert_eq!(transcription_prompt(None, &[]), None);
-    }
-
-    #[test]
-    fn transcription_prompt_vocab_only() {
-        let vocab = vec!["whisrs".to_string(), "Hyprland".to_string()];
-        assert_eq!(
-            transcription_prompt(None, &vocab),
-            Some("whisrs, Hyprland".to_string())
-        );
-    }
-
-    #[test]
-    fn transcription_prompt_prose_only() {
-        assert_eq!(
-            transcription_prompt(Some("Embedded Linux dictation."), &[]),
-            Some("Embedded Linux dictation.".to_string())
-        );
-    }
-
-    #[test]
-    fn transcription_prompt_both_combined_with_separator() {
-        let vocab = vec!["whisrs".to_string(), "Hyprland".to_string()];
-        assert_eq!(
-            transcription_prompt(Some("Embedded Linux dictation"), &vocab),
-            Some("Embedded Linux dictation. whisrs, Hyprland".to_string())
-        );
-    }
-
-    #[test]
-    fn transcription_prompt_blank_prose_treated_as_absent() {
-        let vocab = vec!["whisrs".to_string()];
-        // Whitespace-only prompt must not bleed an empty "" into the output.
-        assert_eq!(
-            transcription_prompt(Some("   \t\n  "), &vocab),
-            Some("whisrs".to_string())
-        );
-    }
-
-    #[test]
-    fn transcription_prompt_empty_string_with_empty_vocab_is_none() {
-        assert_eq!(transcription_prompt(Some(""), &[]), None);
-    }
-
     /// A default config with the given vocabulary, for the keyterm routing
     /// tests. Every `Config` field is `#[serde(default)]`, so an empty
     /// document deserializes to the defaults.
@@ -1633,29 +1608,35 @@ pub(crate) mod tests {
         config
     }
 
+    /// The vocabulary rides as keyterms only with the prompt. Command mode
+    /// withholds both: a spoken instruction is not content, so biasing it
+    /// toward the dictation vocabulary is wrong for the same reason the prompt
+    /// is withheld (see `BatchOptions::command_mode`).
     #[test]
-    fn dictation_batch_config_carries_vocabulary_as_keyterms() {
+    fn batch_config_sends_the_vocabulary_only_with_the_prompt() {
         let config = config_with_vocabulary(&["whisrs", "Hyprland"]);
-        let built = batch_transcription_config(&config, "en", BatchOptions::dictation().use_prompt);
-        assert_eq!(built.keyterms, vec!["whisrs", "Hyprland"]);
-        assert!(built.prompt.is_some());
-    }
-
-    #[test]
-    fn command_mode_batch_config_sends_no_keyterms() {
-        // Regression guard: keyterms must ride the same opt-out as `prompt`.
-        // A spoken instruction is not content, so biasing it toward the
-        // dictation vocabulary is wrong for the same reason the prompt is
-        // withheld — see `BatchOptions::command_mode`.
-        let config = config_with_vocabulary(&["whisrs", "Hyprland"]);
-        let built =
-            batch_transcription_config(&config, "en", BatchOptions::command_mode().use_prompt);
-        assert!(
-            built.keyterms.is_empty(),
-            "command mode leaked the dictation vocabulary: {:?}",
-            built.keyterms
-        );
-        assert!(built.prompt.is_none());
+        let cases: [(&str, bool, &[&str], bool); 2] = [
+            (
+                "dictation",
+                BatchOptions::dictation().use_prompt,
+                &["whisrs", "Hyprland"],
+                true,
+            ),
+            (
+                "command mode",
+                BatchOptions::command_mode().use_prompt,
+                &[],
+                false,
+            ),
+        ];
+        for (name, use_prompt, want_keyterms, want_prompt) in cases {
+            let built = batch_transcription_config(&config, "en", use_prompt);
+            assert_eq!(
+                built.keyterms, want_keyterms,
+                "{name}: the keyterms (command mode must not leak the dictation vocabulary)"
+            );
+            assert_eq!(built.prompt.is_some(), want_prompt, "{name}: the prompt");
+        }
     }
 
     #[test]
@@ -1806,58 +1787,70 @@ pub(crate) mod tests {
     }
 
     /// Send `deltas` back to back (one batch window) to a `stream_text`
-    /// batcher; return what reached the sink and the transcript.
-    async fn type_in_one_batch(stream_text: StreamText, deltas: &[&str]) -> (Vec<String>, String) {
+    /// batcher; return what reached the sink and the transcript. `name` is
+    /// the table row, for the failure message.
+    async fn type_in_one_batch(
+        name: &str,
+        stream_text: StreamText,
+        deltas: &[&str],
+    ) -> (Vec<String>, String) {
         let (text_tx, _cancel, typed, batcher) =
             spawn_test_batcher_with(stream_text, str::to_string);
         for delta in deltas {
-            text_tx.send(delta.to_string()).await.unwrap();
+            text_tx
+                .send(delta.to_string())
+                .await
+                .unwrap_or_else(|e| panic!("{name}: send: {e}"));
         }
         drop(text_tx);
-        let full_text = batcher.await.unwrap();
+        let full_text = batcher
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the batcher: {e}"));
         let typed = typed.lock().unwrap().clone();
         (typed, full_text)
     }
 
-    /// Phrase backends (Deepgram streaming, Groq, local whisper) send
-    /// trimmed phrases: two in one batch window used to be glued ("itcopies").
+    /// Deltas within one batch window are typed as one batch. Phrase backends
+    /// (Deepgram streaming, Groq, local whisper) send trimmed phrases: they
+    /// get a space between them, but none before closing punctuation, and a
+    /// space already at the boundary, on either side, is not doubled. OpenAI
+    /// realtime append deltas split words and carry their own spaces, so
+    /// fragments are glued as they come.
     #[tokio::test(start_paused = true)]
-    async fn typing_batcher_spaces_phrases_in_one_batch() {
-        let (typed, full_text) = type_in_one_batch(StreamText::Phrases, &["a", "b"]).await;
-        assert_eq!(typed, ["a b"]);
-        assert_eq!(full_text, "a b");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn typing_batcher_puts_no_space_before_closing_punctuation_in_a_batch() {
-        let (typed, full_text) =
-            type_in_one_batch(StreamText::Phrases, &["word", ", next", "."]).await;
-        assert_eq!(typed, ["word, next."]);
-        assert_eq!(full_text, "word, next.");
-    }
-
-    /// A space already at the boundary, on either side, is not doubled.
-    #[tokio::test(start_paused = true)]
-    async fn typing_batcher_adds_no_second_space_between_phrases() {
-        let (typed, full_text) =
-            type_in_one_batch(StreamText::Phrases, &["one ", "two", " three"]).await;
-        assert_eq!(typed, ["one two three"]);
-        assert_eq!(full_text, "one two three");
-    }
-
-    /// OpenAI realtime append deltas split words and carry their own spaces.
-    #[tokio::test(start_paused = true)]
-    async fn typing_batcher_glues_fragments_in_one_batch() {
-        let (typed, full_text) =
-            type_in_one_batch(StreamText::Fragments, &["Deep", "gram", " is", " fast"]).await;
-        assert_eq!(typed, ["Deepgram is fast"]);
-        assert_eq!(full_text, "Deepgram is fast");
+    async fn typing_batcher_spaces_phrases_within_a_batch() {
+        let cases: [(&str, StreamText, &[&str], &str); 4] = [
+            ("phrases", StreamText::Phrases, &["a", "b"], "a b"),
+            (
+                "closing punctuation",
+                StreamText::Phrases,
+                &["word", ", next", "."],
+                "word, next.",
+            ),
+            (
+                "space already at the boundary",
+                StreamText::Phrases,
+                &["one ", "two", " three"],
+                "one two three",
+            ),
+            (
+                "fragments glue",
+                StreamText::Fragments,
+                &["Deep", "gram", " is", " fast"],
+                "Deepgram is fast",
+            ),
+        ];
+        for (name, stream_text, deltas, want) in cases {
+            let (typed, full_text) = type_in_one_batch(name, stream_text, deltas).await;
+            assert_eq!(typed, [want], "{name}: what the sink typed");
+            assert_eq!(full_text, want, "{name}: the transcript");
+        }
     }
 
     /// Send each of `batches` in its own batch window to a `stream_text`
     /// batcher with `filler_filter`; return what reached the sink and the
-    /// transcript.
+    /// transcript. `name` is the table row, for the failure message.
     async fn type_in_batches(
+        name: &str,
         stream_text: StreamText,
         filler_filter: Option<FillerFilter>,
         batches: &[&str],
@@ -1877,56 +1870,91 @@ pub(crate) mod tests {
             },
         ));
         for batch in batches {
-            text_tx.send(batch.to_string()).await.unwrap();
+            text_tx
+                .send(batch.to_string())
+                .await
+                .unwrap_or_else(|e| panic!("{name}: send: {e}"));
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         drop(text_tx);
-        let full_text = batcher.await.unwrap();
+        let full_text = batcher
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the batcher: {e}"));
         let typed = typed.lock().unwrap().clone();
         (typed, full_text)
     }
 
-    /// Issue #201: a word whose append deltas land in two batches was typed
-    /// with a space inside it ("П они ет").
+    /// Fragments sent in separate batch windows get a space between batches
+    /// only where the raw text had a word gap. A word whose append deltas land
+    /// in two batches stays whole; a gap is kept, also when filler removal trimmed the
+    /// whitespace off the batch. The first batch gets no space, nor does a
+    /// batch that opens with closing punctuation, even where the raw text had
+    /// a gap before it. `typed` is checked where the batches matter.
     #[tokio::test(start_paused = true)]
-    async fn typing_batcher_keeps_a_word_split_across_fragment_batches_whole() {
-        let (typed, full_text) =
-            type_in_batches(StreamText::Fragments, None, &["Пон", "иет"]).await;
-        assert_eq!(typed, ["Пон", "иет"]);
-        assert_eq!(full_text, "Пониет");
-    }
-
-    /// A word gap at a batch boundary is kept, also when filler removal
-    /// trimmed the whitespace off the batch.
-    #[tokio::test(start_paused = true)]
-    async fn typing_batcher_spaces_fragment_batches_at_a_word_gap() {
-        for filler in [false, true] {
-            for batches in [["Hello", " there"], ["Hello ", "there"]] {
-                let filter = filler.then(FillerFilter::builtin);
-                let (_, full_text) = type_in_batches(StreamText::Fragments, filter, &batches).await;
-                assert_eq!(full_text, "Hello there", "filler {filler}, {batches:?}");
+    async fn typing_batcher_spaces_fragment_batches_only_at_a_raw_gap() {
+        // (name, filler removal on, batches, what the sink typed, transcript)
+        type Row<'a> = (&'a str, bool, &'a [&'a str], Option<&'a [&'a str]>, &'a str);
+        let cases: [Row; 7] = [
+            (
+                "word split across batches",
+                false,
+                &["Пон", "иет"],
+                Some(&["Пон", "иет"]),
+                "Пониет",
+            ),
+            (
+                "word gap before, no filter",
+                false,
+                &["Hello", " there"],
+                None,
+                "Hello there",
+            ),
+            (
+                "word gap after, no filter",
+                false,
+                &["Hello ", "there"],
+                None,
+                "Hello there",
+            ),
+            (
+                "word gap before, filter",
+                true,
+                &["Hello", " there"],
+                None,
+                "Hello there",
+            ),
+            (
+                "word gap after, filter",
+                true,
+                &["Hello ", "there"],
+                None,
+                "Hello there",
+            ),
+            (
+                "punctuation batch",
+                false,
+                &["Hello", "."],
+                Some(&["Hello", "."]),
+                "Hello.",
+            ),
+            // The filter trims " Hello" to "Hello" and " um." to ".".
+            (
+                "filter trims the gap",
+                true,
+                &[" Hello", " um."],
+                Some(&["Hello", "."]),
+                "Hello.",
+            ),
+        ];
+        for (name, filler, batches, want_typed, want_full) in cases {
+            let filter = filler.then(FillerFilter::builtin);
+            let (typed, full_text) =
+                type_in_batches(name, StreamText::Fragments, filter, batches).await;
+            if let Some(want_typed) = want_typed {
+                assert_eq!(typed, want_typed, "{name}: what the sink typed");
             }
+            assert_eq!(full_text, want_full, "{name}: the transcript");
         }
-    }
-
-    /// The first batch gets no space, nor does a batch that opens with
-    /// closing punctuation, even where the raw text had a gap before it.
-    #[tokio::test(start_paused = true)]
-    async fn typing_batcher_puts_no_space_before_a_first_or_punctuation_fragment_batch() {
-        let (typed, full_text) =
-            type_in_batches(StreamText::Fragments, None, &["Hello", "."]).await;
-        assert_eq!(typed, ["Hello", "."]);
-        assert_eq!(full_text, "Hello.");
-
-        // The filter trims " Hello" to "Hello" and " um." to ".".
-        let (typed, full_text) = type_in_batches(
-            StreamText::Fragments,
-            Some(FillerFilter::builtin()),
-            &[" Hello", " um."],
-        )
-        .await;
-        assert_eq!(typed, ["Hello", "."]);
-        assert_eq!(full_text, "Hello.");
     }
 
     /// The real trigger: phrases that arrive while the sink is still typing
@@ -2275,55 +2303,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Per-origin gate-skip toast wording: command mode announces itself,
-    /// dictation and llm-commands share the plain skip message.
-    #[test]
-    fn gate_skip_message_per_origin() {
-        let cases = [
-            (BatchOrigin::Dictation, "Skipped: the audio was silent"),
-            (
-                BatchOrigin::CommandMode,
-                "Command mode: the audio was silent",
-            ),
-            (
-                BatchOrigin::LlmCommand { name: "proofread" },
-                "Skipped: the audio was silent",
-            ),
-        ];
-        for (origin, expected) in cases {
-            assert_eq!(origin.gate_skip_message("silent"), expected, "{origin:?}");
-        }
-        // The speech detector's reasons read the same way on every origin.
-        use audio_silence_gate::GateReason;
-        for reason in [GateReason::TooQuiet, GateReason::NoSpeech] {
-            let label = reason.as_str();
-            for (origin, expected) in [
-                (
-                    BatchOrigin::Dictation,
-                    format!("Skipped: the audio was {label}"),
-                ),
-                (
-                    BatchOrigin::CommandMode,
-                    format!("Command mode: the audio was {label}"),
-                ),
-                (
-                    BatchOrigin::LlmCommand { name: "proofread" },
-                    format!("Skipped: the audio was {label}"),
-                ),
-                (
-                    BatchOrigin::Agent { name: "jarvis" },
-                    format!("Agent 'jarvis': the audio was {label}, nothing was sent"),
-                ),
-            ] {
-                assert_eq!(origin.gate_skip_message(label), expected, "{origin:?}");
-            }
-        }
-        assert_eq!(
-            BatchOrigin::Dictation.gate_skip_message(GateReason::NoSpeech.as_str()),
-            "Skipped: the audio was without speech"
-        );
-    }
-
     /// The skip toast names its reason with a level, on every origin, and
     /// silent audio asks about a muted mic after it.
     #[test]
@@ -2452,26 +2431,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// The echo-skip toast wording is origin-independent — every batch path
-    /// sends the same message.
-    #[test]
-    fn prompt_echo_skip_toast_wording() {
-        assert_eq!(
-            PROMPT_ECHO_SKIP_TOAST,
-            "Skipped: response looked like a prompt echo (no speech detected)"
-        );
-    }
-
     /// The prompt-echo guard needs all three conditions to fire: the calling
     /// path enables the check, the backend actually transmits the prompt, and
     /// a prompt exists.
     ///
     /// The llm-command path (whose transcript is LLM input) checks, while
     /// command mode (which sends no prompt) never does. The backend gate is
-    /// issue #133: `config.prompt` is built for every backend, but Deepgram
+    /// there because `config.prompt` is built for every backend, but Deepgram
     /// and `openai-compatible-realtime` never put it on the wire, so without
     /// that condition genuine speech resembling the user's own
-    /// `[general] vocabulary` was discarded as an echo of something the model
+    /// `[general] vocabulary` would be discarded as an echo of something the model
     /// never saw. `openai-realtime` joins them on gpt-realtime-whisper, the
     /// one model that takes no prompt, which is why the flag is read per
     /// request rather than per backend.
@@ -2509,7 +2478,7 @@ pub(crate) mod tests {
                 false,
             ),
             (
-                "dictation: promptless backend, vocabulary-shaped speech passes (#133)",
+                "dictation: promptless backend, vocabulary-shaped speech passes",
                 BatchOptions::dictation(),
                 false,
                 Some(prompt),
@@ -2525,7 +2494,7 @@ pub(crate) mod tests {
                 true,
             ),
             (
-                "llm_command: promptless backend, echo-shaped text passes (#133)",
+                "llm_command: promptless backend, echo-shaped text passes",
                 BatchOptions::llm_command("proofread"),
                 false,
                 Some(prompt),
@@ -2550,14 +2519,13 @@ pub(crate) mod tests {
         }
     }
 
-    // ── The #133 gate is wired into the batch path ──────────────────────
+    // ── The backend prompt gate is wired into the batch path ────────────
     //
     // `should_drop_as_echo` is covered above and the per-backend answers are
     // covered next to each backend, but neither proves `transcribe_batch_audio`
-    // ever *asks* the backend. Hardcoding `true` at that call site — which
-    // disables the whole fix — left every one of those tests green. That is the
-    // failure shape of #71 all over again, so the two tests below drive the real
-    // function and flip nothing but `sends_prompt()`.
+    // ever *asks* the backend: with `true` hardcoded at that call site every
+    // one of those tests stays green. The table below drives the real
+    // function and flips nothing but `sends_prompt()`.
 
     /// A backend that returns a fixed transcript and answers `sends_prompt()`
     /// however the test asks it to. Nothing else about the batch path cares.
@@ -2639,8 +2607,7 @@ pub(crate) mod tests {
 
     /// Genuine speech that normalizes to a substring of the prompt built from
     /// `WIRING_VOCABULARY`, so `is_prompt_echo` flags it. Someone dictating a
-    /// run of their own vocabulary terms produces exactly this shape — which
-    /// is what issue #133 reported.
+    /// run of their own vocabulary terms produces exactly this shape.
     const VOCABULARY_SHAPED_SPEECH: &str = "Hyprland, whisrs, Wayland";
 
     /// `notify: false` keeps `send_notification` (which spawns a D-Bus thread)
@@ -2722,50 +2689,47 @@ pub(crate) mod tests {
         assert!(take_saved_recoveries().is_empty());
     }
 
+    /// Echo-shaped text is dropped only from a backend that sent the prompt.
+    /// Same audio, same transcript, same options: only the backend's answer
+    /// changes, which pins the flag as the thing being consulted.
     #[tokio::test]
-    async fn batch_path_keeps_echo_shaped_text_from_a_promptless_backend() {
-        let context = context_with_backend(StubBackend {
-            text: VOCABULARY_SHAPED_SPEECH,
-            sends_prompt: false,
-        });
+    async fn batch_path_drops_echo_shaped_text_only_from_a_prompting_backend() {
+        for (name, sends_prompt, want, why) in [
+            (
+                "promptless backend keeps it",
+                false,
+                VOCABULARY_SHAPED_SPEECH,
+                "the backend never sent the prompt, so this cannot be an echo of it: does \
+                 `transcribe_batch_audio` still pass `sends_prompt()` to `should_drop_as_echo`?",
+            ),
+            (
+                "prompting backend drops it",
+                true,
+                "",
+                "a backend that does send the prompt must still have echoes filtered",
+            ),
+        ] {
+            let context = context_with_backend(StubBackend {
+                text: VOCABULARY_SHAPED_SPEECH,
+                sends_prompt,
+            });
 
-        let text = transcribe_batch_audio(
-            &audio_that_passes_the_gate(),
-            &context,
-            "en",
-            &BatchOptions::dictation(),
-        )
-        .await
-        .expect("the stub backend never fails");
+            let text = transcribe_batch_audio(
+                &audio_that_passes_the_gate(),
+                &context,
+                "en",
+                &BatchOptions::dictation(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the stub backend never fails: {e}"));
 
-        assert_eq!(
-            text, VOCABULARY_SHAPED_SPEECH,
-            "the backend never sent the prompt, so this cannot be an echo of it (#133) — \
-             does `transcribe_batch_audio` still pass `sends_prompt()` to `should_drop_as_echo`?"
-        );
-    }
-
-    #[tokio::test]
-    async fn batch_path_drops_echo_shaped_text_from_a_prompting_backend() {
-        // Same audio, same transcript, same options — only the backend's
-        // answer changes, which pins the flag as the thing being consulted.
-        let context = context_with_backend(StubBackend {
-            text: VOCABULARY_SHAPED_SPEECH,
-            sends_prompt: true,
-        });
-
-        let text = transcribe_batch_audio(
-            &audio_that_passes_the_gate(),
-            &context,
-            "en",
-            &BatchOptions::dictation(),
-        )
-        .await
-        .expect("the stub backend never fails");
-
+            assert_eq!(text, want, "{name}: {why}");
+        }
+        // The drop's toast is a const, out of reach of the recording module's
+        // scan of `send_notification(` calls.
         assert!(
-            text.is_empty(),
-            "a backend that does send the prompt must still have echoes filtered, got {text:?}"
+            !PROMPT_ECHO_SKIP_TOAST.to_lowercase().contains("recording"),
+            "the echo toast says recording"
         );
     }
 
@@ -2837,53 +2801,43 @@ pub(crate) mod tests {
         assert_eq!(instruction, SPOKEN);
     }
 
-    // ── Toggle-path LLM post-processing (issue #85) ─────────────────────
+    // ── Toggle-path LLM post-processing ─────────────────────────────────
 
-    /// Parse a config from TOML, with a `[general] backend` already set so
-    /// only the keys under test have to be spelled out.
-    fn config_from(general_extra: &str) -> Config {
-        toml::from_str(&format!("[general]\nbackend = \"groq\"\n{general_extra}\n"))
-            .expect("test config parses")
-    }
-
-    /// The flag is opt-in: an untouched config never post-processes, whatever
-    /// the (defaulted) instruction says.
+    /// The instruction the toggle path sends. The flag is opt-in: an
+    /// untouched config never post-processes, whatever the (defaulted)
+    /// instruction says. Flag on: the trimmed instruction; with the key
+    /// omitted, the built-in cleanup instruction, so the flag alone is a
+    /// working configuration; a blank instruction disables post-processing
+    /// rather than sending an empty instruction to the LLM.
     #[test]
-    fn llm_post_process_off_by_default() {
-        let config = config_from("");
-        assert!(!config.general.llm_post_process);
-        assert!(llm_post_process_instruction(&config).is_none());
-    }
-
-    /// Flag on: the trimmed instruction is what gets sent to the LLM.
-    #[test]
-    fn llm_post_process_instruction_is_trimmed() {
-        let config =
-            config_from("llm_post_process = true\nllm_instruction = \"  Translate to German.  \"");
-        assert_eq!(
-            llm_post_process_instruction(&config),
-            Some("Translate to German.")
-        );
-    }
-
-    /// Flag on with the key omitted still has something to apply — the built
-    /// in cleanup instruction — so the flag alone is a working configuration.
-    #[test]
-    fn llm_post_process_uses_default_instruction_when_key_omitted() {
-        let config = config_from("llm_post_process = true");
-        let instruction = llm_post_process_instruction(&config).expect("default instruction");
-        assert!(
-            instruction.contains("Return only the corrected text"),
-            "unexpected default instruction: {instruction}"
-        );
-    }
-
-    /// A blank instruction disables post-processing rather than sending an
-    /// empty instruction to the LLM.
-    #[test]
-    fn llm_post_process_blank_instruction_skips() {
-        let config = config_from("llm_post_process = true\nllm_instruction = \"   \"");
-        assert!(llm_post_process_instruction(&config).is_none());
+    fn llm_post_process_instruction_per_config() {
+        type Check = fn(Option<&str>) -> bool;
+        let cases: [(&str, &str, Check); 4] = [
+            ("off by default", "", |i| i.is_none()),
+            (
+                "trimmed",
+                "llm_post_process = true\nllm_instruction = \"  Translate to German.  \"",
+                |i| i == Some("Translate to German."),
+            ),
+            (
+                "key omitted: the built-in instruction",
+                "llm_post_process = true",
+                |i| i.is_some_and(|i| i.contains("Return only the corrected text")),
+            ),
+            (
+                "blank instruction skips",
+                "llm_post_process = true\nllm_instruction = \"   \"",
+                |i| i.is_none(),
+            ),
+        ];
+        for (name, general_extra, check) in cases {
+            // `[general] backend` is set so only the keys under test are spelled out.
+            let config: Config =
+                toml::from_str(&format!("[general]\nbackend = \"groq\"\n{general_extra}\n"))
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let instruction = llm_post_process_instruction(&config);
+            assert!(check(instruction), "{name}: got {instruction:?}");
+        }
     }
 
     /// The failure contract: only a non-blank completion may replace the
@@ -2953,96 +2907,55 @@ pub(crate) mod tests {
         }
     }
 
-    /// A dictation that was not post-processed keeps the bare backend name it
-    /// has always been logged under, byte for byte. Anything else would shift
-    /// the meaning of every pre-existing history entry.
-    #[test]
-    fn history_backend_tag_is_unchanged_for_raw_dictation() {
-        for backend in ["groq", "deepgram", "openai", "local-whisper", "asr-sidecar"] {
-            assert_eq!(history_backend_tag(backend, false), backend);
-        }
-    }
-
     /// A post-processed dictation is tagged `<backend>+llm`, so `whisrs log`
     /// shows which entries hold the LLM's words rather than the microphone's.
+    /// One that was not keeps the bare backend name, byte for byte: anything
+    /// else would shift the meaning of every existing history entry. The
+    /// backend in front and the marker behind keep the tag apart from the
+    /// llm-command path's `llm:<name>` entries (`command_mode.rs`), even for a
+    /// command named after a backend.
     #[test]
-    fn history_backend_tag_marks_post_processed_dictation() {
-        assert_eq!(history_backend_tag("groq", true), "groq+llm");
-        assert_eq!(history_backend_tag("deepgram", true), "deepgram+llm");
-    }
-
-    /// The tag must not collide with the llm-command path's `llm:<name>`
-    /// entries (`command_mode.rs`), which name a configured command rather
-    /// than a transcription backend. Keeping the backend in front and the
-    /// marker behind means neither form can be mistaken for the other, even
-    /// when an `[[llm_commands]]` entry is named after a backend.
-    #[test]
-    fn history_backend_tag_does_not_collide_with_llm_command_tags() {
-        let post_processed = history_backend_tag("groq", true);
-        assert!(!post_processed.starts_with("llm:"));
-        assert_ne!(post_processed, "llm:groq");
-    }
-
-    /// The streaming path can only ever produce raw dictation, so its
-    /// constructor must never claim otherwise.
-    #[test]
-    fn dictation_outcome_raw_is_not_post_processed() {
-        let outcome = DictationOutcome::raw("hello".to_string());
-        assert!(!outcome.post_processed);
-        assert_eq!(
-            history_backend_tag("openai-realtime", outcome.post_processed),
-            "openai-realtime"
-        );
-    }
-
-    /// Scripted clipboard double, copied verbatim from the `injection.rs`
-    /// tests. Deliberately a third copy of that exact shape rather than a
-    /// fourth shape or a shared helper: this crate has no test-support
-    /// module, and adding one would mean reworking the doubles in
-    /// `injection.rs` and `selection.rs`, which this change has no business
-    /// touching. `texts` is the sequence of `get_text` results
-    /// (each call consumes the front entry; the last entry is sticky),
-    /// `writes` records every `set_text` so tests can assert the
-    /// fallback/restore policy byte-for-byte — including that nothing is
-    /// ever written. An empty `texts` list makes any `get_text` panic, which
-    /// is itself an assertion in the streaming tests below (the streaming
-    /// path must never read the clipboard).
-    struct ScriptedClipboard {
-        texts: StdMutex<Vec<Option<String>>>,
-        writes: StdMutex<Vec<String>>,
-        fail_writes: bool,
-    }
-
-    impl ScriptedClipboard {
-        fn new(texts: &[Option<&str>]) -> Self {
-            Self {
-                texts: StdMutex::new(texts.iter().map(|t| t.map(String::from)).collect()),
-                writes: StdMutex::new(Vec::new()),
-                fail_writes: false,
-            }
+    fn history_backend_tag_marks_only_post_processed_dictation() {
+        for (backend, post_processed, want) in [
+            ("groq", false, "groq"),
+            ("deepgram", false, "deepgram"),
+            ("openai", false, "openai"),
+            ("local-whisper", false, "local-whisper"),
+            ("asr-sidecar", false, "asr-sidecar"),
+            ("openai-realtime", false, "openai-realtime"),
+            ("groq", true, "groq+llm"),
+            ("deepgram", true, "deepgram+llm"),
+        ] {
+            assert_eq!(
+                history_backend_tag(backend, post_processed),
+                want,
+                "{backend}, post_processed {post_processed}"
+            );
         }
+    }
 
+    /// A clipboard that records every `set_text`, so the tests below can
+    /// assert the copy policy byte for byte, including that nothing is ever
+    /// written. The streaming path never reads the clipboard, so a read
+    /// panics: on a row that expects a write, a read before it leaves the
+    /// write out.
+    #[derive(Default)]
+    struct ClipboardLog {
+        writes: StdMutex<Vec<String>>,
+    }
+
+    impl ClipboardLog {
         fn writes(&self) -> Vec<String> {
             self.writes.lock().unwrap().clone()
         }
     }
 
-    impl ClipboardBackend for ScriptedClipboard {
+    impl ClipboardBackend for ClipboardLog {
         fn get_text(&self) -> anyhow::Result<String> {
-            let mut texts = self.texts.lock().unwrap();
-            assert!(!texts.is_empty(), "get_text called with no scripted result");
-            let head = if texts.len() > 1 {
-                texts.remove(0)
-            } else {
-                texts[0].clone()
-            };
-            head.ok_or_else(|| anyhow::anyhow!("clipboard holds non-text content"))
+            panic!("the streaming path read the clipboard")
         }
 
         fn set_text(&self, text: &str) -> anyhow::Result<()> {
-            if self.fail_writes {
-                return Err(anyhow::anyhow!("mock clipboard write failure"));
-            }
             self.writes.lock().unwrap().push(text.to_string());
             Ok(())
         }
@@ -3052,112 +2965,58 @@ pub(crate) mod tests {
         }
     }
 
-    /// The plain stop path with `[input] clipboard_fallback` on: exactly one
-    /// copy of the final transcript, never a partial delta and never a
-    /// duplicate. The empty script is itself an assertion — the streaming
-    /// path must never *read* the clipboard, so any read panics.
+    /// The streaming stop path copies the final transcript, exactly once and
+    /// never a partial delta, only when a clipboard mode asks for it:
+    /// `[input] clipboard_fallback`, or `clipboard_only` on its own, where the
+    /// copy is the dictation's entire output. Nothing on `whisrs cancel` (the
+    /// batch path produces nothing on cancel either), nothing for an empty
+    /// transcript (silence, an accidental tap) over what the user had copied,
+    /// and nothing with both modes off: typing already delivered the text.
     #[tokio::test]
-    async fn streaming_stop_copies_the_final_transcript_once() {
-        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+    async fn streaming_clipboard_gets_the_final_transcript_only_when_asked() {
+        // (name, text, clipboard_fallback, clipboard_only, cancelled, writes)
+        type Row<'a> = (&'a str, &'a str, bool, bool, bool, &'a [&'a str]);
+        let cases: [Row; 5] = [
+            (
+                "fallback on: one copy",
+                "hello world",
+                true,
+                false,
+                false,
+                &["hello world"],
+            ),
+            (
+                "clipboard_only alone",
+                "hello world",
+                false,
+                true,
+                false,
+                &["hello world"],
+            ),
+            (
+                "cancel copies nothing",
+                "hello world",
+                true,
+                false,
+                true,
+                &[],
+            ),
+            ("empty transcript", "", true, false, false, &[]),
+            ("neither mode", "hello world", false, false, false, &[]),
+        ];
+        for (name, text, clipboard_fallback, clipboard_only, cancelled, want_writes) in cases {
+            let clipboard = Arc::new(ClipboardLog::default());
 
-        write_streaming_clipboard(
-            "hello world",
-            /* clipboard_fallback = */ true,
-            /* clipboard_only = */ false,
-            /* cancelled = */ false,
-            clipboard.clone(),
-        )
-        .await;
+            write_streaming_clipboard(
+                text,
+                clipboard_fallback,
+                clipboard_only,
+                cancelled,
+                clipboard.clone(),
+            )
+            .await;
 
-        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
-    }
-
-    /// `[input] clipboard_only` reaches the same copy on its own, with the
-    /// fallback off: in copy-only mode the clipboard write is the entire
-    /// output of the dictation, so gating it on `clipboard_fallback` would
-    /// silently produce nothing at all.
-    #[tokio::test]
-    async fn streaming_clipboard_only_copies_the_final_transcript() {
-        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
-
-        write_streaming_clipboard(
-            "hello world",
-            /* clipboard_fallback = */ false,
-            /* clipboard_only = */ true,
-            /* cancelled = */ false,
-            clipboard.clone(),
-        )
-        .await;
-
-        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
-    }
-
-    /// `whisrs cancel` discards. The transcript is non-empty and the
-    /// fallback is on, so `cancelled` is the only thing standing between
-    /// this run and a clipboard write — which is the point: the batch path
-    /// produces nothing on cancel, and a streaming backend that copied
-    /// anyway would be the streaming/batch divergence class from #54.
-    #[tokio::test]
-    async fn streaming_cancel_copies_nothing() {
-        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
-
-        write_streaming_clipboard(
-            "hello world",
-            /* clipboard_fallback = */ true,
-            /* clipboard_only = */ false,
-            /* cancelled = */ true,
-            clipboard.clone(),
-        )
-        .await;
-
-        assert!(
-            clipboard.writes().is_empty(),
-            "a cancelled run must leave the clipboard exactly as it found it"
-        );
-    }
-
-    /// A recording that transcribed to nothing (silence, an accidental
-    /// tap) must not overwrite whatever the user already had copied. The
-    /// fallback is on and the run was not cancelled, so the empty string is
-    /// the only reason to skip.
-    #[tokio::test]
-    async fn streaming_empty_transcript_never_clobbers_the_clipboard() {
-        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
-
-        write_streaming_clipboard(
-            "",
-            /* clipboard_fallback = */ true,
-            /* clipboard_only = */ false,
-            /* cancelled = */ false,
-            clipboard.clone(),
-        )
-        .await;
-
-        assert!(
-            clipboard.writes().is_empty(),
-            "an empty transcript must not clobber the user's clipboard"
-        );
-    }
-
-    /// The default configuration: both flags off, a perfectly ordinary
-    /// successful dictation. Typing already delivered the text, so the
-    /// clipboard is none of our business.
-    #[tokio::test]
-    async fn streaming_without_fallback_never_touches_the_clipboard() {
-        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
-
-        write_streaming_clipboard(
-            "hello world",
-            /* clipboard_fallback = */ false,
-            /* clipboard_only = */ false,
-            /* cancelled = */ false,
-            clipboard.clone(),
-        )
-        .await;
-
-        assert!(
-            clipboard.writes().is_empty(),
-            "clipboard must stay untouched when neither clipboard mode is on"
-        );
+            assert_eq!(clipboard.writes(), want_writes, "{name}");
+        }
     }
 }

@@ -72,7 +72,7 @@ impl StateMachine {
     /// - RetryStart:        Idle → Transcribing
     ///
     /// Recording is intentionally refused while read-aloud is active
-    /// (Toggle/CommandMode from Synthesizing/Speaking are invalid).
+    /// (Toggle from Synthesizing/Speaking is invalid).
     pub fn transition(&mut self, action: Action) -> Result<State, WhisrsError> {
         let new_state = match (self.state, action) {
             (State::Idle, Action::Toggle) => State::Recording,
@@ -108,316 +108,160 @@ impl Default for StateMachine {
 
 #[cfg(test)]
 mod tests {
+    use super::Action::*;
     use super::*;
+    use crate::State::{Idle, Recording, Speaking, Synthesizing, Transcribing};
 
+    /// Every valid transition, walked as the flows run: a new machine is
+    /// Idle, and each step returns the new state, which the machine holds.
     #[test]
-    fn initial_state_is_idle() {
-        let sm = StateMachine::new();
-        assert_eq!(sm.state(), State::Idle);
-    }
-
-    #[test]
-    fn toggle_idle_to_recording() {
-        let mut sm = StateMachine::new();
-        let s = sm.transition(Action::Toggle).unwrap();
-        assert_eq!(s, State::Recording);
-        assert_eq!(sm.state(), State::Recording);
-    }
-
-    #[test]
-    fn toggle_recording_to_transcribing() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        let s = sm.transition(Action::Toggle).unwrap();
-        assert_eq!(s, State::Transcribing);
-    }
-
-    #[test]
-    fn cancel_recording_to_idle() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        let s = sm.transition(Action::Cancel).unwrap();
-        assert_eq!(s, State::Idle);
-    }
-
-    #[test]
-    fn transcription_done_to_idle() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        sm.transition(Action::Toggle).unwrap(); // → Transcribing
-        let s = sm.transition(Action::TranscriptionDone).unwrap();
-        assert_eq!(s, State::Idle);
-    }
-
-    #[test]
-    fn invalid_toggle_while_transcribing() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        sm.transition(Action::Toggle).unwrap(); // → Transcribing
-        let err = sm.transition(Action::Toggle).unwrap_err();
-        assert!(matches!(
-            err,
-            WhisrsError::InvalidTransition {
-                from: State::Transcribing,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn invalid_cancel_while_idle() {
-        let mut sm = StateMachine::new();
-        let err = sm.transition(Action::Cancel).unwrap_err();
-        assert!(matches!(
-            err,
-            WhisrsError::InvalidTransition {
-                from: State::Idle,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn invalid_cancel_while_transcribing() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        sm.transition(Action::Toggle).unwrap(); // → Transcribing
-        let err = sm.transition(Action::Cancel).unwrap_err();
-        assert!(matches!(
-            err,
-            WhisrsError::InvalidTransition {
-                from: State::Transcribing,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn invalid_transcription_done_while_idle() {
-        let mut sm = StateMachine::new();
-        let err = sm.transition(Action::TranscriptionDone).unwrap_err();
-        assert!(matches!(
-            err,
-            WhisrsError::InvalidTransition {
-                from: State::Idle,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn full_cycle() {
-        let mut sm = StateMachine::new();
-        assert_eq!(sm.state(), State::Idle);
-
-        sm.transition(Action::Toggle).unwrap();
-        assert_eq!(sm.state(), State::Recording);
-
-        sm.transition(Action::Toggle).unwrap();
-        assert_eq!(sm.state(), State::Transcribing);
-
-        sm.transition(Action::TranscriptionDone).unwrap();
-        assert_eq!(sm.state(), State::Idle);
-    }
-
-    #[test]
-    fn cancel_then_restart() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        sm.transition(Action::Cancel).unwrap(); // → Idle
-        sm.transition(Action::Toggle).unwrap(); // → Recording again
-        assert_eq!(sm.state(), State::Recording);
-    }
-
-    /// A background task finishing after `cancel` must not move the machine:
-    /// its late TranscriptionDone is invalid from Idle and leaves Idle
-    /// untouched (issues #81/#90).
-    #[test]
-    fn late_transcription_done_after_cancel_stays_idle() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        sm.transition(Action::Cancel).unwrap(); // → Idle
-        assert!(sm.transition(Action::TranscriptionDone).is_err());
-        assert_eq!(sm.state(), State::Idle);
-    }
-
-    /// Documents the #81/#90 trap: from a post-cancel Idle, Toggle is a
-    /// valid user action that starts a NEW recording, so the machine cannot
-    /// reject a background task that fires Toggle blindly — the task must
-    /// check its session context first (`claim_session` in
-    /// src/daemon/command_mode.rs). A blind Toggle re-enters Recording and
-    /// the finalizer's TranscriptionDone then wedges there.
-    #[test]
-    fn blind_toggle_after_cancel_reenters_recording_and_wedges() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        sm.transition(Action::Cancel).unwrap(); // → Idle
-                                                // The old buggy background: Toggle from Idle is valid...
-        assert_eq!(sm.transition(Action::Toggle).unwrap(), State::Recording);
-        // ...and its finalizer's TranscriptionDone is then swallowed,
-        // leaving the machine stuck in Recording. This is the wedge the
-        // daemon-side context check prevents from ever being reachable.
-        assert!(sm.transition(Action::TranscriptionDone).is_err());
-        assert_eq!(sm.state(), State::Recording);
-    }
-
-    /// Once a claimed session is Transcribing, cancel cannot yank the state
-    /// out from under the pipeline — its finalizer's TranscriptionDone is
-    /// the only way back to Idle. (This is why the post-claim half of the
-    /// cancel race is safe: cancel returns an error instead.)
-    #[test]
-    fn cancel_cannot_interrupt_transcribing_before_finalize() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        sm.transition(Action::Toggle).unwrap(); // claimed → Transcribing
-        assert!(sm.transition(Action::Cancel).is_err());
-        assert_eq!(sm.state(), State::Transcribing);
-        assert_eq!(
-            sm.transition(Action::TranscriptionDone).unwrap(),
-            State::Idle
-        );
-    }
-
-    // --- Read-aloud flow ---
-
-    #[test]
-    fn speak_full_cycle() {
-        let mut sm = StateMachine::new();
-        assert_eq!(
-            sm.transition(Action::SpeakStart).unwrap(),
-            State::Synthesizing
-        );
-        assert_eq!(
-            sm.transition(Action::SpeakPlaying).unwrap(),
-            State::Speaking
-        );
-        assert_eq!(sm.transition(Action::SpeakDone).unwrap(), State::Idle);
-    }
-
-    #[test]
-    fn speak_done_from_synthesizing() {
-        // Synthesis produced nothing / was cancelled before playback began.
-        let mut sm = StateMachine::new();
-        sm.transition(Action::SpeakStart).unwrap();
-        assert_eq!(sm.transition(Action::SpeakDone).unwrap(), State::Idle);
-    }
-
-    #[test]
-    fn cancel_synthesizing_to_idle() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::SpeakStart).unwrap();
-        assert_eq!(sm.transition(Action::Cancel).unwrap(), State::Idle);
-    }
-
-    #[test]
-    fn cancel_speaking_to_idle() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::SpeakStart).unwrap();
-        sm.transition(Action::SpeakPlaying).unwrap();
-        assert_eq!(sm.transition(Action::Cancel).unwrap(), State::Idle);
-    }
-
-    #[test]
-    fn speak_then_speak_again() {
-        // After a read-aloud cycle finishes, a fresh read-aloud can start.
-        let mut sm = StateMachine::new();
-        sm.transition(Action::SpeakStart).unwrap();
-        sm.transition(Action::SpeakPlaying).unwrap();
-        sm.transition(Action::SpeakDone).unwrap(); // → Idle
-        assert_eq!(
-            sm.transition(Action::SpeakStart).unwrap(),
-            State::Synthesizing
-        );
-    }
-
-    #[test]
-    fn invalid_toggle_while_speaking() {
-        // Recording is refused while read-aloud is playing.
-        let mut sm = StateMachine::new();
-        sm.transition(Action::SpeakStart).unwrap();
-        sm.transition(Action::SpeakPlaying).unwrap();
-        let err = sm.transition(Action::Toggle).unwrap_err();
-        assert!(matches!(
-            err,
-            WhisrsError::InvalidTransition {
-                from: State::Speaking,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn invalid_toggle_while_synthesizing() {
-        let mut sm = StateMachine::new();
-        sm.transition(Action::SpeakStart).unwrap();
-        let err = sm.transition(Action::Toggle).unwrap_err();
-        assert!(matches!(
-            err,
-            WhisrsError::InvalidTransition {
-                from: State::Synthesizing,
-                ..
-            }
-        ));
-    }
-
-    // --- Recovery retry ---
-
-    /// A retry goes straight to Transcribing and back, and `cancel` cannot
-    /// cut it short: its own TranscriptionDone is the only way back.
-    #[test]
-    fn retry_full_cycle() {
-        let mut sm = StateMachine::new();
-        assert_eq!(
-            sm.transition(Action::RetryStart).unwrap(),
-            State::Transcribing
-        );
-        assert!(sm.transition(Action::Cancel).is_err());
-        assert!(sm.transition(Action::Toggle).is_err());
-        assert_eq!(sm.state(), State::Transcribing);
-        assert_eq!(
-            sm.transition(Action::TranscriptionDone).unwrap(),
-            State::Idle
-        );
-    }
-
-    /// A retry starts only from Idle.
-    #[test]
-    fn retry_refused_unless_idle() {
-        let busy: [&[Action]; 4] = [
-            &[Action::Toggle],
-            &[Action::Toggle, Action::Toggle],
-            &[Action::SpeakStart],
-            &[Action::SpeakStart, Action::SpeakPlaying],
+    fn valid_transitions() {
+        let flows: &[(&str, &[(Action, State)])] = &[
+            (
+                "dictation",
+                &[
+                    (Toggle, Recording),
+                    (Toggle, Transcribing),
+                    (TranscriptionDone, Idle),
+                ],
+            ),
+            (
+                "cancel, then record again",
+                &[(Toggle, Recording), (Cancel, Idle), (Toggle, Recording)],
+            ),
+            (
+                "read-aloud, then another",
+                &[
+                    (SpeakStart, Synthesizing),
+                    (SpeakPlaying, Speaking),
+                    (SpeakDone, Idle),
+                    (SpeakStart, Synthesizing),
+                ],
+            ),
+            (
+                "synthesis that plays nothing",
+                &[(SpeakStart, Synthesizing), (SpeakDone, Idle)],
+            ),
+            (
+                "cancel while synthesizing",
+                &[(SpeakStart, Synthesizing), (Cancel, Idle)],
+            ),
+            (
+                "cancel while speaking",
+                &[
+                    (SpeakStart, Synthesizing),
+                    (SpeakPlaying, Speaking),
+                    (Cancel, Idle),
+                ],
+            ),
+            (
+                "recovery retry",
+                &[(RetryStart, Transcribing), (TranscriptionDone, Idle)],
+            ),
         ];
-        for steps in busy {
+        for (flow, steps) in flows {
             let mut sm = StateMachine::new();
-            for &step in steps {
-                sm.transition(step).unwrap();
+            assert_eq!(sm.state(), Idle, "{flow}: a new machine");
+            for (step, &(action, to)) in steps.iter().enumerate() {
+                let got = sm
+                    .transition(action)
+                    .unwrap_or_else(|e| panic!("{flow}, step {step}: {e}"));
+                assert_eq!(got, to, "{flow}, step {step}");
+                assert_eq!(sm.state(), to, "{flow}, step {step}");
             }
-            let before = sm.state();
-            let err = sm.transition(Action::RetryStart).unwrap_err();
-            assert!(
-                matches!(err, WhisrsError::InvalidTransition { from, .. } if from == before),
-                "{steps:?}"
-            );
-            assert_eq!(sm.state(), before, "{steps:?}");
         }
     }
 
+    /// The refusals the flows meet: an `InvalidTransition` from the state the
+    /// machine was in, which it keeps. Recording and read-aloud refuse each
+    /// other, and a transcription, a retry's too, ends only with its own
+    /// `TranscriptionDone`: cancel cannot cut it short.
     #[test]
-    fn invalid_speak_start_while_recording() {
-        // Read-aloud is refused while recording (handler maps this to a
-        // "busy" error without mutating the FSM, but the transition itself
-        // is also invalid as a defence in depth).
-        let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        let err = sm.transition(Action::SpeakStart).unwrap_err();
-        assert!(matches!(
-            err,
-            WhisrsError::InvalidTransition {
-                from: State::Recording,
-                ..
+    fn invalid_transitions_leave_the_state() {
+        let cases: &[(&str, &[Action], Action, State)] = &[
+            (
+                "toggle while transcribing",
+                &[Toggle, Toggle],
+                Toggle,
+                Transcribing,
+            ),
+            ("cancel while idle", &[], Cancel, Idle),
+            (
+                "cancel while transcribing",
+                &[Toggle, Toggle],
+                Cancel,
+                Transcribing,
+            ),
+            (
+                "transcription done while idle",
+                &[],
+                TranscriptionDone,
+                Idle,
+            ),
+            // A task that finishes after a cancel cannot move the machine.
+            (
+                "a late transcription done after cancel",
+                &[Toggle, Cancel],
+                TranscriptionDone,
+                Idle,
+            ),
+            // A task that fires Toggle blindly after a cancel starts a new
+            // recording, whose TranscriptionDone is then refused: the
+            // daemon's tasks claim their session first (`claim_session`,
+            // daemon/command_mode.rs).
+            (
+                "transcription done while recording",
+                &[Toggle, Cancel, Toggle],
+                TranscriptionDone,
+                Recording,
+            ),
+            (
+                "toggle while synthesizing",
+                &[SpeakStart],
+                Toggle,
+                Synthesizing,
+            ),
+            (
+                "toggle while speaking",
+                &[SpeakStart, SpeakPlaying],
+                Toggle,
+                Speaking,
+            ),
+            ("speak while recording", &[Toggle], SpeakStart, Recording),
+            ("retry while recording", &[Toggle], RetryStart, Recording),
+            (
+                "retry while transcribing",
+                &[Toggle, Toggle],
+                RetryStart,
+                Transcribing,
+            ),
+            (
+                "retry while synthesizing",
+                &[SpeakStart],
+                RetryStart,
+                Synthesizing,
+            ),
+            (
+                "retry while speaking",
+                &[SpeakStart, SpeakPlaying],
+                RetryStart,
+                Speaking,
+            ),
+            ("cancel during a retry", &[RetryStart], Cancel, Transcribing),
+            ("toggle during a retry", &[RetryStart], Toggle, Transcribing),
+        ];
+        for &(case, setup, action, before) in cases {
+            let mut sm = StateMachine::new();
+            for &step in setup {
+                sm.transition(step)
+                    .unwrap_or_else(|e| panic!("{case}: setup {step}: {e}"));
             }
-        ));
+            let err = sm.transition(action).expect_err(case);
+            assert!(
+                matches!(err, WhisrsError::InvalidTransition { from, .. } if from == before),
+                "{case}: {err}"
+            );
+            assert_eq!(sm.state(), before, "{case}");
+        }
     }
 }

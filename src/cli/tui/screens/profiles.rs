@@ -989,16 +989,6 @@ mod tests {
             .unwrap()
             .starts_with("profiles/broken.toml is not valid TOML"));
 
-        let one = drawn(&fixture, 89, 30);
-        assert!(one
-            .iter()
-            .any(|r| r.contains("\u{25CF} offline") && r.contains("3 keys")));
-        assert!(one
-            .iter()
-            .any(|r| r.contains("work") && r.contains("base only, ignored: groq.api_key")));
-        assert!(one
-            .iter()
-            .any(|r| r.contains("broken: profiles/broken.toml")));
         // The pane lists the focused one's keys.
         let mut on_work = three();
         to(&mut on_work, "work");

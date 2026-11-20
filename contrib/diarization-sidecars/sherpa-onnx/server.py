@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     # The versions measured; --threshold 1.1 was tuned on sherpa-onnx 1.13.8.
+#     # Known to work with these versions; --threshold 1.1 suits sherpa-onnx 1.13.8.
 #     "sherpa-onnx==1.13.8",
 #     "numpy==2.5.4",
 #     "soundfile==0.14.0",

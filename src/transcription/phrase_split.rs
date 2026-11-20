@@ -556,10 +556,10 @@ impl PhraseSplitter {
         let search_start = self.split_search_start(i);
         let mut split_frame = search_start;
         let mut min_energy = f64::INFINITY;
-        for j in search_start..=i {
-            if self.energies[j] < min_energy {
-                min_energy = self.energies[j];
-                split_frame = j;
+        for (k, &e) in self.energies[search_start..=i].iter().enumerate() {
+            if e < min_energy {
+                min_energy = e;
+                split_frame = search_start + k;
             }
         }
         self.cut_at(split_frame, out);
@@ -698,6 +698,8 @@ mod tests {
         assert_eq!(phrases[0].samples.len(), 7 * FRAME);
         // Phrase 2: 1 pad + 3 speech + 1 pad frames.
         assert_eq!(phrases[1].samples.len(), 5 * FRAME);
+        // Natural phrases are never continuations.
+        assert!(phrases.iter().all(|p| !p.continuation));
     }
 
     #[test]
@@ -841,14 +843,6 @@ mod tests {
 
     #[test]
     fn continuation_flag_tracks_forced_cuts() {
-        // Natural phrases carry continuation == false.
-        let mut s = splitter();
-        let audio = frames(&[(0, 2), (SPEECH, 5), (0, 4), (SPEECH, 3), (0, 4)]);
-        let mut phrases = s.feed(&audio);
-        phrases.extend(s.flush());
-        assert_eq!(phrases.len(), 2);
-        assert!(phrases.iter().all(|p| !p.continuation));
-
         // A forced cut marks the remainder as a continuation; the next
         // naturally started phrase is not one.
         let mut s = capped_splitter(10);
@@ -925,29 +919,25 @@ mod tests {
     }
 
     #[test]
-    fn flush_emits_trailing_phrase_once() {
-        let mut s = splitter();
-        // Speech that never sees enough trailing silence to split.
-        let audio = frames(&[(0, 1), (SPEECH, 4), (0, 1)]);
-        assert!(s.feed(&audio).is_empty());
+    fn flush_emits_the_trailing_phrase_once_trimmed_to_the_pad() {
+        // Speech that never sees enough trailing silence to split (the split
+        // threshold is 3 frames). Either way the phrase is 1 pad + 4 speech
+        // + 1 pad: a trailing frame within the pad is kept, more is trimmed.
+        for (name, trailing_silent_frames) in [
+            ("trailing silence within the pad", 1),
+            ("excess trailing silence trimmed", 2),
+        ] {
+            let mut s = splitter();
+            let audio = frames(&[(0, 1), (SPEECH, 4), (0, trailing_silent_frames)]);
+            assert!(s.feed(&audio).is_empty(), "{name}: feed emitted");
 
-        let phrase = s.flush().expect("trailing phrase should flush");
-        // 1 pad + 4 speech + 1 trailing silence frame (<= pad, kept).
-        assert_eq!(phrase.samples.len(), 6 * FRAME);
-        assert!(!phrase.continuation);
-        assert!(s.flush().is_none(), "flush must emit exactly once");
-    }
-
-    #[test]
-    fn flush_trims_excess_trailing_silence() {
-        let mut s = splitter();
-        // 2 trailing silent frames (< split threshold of 3, > pad of 1).
-        let audio = frames(&[(0, 1), (SPEECH, 4), (0, 2)]);
-        assert!(s.feed(&audio).is_empty());
-
-        let phrase = s.flush().expect("trailing phrase should flush");
-        // Trimmed to 1 pad + 4 speech + 1 pad.
-        assert_eq!(phrase.samples.len(), 6 * FRAME);
+            let phrase = s
+                .flush()
+                .unwrap_or_else(|| panic!("{name}: trailing phrase should flush"));
+            assert_eq!(phrase.samples.len(), 6 * FRAME, "{name}");
+            assert!(!phrase.continuation, "{name}");
+            assert!(s.flush().is_none(), "{name}: flush must emit exactly once");
+        }
     }
 
     #[test]
@@ -1484,10 +1474,10 @@ mod tests {
                 let search_start = self.split_search_start(i);
                 let mut split_frame = search_start;
                 let mut min_energy = f64::INFINITY;
-                for j in search_start..=i {
-                    if self.energies[j] < min_energy {
-                        min_energy = self.energies[j];
-                        split_frame = j;
+                for (k, &e) in self.energies[search_start..=i].iter().enumerate() {
+                    if e < min_energy {
+                        min_energy = e;
+                        split_frame = search_start + k;
                     }
                 }
                 self.cut_at(split_frame, out);

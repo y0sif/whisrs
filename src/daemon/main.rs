@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
         let backend = config.input.backend;
         tokio::task::spawn_blocking(move || warm_keyboard(key_delay, backend));
     }
-    // Open the keyboards the pre-injection modifier check reads (#154) now,
+    // Open the keyboards the pre-injection modifier check reads now,
     // off the hot path, so the first dictation does not pay for it. Always:
     // selection capture (speak, command) checks modifiers even when
     // clipboard_only skips typing.

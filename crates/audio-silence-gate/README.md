@@ -66,8 +66,7 @@ The right level floor depends on who may speak:
   transcript.
 
 The fields are public for tuning. The shipped values are tuned with the
-benchmark in whisrs'
-[`scripts/check-vad.sh`](https://github.com/y0sif/whisrs/blob/main/scripts/check-vad.sh).
+maintainer's VAD check.
 
 ## Real-time auto-stop
 
@@ -140,7 +139,7 @@ quiet or too noisy is left to the caller.
 |                   | audio-silence-gate (earshot)       | audio-silence-gate (`Vad::Rms`) | Silero VAD             |
 |-------------------|------------------------------------|---------------------------------|------------------------|
 | Dependencies      | earshot (std only, none of its own) | same                           | ONNX runtime           |
-| Cost              | about 11 microseconds per 16 ms frame, measured by check-vad.sh on one machine | microseconds | milliseconds |
+| Cost              | microseconds per 16 ms frame       | microseconds                    | milliseconds           |
 | Decision delay    | 48 to 64 ms, earshot's own (onset confirmation adds a frame) | one frame | one window |
 | Noise             | a steady fan or hum is not speech  | anything loud is speech         | neural                 |
 | Best for          | auto-stop and gating on 16 kHz audio | a mic the model handles badly | precise speech segmentation |

@@ -355,8 +355,8 @@ mod tests {
 
     #[test]
     fn parse_every_digit_key() {
-        // Issue #219: a one-character key was read as a letter only, so the
-        // digit arms were unreachable and `Super+1` was an unknown key.
+        // A one-character key can be a digit, not only a letter: `Super+1` is
+        // a known key.
         let expected = [
             ("0", Key::KEY_0),
             ("1", Key::KEY_1),

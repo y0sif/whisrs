@@ -1,4 +1,4 @@
-.TH WHISRSD 1 "2026-10-31" "whisrs 0.2.0" "User Commands"
+.TH WHISRSD 1 "2026-11-14" "whisrs 0.2.1" "User Commands"
 .SH NAME
 whisrsd \- whisrs dictation daemon
 .SH SYNOPSIS
@@ -13,7 +13,7 @@ keyboard.
 The daemon listens on a Unix domain socket for commands from the
 .BR whisrs (1)
 CLI client. It runs as a long-lived process, either standalone or as a
-systemd user service.
+systemd or OpenRC user service.
 .PP
 On startup, the daemon:
 .IP \(bu 2
@@ -89,15 +89,9 @@ A switch to base is refused too while
 .I config.toml
 does not load. Otherwise the daemon writes the active name, notifies,
 answers, and restarts on it: through its service when it runs as one
-(systemd:
-.BR whisrs.service ,
-the restart queued with
-.BR \-\-no\-block ;
-OpenRC:
-.BR RC_SVCNAME=whisrs ),
-else by starting itself again in place, with the same arguments, after the
-shutdown SIGTERM runs (a recording in progress is finalized), from the
-binary its path names now, so an upgrade takes effect. Until the restart,
+(systemd or OpenRC), else by starting itself again with the same arguments.
+Either way a recording in progress is finalized first, and the restart
+runs the binary installed now, so an upgrade takes effect. Until the restart,
 anything that would start a dictation, command mode, a read\-aloud, a
 recording or a job on one, or an agent turn is refused with
 .BR "switching profile: try again in a moment" ,
@@ -105,29 +99,37 @@ and agent replies wait. When something started anyway, or the restart
 fails, the previous name comes back and a notification says why. The tray's
 Restart Daemon restarts the same way.
 .SH TRANSCRIPTION BACKENDS
+Set with
+.BR "[general] backend" .
+Streaming backends type the text while you speak; the others send the audio
+when you stop.
 .TP
-.B groq
-Groq Whisper API. Free tier available. Audio is chunked at silence
-boundaries and sent as HTTP POST requests. Timestamp-based deduplication
-prevents repeated text.
+.BR groq ", " deepgram ", " openai
+Groq's Whisper API, and the REST APIs of Deepgram and OpenAI.
 .TP
-.B openai-realtime
-OpenAI Realtime API via WebSocket. Provides true streaming transcription
-with the lowest latency. Recommended for the best experience.
+.BR deepgram\-streaming ", " openai\-realtime
+Deepgram and OpenAI's Realtime API over a WebSocket. Streaming.
 .TP
-.B openai
-OpenAI REST API. Simple HTTP POST, non-streaming fallback.
+.B openai\-compatible\-realtime
+A realtime server that speaks OpenAI's protocol, such as a local one.
+Streaming.
 .TP
-.B asr-sidecar
-Generic local HTTP ASR sidecar. Sends WAV audio as multipart form
-data and expects a JSON response with a
+.B local\-whisper
+whisper.cpp on this machine (the
+.B local\-whisper
+build feature, on by default). Fully offline. Streaming, phrase by phrase;
+batch when \fB[local\-whisper] segmentation\fR is \fBnone\fR.
+.TP
+.B asr\-sidecar
+Any HTTP server, local or hosted (OpenRouter, for example), that takes
+OpenAI's transcription request format at
+.BR "[asr\-sidecar] url" :
+WAV audio as multipart form data, answered with JSON whose
 .B text
-field.
+field is the transcript.
 .TP
-.B local
-Local transcription via whisper.cpp (requires the
-.B local
-feature flag at compile time). Fully offline.
+.BR local\-vosk ", " local\-parakeet
+Placeholders for native backends not built yet.
 .SH SOCKET
 The daemon creates a Unix domain socket at:
 .PP
@@ -172,6 +174,14 @@ Groq API key. Overrides the config file value.
 .B WHISRS_OPENAI_API_KEY
 OpenAI API key. Overrides the config file value.
 .TP
+.B WHISRS_DEEPGRAM_API_KEY
+Deepgram API key. Overrides the config file value.
+.TP
+.B WHISRS_ASR_SIDECAR_API_KEY
+Bearer token for an
+.B asr\-sidecar
+server. Overrides the config file value.
+.TP
 .B XDG_RUNTIME_DIR
 Socket directory.
 .TP
@@ -184,11 +194,18 @@ Used to detect Wayland session for clipboard operations.
 .B HYPRLAND_INSTANCE_SIGNATURE
 Used to detect Hyprland compositor for window tracking.
 .TP
+.B NIRI_SOCKET
+Used to detect Niri compositor for window tracking.
+.TP
 .B SWAYSOCK
 Used to detect Sway compositor for window tracking.
 .TP
 .B XDG_SESSION_TYPE
 Used to detect X11 session for window tracking.
+.TP
+.B XDG_CURRENT_DESKTOP
+Used to detect GNOME and KDE, where window tracking is off: neither tells
+whisrs which window has focus.
 .SH FILES
 .TP
 .I ~/.config/whisrs/config.toml

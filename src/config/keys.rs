@@ -88,15 +88,18 @@ pub fn key_summary_from(config: &Config, env: impl Fn(&str) -> Option<String>) -
             if let Some(key) = env(var).filter(|key| !key.trim().is_empty()) {
                 return from_env(var, key.trim());
             }
-            return match config
-                .asr_sidecar
-                .as_ref()
+            let sidecar = config.asr_sidecar.as_ref();
+            return match sidecar
                 .and_then(|s| s.api_key.as_deref())
                 .filter(|key| !key.trim().is_empty())
             {
                 Some(key) => KeySummary::File {
                     masked: mask_api_key(key),
                 },
+                // OpenRouter refuses a request without one.
+                None if sidecar.is_some_and(|s| crate::config::catalog::is_openrouter(&s.url)) => {
+                    KeySummary::NotSet
+                }
                 None => KeySummary::Optional("API key"),
             };
         }
@@ -155,8 +158,8 @@ mod tests {
         assert_eq!(mask_api_key(""), "****");
     }
 
-    /// A key ending in multi-byte characters used to panic: the cut fell
-    /// four bytes from the end, inside a character. It is four characters now.
+    /// A key ending in multi-byte characters must not panic: a cut four bytes
+    /// from the end falls inside a character, so the cut is four characters.
     #[test]
     fn mask_api_key_counts_characters_not_bytes() {
         assert_eq!(mask_api_key("sk-abc€€"), "****bc€€");
@@ -343,42 +346,31 @@ api_key = "tts-SECRET-gggg"
         }
     }
 
+    /// Each keyed backend, as the daemon resolves it: a non-empty env key
+    /// wins, with or without a key in the file; else the file's key; else
+    /// none (the sidecar's is optional).
     #[test]
-    fn key_summary_shows_an_env_key_without_a_config_key() {
+    fn key_summary_of_each_keyed_backend() {
         for &(backend, section, var) in KEYED_BACKENDS {
             let absent = format!("[general]\nbackend = \"{backend}\"\n");
             let empty = format!("{absent}[{section}]\napi_key = \"\"\n");
-            for toml in [absent, empty] {
-                let summary = key_summary(&toml, &[(var, "env-key-9876")]);
-                assert_eq!(summary, env_key(var, "****9876"), "{backend}");
-            }
-        }
-    }
-
-    #[test]
-    fn key_summary_prefers_the_env_key_like_the_daemon() {
-        for &(backend, section, var) in KEYED_BACKENDS {
-            let toml = format!(
-                "[general]\nbackend = \"{backend}\"\n[{section}]\napi_key = \"file-key-1234\"\n"
-            );
-            let both = key_summary(&toml, &[(var, "env-key-9876")]);
-            assert_eq!(both, env_key(var, "****9876"), "{backend}");
-
-            let file_only = key_summary(&toml, &[]);
-            assert_eq!(file_only, file_key("****1234"), "{backend}");
-        }
-    }
-
-    #[test]
-    fn key_summary_without_any_key_is_unchanged() {
-        for &(backend, section, _) in KEYED_BACKENDS {
-            let summary = key_summary(&format!("[general]\nbackend = \"{backend}\"\n"), &[]);
-            let expected = if section == "asr-sidecar" {
+            let keyed = format!("{absent}[{section}]\napi_key = \"file-key-1234\"\n");
+            let none = if section == "asr-sidecar" {
                 KeySummary::Optional("API key")
             } else {
                 KeySummary::NotSet
             };
-            assert_eq!(summary, expected, "{backend}");
+            let env = [(var, "env-key-9876")];
+            let from_env = env_key(var, "****9876");
+            for (row, toml, env, expected) in [
+                ("env, no section", &absent, &env[..], from_env.clone()),
+                ("env, an empty file key", &empty, &env[..], from_env.clone()),
+                ("env over the file", &keyed, &env[..], from_env),
+                ("the file alone", &keyed, &[][..], file_key("****1234")),
+                ("nothing", &absent, &[][..], none),
+            ] {
+                assert_eq!(key_summary(toml, env), expected, "{backend}: {row}");
+            }
         }
     }
 
@@ -398,6 +390,25 @@ api_key = "tts-SECRET-gggg"
         assert_eq!(key_summary(&keyed, &[]), file_key("****5555"));
         let unknown = "[general]\nbackend = \"nope\"\n";
         assert_eq!(key_summary(unknown, &[]), KeySummary::NotSet);
+    }
+
+    /// The sidecar's key is optional, but not on OpenRouter, which refuses
+    /// a request without one.
+    #[test]
+    fn key_summary_of_the_sidecar_on_openrouter_needs_a_key() {
+        let openrouter = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\n\
+                          url = \"https://openrouter.ai/api/v1/audio/transcriptions\"\n";
+        assert_eq!(key_summary(openrouter, &[]), KeySummary::NotSet);
+        let keyed = format!("{openrouter}api_key = \"sk-or-v1-4321\"\n");
+        assert_eq!(key_summary(&keyed, &[]), file_key("****4321"));
+        let env = key_summary(
+            openrouter,
+            &[("WHISRS_ASR_SIDECAR_API_KEY", "sk-or-env-9876")],
+        );
+        assert_eq!(env, env_key("WHISRS_ASR_SIDECAR_API_KEY", "****9876"));
+        let own = "[general]\nbackend = \"asr-sidecar\"\n[asr-sidecar]\n\
+                   url = \"http://10.0.0.2:8765/transcribe\"\n";
+        assert_eq!(key_summary(own, &[]), KeySummary::Optional("API key"));
     }
 
     /// The daemon's blank-env rules differ by backend: groq only skips an

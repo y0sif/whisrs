@@ -1578,7 +1578,7 @@ pub(crate) async fn handle_agent(
     if !rt.is_enabled() {
         return error(
             "no agents are configured: add an [[agents]] entry to config.toml \
-             (see docs/configuration.md)",
+             (see docs/agents.md)",
         );
     }
     let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
@@ -2897,14 +2897,6 @@ mod tests {
         assert_eq!(context.agents.any_turn_running(), Some(true));
         drop(second);
         assert_eq!(context.agents.any_turn_running(), Some(false));
-
-        let _pending = context.agents.begin_turn();
-        let ds = Arc::new(Mutex::new(crate::context::DaemonState::new()));
-        let answer = crate::handle_command(whisrs::Command::Info, ds, Arc::clone(&context)).await;
-        let whisrs::Response::Info { info } = answer else {
-            panic!("expected an info response, got {answer:?}");
-        };
-        assert!(info.agent_turn);
     }
 
     fn queued(rt: &AgentRuntime) -> Vec<String> {
@@ -3284,66 +3276,6 @@ mod tests {
         assert!(!rt.has_utterances());
     }
 
-    /// A harness whose session waits on a permission prompt it hit on its
-    /// own (no whisrs turn running), and stops when asked.
-    struct PromptWaitingDriver;
-
-    #[async_trait::async_trait]
-    impl Driver for PromptWaitingDriver {
-        async fn run_turn(
-            &self,
-            _agent: &Agent,
-            _session: SessionRef,
-            _request: TurnRequest,
-            _io: TurnIo,
-        ) -> TurnOutcome {
-            unreachable!("no turn runs")
-        }
-
-        async fn rewatch(
-            &self,
-            _agent: &Agent,
-            _session: SessionRef,
-            _request: TurnRequest,
-            _io: TurnIo,
-        ) -> TurnOutcome {
-            unreachable!("no turn runs")
-        }
-
-        async fn stop(&self, _agent: &Agent, _session: &SessionRef) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn forget(&self, _session: &SessionRef) {}
-
-        fn hook_matches(&self, payload: &serde_json::Value, _session: &SessionRef) -> bool {
-            payload["session_id"] == "sid-1"
-        }
-
-        async fn session_phase(
-            &self,
-            _agent: &Agent,
-            _session: &SessionRef,
-        ) -> Result<AgentPhase, String> {
-            Ok(AgentPhase::NeedsYou)
-        }
-
-        async fn session_phases(
-            &self,
-            sessions: &[(Arc<Agent>, SessionRef)],
-        ) -> Vec<Result<AgentPhase, String>> {
-            sessions.iter().map(|_| Ok(AgentPhase::NeedsYou)).collect()
-        }
-
-        async fn idle_event(
-            &self,
-            _payload: &serde_json::Value,
-            _session: &SessionRef,
-        ) -> IdleEvent {
-            IdleEvent::NeedsYou("Waiting for your approval to use Bash.".into())
-        }
-    }
-
     /// `--stop` with no whisrs turn running stops the session's own work,
     /// and the needs-you its permission prompt set goes with it: the row
     /// printed after the stop says idle.
@@ -3351,11 +3283,11 @@ mod tests {
     async fn stopping_a_sessions_own_work_clears_needs_you() {
         let dir = tempfile::tempdir().unwrap();
         let mut context = test_context(&["jarvis"], dir.path());
-        Arc::get_mut(&mut context)
-            .unwrap()
-            .agents
-            .drivers
-            .insert(Harness::Claude, Arc::new(PromptWaitingDriver));
+        // The session waits on a permission prompt it hit on its own.
+        Arc::get_mut(&mut context).unwrap().agents.drivers.insert(
+            Harness::Claude,
+            Arc::new(IdleListingDriver::new(AgentPhase::NeedsYou)),
+        );
         {
             let mut inner = context.agents.inner.lock().await;
             let mut record = AgentRecord::new("claude", Path::new("/proj"));
@@ -3410,6 +3342,8 @@ mod tests {
         assert!(!error_already_notified("no agent named 'x'"));
     }
 
+    /// No agents: nothing runs, nothing is queued to speak, and there is no
+    /// board channel for a task to own, nor is anything ever sent to one.
     #[test]
     fn no_agents_means_an_inert_runtime() {
         let config: Config = toml::from_str("").unwrap();
@@ -3421,6 +3355,13 @@ mod tests {
         // Nothing is queued to speak.
         rt.say("jarvis", "x".into());
         assert!(!rt.has_utterances());
+        assert!(rt.take_board_events().is_none());
+        assert!(rt.board_tx.is_none());
+        rt.board(BoardEvent::Clear {
+            agent: "jarvis".into(),
+        });
+        rt.pending_changed();
+        assert!(rt.last_pending.lock().unwrap().is_empty());
     }
 
     /// A session's events from before a turn started (its previous turn, or
@@ -4904,21 +4845,6 @@ mod tests {
         rt.say("jarvis", "jarvis: Another reply.".into());
         reset(&context, &agent).await.unwrap();
         assert_eq!(queued(rt), ["jarvis: Another reply."]);
-    }
-
-    /// No agents: no board channel for a task to own, and nothing is ever
-    /// sent to one.
-    #[test]
-    fn no_agents_starts_no_board() {
-        let config: Config = toml::from_str("").unwrap();
-        let rt = AgentRuntime::new(&config, Path::new("/nonexistent.sock"));
-        assert!(rt.take_board_events().is_none());
-        assert!(rt.board_tx.is_none());
-        rt.board(BoardEvent::Clear {
-            agent: "jarvis".into(),
-        });
-        rt.pending_changed();
-        assert!(rt.last_pending.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -30,6 +30,10 @@ pub enum Command {
     Status,
     /// What the daemon is and does ([`DaemonInfo`]). Newer than `status`, so
     /// a client falls back to `status` when an older daemon hangs up on it.
+    ///
+    /// Never waits on a lock, so it is safe to poll: with the dictation lock
+    /// held, `state` is the last one published and `busy` is set
+    /// ([`DaemonInfo::busy`]).
     Info,
     /// Retrieve recent transcription history.
     Log {
@@ -541,8 +545,8 @@ impl InfoAnswer {
 }
 
 /// Ask the daemon for its dictation state with `status`, which every daemon
-/// knows. `whisrs status` uses this rather than `info`: a daemon older than
-/// `info` logs an error for each `info` it cannot parse.
+/// knows. The TUI polls with this once a daemon turns out older than `info`:
+/// such a daemon logs an error for each `info` it cannot parse.
 pub fn request_status_blocking(timeout: Option<Duration>) -> Result<State, RequestError> {
     request_status_blocking_at(&socket_path(), timeout)
 }
@@ -593,152 +597,342 @@ pub fn request_info_blocking_at(
 mod tests {
     use super::*;
 
+    /// The `-l` rule: a 2 to 3 letter ISO 639 code, with optional region or
+    /// script subtags, or `auto`; normalized, or refused when clearly
+    /// invalid.
     #[test]
-    fn command_serialization_roundtrip() {
-        let cmd = Command::Toggle { language: None };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Command::Toggle { language: None }));
+    fn language_override_normalizes_or_refuses() {
+        for (input, expected) in [
+            ("en", Some("en")),
+            ("PL", Some("pl")),
+            ("auto", Some("auto")),
+            ("en-US", Some("en-US")),
+            ("pt-br", Some("pt-BR")),
+            ("en_US", Some("en-US")),
+            // Deepgram's multilingual mode, whisper.cpp's three-letter codes,
+            // and script subtags pass through structurally.
+            ("multi", Some("multi")),
+            ("yue", Some("yue")),
+            ("zh-Hans", Some("zh-Hans")),
+            ("", None),
+            ("english", None),
+            ("123", None),
+            ("e", None),
+            ("en-", None),
+        ] {
+            assert_eq!(
+                validate_language_override(input).ok().as_deref(),
+                expected,
+                "{input:?}"
+            );
+        }
     }
 
+    /// A state has one name, on the wire (serde) and on screen (`Display`).
     #[test]
-    fn toggle_language_serialization_roundtrip() {
-        let cmd = Command::Toggle {
-            language: Some("pl".to_string()),
+    fn state_names_match_on_the_wire_and_on_screen() {
+        for (state, name) in [
+            (State::Idle, "idle"),
+            (State::Recording, "recording"),
+            (State::Transcribing, "transcribing"),
+            (State::Synthesizing, "synthesizing"),
+            (State::Speaking, "speaking"),
+        ] {
+            assert_eq!(state.to_string(), name, "{name}: Display");
+            let wire = format!("\"{name}\"");
+            let json = serde_json::to_string(&state).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(json, wire, "{name}: serialized");
+            let parsed: State =
+                serde_json::from_str(&wire).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(parsed, state, "{name}: parsed");
+        }
+    }
+
+    /// Every command's JSON, both ways: the command serializes to exactly
+    /// this, and this parses back to the command. Old and new builds must
+    /// keep talking, so no name or field here changes.
+    #[test]
+    fn every_command_keeps_its_wire_shape() {
+        let recording =
+            |action, title: Option<&str>, id: Option<&str>, options| Command::Recording {
+                action,
+                title: title.map(str::to_string),
+                id: id.map(str::to_string),
+                options,
+            };
+        let agent = |action, name: Option<&str>, text: Option<&str>, new| Command::Agent {
+            action,
+            name: name.map(str::to_string),
+            text: text.map(str::to_string),
+            new,
         };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"cmd":"toggle","language":"pl"}"#);
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Command::Toggle { language: Some(l) } if l == "pl"));
-    }
-
-    #[test]
-    fn language_override_accepts_iso_codes() {
-        assert_eq!(validate_language_override("en").unwrap(), "en");
-        assert_eq!(validate_language_override("PL").unwrap(), "pl");
-        assert_eq!(validate_language_override("auto").unwrap(), "auto");
-    }
-
-    #[test]
-    fn language_override_accepts_region_tags() {
-        assert_eq!(validate_language_override("en-US").unwrap(), "en-US");
-        assert_eq!(validate_language_override("pt-br").unwrap(), "pt-BR");
-        assert_eq!(validate_language_override("en_US").unwrap(), "en-US");
-    }
-
-    #[test]
-    fn language_override_accepts_backend_specific_codes() {
-        // Deepgram's multilingual mode, whisper.cpp's three-letter codes,
-        // and script subtags pass through structurally.
-        assert_eq!(validate_language_override("multi").unwrap(), "multi");
-        assert_eq!(validate_language_override("yue").unwrap(), "yue");
-        assert_eq!(validate_language_override("zh-Hans").unwrap(), "zh-Hans");
-    }
-
-    #[test]
-    fn language_override_rejects_clearly_invalid() {
-        assert!(validate_language_override("").is_err());
-        assert!(validate_language_override("english").is_err());
-        assert!(validate_language_override("123").is_err());
-        assert!(validate_language_override("e").is_err());
-        assert!(validate_language_override("en-").is_err());
-    }
-
-    #[test]
-    fn response_serialization_roundtrip() {
-        let resp = Response::Ok {
-            state: State::Recording,
+        let standup = Some("2026-10-27_1402_standup");
+        // The options travel flat beside `action`, and each one is optional.
+        let lesson = RecordingOptions {
+            language: Some("de".to_string()),
+            system_language: Some("auto".to_string()),
+            others: Some("Video".to_string()),
+            shared_mic: Some(true),
+            num_speakers: Some(3),
+            participants: Some(vec!["Sarah".to_string(), "Omar".to_string()]),
+            ..Default::default()
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            parsed,
-            Response::Ok {
-                state: State::Recording
-            }
-        ));
-    }
-
-    #[test]
-    fn command_json_format() {
-        let cmd = Command::Toggle { language: None };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"cmd":"toggle"}"#);
-    }
-
-    #[test]
-    fn speak_command_serializes_lowercase() {
-        let cmd = Command::Speak;
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"cmd":"speak"}"#);
-    }
-
-    #[test]
-    fn speak_command_roundtrip() {
-        let parsed: Command = serde_json::from_str(r#"{"cmd":"speak"}"#).unwrap();
-        assert!(matches!(parsed, Command::Speak));
-    }
-
-    #[test]
-    fn speak_command_read_alias() {
-        let parsed: Command = serde_json::from_str(r#"{"cmd":"read"}"#).unwrap();
-        assert!(matches!(parsed, Command::Speak));
-    }
-
-    #[test]
-    fn response_json_format() {
-        let resp = Response::Ok { state: State::Idle };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert_eq!(json, r#"{"status":"ok","state":"idle"}"#);
-
-        let err = Response::Error {
-            message: "no microphone found".to_string(),
+        let retry = RecordingOptions {
+            mic_language: Some("en".to_string()),
+            shared_mic: Some(false),
+            num_speakers: Some(0),
+            participants: Some(Vec::new()),
+            ..Default::default()
         };
-        let json = serde_json::to_string(&err).unwrap();
-        assert_eq!(
-            json,
-            r#"{"status":"error","message":"no microphone found"}"#
-        );
-    }
+        let rename = RecordingOptions {
+            speaker: Some("Speaker 2".to_string()),
+            name: Some("Sarah".to_string()),
+            ..Default::default()
+        };
+        // `exact` goes on the wire only when set.
+        let exact = RecordingOptions {
+            exact: true,
+            ..Default::default()
+        };
+        let rows: Vec<(&str, Command, &str)> = vec![
+            (
+                "toggle",
+                Command::Toggle { language: None },
+                r#"{"cmd":"toggle"}"#,
+            ),
+            (
+                "toggle -l",
+                Command::Toggle {
+                    language: Some("pl".to_string()),
+                },
+                r#"{"cmd":"toggle","language":"pl"}"#,
+            ),
+            ("cancel", Command::Cancel, r#"{"cmd":"cancel"}"#),
+            ("status", Command::Status, r#"{"cmd":"status"}"#),
+            ("info", Command::Info, r#"{"cmd":"info"}"#),
+            (
+                "log",
+                Command::Log { limit: 5 },
+                r#"{"cmd":"log","limit":5}"#,
+            ),
+            (
+                "clear-history",
+                Command::ClearHistory,
+                r#"{"cmd":"clear-history"}"#,
+            ),
+            ("command", Command::CommandMode, r#"{"cmd":"command"}"#),
+            ("speak", Command::Speak, r#"{"cmd":"speak"}"#),
+            // Its own command: it never parses as `speak`, which a daemon
+            // would answer by reading the selection.
+            (
+                "speak-text",
+                Command::SpeakText {
+                    text: "hello".to_string(),
+                },
+                r#"{"cmd":"speak-text","text":"hello"}"#,
+            ),
+            (
+                "llm-command",
+                Command::LlmCommand {
+                    name: "translate-de".to_string(),
+                },
+                r#"{"cmd":"llm-command","name":"translate-de"}"#,
+            ),
+            (
+                "set-llm-instruction",
+                Command::SetLlmInstruction {
+                    name: "translate-de".to_string(),
+                },
+                r#"{"cmd":"set-llm-instruction","name":"translate-de"}"#,
+            ),
+            (
+                "recording start, title",
+                recording(
+                    RecordingAction::Start,
+                    Some("x"),
+                    None,
+                    RecordingOptions::default(),
+                ),
+                r#"{"cmd":"recording","action":"start","title":"x"}"#,
+            ),
+            (
+                "recording toggle",
+                recording(
+                    RecordingAction::Toggle,
+                    None,
+                    None,
+                    RecordingOptions::default(),
+                ),
+                r#"{"cmd":"recording","action":"toggle"}"#,
+            ),
+            (
+                "recording retry, id",
+                recording(
+                    RecordingAction::Retry,
+                    None,
+                    Some("last"),
+                    RecordingOptions::default(),
+                ),
+                r#"{"cmd":"recording","action":"retry","id":"last"}"#,
+            ),
+            (
+                "recording start, options",
+                recording(RecordingAction::Start, Some("Lesson 50"), None, lesson),
+                r#"{"cmd":"recording","action":"start","title":"Lesson 50","language":"de","system_language":"auto","others":"Video","shared_mic":true,"num_speakers":3,"participants":["Sarah","Omar"]}"#,
+            ),
+            (
+                "recording retry, options",
+                recording(RecordingAction::Retry, None, Some("last"), retry),
+                r#"{"cmd":"recording","action":"retry","id":"last","mic_language":"en","shared_mic":false,"num_speakers":0,"participants":[]}"#,
+            ),
+            // `name` carries the speaker and its new name beside the id.
+            (
+                "recording name",
+                recording(RecordingAction::Name, None, Some("last"), rename),
+                r#"{"cmd":"recording","action":"name","id":"last","speaker":"Speaker 2","name":"Sarah"}"#,
+            ),
+            (
+                "recording summarize",
+                recording(
+                    RecordingAction::Summarize,
+                    None,
+                    Some("last"),
+                    RecordingOptions::default(),
+                ),
+                r#"{"cmd":"recording","action":"summarize","id":"last"}"#,
+            ),
+            (
+                "recording copy",
+                recording(
+                    RecordingAction::Copy,
+                    None,
+                    standup,
+                    RecordingOptions::default(),
+                ),
+                r#"{"cmd":"recording","action":"copy","id":"2026-10-27_1402_standup"}"#,
+            ),
+            (
+                "recording copy, exact",
+                recording(RecordingAction::Copy, None, standup, exact),
+                r#"{"cmd":"recording","action":"copy","id":"2026-10-27_1402_standup","exact":true}"#,
+            ),
+            (
+                "recording delete",
+                recording(
+                    RecordingAction::Delete,
+                    None,
+                    standup,
+                    RecordingOptions::default(),
+                ),
+                r#"{"cmd":"recording","action":"delete","id":"2026-10-27_1402_standup"}"#,
+            ),
+            (
+                "agent list",
+                agent(AgentAction::List, None, None, false),
+                r#"{"cmd":"agent","action":"list"}"#,
+            ),
+            (
+                "agent send, new",
+                agent(
+                    AgentAction::Send,
+                    Some("jarvis"),
+                    Some("run the tests"),
+                    true,
+                ),
+                r#"{"cmd":"agent","action":"send","name":"jarvis","text":"run the tests","new":true}"#,
+            ),
+            // A fresh-session voice turn.
+            (
+                "agent toggle, new",
+                agent(AgentAction::Toggle, Some("jarvis"), None, true),
+                r#"{"cmd":"agent","action":"toggle","name":"jarvis","new":true}"#,
+            ),
+            (
+                "agent toggle",
+                agent(AgentAction::Toggle, Some("jarvis"), None, false),
+                r#"{"cmd":"agent","action":"toggle","name":"jarvis"}"#,
+            ),
+            (
+                "agent reset",
+                agent(AgentAction::Reset, Some("jarvis"), None, false),
+                r#"{"cmd":"agent","action":"reset","name":"jarvis"}"#,
+            ),
+            (
+                "agent stop",
+                agent(AgentAction::Stop, Some("jarvis"), None, false),
+                r#"{"cmd":"agent","action":"stop","name":"jarvis"}"#,
+            ),
+            // `transcribe-recovery` leaves out what it was not given.
+            (
+                "transcribe-recovery, newest",
+                Command::TranscribeRecovery {
+                    file: None,
+                    language: None,
+                },
+                r#"{"cmd":"transcribe-recovery"}"#,
+            ),
+            (
+                "transcribe-recovery, named",
+                Command::TranscribeRecovery {
+                    file: Some("/abs/path".to_string()),
+                    language: Some("de".to_string()),
+                },
+                r#"{"cmd":"transcribe-recovery","file":"/abs/path","language":"de"}"#,
+            ),
+            // `switch-profile` names the profile, or leaves it out for the
+            // next one.
+            (
+                "switch-profile, named",
+                Command::SwitchProfile {
+                    name: Some("offline".to_string()),
+                },
+                r#"{"cmd":"switch-profile","name":"offline"}"#,
+            ),
+            (
+                "switch-profile, next",
+                Command::SwitchProfile { name: None },
+                r#"{"cmd":"switch-profile"}"#,
+            ),
+        ];
+        for (row, cmd, json) in rows {
+            let written = serde_json::to_string(&cmd).unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert_eq!(written, json, "{row}: serialized");
+            let parsed: Command =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert_eq!(format!("{parsed:?}"), format!("{cmd:?}"), "{row}: parsed");
+        }
 
-    #[test]
-    fn state_display() {
-        assert_eq!(State::Idle.to_string(), "idle");
-        assert_eq!(State::Recording.to_string(), "recording");
-        assert_eq!(State::Transcribing.to_string(), "transcribing");
-        assert_eq!(State::Synthesizing.to_string(), "synthesizing");
-        assert_eq!(State::Speaking.to_string(), "speaking");
-    }
+        // Read, never written: the `read` alias, and a field the options do
+        // not know, ignored as an older daemon ignores `exact`.
+        for (row, json, cmd) in [
+            ("read alias", r#"{"cmd":"read"}"#, Command::Speak),
+            (
+                "recording, unknown field ignored",
+                r#"{"cmd":"recording","action":"copy","id":"x","later":1}"#,
+                recording(
+                    RecordingAction::Copy,
+                    None,
+                    Some("x"),
+                    RecordingOptions::default(),
+                ),
+            ),
+        ] {
+            let parsed: Command =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert_eq!(format!("{parsed:?}"), format!("{cmd:?}"), "{row}: parsed");
+        }
 
-    #[test]
-    fn state_serde_wire_format() {
-        // serde rename_all = "lowercase" governs the IPC wire form.
-        assert_eq!(
-            serde_json::to_string(&State::Synthesizing).unwrap(),
-            r#""synthesizing""#
+        // A speak-text without its text is malformed, not a read-aloud.
+        assert!(
+            serde_json::from_str::<Command>(r#"{"cmd":"speak-text"}"#).is_err(),
+            "speak-text without its text"
         );
-        assert_eq!(
-            serde_json::to_string(&State::Speaking).unwrap(),
-            r#""speaking""#
-        );
-        let parsed: State = serde_json::from_str(r#""speaking""#).unwrap();
-        assert_eq!(parsed, State::Speaking);
     }
 
     #[test]
     fn socket_path_is_not_empty() {
         let path = socket_path();
         assert!(!path.as_os_str().is_empty());
-    }
-
-    #[tokio::test]
-    async fn encode_decode_roundtrip() {
-        let cmd = Command::Status;
-        let encoded = encode_message(&cmd).unwrap();
-
-        let mut cursor = std::io::Cursor::new(encoded);
-        let decoded: Command = read_message(&mut cursor).await.unwrap();
-        assert!(matches!(decoded, Command::Status));
     }
 
     #[tokio::test]
@@ -796,279 +990,6 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    #[tokio::test]
-    async fn ipc_error_response_roundtrip() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::{UnixListener, UnixStream};
-
-        let dir = std::env::temp_dir().join(format!("whisrs-test-err-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock_path = dir.join("test.sock");
-        let _ = std::fs::remove_file(&sock_path);
-
-        let listener = UnixListener::bind(&sock_path).unwrap();
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (mut reader, mut writer) = stream.into_split();
-
-            let _cmd: Command = read_message(&mut reader).await.unwrap();
-
-            let response = Response::Error {
-                message: "test error".to_string(),
-            };
-            let encoded = encode_message(&response).unwrap();
-            writer.write_all(&encoded).await.unwrap();
-            writer.shutdown().await.unwrap();
-        });
-
-        let stream = UnixStream::connect(&sock_path).await.unwrap();
-        let (mut reader, mut writer) = stream.into_split();
-
-        let encoded = encode_message(&Command::Cancel).unwrap();
-        writer.write_all(&encoded).await.unwrap();
-        writer.shutdown().await.unwrap();
-
-        let response: Response = read_message(&mut reader).await.unwrap();
-        match response {
-            Response::Error { message } => assert_eq!(message, "test error"),
-            _ => panic!("expected error response"),
-        }
-
-        server.await.unwrap();
-
-        let _ = std::fs::remove_file(&sock_path);
-        let _ = std::fs::remove_dir(&dir);
-    }
-
-    #[test]
-    fn llm_command_serialization_roundtrip() {
-        let cmd = Command::LlmCommand {
-            name: "translate-de".to_string(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"cmd":"llm-command","name":"translate-de"}"#);
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Command::LlmCommand { name } if name == "translate-de"));
-    }
-
-    #[test]
-    fn set_llm_instruction_serialization_roundtrip() {
-        let cmd = Command::SetLlmInstruction {
-            name: "translate-de".to_string(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(
-            json,
-            r#"{"cmd":"set-llm-instruction","name":"translate-de"}"#
-        );
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Command::SetLlmInstruction { name } if name == "translate-de"));
-    }
-    #[test]
-    fn recording_command_wire_format() {
-        let cmd = Command::Recording {
-            action: RecordingAction::Start,
-            title: Some("x".to_string()),
-            id: None,
-            options: RecordingOptions::default(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"cmd":"recording","action":"start","title":"x"}"#);
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            parsed,
-            Command::Recording { action: RecordingAction::Start, title: Some(t), id: None, options }
-                if t == "x" && options == RecordingOptions::default()
-        ));
-    }
-
-    #[test]
-    fn recording_command_without_options() {
-        let parsed: Command =
-            serde_json::from_str(r#"{"cmd":"recording","action":"toggle"}"#).unwrap();
-        assert!(matches!(
-            parsed,
-            Command::Recording {
-                action: RecordingAction::Toggle,
-                title: None,
-                id: None,
-                options,
-            } if options == RecordingOptions::default()
-        ));
-        let cmd = Command::Recording {
-            action: RecordingAction::Retry,
-            title: None,
-            id: Some("last".to_string()),
-            options: RecordingOptions::default(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"cmd":"recording","action":"retry","id":"last"}"#);
-    }
-
-    /// The options travel flat beside `action`, and each one is optional.
-    #[test]
-    fn recording_command_with_options_roundtrip() {
-        let options = RecordingOptions {
-            language: Some("de".to_string()),
-            mic_language: None,
-            system_language: Some("auto".to_string()),
-            others: Some("Video".to_string()),
-            shared_mic: Some(true),
-            num_speakers: Some(3),
-            participants: Some(vec!["Sarah".to_string(), "Omar".to_string()]),
-            ..Default::default()
-        };
-        let cmd = Command::Recording {
-            action: RecordingAction::Start,
-            title: Some("Lesson 50".to_string()),
-            id: None,
-            options: options.clone(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(
-            json,
-            r#"{"cmd":"recording","action":"start","title":"Lesson 50","language":"de","system_language":"auto","others":"Video","shared_mic":true,"num_speakers":3,"participants":["Sarah","Omar"]}"#
-        );
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        assert!(
-            matches!(&parsed, Command::Recording { options: o, .. } if *o == options),
-            "{parsed:?}"
-        );
-
-        let retry: Command = serde_json::from_str(
-            r#"{"cmd":"recording","action":"retry","id":"last","mic_language":"en","shared_mic":false,"num_speakers":0,"participants":[]}"#,
-        )
-        .unwrap();
-        let Command::Recording {
-            action,
-            id,
-            options,
-            ..
-        } = retry
-        else {
-            panic!("not a recording command");
-        };
-        assert_eq!(action, RecordingAction::Retry);
-        assert_eq!(id.as_deref(), Some("last"));
-        assert_eq!(
-            options,
-            RecordingOptions {
-                mic_language: Some("en".to_string()),
-                shared_mic: Some(false),
-                num_speakers: Some(0),
-                participants: Some(Vec::new()),
-                ..Default::default()
-            }
-        );
-    }
-
-    /// `name` carries the speaker and its new name beside the id.
-    #[test]
-    fn recording_name_roundtrip() {
-        let json = r#"{"cmd":"recording","action":"name","id":"last","speaker":"Speaker 2","name":"Sarah"}"#;
-        let Command::Recording {
-            action,
-            id,
-            options,
-            ..
-        } = serde_json::from_str(json).unwrap()
-        else {
-            panic!("not a recording command");
-        };
-        assert_eq!(action, RecordingAction::Name);
-        assert_eq!(id.as_deref(), Some("last"));
-        assert_eq!(options.speaker.as_deref(), Some("Speaker 2"));
-        assert_eq!(options.name.as_deref(), Some("Sarah"));
-        let back = serde_json::to_string(&Command::Recording {
-            action,
-            title: None,
-            id,
-            options,
-        })
-        .unwrap();
-        assert_eq!(back, json);
-    }
-
-    /// `summarize` is an action of its own and takes an id.
-    #[test]
-    fn recording_summarize_roundtrip() {
-        let json = r#"{"cmd":"recording","action":"summarize","id":"last"}"#;
-        let Command::Recording { action, id, .. } = serde_json::from_str(json).unwrap() else {
-            panic!("not a recording command");
-        };
-        assert_eq!(action, RecordingAction::Summarize);
-        assert_eq!(id.as_deref(), Some("last"));
-    }
-
-    /// `exact` goes on the wire only when set, so a message without it (the
-    /// CLI's) is as before, and reads back as false when left out.
-    #[test]
-    fn recording_exact_is_sent_only_when_set() {
-        let plain = Command::Recording {
-            action: RecordingAction::Copy,
-            title: None,
-            id: Some("2026-10-27_1402_standup".to_string()),
-            options: RecordingOptions::default(),
-        };
-        assert_eq!(
-            serde_json::to_string(&plain).unwrap(),
-            r#"{"cmd":"recording","action":"copy","id":"2026-10-27_1402_standup"}"#
-        );
-        let exact = Command::Recording {
-            action: RecordingAction::Copy,
-            title: None,
-            id: Some("2026-10-27_1402_standup".to_string()),
-            options: RecordingOptions {
-                exact: true,
-                ..RecordingOptions::default()
-            },
-        };
-        let json = serde_json::to_string(&exact).unwrap();
-        assert_eq!(
-            json,
-            r#"{"cmd":"recording","action":"copy","id":"2026-10-27_1402_standup","exact":true}"#
-        );
-        let Command::Recording { options, .. } = serde_json::from_str(&json).unwrap() else {
-            panic!("not a recording command");
-        };
-        assert!(options.exact);
-        // A field the options do not know is ignored, as an older daemon
-        // ignores `exact`.
-        let Command::Recording { options, .. } =
-            serde_json::from_str(r#"{"cmd":"recording","action":"copy","id":"x","later":1}"#)
-                .unwrap()
-        else {
-            panic!("not a recording command");
-        };
-        assert_eq!(options, RecordingOptions::default());
-    }
-
-    /// `delete` is an action of its own and carries the full id.
-    #[test]
-    fn recording_delete_roundtrip() {
-        let json = r#"{"cmd":"recording","action":"delete","id":"2026-10-27_1402_standup"}"#;
-        let Command::Recording {
-            action,
-            title,
-            id,
-            options,
-        } = serde_json::from_str(json).unwrap()
-        else {
-            panic!("not a recording command");
-        };
-        assert_eq!(action, RecordingAction::Delete);
-        assert_eq!(id.as_deref(), Some("2026-10-27_1402_standup"));
-        let back = serde_json::to_string(&Command::Recording {
-            action,
-            title,
-            id,
-            options,
-        })
-        .unwrap();
-        assert_eq!(back, json);
-    }
-
     #[test]
     fn recording_response_roundtrip() {
         let status = RecordingStatus {
@@ -1098,94 +1019,6 @@ mod tests {
         );
     }
 
-    /// `speak-text` is its own command: it never parses as `speak` (which a
-    /// daemon would answer by reading the selection), and `speak` stays a
-    /// plain read-aloud.
-    #[test]
-    fn speak_text_is_not_confused_with_speak() {
-        let cmd = Command::SpeakText {
-            text: "hello".to_string(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"cmd":"speak-text","text":"hello"}"#);
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Command::SpeakText { text } if text == "hello"));
-        assert!(matches!(
-            serde_json::from_str::<Command>(r#"{"cmd":"speak"}"#).unwrap(),
-            Command::Speak
-        ));
-        assert!(matches!(
-            serde_json::from_str::<Command>(r#"{"cmd":"read"}"#).unwrap(),
-            Command::Speak
-        ));
-        // A speak-text without its text is malformed, not a read-aloud.
-        assert!(serde_json::from_str::<Command>(r#"{"cmd":"speak-text"}"#).is_err());
-    }
-
-    #[test]
-    fn agent_command_wire_format() {
-        let list = Command::Agent {
-            action: AgentAction::List,
-            name: None,
-            text: None,
-            new: false,
-        };
-        assert_eq!(
-            serde_json::to_string(&list).unwrap(),
-            r#"{"cmd":"agent","action":"list"}"#
-        );
-        let send = Command::Agent {
-            action: AgentAction::Send,
-            name: Some("jarvis".to_string()),
-            text: Some("run the tests".to_string()),
-            new: true,
-        };
-        let json = serde_json::to_string(&send).unwrap();
-        assert_eq!(
-            json,
-            r#"{"cmd":"agent","action":"send","name":"jarvis","text":"run the tests","new":true}"#
-        );
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            parsed,
-            Command::Agent { action: AgentAction::Send, name: Some(n), text: Some(t), new: true }
-                if n == "jarvis" && t == "run the tests"
-        ));
-        // A fresh-session voice turn.
-        let fresh = Command::Agent {
-            action: AgentAction::Toggle,
-            name: Some("jarvis".to_string()),
-            text: None,
-            new: true,
-        };
-        let json = serde_json::to_string(&fresh).unwrap();
-        assert_eq!(
-            json,
-            r#"{"cmd":"agent","action":"toggle","name":"jarvis","new":true}"#
-        );
-        assert!(matches!(
-            serde_json::from_str::<Command>(&json).unwrap(),
-            Command::Agent {
-                action: AgentAction::Toggle,
-                text: None,
-                new: true,
-                ..
-            }
-        ));
-        for (wire, action) in [
-            ("toggle", AgentAction::Toggle),
-            ("reset", AgentAction::Reset),
-            ("stop", AgentAction::Stop),
-        ] {
-            let json = format!(r#"{{"cmd":"agent","action":"{wire}","name":"jarvis"}}"#);
-            let parsed: Command = serde_json::from_str(&json).unwrap();
-            assert!(
-                matches!(parsed, Command::Agent { action: a, new: false, text: None, .. } if a == action),
-                "{json}"
-            );
-        }
-    }
-
     #[test]
     fn agent_event_carries_the_payload_verbatim() {
         let json = r#"{"cmd":"agent-event","payload":{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}}"#;
@@ -1208,91 +1041,6 @@ mod tests {
         assert_eq!(speak.log_summary(), "SpeakText { 12 chars }");
     }
 
-    /// `transcribe-recovery` leaves out what it was not given, and its
-    /// answer is a response of its own.
-    #[test]
-    fn transcribe_recovery_wire() {
-        let newest = Command::TranscribeRecovery {
-            file: None,
-            language: None,
-        };
-        assert_eq!(
-            serde_json::to_string(&newest).unwrap(),
-            r#"{"cmd":"transcribe-recovery"}"#
-        );
-        let named = Command::TranscribeRecovery {
-            file: Some("/abs/path".to_string()),
-            language: Some("de".to_string()),
-        };
-        let json = serde_json::to_string(&named).unwrap();
-        assert_eq!(
-            json,
-            r#"{"cmd":"transcribe-recovery","file":"/abs/path","language":"de"}"#
-        );
-        assert!(matches!(
-            serde_json::from_str::<Command>(&json).unwrap(),
-            Command::TranscribeRecovery { file: Some(f), language: Some(l) }
-                if f == "/abs/path" && l == "de"
-        ));
-        assert!(matches!(
-            serde_json::from_str::<Command>(r#"{"cmd":"transcribe-recovery"}"#).unwrap(),
-            Command::TranscribeRecovery {
-                file: None,
-                language: None
-            }
-        ));
-
-        let answer = Response::Transcript {
-            text: "hello there".to_string(),
-            file: "/c/recovery_a.wav".to_string(),
-            copied: true,
-            removed: false,
-        };
-        let json = serde_json::to_string(&answer).unwrap();
-        assert_eq!(
-            json,
-            r#"{"status":"transcript","text":"hello there","file":"/c/recovery_a.wav","copied":true,"removed":false}"#
-        );
-        assert!(matches!(
-            serde_json::from_str::<Response>(&json).unwrap(),
-            Response::Transcript { text, file, copied: true, removed: false }
-                if text == "hello there" && file == "/c/recovery_a.wav"
-        ));
-        // An answer without the flags claims neither a copy nor a removal.
-        assert!(matches!(
-            serde_json::from_str::<Response>(
-                r#"{"status":"transcript","text":"","file":"/c/recovery_a.wav"}"#
-            )
-            .unwrap(),
-            Response::Transcript {
-                copied: false,
-                removed: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn agents_response_roundtrip() {
-        use crate::agent::AgentPhase;
-        let resp = Response::Agents {
-            agents: vec![AgentInfo {
-                name: "jarvis".to_string(),
-                harness: "claude".to_string(),
-                phase: AgentPhase::Working,
-                session: Some("cc7a37cf".to_string()),
-                bg_id: Some("cc7a37cf".to_string()),
-            }],
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert_eq!(
-            json,
-            r#"{"status":"agents","agents":[{"name":"jarvis","harness":"claude","phase":"working","session":"cc7a37cf","bg_id":"cc7a37cf"}]}"#
-        );
-        let parsed: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Response::Agents { agents } if agents.len() == 1));
-    }
-
     fn sample_info() -> DaemonInfo {
         DaemonInfo {
             version: "0.2.0".to_string(),
@@ -1308,107 +1056,161 @@ mod tests {
         }
     }
 
+    /// Every response's JSON, both ways, as for the commands.
     #[test]
-    fn info_wire_format() {
-        assert_eq!(
-            serde_json::to_string(&Command::Info).unwrap(),
-            r#"{"cmd":"info"}"#
+    fn every_response_keeps_its_wire_shape() {
+        use crate::agent::AgentPhase;
+        use chrono::TimeZone;
+        // chrono writes a history timestamp in the local zone ("Z" in UTC);
+        // the fields around it are the wire shape.
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 10, 27, 14, 2, 0)
+            .unwrap();
+        let history_json = format!(
+            r#"{{"status":"history","entries":[{{"timestamp":{},"text":"hello there","backend":"groq","language":"en","duration_secs":2.5}}]}}"#,
+            serde_json::to_string(&at).unwrap()
         );
-        assert!(matches!(
-            serde_json::from_str::<Command>(r#"{"cmd":"info"}"#).unwrap(),
-            Command::Info
-        ));
-
-        let resp = Response::Info {
-            info: sample_info(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert_eq!(
-            json,
-            r#"{"status":"info","info":{"version":"0.2.0","state":"recording","recording":"processing","backend":"deepgram-streaming","features":["tray","recording"],"started_at":1793000000000,"busy":true,"agent_turn":false}}"#
-        );
-        let parsed: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Response::Info { info } if info == sample_info()));
-    }
-
-    /// `switch-profile` names the profile, or leaves it out for the next one.
-    #[test]
-    fn switch_profile_wire_format() {
-        for (cmd, json) in [
+        let rows: Vec<(&str, Response, &str)> = vec![
             (
-                Command::SwitchProfile {
-                    name: Some("offline".into()),
+                "ok idle",
+                Response::Ok { state: State::Idle },
+                r#"{"status":"ok","state":"idle"}"#,
+            ),
+            (
+                "ok recording",
+                Response::Ok {
+                    state: State::Recording,
                 },
-                r#"{"cmd":"switch-profile","name":"offline"}"#,
+                r#"{"status":"ok","state":"recording"}"#,
             ),
             (
-                Command::SwitchProfile { name: None },
-                r#"{"cmd":"switch-profile"}"#,
+                "error",
+                Response::Error {
+                    message: "no microphone found".to_string(),
+                },
+                r#"{"status":"error","message":"no microphone found"}"#,
             ),
-        ] {
-            assert_eq!(serde_json::to_string(&cmd).unwrap(), json);
-            let parsed: Command = serde_json::from_str(json).unwrap();
-            assert_eq!(format!("{parsed:?}"), format!("{cmd:?}"));
+            (
+                "history",
+                Response::History {
+                    entries: vec![history::HistoryEntry {
+                        timestamp: at,
+                        text: "hello there".to_string(),
+                        backend: "groq".to_string(),
+                        language: "en".to_string(),
+                        duration_secs: 2.5,
+                    }],
+                },
+                history_json.as_str(),
+            ),
+            // The answer to `transcribe-recovery` is a response of its own.
+            (
+                "transcript",
+                Response::Transcript {
+                    text: "hello there".to_string(),
+                    file: "/c/recovery_a.wav".to_string(),
+                    copied: true,
+                    removed: false,
+                },
+                r#"{"status":"transcript","text":"hello there","file":"/c/recovery_a.wav","copied":true,"removed":false}"#,
+            ),
+            (
+                "agents",
+                Response::Agents {
+                    agents: vec![AgentInfo {
+                        name: "jarvis".to_string(),
+                        harness: "claude".to_string(),
+                        phase: AgentPhase::Working,
+                        session: Some("cc7a37cf".to_string()),
+                        bg_id: Some("cc7a37cf".to_string()),
+                    }],
+                },
+                r#"{"status":"agents","agents":[{"name":"jarvis","harness":"claude","phase":"working","session":"cc7a37cf","bg_id":"cc7a37cf"}]}"#,
+            ),
+            // On base, `info` sends no profile, so its answer reads as before.
+            (
+                "info",
+                Response::Info {
+                    info: sample_info(),
+                },
+                r#"{"status":"info","info":{"version":"0.2.0","state":"recording","recording":"processing","backend":"deepgram-streaming","features":["tray","recording"],"started_at":1793000000000,"busy":true,"agent_turn":false}}"#,
+            ),
+            (
+                "info, profile",
+                Response::Info {
+                    info: DaemonInfo {
+                        profile: Some("offline".to_string()),
+                        ..sample_info()
+                    },
+                },
+                r#"{"status":"info","info":{"version":"0.2.0","state":"recording","recording":"processing","profile":"offline","backend":"deepgram-streaming","features":["tray","recording"],"started_at":1793000000000,"busy":true,"agent_turn":false}}"#,
+            ),
+            (
+                "profile",
+                Response::Profile {
+                    active: "offline".to_string(),
+                    switching: true,
+                    skipped: Vec::new(),
+                },
+                r#"{"status":"profile","active":"offline","switching":true}"#,
+            ),
+            (
+                "profile, skipped",
+                Response::Profile {
+                    active: "clean".to_string(),
+                    switching: true,
+                    skipped: vec!["broken".to_string()],
+                },
+                r#"{"status":"profile","active":"clean","switching":true,"skipped":["broken"]}"#,
+            ),
+        ];
+        for (row, resp, json) in rows {
+            let written = serde_json::to_string(&resp).unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert_eq!(written, json, "{row}: serialized");
+            let parsed: Response =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert_eq!(format!("{parsed:?}"), format!("{resp:?}"), "{row}: parsed");
         }
 
-        let resp = Response::Profile {
-            active: "offline".into(),
-            switching: true,
-            skipped: Vec::new(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert_eq!(
-            json,
-            r#"{"status":"profile","active":"offline","switching":true}"#
-        );
-        let resp = Response::Profile {
-            active: "clean".into(),
-            switching: true,
-            skipped: vec!["broken".into()],
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert_eq!(
-            json,
-            r#"{"status":"profile","active":"clean","switching":true,"skipped":["broken"]}"#
-        );
-        let parsed: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Response::Profile { skipped, .. } if skipped == ["broken"]));
-        let parsed: Response = serde_json::from_str(r#"{"status":"profile","active":"base"}"#)
-            .expect("switching defaults");
-        assert!(matches!(
-            parsed,
-            Response::Profile { active, switching: false, skipped } if active == "base" && skipped.is_empty()
-        ));
-    }
-
-    /// `info` names the profile, and why one did not load; on base it sends
-    /// neither, so its answer reads as before.
-    #[test]
-    fn info_carries_the_profile() {
-        let info = DaemonInfo {
-            profile: Some("offline".into()),
-            ..sample_info()
-        };
-        let json = serde_json::to_string(&Response::Info { info: info.clone() }).unwrap();
-        assert!(json.contains(r#""recording":"processing","profile":"offline","backend""#));
-        let parsed: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Response::Info { info: back } if back == info));
-
+        // Read with what is left out at its default.
         let why = "profile offline did not load, using base: profiles/offline.toml does not exist";
-        let parsed: Response = serde_json::from_str(&format!(
-            r#"{{"status":"info","info":{{"profile_error":"{why}"}}}}"#
-        ))
-        .unwrap();
-        let Response::Info { info } = parsed else {
-            panic!("not an info response: {parsed:?}");
-        };
-        assert_eq!(
-            (info.profile, info.profile_error.as_deref()),
-            (None, Some(why))
-        );
-
-        let base = serde_json::to_string(&sample_info()).unwrap();
-        assert!(!base.contains("profile"), "{base}");
+        for (row, json, resp) in [
+            // An answer without the flags claims neither a copy nor a removal.
+            (
+                "transcript, no flags",
+                r#"{"status":"transcript","text":"","file":"/c/recovery_a.wav"}"#.to_string(),
+                Response::Transcript {
+                    text: String::new(),
+                    file: "/c/recovery_a.wav".to_string(),
+                    copied: false,
+                    removed: false,
+                },
+            ),
+            (
+                "profile, defaults",
+                r#"{"status":"profile","active":"base"}"#.to_string(),
+                Response::Profile {
+                    active: "base".to_string(),
+                    switching: false,
+                    skipped: Vec::new(),
+                },
+            ),
+            // Why the profile did not load, with no profile named.
+            (
+                "info, profile_error only",
+                format!(r#"{{"status":"info","info":{{"profile_error":"{why}"}}}}"#),
+                Response::Info {
+                    info: DaemonInfo {
+                        profile_error: Some(why.to_string()),
+                        ..Default::default()
+                    },
+                },
+            ),
+        ] {
+            let parsed: Response =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert_eq!(format!("{parsed:?}"), format!("{resp:?}"), "{row}: parsed");
+        }
     }
 
     /// Fields come and go additively: a missing one takes its default, and

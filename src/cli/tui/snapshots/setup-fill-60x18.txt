@@ -13,6 +13,6 @@
    │   sample   t says "This is how whisrs reads yo…    │
    │                                                    │
    │   Who reads the text: a cloud voice, or            │
-   │   tts-sidecar, your own OpenAI-compatible          │
+   │   tts-sidecar, which asks a server of your own     │
    ╰────────────────────────────────────────────────────╯
      h/l change · space pick · enter next · esc leave

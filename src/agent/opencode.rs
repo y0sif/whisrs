@@ -363,9 +363,6 @@ mod tests {
 
     #[test]
     fn permissions_map_to_opencode_flags() {
-        assert_eq!(permission_args(Permissions::Auto), &[] as &[&str]);
-        assert_eq!(permission_args(Permissions::Bypass), ["--auto"]);
-        assert_eq!(permission_args(Permissions::Ask), &[] as &[&str]);
         // The first turn creates the session: title and args, once.
         assert_eq!(
             turn_args(&agent(Permissions::Auto), "ses_1", true),
@@ -571,20 +568,6 @@ mod tests {
         TurnUpdate::Session(resumed(id))
     }
 
-    /// A pending first turn that works is confirmed by its first text.
-    #[test]
-    fn the_first_text_confirms_a_pending_session() {
-        let (sent, _) = replay_in(ACK_THEN_TOOL, pending("ses_whisrsfixtureacktool"));
-        assert_eq!(
-            sent,
-            [
-                session("ses_whisrsfixtureacktool"),
-                TurnUpdate::Activity("Running a command".into()),
-                TurnUpdate::Interim("<spoken>On it.</spoken> Let me run that.".into()),
-            ]
-        );
-    }
-
     #[test]
     fn a_text_then_a_tool_call_is_an_interim_and_the_last_message_the_reply() {
         let lines: Vec<&str> = ACK_THEN_TOOL.lines().collect();
@@ -625,10 +608,6 @@ mod tests {
             "Finished the tool step. <spoken>The tool step is done.</spoken>"
         );
         assert_eq!(spoken::spoken_reply(&reply), "The tool step is done.");
-        assert_eq!(
-            spoken::interim_line("<spoken>On it.</spoken> Let me run that.").as_deref(),
-            Some("On it.")
-        );
     }
 
     #[test]

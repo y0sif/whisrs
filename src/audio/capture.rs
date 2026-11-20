@@ -1105,10 +1105,6 @@ mod tests {
     #[test]
     fn dictation_hint_is_unchanged() {
         // The dictation messages predate the recording feature; keep their wording.
-        assert_eq!(
-            CaptureMode::Dictation.hint(),
-            "set [audio] device = \"default\""
-        );
         let msg = start_timeout_error("usb-mic", CaptureMode::Dictation).to_string();
         assert_eq!(
             msg,

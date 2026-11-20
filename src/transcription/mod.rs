@@ -35,7 +35,8 @@ pub mod local_whisper {
         // Unreachable: `transcribe` bails before a request exists. `false`
         // is what the rule above the trait method yields — read the answer off
         // the request-building code, and this build has none — and it is the
-        // safe direction, since a stale `true` is the exact shape of #133.
+        // safe direction, since a stale `true` lets the prompt-echo filter
+        // discard real speech.
         // The real backend answers `true` off its own `set_initial_prompt`
         // call; the divergence is deliberate and unobservable.
         fn sends_prompt(&self, _config: &super::TranscriptionConfig) -> bool {
@@ -479,17 +480,16 @@ pub trait TranscriptionBackend: Send + Sync {
     /// Whether this backend actually transmits [`TranscriptionConfig::prompt`]
     /// to the provider for *this* request.
     ///
-    /// Gates the prompt-echo filter in the batch pipeline (issue #133).
+    /// Gates the prompt-echo filter in the batch pipeline.
     /// `config.prompt` is built for *every* backend from `[general] prompt` +
     /// `[general] vocabulary`, so a backend that silently drops it would
     /// otherwise have genuine speech that happens to resemble the user's own
     /// vocabulary discarded as an "echo" of a prompt that never went on the
     /// wire.
     ///
-    /// Required rather than defaulted on purpose: a default of `true` is
-    /// exactly what let `openai-compatible-realtime` inherit the wrong answer
-    /// in the first cut of the #133 fix. Answer it from the request-building
-    /// code, not from what the backend "should" do.
+    /// Required rather than defaulted on purpose: with a default of `true`, a
+    /// promptless backend inherits the wrong answer silently. Answer it from
+    /// the request-building code, not from what the backend "should" do.
     ///
     /// Takes the request because for the realtime profiles the answer is not a
     /// property of the backend at all: the model is. `openai-realtime` asks
@@ -833,18 +833,50 @@ mod tests {
             .all(|c| c.downcast_ref::<RetryableHttpError>().is_none()));
     }
 
+    /// The trimmed prompt, then the vocabulary joined by ", ", with ". "
+    /// between them; a blank prompt counts as none, so it never bleeds an
+    /// empty "" into the output.
     #[test]
     fn transcription_prompt_joins_prompt_and_vocabulary() {
-        let vocab = vec!["Hyprland".to_string(), "whisrs".to_string()];
-        assert_eq!(
-            transcription_prompt(Some(" Notes. "), &vocab).as_deref(),
-            Some("Notes.. Hyprland, whisrs")
-        );
-        assert_eq!(transcription_prompt(Some("  "), &[]), None);
-        assert_eq!(
-            transcription_prompt(None, &vocab).as_deref(),
-            Some("Hyprland, whisrs")
-        );
+        // (name, prompt, vocabulary, the joined prompt)
+        type Row<'a> = (&'a str, Option<&'a str>, &'a [&'a str], Option<&'a str>);
+        let cases: [Row; 7] = [
+            (
+                "prompt and vocabulary",
+                Some(" Notes. "),
+                &["Hyprland", "whisrs"],
+                Some("Notes.. Hyprland, whisrs"),
+            ),
+            (
+                "vocabulary only",
+                None,
+                &["Hyprland", "whisrs"],
+                Some("Hyprland, whisrs"),
+            ),
+            (
+                "prompt only",
+                Some("Embedded Linux dictation."),
+                &[],
+                Some("Embedded Linux dictation."),
+            ),
+            (
+                "blank prompt with vocabulary",
+                Some("   \t\n  "),
+                &["whisrs"],
+                Some("whisrs"),
+            ),
+            ("blank prompt, no vocabulary", Some("  "), &[], None),
+            ("empty prompt, no vocabulary", Some(""), &[], None),
+            ("neither", None, &[], None),
+        ];
+        for (name, prompt, vocabulary, want) in cases {
+            let vocabulary: Vec<String> = vocabulary.iter().map(|t| t.to_string()).collect();
+            assert_eq!(
+                transcription_prompt(prompt, &vocabulary).as_deref(),
+                want,
+                "{name}"
+            );
+        }
     }
 
     #[test]

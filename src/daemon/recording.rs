@@ -8,6 +8,18 @@
 //! recording finishes as usual. Status goes out on a separate watch channel
 //! that only the tray reads, so a recording never animates the overlay or
 //! fires the dictation hooks.
+//!
+//! Every processing job goes through one queue and one worker: a [`Job`] is
+//! a transcription or a summary, claimed with `reserve` (which refuses a
+//! recording already queued, processed or held) and handed over with
+//! `dispatch`. Waiting transcriptions run before waiting summaries
+//! ([`next_job`]), but a running summary delays the next transcription. A
+//! short rewrite that is no job (`recording name`, the retention sweep)
+//! takes a `hold` instead, which a transcription blocks and a summary job
+//! does not; a delete's hold is refused by both. A summary job reads a snapshot and calls
+//! the LLM unheld, then holds the recording only to merge its result in
+//! ([`summarize_one`]); it never transcribes again. Its `summary_pending`
+//! mark brings an interrupted one back at the next start ([`resume_summaries`]).
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
@@ -2864,14 +2876,6 @@ mod tests {
     }
 
     #[test]
-    fn status_idle_by_default() {
-        assert_eq!(
-            RecordingView::default().status(),
-            RecordingStatus::default()
-        );
-    }
-
-    #[test]
     fn status_recording_wins_over_processing() {
         let view = RecordingView {
             capturing: Some(active("rec")),
@@ -2906,6 +2910,12 @@ mod tests {
         assert_eq!(queued_only.status().queued, vec!["a", "b2"]);
         assert!(queued_only.is_pending("a"));
         assert!(!queued_only.is_pending("b"));
+
+        // Nothing queued either: idle, and nothing else is shown.
+        assert_eq!(
+            RecordingView::default().status(),
+            RecordingStatus::default()
+        );
     }
 
     #[test]
@@ -2950,14 +2960,20 @@ mod tests {
         assert_eq!(offset_ms(start + Duration::from_secs(1), Some(start)), 0);
     }
 
-    #[test]
-    fn apply_outcomes_fills_tracks_and_notes_failures() {
-        let start = Instant::now();
+    /// A recording's meta with a mic and a system track.
+    fn mic_and_system_meta() -> RecordingMeta {
         let mut meta = RecordingMeta::new("m".into(), None, Local::now());
         meta.tracks = vec![
             track_meta(TrackKind::Mic, "mic".into()),
             track_meta(TrackKind::System, "sys".into()),
         ];
+        meta
+    }
+
+    #[test]
+    fn apply_outcomes_fills_tracks_and_notes_failures() {
+        let start = Instant::now();
+        let mut meta = mic_and_system_meta();
         let outcomes = vec![
             TrackOutcome {
                 kind: TrackKind::Mic,
@@ -3009,12 +3025,8 @@ mod tests {
             stuck: false,
             ended_early: false,
         };
-        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
-        meta.tracks = vec![
-            track_meta(TrackKind::Mic, "mic".into()),
-            track_meta(TrackKind::System, "sys".into()),
-        ];
-        let outcomes = vec![
+        // The mic heard speech while the system track was silent.
+        let silent_mic = || {
             outcome(
                 TrackKind::Mic,
                 TrackStats {
@@ -3023,7 +3035,11 @@ mod tests {
                     raised: vec![Check::SystemSilent],
                     ..TrackStats::default()
                 },
-            ),
+            )
+        };
+        let mut meta = mic_and_system_meta();
+        let outcomes = vec![
+            silent_mic(),
             outcome(
                 TrackKind::System,
                 TrackStats {
@@ -3049,17 +3065,6 @@ mod tests {
 
         // A system writer that wrote nothing, or failed, measured nothing:
         // the live warning is stored all the same, on an unmeasured quality.
-        let silent_mic = || {
-            outcome(
-                TrackKind::Mic,
-                TrackStats {
-                    samples: 16_000,
-                    quality: report(&tone),
-                    raised: vec![Check::SystemSilent],
-                    ..TrackStats::default()
-                },
-            )
-        };
         let failed = TrackOutcome {
             kind: TrackKind::System,
             stats: Err("failed to finalize system.wav".to_string()),
@@ -3067,11 +3072,7 @@ mod tests {
             ended_early: false,
         };
         for system_outcome in [outcome(TrackKind::System, TrackStats::default()), failed] {
-            let mut meta = RecordingMeta::new("m".into(), None, Local::now());
-            meta.tracks = vec![
-                track_meta(TrackKind::Mic, "mic".into()),
-                track_meta(TrackKind::System, "sys".into()),
-            ];
+            let mut meta = mic_and_system_meta();
             apply_outcomes(&mut meta, start, &[silent_mic(), system_outcome]);
             let system = meta.tracks[1].quality.as_ref().expect("stored");
             assert!(!system.is_measured());
@@ -3079,11 +3080,7 @@ mod tests {
             assert_eq!(system.warnings, ["system-silent"]);
         }
         // Without the live warning nothing is stored for it.
-        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
-        meta.tracks = vec![
-            track_meta(TrackKind::Mic, "mic".into()),
-            track_meta(TrackKind::System, "sys".into()),
-        ];
+        let mut meta = mic_and_system_meta();
         let quiet_mic = outcome(
             TrackKind::Mic,
             TrackStats {
@@ -3249,11 +3246,7 @@ mod tests {
     async fn crashed_recording_is_recovered_and_transcribed() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = crashed_recording(tmp.path());
-        let backend = Arc::new(FakeBackend {
-            text: "hello from the crash",
-            fail: false,
-            calls: AtomicUsize::new(0),
-        });
+        let backend = backend_saying("hello from the crash");
         let (context, mut queue) = test_context(tmp.path(), backend.clone());
 
         recover_on_startup(Arc::clone(&context)).await;
@@ -3311,12 +3304,7 @@ mod tests {
     #[tokio::test]
     async fn stop_and_cancel_without_a_recording_are_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let backend = Arc::new(FakeBackend {
-            text: "",
-            fail: false,
-            calls: AtomicUsize::new(0),
-        });
-        let (context, _queue) = test_context(tmp.path(), backend);
+        let (context, _queue) = test_context(tmp.path(), working_backend());
         let none = RecordingOptions::default;
         let resp = handle_recording(
             Arc::clone(&context),
@@ -3469,11 +3457,7 @@ mod tests {
         meta.status = RecordingState::Failed;
         meta.tracks.push(track_meta(TrackKind::Mic, "test".into()));
         store::write_meta(&dir, &meta).unwrap();
-        std::fs::write(
-            store::audio_path(&dir, TrackKind::Mic),
-            whisrs::audio::wav::encode_wav(&[0; 1600]).unwrap(),
-        )
-        .unwrap();
+        write_silent_mic(&dir);
 
         retry(&context, "last", &RecordingOptions::default())
             .await
@@ -3585,12 +3569,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         crashed_recording(tmp.path());
         let (context, _queue) = test_context(tmp.path(), working_backend());
-        let refused = |response: Response, want: &str| {
-            let Response::Error { message } = &response else {
-                panic!("accepted: {response:?}");
-            };
-            assert!(message.contains(want), "{want:?} not in {message:?}");
-        };
         refused(
             name_speaker(&context, "me", "Yo").await,
             "has no transcript yet (status recording)",
@@ -3643,14 +3621,10 @@ mod tests {
             "audio_retention_days = 0
 ",
         );
-        let (id, dir) = store::create(tmp.path(), Local::now(), Some("done")).unwrap();
-        let mut meta = RecordingMeta::new(id.clone(), Some("done".into()), Local::now());
-        meta.status = RecordingState::Done;
-        meta.ended_at = Some(Local::now() - chrono::Duration::days(1));
-        meta.tracks.push(track_meta(TrackKind::Mic, "test".into()));
-        store::write_meta(&dir, &meta).unwrap();
+        let (id, dir) = finished_recording(tmp.path(), "done", |meta| {
+            meta.ended_at = Some(Local::now() - chrono::Duration::days(1))
+        });
         let audio = store::audio_path(&dir, TrackKind::Mic);
-        std::fs::write(&audio, whisrs::audio::wav::encode_wav(&[0; 1600]).unwrap()).unwrap();
 
         context.recording.hold(&id).unwrap();
         assert_eq!(
@@ -3974,15 +3948,10 @@ mod tests {
             working_backend(),
             "audio_retention_days = 0\n[llm]\napi_key = \"k\"\n",
         );
-        let (id, dir) = store::create(tmp.path(), Local::now(), Some("done")).unwrap();
-        let mut meta = RecordingMeta::new(id, Some("done".into()), Local::now());
-        meta.status = RecordingState::Done;
-        meta.ended_at = Some(Local::now());
-        meta.tracks.push(track_meta(TrackKind::Mic, "test".into()));
-        meta.summary_pending = Some(SummaryRequest::Asked);
-        store::write_meta(&dir, &meta).unwrap();
+        let (_, dir) = finished_recording(tmp.path(), "done", |meta| {
+            meta.summary_pending = Some(SummaryRequest::Asked)
+        });
         let audio = store::audio_path(&dir, TrackKind::Mic);
-        std::fs::write(&audio, whisrs::audio::wav::encode_wav(&[0; 1600]).unwrap()).unwrap();
         recover_on_startup(Arc::clone(&context)).await;
         assert!(queue.try_recv().is_ok(), "the summary is queued again");
         assert!(
@@ -4061,14 +4030,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = crashed_recording(tmp.path());
         let (url, arrived, release) = held_llm("{\"summary\": \"Tester counted.\"}").await;
-        let backend = Arc::new(FakeBackend {
-            text: LONG_SPEECH,
-            fail: false,
-            calls: AtomicUsize::new(0),
-        });
         let (context, mut queue) = test_context_with(
             tmp.path(),
-            backend,
+            backend_saying(LONG_SPEECH),
             &format!("summary = true\n[llm]\napi_key = \"k\"\napi_url = \"{url}\"\n"),
         );
         recover_on_startup(Arc::clone(&context)).await;
@@ -4261,8 +4225,13 @@ mod tests {
     }
 
     fn working_backend() -> Arc<FakeBackend> {
+        backend_saying("fine")
+    }
+
+    /// A [`FakeBackend`] whose every segment says `text`.
+    fn backend_saying(text: &'static str) -> Arc<FakeBackend> {
         Arc::new(FakeBackend {
-            text: "fine",
+            text,
             fail: false,
             calls: AtomicUsize::new(0),
         })
@@ -4879,33 +4848,72 @@ mod tests {
         &rest[..rest.find("\n}").expect("the fn ends")]
     }
 
+    /// The start [`note_hold`] watches, and what it saw: each step of the
+    /// start, and whether agent replies were held then.
+    static WATCHED_START: std::sync::Mutex<Option<Arc<DaemonContext>>> =
+        std::sync::Mutex::new(None);
+    static HELD_AT: std::sync::Mutex<Vec<(&str, bool)>> = std::sync::Mutex::new(Vec::new());
+
+    fn note_hold(step: &'static str) {
+        let context = WATCHED_START
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a watched start");
+        let held = crate::agent::replies_held(&context);
+        HELD_AT.lock().unwrap().push((step, held));
+    }
+
     /// A recording start holds agent replies (and stops one playing) before
     /// anything that can take a while: the free-space check, the device
-    /// lookup and opening the tracks. Not only once its devices are open.
-    #[test]
-    fn a_recording_start_holds_agent_replies_first() {
-        // This file has a test-only item before its test module, so it is
-        // cut at the module itself.
-        let source = include_str!("recording.rs");
-        let code = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
-        let body = fn_body(code, "async fn start(");
-        let hold = body
-            .find("crate::agent::hold_for_recording(context)")
-            .expect("start holds agent replies");
-        for later in ["check_space_to_start(", "resolve_system)", "open_tracks)"] {
-            let at = body
-                .find(later)
-                .unwrap_or_else(|| panic!("{later} not found"));
-            assert!(hold < at, "the hold comes after {later}");
-        }
-        // Bound to a name, so it lives until the start returns.
-        assert!(body.contains("let _replies = crate::agent::hold_for_recording"));
+    /// lookup and opening the tracks. Not only once its devices are open,
+    /// and not past the start: the hold ends with it.
+    #[tokio::test]
+    async fn a_recording_start_holds_agent_replies_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let free_space = |_: &Path| {
+            note_hold("free space");
+            Ok(u64::MAX)
+        };
+        let (mut context, _queue) = build_context(tmp.path(), working_backend(), "", free_space);
+        let recording = &mut Arc::get_mut(&mut context)
+            .expect("a fresh context")
+            .recording;
+        recording.devices = Devices {
+            resolve_system: |_| {
+                note_hold("system lookup");
+                None
+            },
+            open_tracks: |_, _, _, _, _| {
+                note_hold("open tracks");
+                bail!("a test opens no devices")
+            },
+        };
+        *WATCHED_START.lock().unwrap() = Some(Arc::clone(&context));
+        let err = start(&context, None, &RecordingOptions::default()).await;
+        *WATCHED_START.lock().unwrap() = None;
+
+        assert_eq!(err.unwrap_err().to_string(), "a test opens no devices");
+        assert_eq!(
+            *HELD_AT.lock().unwrap(),
+            [
+                ("free space", true),
+                ("system lookup", true),
+                ("open tracks", true)
+            ]
+        );
+        assert!(
+            !crate::agent::replies_held(&context),
+            "the hold ends with the start"
+        );
     }
 
     /// Dictation and voice-command toasts never say "recording", the
     /// recording feature's word, so the two cannot be mistaken for each
     /// other. The audio gate's skip toast is built in one place and pinned
-    /// by its own test (`gate_skip_message_per_origin`).
+    /// by its own test (`gate_skip_toast_names_a_level_per_reason_and_origin`),
+    /// and the prompt-echo toast, a const, by
+    /// `batch_path_drops_echo_shaped_text_only_from_a_prompting_backend`.
     #[test]
     fn dictation_toasts_never_say_recording() {
         for (file, source) in [
@@ -5970,19 +5978,36 @@ mod tests {
     /// A transcribed recording titled `title` in `root`, its mic track on
     /// disk.
     fn done_recording(root: &Path, title: &str) -> (String, PathBuf) {
+        let (id, dir) = finished_recording(root, title, |_| {});
+        std::fs::write(store::transcript_path(&dir, &id), "# done\n").unwrap();
+        (id, dir)
+    }
+
+    /// A recording titled `title` in `root`, done, its mic track on disk
+    /// and no transcript file; `edit` changes its meta before it is written.
+    fn finished_recording(
+        root: &Path,
+        title: &str,
+        edit: impl FnOnce(&mut RecordingMeta),
+    ) -> (String, PathBuf) {
         let (id, dir) = store::create(root, Local::now(), Some(title)).unwrap();
         let mut meta = RecordingMeta::new(id.clone(), Some(title.into()), Local::now());
         meta.status = RecordingState::Done;
         meta.ended_at = Some(Local::now());
         meta.tracks.push(track_meta(TrackKind::Mic, "test".into()));
+        edit(&mut meta);
         store::write_meta(&dir, &meta).unwrap();
+        write_silent_mic(&dir);
+        (id, dir)
+    }
+
+    /// A tenth of a second of silence as `dir`'s mic track.
+    fn write_silent_mic(dir: &Path) {
         std::fs::write(
-            store::audio_path(&dir, TrackKind::Mic),
+            store::audio_path(dir, TrackKind::Mic),
             whisrs::audio::wav::encode_wav(&[0; 1600]).unwrap(),
         )
         .unwrap();
-        std::fs::write(store::transcript_path(&dir, &id), "# done\n").unwrap();
-        (id, dir)
     }
 
     /// A delete takes the whole folder and nothing else, by its whole id

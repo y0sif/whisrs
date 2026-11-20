@@ -11,16 +11,39 @@ members = [
 
 [package]
 name = "whisrs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-description = "Voice for the Linux desktop: dictation, read-aloud (TTS), and voice-driven LLM commands, with Groq, OpenAI, Deepgram, and local Whisper backends"
+description = "Voice for the Linux desktop: dictation, read-aloud, meeting transcription, voice-driven LLM commands and coding agents, with Groq, Deepgram, OpenAI or offline whisper.cpp."
 license = "MIT"
 repository = "https://github.com/y0sif/whisrs"
 homepage = "https://y0sif.github.io/whisrs/"
 keywords = ["voice", "dictation", "speech-to-text", "whisper", "linux"]
 categories = ["multimedia::audio", "accessibility", "command-line-utilities"]
 readme = "README.md"
-exclude = ["assets/"]
+# The crates.io package: what a build and its tests read, plus the files a packager installs.
+include = [
+    "/src/**/*.rs",
+    "/src/overlay/font/*.ttf",
+    "/src/overlay/font/OFL.txt",
+    "/src/tray/icons/*.png",
+    "/src/cli/tui/snapshots/*.txt",
+    "/tests/**",
+    "/docs/agents.md",
+    "/docs/config-reference.md",
+    "/docs/configuration.md",
+    "/docs/recording.md",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/contrib/whisrs.1",
+    "/contrib/whisrsd.1",
+    "/contrib/whisrs.service",
+    "/contrib/openrc/whisrs.initd",
+    "/contrib/openrc/whisrs.confd",
+    "/contrib/99-whisrs.rules",
+    "/contrib/gnome-shell-extension/**",
+]
 
 [package.metadata.docs.rs]
 all-features = false
@@ -33,18 +56,6 @@ path = "src/cli/main.rs"
 [[bin]]
 name = "whisrsd"
 path = "src/daemon/main.rs"
-
-[[example]]
-name = "issue55_stream_check"
-required-features = ["local-whisper"]
-
-[[example]]
-name = "issue208_batch_check"
-required-features = ["local-whisper"]
-
-[[example]]
-name = "agent_overlay_frames"
-required-features = ["overlay"]
 
 [features]
 default = ["local-whisper", "tray", "overlay", "hooks", "recording", "mcp"]
@@ -60,8 +71,8 @@ hooks = ["dep:zbus"]
 recording = ["dep:flacenc", "dep:realfft", "dep:bytes"]
 # `whisrs mcp`: a read-only MCP server (stdio) over the recordings folder.
 mcp = ["recording", "dep:rmcp", "dep:schemars"]
-# GPU backends for the bundled whisper.cpp. Opt-in at build time — the backend
-# has to be linked in, so there is no runtime switch — and CPU stays the default.
+# GPU backends for the bundled whisper.cpp. Opt-in at build time: the backend
+# has to be linked in, so there is no runtime switch, and CPU stays the default.
 # The `whisper-rs?/…` weak syntax applies the feature to whisper-rs without
 # itself enabling the optional dependency; `local-whisper` is what pulls it in,
 # so builds that never enable it stay free of whisper-rs.
@@ -179,6 +190,3 @@ claxon = "0.4"
 tempfile = "3"
 # start_paused tests need tokio's paused clock ("test-util" is not in "full").
 tokio = { version = "1", features = ["test-util"] }
-# PNG output for examples/agent_overlay_frames.rs. Dev only, so the binaries
-# keep tiny-skia without its PNG encoder.
-tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }
