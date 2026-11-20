@@ -10,14 +10,11 @@ use async_trait::async_trait;
 use super::{StreamText, TranscriptionBackend, TranscriptionConfig};
 
 /// Vosk-based local transcription backend.
-pub struct VoskBackend {
-    #[allow(dead_code)]
-    model_path: String,
-}
+pub struct VoskBackend;
 
 impl VoskBackend {
-    pub fn new(model_path: String) -> Self {
-        Self { model_path }
+    pub fn new(_model_path: String) -> Self {
+        Self
     }
 }
 

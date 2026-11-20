@@ -499,7 +499,6 @@ fn batch_windows(samples: &[i16], phrase_silence_ms: u64, vad: Vad) -> Vec<Decod
 }
 
 /// Convert i16 PCM samples to f32 in the range [-1.0, 1.0].
-#[cfg(any(feature = "local-whisper", test))]
 fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
     samples
         .iter()
@@ -513,7 +512,6 @@ fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
 /// cut): whisper capitalizes each decode independently, so a continuation's
 /// leading capital is spurious mid-sentence. Char-safe for UTF-8;
 /// `char::to_lowercase` may expand to multiple chars.
-#[cfg(any(feature = "local-whisper", test))]
 fn decapitalize_first(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {

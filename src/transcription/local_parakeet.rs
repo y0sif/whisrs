@@ -10,14 +10,11 @@ use async_trait::async_trait;
 use super::{StreamText, TranscriptionBackend, TranscriptionConfig};
 
 /// Parakeet-based local transcription backend.
-pub struct ParakeetBackend {
-    #[allow(dead_code)]
-    model_path: String,
-}
+pub struct ParakeetBackend;
 
 impl ParakeetBackend {
-    pub fn new(model_path: String) -> Self {
-        Self { model_path }
+    pub fn new(_model_path: String) -> Self {
+        Self
     }
 }
 
