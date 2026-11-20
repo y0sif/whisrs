@@ -1,5 +1,5 @@
 //! The user service: whether one is installed and runs the whisrsd on PATH,
-//! writing it, repointing a stale one (issue #146) and enabling it.
+//! writing it, repointing a stale one and enabling it.
 //!
 //! systemd units are repointed in place, so the user's own edits survive;
 //! OpenRC init scripts are written and enabled, never repointed.

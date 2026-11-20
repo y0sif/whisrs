@@ -158,8 +158,8 @@ mod tests {
         assert_eq!(mask_api_key(""), "****");
     }
 
-    /// A key ending in multi-byte characters used to panic: the cut fell
-    /// four bytes from the end, inside a character. It is four characters now.
+    /// A key ending in multi-byte characters must not panic: a cut four bytes
+    /// from the end falls inside a character, so the cut is four characters.
     #[test]
     fn mask_api_key_counts_characters_not_bytes() {
         assert_eq!(mask_api_key("sk-abc€€"), "****bc€€");

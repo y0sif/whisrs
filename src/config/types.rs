@@ -641,9 +641,9 @@ pub struct GeneralConfig {
     /// [`Self::llm_instruction`], before the text is injected. Off by default,
     /// so existing setups keep typing the raw transcript.
     ///
-    /// Unlike `[[llm_commands]]` — which does the same rewrite but needs a
-    /// dedicated hotkey per entry — this is simply on for `whisrs toggle`
-    /// (issue #85). Batch path only, and that is not an oversight: streaming
+    /// Unlike `[[llm_commands]]`, which does the same rewrite but needs a
+    /// dedicated hotkey per entry, this is simply on for `whisrs toggle`.
+    /// Batch path only, and that is not an oversight: streaming
     /// backends type partials at the cursor as they arrive, so there is never
     /// a whole transcript to hand the LLM. [`Config::validate`] warns when
     /// this is paired with one of them.
@@ -732,7 +732,7 @@ fn default_vad() -> String {
 /// between two keyboard layouts) gets garbled — characters absent from the
 /// active layout cannot be produced. The Wayland virtual-keyboard backend
 /// (`zwp_virtual_keyboard_v1`) ships its own keymap and types
-/// layout-independently, fixing that class of bugs (see issue #44).
+/// layout-independently, so that class of bugs cannot happen.
 ///
 /// On X11, uinput keys pass through the kernel's evdev queue to the X
 /// server, and a fast burst overflows it: the server drops the rest of the
@@ -776,9 +776,9 @@ pub struct InputConfig {
     ///
     /// A keystroke sent while a modifier is held becomes a shortcut: stopping
     /// a dictation with `Super+W` and keeping Super down would otherwise turn
-    /// the typed text into `Super+<letter>` compositor binds (#154). whisrs
+    /// the typed text into `Super+<letter>` compositor binds. whisrs
     /// never types while a modifier is held. The check runs before every
-    /// typed key (#171), so a modifier pressed while the text is being typed
+    /// typed key, so a modifier pressed while the text is being typed
     /// pauses the typing, and the cap applies to each such wait. If one is
     /// still down when the cap runs out, typing stops there: the rest of the
     /// text (all of it if nothing was typed yet) is copied to the clipboard
@@ -798,7 +798,7 @@ pub struct InputConfig {
     /// Keyboard-injection backend. `auto` (the recommended default) prefers
     /// the Wayland virtual keyboard when available and otherwise falls back
     /// to uinput. Set this to `wayland-vk` to fix garbled bilingual /
-    /// code-switching dictation on Wayland (issue #44), where the uinput
+    /// code-switching dictation on Wayland, where the uinput
     /// backend can only emit characters present in the active XKB layout.
     /// On X11, `xtest` types through the X server instead of uinput, so
     /// `key_delay_ms = 0` drops no keys.
@@ -859,7 +859,7 @@ pub struct InputConfig {
     /// paste mode a non-text clipboard (an image, a file list) is still
     /// protected: an unreadable clipboard makes the paste path fall back to
     /// typing without touching the clipboard, since overwriting content that
-    /// can never be restored is worse than losing the fallback (issue #69).
+    /// can never be restored is worse than losing the fallback.
     #[serde(default)]
     pub clipboard_fallback: bool,
     /// Copy-only mode: the final text is written to the system clipboard
@@ -882,11 +882,11 @@ pub struct InputConfig {
     /// Terminal detection picks Ctrl+Shift+C / Ctrl+Shift+V over Ctrl+C /
     /// Ctrl+V and, in command mode, sends Ctrl+A then Ctrl+K to clear the
     /// prompt line before injecting. That last one *empties the field* if it
-    /// fires in a GUI text input (#70), so the built-in list stays
+    /// fires in a GUI text input, so the built-in list stays
     /// conservative and this is the explicit, opt-in escape hatch for the two
     /// cases it cannot know about: an `st` build with a custom `termname` in
     /// `config.h`, and scratchpad/dropdown classes such as `Alacritty-float`,
-    /// `kitty-dropdown` or `wezterm-quake` (#92).
+    /// `kitty-dropdown` or `wezterm-quake`.
     ///
     /// Entries are compared case-insensitively against the *whole* focused
     /// window class. They are never substring-matched, and they never go
@@ -1393,7 +1393,7 @@ struct UnknownKeyScan {
 ///
 /// Every variant means the same thing to a caller about to rewrite the file:
 /// there is no preserve set for these bytes, so merging the reserialized struct
-/// into them would delete every key the schema does not carry — issue #134. The
+/// into them would delete every key the schema does not carry. The
 /// [`Self::summary`] completes the sentence "existing config at `<path>` ...",
 /// which is how `write_config_to` reports the divert. There is no `Display`,
 /// and `Debug` names only the variant: the errors' own text quotes the file,
@@ -1504,7 +1504,7 @@ fn unknown_config_key_paths(contents: &str) -> Vec<Vec<Seg>> {
 
 /// The one message the user gets about unknown config keys, shared by every
 /// path that loads a config: the daemon at startup, `whisrs setup`, and
-/// `whisrs config` (issue #116 — only the daemon used to say anything).
+/// `whisrs config`.
 ///
 /// Returns `None` when there is nothing to report: the running binary does not
 /// read these keys. `write_config` keeps almost all of them in the file rather
@@ -1527,9 +1527,9 @@ pub fn unknown_keys_warning(config_path: &Path, unknown: &[String]) -> Option<St
 /// the format-preserving writer can look them up as it walks it.
 ///
 /// `write_config` rebuilds the on-disk file to mirror the [`Config`] struct,
-/// which used to delete every key the struct never knew about — including the
-/// very typo the load-time warning had just told the user to fix (issue #116).
-/// Keys named here survive that rewrite instead.
+/// which would delete every key the struct does not know about, including the
+/// very typo the load-time warning just told the user to fix. Keys named here
+/// survive that rewrite.
 ///
 /// Build this from the *on-disk* text on every write, never from the fresh
 /// serialization and never cached: it describes bytes that are already in the
@@ -1567,8 +1567,8 @@ impl PreservedKeys {
     ///
     /// Fails rather than returning an empty set when the file cannot be
     /// described at all, so a caller that is about to merge into those bytes
-    /// cannot mistake "nothing to preserve" for "nothing describable here"
-    /// (issue #134). The empty set means the file was understood and has no
+    /// cannot mistake "nothing to preserve" for "nothing describable here".
+    /// The empty set means the file was understood and has no
     /// unknown keys; [`UndescribableConfig`] means the merge must not run.
     pub(crate) fn from_config_str(contents: &str) -> Result<Self, UndescribableConfig> {
         let scan = scan_unknown_keys(contents)?;
@@ -1639,16 +1639,16 @@ impl PreservedKeys {
     /// `[asr-sidecar]`. `asr` is a serde *alias* for that section, so the file
     /// then fails to deserialize with `duplicate field`, the daemon falls back
     /// to defaults, and the user's whole config is discarded: strictly worse
-    /// than the missing-warning bug. `[asr]` does not prune cleanly, so the
+    /// than a missing warning. `[asr]` does not prune cleanly, so the
     /// flag says so and the writer drops it.
     ///
     /// This only *records* the answer; nothing is dropped here. Acting on it
-    /// eagerly deleted the nodes for `[hooks]`, `[hotkeys]`, `[overlay]` and
-    /// `[llm]` too, because those sections are all-optional structs whose
+    /// eagerly would delete the nodes for `[hooks]`, `[hotkeys]`, `[overlay]`
+    /// and `[llm]` too, because those sections are all-optional structs whose
     /// removal also changes the parse (`Some(default)` becomes `None`) — and
-    /// they are the exact typo'd sections this feature exists to protect.
-    /// The difference the writer can see, and this module cannot, is whether
-    /// the fresh serialization already carries the key: see
+    /// they are the exact typo'd sections this feature exists to protect. The
+    /// difference the writer can see, and this module cannot, is whether the
+    /// fresh serialization already carries the key: see
     /// [`PreservedKeys::table_prunable`].
     ///
     /// Costs one extra prune-and-reparse per fully-unknown table, and nothing
@@ -1671,7 +1671,7 @@ impl PreservedKeys {
     /// aliased spelling *and* writes the canonical one, serde rejects the
     /// result with `duplicate field`, and the daemon falls back to defaults —
     /// the user's entire config, silently discarded. That is strictly worse
-    /// than the key-eating bug this module exists to fix. Demonstrated by
+    /// than the key loss this module exists to prevent. Demonstrated by
     /// adding `alias = "in"` to the non-`Option` `Config::input`: `[in] bogus =
     /// 1` rewrites to a file holding both `[in]` and `[input]`.
     ///
@@ -1753,11 +1753,11 @@ impl PreservedKeys {
     /// A sub-table with *no leaves at all* (`t = {}`, `a = { b = {} }`, a bare
     /// `[bogus.emptysub]` header) satisfies that vacuously, and it has no node
     /// here — there was no leaf to build one from. Reading a missing node as
-    /// "not covered" is what let a single stray `{}` anywhere inside `[bogus]`
-    /// delete the entire section, comments and real keys included: issue #116's
-    /// own symptom, in the code written to fix it. Hence [`has_no_leaves`]
-    /// rather than `is_some_and`, and no `!doc.is_empty()` guard — an empty
-    /// table covers nothing, which is not the same as failing to cover.
+    /// "not covered" would let a single stray `{}` anywhere inside `[bogus]`
+    /// delete the entire section, comments and real keys included. Hence
+    /// [`has_no_leaves`] rather than `is_some_and`, and no `!doc.is_empty()`
+    /// guard: an empty table covers nothing, which is not the same as failing
+    /// to cover.
     fn covers(&self, doc: &toml::Table) -> bool {
         doc.iter().all(|(key, value)| match value {
             toml::Value::Table(inner) => match self.tables.get(key) {
@@ -1950,9 +1950,8 @@ struct BackendName {
 /// cannot reach a user without the inert-prompt gate being taught about it.
 ///
 /// That chain is the whole reason this is a const rather than three hand-kept
-/// lists. The test used to enumerate its own cases: a reviewer added a
-/// promptless `acme-realtime` to `validate` and to `create_backend`, touched
-/// neither the gate nor the test, and all 663 tests stayed green.
+/// lists: a test that enumerates its own cases stays green when a promptless
+/// backend is added to `validate` and `create_backend` but not to the gate.
 const BACKEND_NAMES: &[BackendName] = &[
     BackendName {
         name: "deepgram",
@@ -2401,7 +2400,7 @@ impl Config {
             });
         }
 
-        // Toggle-path LLM post-processing (issue #85). Same shape as the
+        // Toggle-path LLM post-processing. Same shape as the
         // llm_commands block below — missing [llm] section, empty instruction,
         // streaming backend — but the failure modes differ, so the wording
         // does too.
@@ -3001,11 +3000,10 @@ impl Config {
     ///
     /// `pub`, not private, because the model that actually goes on the wire is
     /// resolved by the daemon's `get_model_for_backend`, and the daemon is a
-    /// separate binary crate. It used to carry its own `"nova-3"` literal, and
-    /// that literal was unpinned: flipping it to `"nova-2"` left the whole test
-    /// suite green while every request would have 400'd with `validate` silent,
-    /// because the gate here inspected a different string than the wire used.
-    /// One function, one answer.
+    /// separate binary crate. A literal of its own there would be unpinned:
+    /// flipping it would leave the test suite green while every request 400s
+    /// with `validate` silent, because the gate here would inspect a different
+    /// string than the wire uses. One function, one answer.
     pub fn deepgram_model(&self) -> String {
         self.deepgram
             .as_ref()
@@ -3207,7 +3205,7 @@ impl Config {
     }
 
     /// Load-time warning that OpenRouter drops `[general] prompt` and
-    /// `[general] vocabulary` (#230). The asr-sidecar backend sends them (as
+    /// `[general] vocabulary`. The asr-sidecar backend sends them (as
     /// `hotwords`), and OpenRouter takes the field and ignores it on every one
     /// of its speech-to-text models, so nothing at run time says they are
     /// lost. Said once, when dictation (`[general] backend`) or recordings
@@ -3260,7 +3258,7 @@ impl Config {
 
     /// Load-time warning that `[tts] backend = "openai"` stops working on
     /// 2027-01-06, when OpenAI shuts down its speech models. The backend
-    /// itself goes in a later release (#220).
+    /// itself goes in a later release.
     ///
     /// Gated on `enabled`: with TTS off no backend is built (`tts_backend` in
     /// `daemon/speak.rs` refuses, and agent replies go through it too), and
@@ -3304,7 +3302,7 @@ impl Config {
     }
 
     /// Load-time warnings about `[general] prompt` and `[general] vocabulary`
-    /// being discarded by a backend that puts no prompt on the wire (#140).
+    /// being discarded by a backend that puts no prompt on the wire.
     ///
     /// Both keys are documented as hints to the transcription backend, and on
     /// Deepgram and the two realtime backends the hint is built, handed to the
@@ -3655,7 +3653,7 @@ mod tests {
         assert_eq!(parse_hex_color("#11223380"), Some([0x80, 0x11, 0x22, 0x33]));
     }
 
-    /// A multi-byte character used to panic the byte slicing; it is not a
+    /// A multi-byte character must not panic the byte slicing; it is not a
     /// color, and neither is a sign `from_str_radix` would take.
     #[test]
     fn a_hex_color_with_a_non_hex_character_is_none() {
@@ -3666,12 +3664,10 @@ mod tests {
 
     #[test]
     fn cloud_backend_sections_parse_without_api_key() {
-        // Regression: `api_key` used to be a required field, so a `[groq]`
-        // section kept for its `model` (with the key supplied via the
-        // WHISRS_GROQ_API_KEY env var) was a TOML parse error, and the daemon
-        // discarded the *whole* config: backend, hotkeys and every other
-        // section silently reverted to defaults. The key is optional now; an
-        // empty value means "resolve from the environment".
+        // `api_key` is optional: a `[groq]` section kept for its `model`
+        // (with the key supplied via the WHISRS_GROQ_API_KEY env var) must
+        // parse, or the daemon discards the *whole* config. An empty value
+        // means "resolve from the environment".
         let cfg: Config =
             toml::from_str("[general]\nbackend = \"groq\"\n[groq]\nmodel = \"whisper-large-v3\"\n")
                 .unwrap();
@@ -3713,10 +3709,9 @@ mod tests {
 
     #[test]
     fn openai_compatible_realtime_without_url_reaches_validate() {
-        // `url` used to be required, so omitting it failed the whole-config
-        // parse and `validate`'s dedicated error was unreachable from a
-        // config file. Now the section deserializes and the user gets the
-        // error that names the key to add.
+        // Without `url` the section still deserializes, so the user gets
+        // `validate`'s error that names the key to add, not a whole-config
+        // parse failure.
         let cfg: Config = toml::from_str(
             "[general]\nbackend = \"openai-compatible-realtime\"\n\
              [openai-compatible-realtime]\nmodel = \"Whisper-Tiny\"\n",
@@ -3842,8 +3837,6 @@ mod tests {
 
     #[test]
     fn unknown_keys_warning_is_the_one_message_every_path_prints() {
-        // Byte-identical to what the daemon logged before this literal was
-        // shared with the two interactive flows (issue #116).
         let warning = unknown_keys_warning(
             Path::new("/home/u/.config/whisrs/config.toml"),
             &["input.past".to_string(), "deepgram.bogus".to_string()],
@@ -3930,10 +3923,9 @@ mod tests {
 
         // The section aliases (`read` is a key alias, covered by the hotkey
         // alias rows of `the_preserve_matrix_holds_and_every_rewrite_still_loads`)
-        // are the ones the guard has to drop whole. `local` joined the loop
-        // when #137 gave `LocalWhisperConfig::model_path` a serde default:
-        // `[local] bogus = 1` deserializes now, so `[local]` can be wholly
-        // unknown exactly like `[asr]`.
+        // are the ones the guard has to drop whole. The serde default on
+        // `LocalWhisperConfig::model_path` lets `[local] bogus = 1` deserialize,
+        // so `[local]` can be wholly unknown exactly like `[asr]`.
         for section in ["asr", "vibevoice", "local"] {
             let contents = format!("[general]\nbackend = \"groq\"\n[{section}]\nbogus = 1\n");
             // Without this the row can pass for the wrong reason: a fixture
@@ -4179,9 +4171,7 @@ mod tests {
     /// `.github/workflows/release.yml`), and in those binaries the stub that
     /// stands in for it bails with "local-whisper feature not enabled". Half
     /// the artifacts this project ships cannot act on the advice, and the
-    /// warning has no way to tell which binary it is running in. `origin/main`
-    /// never named it as a destination; the #140 warnings were the first to,
-    /// which is what this check stops coming back.
+    /// warning has no way to tell which binary it is running in.
     ///
     /// Checked per recommendation sentence rather than over the whole message,
     /// because unlike the two stubs, local-whisper is legitimately *described*
@@ -4399,11 +4389,9 @@ mod tests {
     #[test]
     fn config_validate_advertises_the_count_that_goes_on_the_wire() {
         // The no-drift invariant, in every shape that trips a different limit.
-        // This broke once already: blanks were charged against the byte budget
-        // and filtered afterwards, so `validate` promised 335 while the request
-        // carried 135.
         let cases: Vec<(&str, Vec<String>)> = vec![
-            // Byte-budget-bound: 1000 short single-word terms.
+            // Term-cap-bound too: 200 of these 1000 terms cost 17 B each on the
+            // wire, 3400 of the 4096-byte budget.
             (
                 "byte budget",
                 (0..1000).map(|i| format!("term{i:04}")).collect(),
@@ -5915,7 +5903,7 @@ mod tests {
         }
     }
 
-    // ── Toggle-path LLM post-processing (issue #85) ─────────────────────
+    // ── Toggle-path LLM post-processing ─────────────────────────────────
 
     #[test]
     fn config_validate_warns_llm_post_process_with_streaming_backend() {
@@ -6122,7 +6110,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Inert [general] prompt / vocabulary (#140)
+    // Inert [general] prompt / vocabulary
     // -----------------------------------------------------------------------
 
     /// The backends whose `sends_prompt` is false for a reason that matters:
@@ -6166,7 +6154,7 @@ mod tests {
 
     /// Every "[general] prompt is ignored" message has to end somewhere the
     /// user can actually go. Telling them a key they set does nothing and
-    /// stopping there leaves them exactly where #140 found them.
+    /// stopping there leaves them stuck.
     ///
     /// Asserted per shape rather than as "one of these words appears": the
     /// message shapes offer different escape hatches, and a check that
@@ -6399,7 +6387,7 @@ mod tests {
         // "none of the 205 term(s) in [general] vocabulary fit the keyterm
         // limits" directly beneath `deepgram_keyterm_warnings`' "200 of 205
         // usable term(s) reach Deepgram": the same contradiction the
-        // three-state channel was introduced to remove, with the numbers
+        // three-state channel exists to prevent, with the numbers
         // swapped. The two warnings are built from one pair of functions
         // precisely so they cannot disagree about a number, and a partial drop
         // is the only shape where the wrong test disagrees.
@@ -6536,7 +6524,7 @@ mod tests {
 
     #[test]
     fn config_inert_prompt_never_warns_about_vocabulary_on_deepgram() {
-        // The regression guard for this change. Deepgram is promptless, so
+        // Deepgram is promptless, so
         // warning A fires — but the vocabulary rides as `keyterm` query params
         // and really does bias transcription, so warning B must not. Telling a
         // Deepgram user their vocabulary is ignored would push them off the one

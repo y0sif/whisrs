@@ -15,9 +15,9 @@ pub fn vocabulary_path() -> PathBuf {
 /// A leading UTF-8 BOM is stripped from the whole file, not per line, because
 /// that is the only place it can appear and because stripping it here is what
 /// makes a BOM-only file yield nothing. `str::trim` does not remove U+FEFF, so
-/// without this an editor that writes a BOM shipped `\u{feff}NixOS` to Deepgram
-/// as a keyterm that can never match, and a BOM-only file produced one bogus
-/// single-character term.
+/// without this an editor that writes a BOM would send `\u{feff}NixOS` to
+/// Deepgram as a keyterm that can never match, and a BOM-only file would
+/// produce one bogus single-character term.
 ///
 /// A single leading `\` is an escape and is stripped after the comment check,
 /// so [`write_vocabulary_file`] can store a term that begins with `#` (or with
@@ -60,15 +60,14 @@ pub fn merge_vocabulary(config_terms: Vec<String>, file_terms: Vec<String>) -> V
 /// One term per line, 0600 like the config it was split out of.
 ///
 /// A term whose first non-whitespace character is `#` or `\` is written with a
-/// single extra leading `\`, which [`parse_vocabulary`] strips back off. Without
-/// that escape the migration destroyed such a term outright: `#1` was written as
-/// a line the parser reads as a comment, so it vanished from `vocabulary.txt`
-/// while `[general] vocabulary` was blanked in the same save — gone from both
-/// stores, with no warning. Nothing else is escaped, so `C# dev` is written
-/// as-is.
+/// single extra leading `\`, which [`parse_vocabulary`] strips back off.
+/// Without that escape `#1` would be written as a line the parser reads as a
+/// comment, and since the same save blanks `[general] vocabulary`, the term
+/// would be gone from both stores, with no warning. Nothing else is escaped, so
+/// `C# dev` is written as-is.
 ///
-/// The file sits next to `config.toml` and now holds vocabulary that used to
-/// live inside it, so it is written the way config.toml is: atomically (a
+/// The file sits next to `config.toml` and holds vocabulary moved out of it,
+/// so it is written the way config.toml is: atomically (a
 /// 0600 temp file renamed over it, so a crash never leaves it half written)
 /// rather than through `fs::write`, which leaves it world-readable under the
 /// usual umask.
@@ -181,13 +180,13 @@ fn should_migrate_vocabulary(
 /// The baseline is the raw merged list; anything that came out of "Vocabulary &
 /// prompt" has been through `join(", ")` and [`parse_csv_list`], and that round
 /// trip is not the identity: it trims padding and splits on commas. Comparing
-/// the two directly made an *unedited* pass through the editor look like an
-/// edit: a config.toml term with padding (`vocabulary = [" whisrs "]`, which is
-/// exactly what the templated-config setups this feature exists for produce) or
-/// with a comma in it fired the destructive migration when the user opened the
-/// section to change only the prompt and pressed Enter over the vocabulary
-/// line. Normalizing both sides removes the difference the editor itself
-/// introduced, leaving only the differences the user actually made.
+/// the two directly would make an *unedited* pass through the editor look like
+/// an edit: a config.toml term with padding (`vocabulary = [" whisrs "]`, which
+/// is exactly what the templated-config setups this feature exists for produce)
+/// or with a comma in it would fire the destructive migration when the user
+/// opens the section to change only the prompt and presses Enter over the
+/// vocabulary line. Normalizing both sides removes the difference the editor
+/// itself introduced, leaving only the differences the user actually made.
 ///
 /// The transform is idempotent (its output has no commas, no padding and no
 /// empty entries) so normalizing a list the editor already produced is a
@@ -378,9 +377,9 @@ NixOS
     }
 
     /// The property the migration depends on: whatever the writer puts on disk,
-    /// the parser reads back as the same list. Before the `\` escape, `#1` was
-    /// written as a comment line and dropped — and since the same save blanks
-    /// `[general] vocabulary`, the term ended up in neither store.
+    /// the parser reads back as the same list. Without the `\` escape, `#1`
+    /// would be written as a comment line and dropped, and since the same save
+    /// blanks `[general] vocabulary`, the term would end up in neither store.
     ///
     /// The corpus is deliberately adversarial about the two characters the
     /// format gives meaning to, plus ordinary terms that must stay untouched.
