@@ -4390,11 +4390,11 @@ mod tests {
     fn config_validate_advertises_the_count_that_goes_on_the_wire() {
         // The no-drift invariant, in every shape that trips a different limit.
         let cases: Vec<(&str, Vec<String>)> = vec![
-            // Term-cap-bound too: 200 of these 1000 terms cost 17 B each on the
-            // wire, 3400 of the 4096-byte budget.
+            // Byte-budget-bound: 12-byte terms cost 21 B each on the wire, so
+            // the 4096-byte budget stops them at 195, before the term cap.
             (
                 "byte budget",
-                (0..1000).map(|i| format!("term{i:04}")).collect(),
+                (0..1000).map(|i| format!("term{i:08}")).collect(),
             ),
             // Term-cap-bound: terms short enough that 200 of them use barely
             // half the byte budget.
