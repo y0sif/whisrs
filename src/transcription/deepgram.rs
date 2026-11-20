@@ -103,18 +103,16 @@ pub(crate) const KEYTERM_QUERY_BUDGET_BYTES: usize = 4096;
 /// This bounds **the parameter count and nothing else**: it keeps a vocabulary
 /// of very short terms from turning one request into thousands of query params,
 /// which the byte budget alone permits (single-char terms cost 10 bytes each,
-/// so 4096 bytes is ~409 params). It is deliberately *not* a token bound — an
-/// earlier revision of this comment claimed staying under 200 terms kept a
-/// byte-legal vocabulary inside Deepgram's 500-token cap, and that is false:
-/// the byte budget cuts `"ab cd ef"` × 400 off at 195 terms, below this cap,
-/// with ≥585 words on the wire. [`KEYTERM_MAX_WORDS`] is the token bound.
+/// so 4096 bytes is ~409 params). It is not a token bound: the byte budget
+/// cuts `"ab cd ef"` × 400 off at 195 terms, below this cap, with ≥585 words
+/// on the wire. [`KEYTERM_MAX_WORDS`] is the token bound.
 pub(crate) const KEYTERM_MAX_TERMS: usize = 200;
 
 /// Ceiling on the total whitespace-delimited word count across all `keyterm`s.
 ///
 /// Deepgram caps the keyterm set at 500 **tokens** per request, not 500 terms,
 /// and whisrs cannot tokenize client-side. Neither limit above bounds tokens.
-/// Measured against the two gates as they stood: `"ab cd ef"` × 400 → 195 terms
+/// Measured against the two gates above: `"ab cd ef"` × 400 → 195 terms
 /// at 4095 bytes and ≥585 words; `"a b c d e"` × 400 → 157 terms at 4082 bytes
 /// and ≥785 words. So a ~136-term two-word domain glossary ("atrial
 /// fibrillation") passes both, lands at roughly 550-800 tokens, and earns
@@ -173,19 +171,16 @@ pub(crate) fn usable_keyterms(keyterms: &[String]) -> impl Iterator<Item = &str>
 /// [`KEYTERM_MAX_WORDS`]. Each bounds a different thing and none implies
 /// another — see their own docs.
 ///
-/// Ordering matters. An earlier split — count the budget over the raw list,
-/// filter the blanks afterwards — let blank entries burn budget they never
-/// spent: 200 blanks in front of a real vocabulary had `validate` advertise 335
-/// terms while the request carried 135, with 105 real terms discarded for
-/// nothing.
+/// Ordering matters. Counting the budget over the raw list and filtering the
+/// blanks afterwards would let blank entries burn budget they never spend, and
+/// `validate` would advertise more terms than the request carries.
 ///
 /// A term that does not fit is **skipped, not fatal**: iteration continues and
-/// later, smaller terms can still make it. Stopping at the first misfit let one
-/// pathological entry discard everything behind it —
-/// `["x" × 5000, "whisrs", "Hyprland"]` put zero terms on the wire and warned
-/// that "the first 0" reached Deepgram, while the same three terms reordered
-/// kept both real ones. The consequence is that the result is no longer a
-/// prefix of the input, so callers must report "N of M", never "the first N".
+/// later, smaller terms can still make it. Stopping at the first misfit would
+/// let one pathological entry discard everything behind it
+/// (`["x" × 5000, "whisrs", "Hyprland"]` would put zero terms on the wire). So
+/// the result is not a prefix of the input, and callers must report "N of M",
+/// never "the first N".
 pub(crate) fn effective_keyterms(keyterms: &[String]) -> Vec<&str> {
     let mut used_bytes = 0usize;
     let mut used_words = 0usize;
@@ -248,10 +243,8 @@ pub const DIARIZATION_LABEL: &str = "deepgram:latest";
 /// `None` when there is nothing to report.
 ///
 /// A function rather than an inline condition so the emptiness test is
-/// testable. This branch used to gate on `keyterms.is_empty()` while every
-/// other count in this file goes through [`usable_keyterms`], so a
-/// vocabulary of nothing but blank entries logged "ignoring 0 vocabulary
-/// term(s)" on a nova-2 config.
+/// testable. It goes through [`usable_keyterms`] like every other count in
+/// this file, so a vocabulary of nothing but blank entries logs nothing.
 fn unsupported_model_keyterm_notice(model: &str, keyterms: &[String]) -> Option<String> {
     let ignored = usable_keyterms(keyterms).count();
     if ignored == 0 {
@@ -1062,11 +1055,9 @@ mod tests {
 
     #[test]
     fn effective_keyterms_is_what_build_query_params_puts_on_the_wire() {
-        // The bug this pins: blanks used to be charged against the budget and
-        // filtered afterwards, so the advertised count and the wire disagreed.
-        // 200 whitespace-only entries in front of 1000 real terms had
-        // `validate` promise 335 while the request carried 135 — 105 real terms
-        // discarded and 1801 budget bytes burned on nothing.
+        // Blanks cost nothing: charged against the budget and filtered
+        // afterwards, they would make the advertised count and the wire
+        // disagree.
         let mut terms: Vec<String> = vec!["   ".to_string(); 200];
         terms.extend((0..1000).map(|i| format!("term{i:04}")));
 
@@ -1099,12 +1090,12 @@ mod tests {
 
     #[test]
     fn effective_keyterms_caps_the_word_count_before_the_byte_budget() {
-        // The claim `KEYTERM_MAX_TERMS` used to make — that staying under 200
-        // terms keeps a byte-legal vocabulary inside Deepgram's 500-token cap —
-        // is false, and this is the counterexample. 400 copies of "ab cd ef"
-        // stop at 195 terms on the byte budget alone: under the term cap, at
-        // 4095 of 4096 bytes, and carrying at least 585 whitespace-delimited
-        // words. `KEYTERM_MAX_WORDS` is what actually bounds it.
+        // Staying under 200 terms does not keep a byte-legal vocabulary inside
+        // Deepgram's 500-token cap, and this is the counterexample. 400 copies
+        // of "ab cd ef" stop at 195 terms on the byte budget alone: under the
+        // term cap, at 4095 of 4096 bytes, and carrying at least 585
+        // whitespace-delimited words. `KEYTERM_MAX_WORDS` is what actually
+        // bounds it.
         let terms: Vec<String> = vec!["ab cd ef".to_string(); 400];
 
         // What the other two limits alone would have allowed.
@@ -1141,12 +1132,10 @@ mod tests {
 
     #[test]
     fn one_oversized_term_does_not_discard_the_rest_of_the_vocabulary() {
-        // `effective_keyterms` used to `break` on the first term that would not
-        // fit, so a single pathological entry nuked everything behind it: this
-        // vocabulary put zero terms on the wire and warned that "the first 0"
-        // reached Deepgram, while the same three terms reordered kept both real
-        // ones. Skipping the misfit and continuing is what makes the outcome
-        // independent of where the long term sits.
+        // A `break` on the first term that does not fit would let a single
+        // pathological entry discard everything behind it. Skipping the misfit
+        // and continuing is what makes the outcome independent of where the
+        // long term sits.
         let long = "x".repeat(5000);
         let first = vec![long.clone(), "whisrs".to_string(), "Hyprland".to_string()];
         let last = vec!["whisrs".to_string(), "Hyprland".to_string(), long];
@@ -1166,9 +1155,8 @@ mod tests {
 
     #[test]
     fn unsupported_model_notice_uses_the_same_emptiness_test_as_the_rest_of_the_file() {
-        // The unsupported-model branch used to gate on `keyterms.is_empty()`
-        // while every other count here goes through `usable_keyterms`, so a
-        // blanks-only vocabulary logged "ignoring 0 vocabulary term(s)".
+        // A blanks-only vocabulary has no usable terms, so there is no
+        // "ignoring 0 vocabulary term(s)" notice.
         let blanks = ["".to_string(), "  ".to_string(), "\t".to_string()];
         assert_eq!(unsupported_model_keyterm_notice("nova-2", &blanks), None);
         assert_eq!(unsupported_model_keyterm_notice("nova-2", &[]), None);

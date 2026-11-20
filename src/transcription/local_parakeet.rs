@@ -1,6 +1,6 @@
 //! Parakeet (NVIDIA) transcription backend for streaming local speech recognition.
 //!
-//! Feature-gated behind `local-parakeet`. Currently a stub — implementation planned.
+//! A stub in every build: `transcribe` bails with "not yet implemented".
 //!
 //! Parakeet offers 160ms chunk processing with end-of-utterance detection,
 //! making it the lowest-latency local option. Native Rust crate, no C dependency.
@@ -32,10 +32,11 @@ impl TranscriptionBackend for ParakeetBackend {
     }
 
     // Unreachable: `transcribe` bails before a request exists. `false` is
-    // what the rule on the trait method yields — read the answer off the
-    // request-building code, and there is none yet — and it is the safe
-    // direction, since a stale `true` is the exact shape of #133. Whoever
-    // implements Parakeet answers it again off the real request.
+    // what the rule on the trait method yields (read the answer off the
+    // request-building code, and there is none yet), and it is the safe
+    // direction, since a stale `true` lets the prompt-echo filter discard
+    // real speech. Whoever implements Parakeet answers it again off the real
+    // request.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
     }

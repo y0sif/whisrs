@@ -1,6 +1,6 @@
 //! Vosk transcription backend for true streaming local speech recognition.
 //!
-//! Feature-gated behind `local-vosk`. Currently a stub — implementation planned.
+//! A stub in every build: `transcribe` bails with "not yet implemented".
 //!
 //! Vosk offers true streaming recognition with very small models (~40 MB),
 //! making it ideal for low-end hardware. Trade-off: lower accuracy than whisper.
@@ -32,10 +32,11 @@ impl TranscriptionBackend for VoskBackend {
     }
 
     // Unreachable: `transcribe` bails before a request exists. `false` is
-    // what the rule on the trait method yields — read the answer off the
-    // request-building code, and there is none yet — and it is the safe
-    // direction, since a stale `true` is the exact shape of #133. Whoever
-    // implements Vosk answers it again off the real request.
+    // what the rule on the trait method yields (read the answer off the
+    // request-building code, and there is none yet), and it is the safe
+    // direction, since a stale `true` lets the prompt-echo filter discard
+    // real speech. Whoever implements Vosk answers it again off the real
+    // request.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
     }

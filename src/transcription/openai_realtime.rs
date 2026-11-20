@@ -179,7 +179,7 @@ mod tests {
         }
     }
 
-    /// The answer has to follow the model, not the backend struct (#133). One
+    /// The answer has to follow the model, not the backend struct. One
     /// backend, three models, two answers, and the `false` case is the one
     /// `whisrs setup` and `get_model_for_backend` both default to.
     #[test]

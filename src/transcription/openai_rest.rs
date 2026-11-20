@@ -132,8 +132,8 @@ fn check_audio_size(audio: &[u8]) -> anyhow::Result<()> {
 ///
 /// Only the Whisper models accept `verbose_json` with
 /// `timestamp_granularities[]`. The gpt-4o family (`gpt-4o-transcribe`,
-/// `gpt-4o-mini-transcribe`, `gpt-transcribe`, and the `-diarize` variant
-/// until #175 wires its diarized format) answer plain `json`, so recordings on
+/// `gpt-4o-mini-transcribe`, `gpt-transcribe`, and the `-diarize` variant,
+/// whose diarized format is not read) answer plain `json`, so recordings on
 /// those go through the phrase fallback.
 pub fn model_has_timestamps(model: &str) -> bool {
     model.starts_with("whisper")

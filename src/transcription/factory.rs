@@ -711,13 +711,11 @@ mod tests {
 
     #[test]
     fn deepgram_model_on_the_wire_is_the_one_validate_gates_on() {
-        // `[deepgram]` is optional, and with the section absent this factory
-        // used to fall back to its own `"nova-3"` literal while
-        // `Config::validate`'s keyterm gate consulted
-        // `Config::deepgram_model`. Two independent strings, neither pinned:
-        // flipping the one here to "nova-2" left the whole suite green, and
-        // would have meant `validate` staying silent about a vocabulary while
-        // every request 400'd on an unsupported `keyterm` parameter.
+        // `[deepgram]` is optional. With the section absent, the model this
+        // factory sends and the one `Config::validate`'s keyterm gate consults
+        // (`Config::deepgram_model`) must be one string: two would let
+        // `validate` stay silent about a vocabulary while every request 400s
+        // on an unsupported `keyterm` parameter.
         let mut config: Config = toml::from_str("").expect("empty config uses defaults");
         config.deepgram = None;
 
@@ -733,14 +731,10 @@ mod tests {
 
     #[test]
     fn local_whisper_fallback_is_the_shared_default() {
-        // Same trap as the test above, on the other local literal. With
-        // `[local-whisper]` absent this factory used to build its own copy of
-        // the model path while `Config::validate` computed the path it checks
-        // for existence separately. Replacing this fallback with a literal
-        // left the whole suite green, so pin it: the absent section, a section
-        // that omits `model_path`, and the path `validate` resolves must all
-        // be the same string, or the daemon loads a model the startup warning
-        // never mentioned.
+        // Same trap as the test above, on the model path. Pin it: the absent
+        // `[local-whisper]` section, a section that omits `model_path`, and the
+        // path `validate` resolves must all be the same string, or the daemon
+        // loads a model the startup warning never mentioned.
         let mut absent: Config = toml::from_str("").expect("empty config uses defaults");
         absent.local_whisper = None;
 

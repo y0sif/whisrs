@@ -35,7 +35,8 @@ pub mod local_whisper {
         // Unreachable: `transcribe` bails before a request exists. `false`
         // is what the rule above the trait method yields — read the answer off
         // the request-building code, and this build has none — and it is the
-        // safe direction, since a stale `true` is the exact shape of #133.
+        // safe direction, since a stale `true` lets the prompt-echo filter
+        // discard real speech.
         // The real backend answers `true` off its own `set_initial_prompt`
         // call; the divergence is deliberate and unobservable.
         fn sends_prompt(&self, _config: &super::TranscriptionConfig) -> bool {
@@ -479,17 +480,16 @@ pub trait TranscriptionBackend: Send + Sync {
     /// Whether this backend actually transmits [`TranscriptionConfig::prompt`]
     /// to the provider for *this* request.
     ///
-    /// Gates the prompt-echo filter in the batch pipeline (issue #133).
+    /// Gates the prompt-echo filter in the batch pipeline.
     /// `config.prompt` is built for *every* backend from `[general] prompt` +
     /// `[general] vocabulary`, so a backend that silently drops it would
     /// otherwise have genuine speech that happens to resemble the user's own
     /// vocabulary discarded as an "echo" of a prompt that never went on the
     /// wire.
     ///
-    /// Required rather than defaulted on purpose: a default of `true` is
-    /// exactly what let `openai-compatible-realtime` inherit the wrong answer
-    /// in the first cut of the #133 fix. Answer it from the request-building
-    /// code, not from what the backend "should" do.
+    /// Required rather than defaulted on purpose: with a default of `true`, a
+    /// promptless backend inherits the wrong answer silently. Answer it from
+    /// the request-building code, not from what the backend "should" do.
     ///
     /// Takes the request because for the realtime profiles the answer is not a
     /// property of the backend at all: the model is. `openai-realtime` asks
