@@ -124,7 +124,7 @@ impl VadConfig {
     /// test's -50.5 dBFS), are not speech, so a TV or a colleague behind them
     /// does not hold a recording open.
     ///
-    /// The values are tuned with `scripts/check-vad.sh` (18 dB: 20 let
+    /// The values are tuned with the maintainer's VAD check (18 dB: 20 let
     /// babble 20 dB under the user hold auto-stop open in a quarter of the
     /// noise draws, 15 cost the user's own soft frames; the cap at the RMS
     /// threshold: a 0.4 s "Oh!" 26 dB over the dictation after it otherwise

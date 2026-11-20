@@ -66,8 +66,7 @@ The right level floor depends on who may speak:
   transcript.
 
 The fields are public for tuning. The shipped values are tuned with the
-benchmark in whisrs'
-[`scripts/check-vad.sh`](https://github.com/y0sif/whisrs/blob/main/scripts/check-vad.sh).
+maintainer's VAD check.
 
 ## Real-time auto-stop
 
