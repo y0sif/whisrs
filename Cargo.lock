@@ -3658,7 +3658,6 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "log",
- "png",
  "tiny-skia-path",
 ]
 
@@ -4888,7 +4887,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "wayland-client",
- "wayland-protocols",
  "wayland-protocols-misc",
  "x11rb",
  "xkbcommon 0.8.0",

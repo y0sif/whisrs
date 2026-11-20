@@ -1459,7 +1459,7 @@ mod tests {
             window(100, false),
             window(120, false),
         ];
-        // The prompt of scripts/check-issue208.sh, typo included.
+        // A real user's prompt, typo included.
         let prompt = "make sure to spell out words like 'slash', 'question mark', etc, \
                       as pancuation marks, like '!', '/', etc, rather than actual text. \
                       whisrs, nvim, hyprland, claude code";
