@@ -90,7 +90,7 @@ pub(super) struct OverlayRenderer {
     /// Set on every idle to visible transition, cleared by
     /// [`Self::take_session_started`]. The Wayland backend recreates its
     /// layer surface on it so the pill opens on the output focused now, not
-    /// the one focused when the daemon started (issue #198).
+    /// the one focused when the daemon started.
     session_started: bool,
 }
 

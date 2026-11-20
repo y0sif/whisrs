@@ -17,8 +17,7 @@
 //! `[[llm_commands]]` entry does the same with the roles swapped (dictated
 //! text + a preset instruction). A generic instruction — "treat the following
 //! text as a request and output only what is asked" — turns an entry into
-//! request-in / text-out generation, which is how issue #91's use case is
-//! served.
+//! request-in / text-out generation.
 //!
 //! Whatever comes back is typed at the user's cursor, so this module also owns
 //! the *text* side of making a reply safe to type: [`clean_llm_output`] strips

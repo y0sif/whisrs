@@ -72,7 +72,7 @@ impl StateMachine {
     /// - RetryStart:        Idle → Transcribing
     ///
     /// Recording is intentionally refused while read-aloud is active
-    /// (Toggle/CommandMode from Synthesizing/Speaking are invalid).
+    /// (Toggle from Synthesizing/Speaking is invalid).
     pub fn transition(&mut self, action: Action) -> Result<State, WhisrsError> {
         let new_state = match (self.state, action) {
             (State::Idle, Action::Toggle) => State::Recording,

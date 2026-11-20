@@ -1422,7 +1422,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Incremental playback (issue #164): parser, frame decoder, resampler
+    // Incremental playback: parser, frame decoder, resampler
     // -----------------------------------------------------------------
 
     /// Tiny deterministic PRNG so chunk splits are reproducible without `rand`.

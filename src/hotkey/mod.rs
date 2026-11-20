@@ -240,7 +240,7 @@ fn build_actions(
 }
 
 /// Modifier keys, left and right. A physically held one turns injected
-/// keystrokes into shortcuts (#154).
+/// keystrokes into shortcuts.
 const MODIFIER_KEYS: [Key; 8] = [
     Key::KEY_LEFTMETA,
     Key::KEY_RIGHTMETA,
@@ -324,7 +324,7 @@ fn is_keyboard(device: &Device, path: &Path) -> bool {
 /// `eventN` number is reclassified rather than served from the cache.
 type NodeId = (PathBuf, u64);
 
-/// Keyboards open for read-only key-state probes (#154), cached per node so
+/// Keyboards open for read-only key-state probes, cached per node so
 /// a probe does not reopen every `/dev/input/event*` node each time (that
 /// costs 100+ ms; the key-state read itself is microseconds).
 ///
@@ -589,7 +589,7 @@ mod tests {
 
     /// Every field of [`HotkeyConfig`] must be wired to a command in
     /// [`build_actions`]. Derived from serde rather than a hand-written count,
-    /// so a fifth field added to the struct fails here instead of shipping as
+    /// so a new field added to the struct fails here instead of shipping as
     /// a binding that parses, validates, and silently never fires.
     #[test]
     fn every_fixed_hotkey_field_is_dispatched() {

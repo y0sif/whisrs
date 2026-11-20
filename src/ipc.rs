@@ -545,8 +545,8 @@ impl InfoAnswer {
 }
 
 /// Ask the daemon for its dictation state with `status`, which every daemon
-/// knows. `whisrs status` uses this rather than `info`: a daemon older than
-/// `info` logs an error for each `info` it cannot parse.
+/// knows. The TUI polls with this once a daemon turns out older than `info`:
+/// such a daemon logs an error for each `info` it cannot parse.
 pub fn request_status_blocking(timeout: Option<Duration>) -> Result<State, RequestError> {
     request_status_blocking_at(&socket_path(), timeout)
 }
