@@ -2,19 +2,13 @@
 //!
 //! Sends WAV audio (FLAC for recording chunks) to Groq's
 //! `/openai/v1/audio/transcriptions` endpoint and returns the transcribed
-//! text. Supports chunked pseudo-streaming by splitting audio at silence
-//! boundaries and sending each chunk independently.
+//! text. Dictation sends the whole buffer in one request once it stops.
 
-use asr_dedup::{TextDedup, TimestampDedup, Word as AsrWord};
+use asr_dedup::Word as AsrWord;
 use async_trait::async_trait;
-use audio_silence_gate::is_silent;
 use reqwest::multipart;
 use serde::Deserialize;
-use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
-
-use crate::audio::wav::encode_wav;
-use crate::audio::AudioChunk;
+use tracing::{debug, warn};
 
 use super::flac::{recording_upload, UploadFormat};
 use super::verbose_json::parse_verbose_segments;
@@ -25,25 +19,6 @@ const MAX_FILE_SIZE: usize = 25 * 1024 * 1024;
 
 /// Groq API endpoint for audio transcription.
 const GROQ_TRANSCRIPTION_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
-
-/// Minimum chunk duration in samples (10 seconds at 16kHz) — Groq bills
-/// at least 10 seconds per request.
-const MIN_CHUNK_SAMPLES: usize = 16_000 * 10;
-
-/// Sample rate used for audio capture.
-const SAMPLE_RATE: u32 = 16_000;
-
-/// Silence threshold for VAD-based chunk splitting (normalized RMS).
-///
-/// Left on the RMS test on purpose, outside `[audio] vad`: this chunked
-/// stream never runs, since [`TranscriptionBackend::supports_streaming`] is
-/// `false` for Groq and the daemon sends it the whole buffer once dictation
-/// stops.
-const SILENCE_THRESHOLD: f64 = 0.005;
-
-/// Minimum silence duration (in samples) to trigger a chunk split.
-/// 300ms at 16kHz.
-const MIN_SILENCE_SAMPLES: usize = 16_000 * 300 / 1000;
 
 /// Groq transcription backend.
 pub struct GroqBackend {
@@ -61,19 +36,6 @@ impl GroqBackend {
             api_key,
             url: GROQ_TRANSCRIPTION_URL.to_string(),
         }
-    }
-
-    /// Send a WAV-encoded audio chunk to the Groq API and return the response.
-    async fn send_chunk(
-        &self,
-        wav_data: &[u8],
-        config: &TranscriptionConfig,
-    ) -> anyhow::Result<GroqTranscriptionResponse> {
-        let body = self
-            .post(wav_data, UploadFormat::WAV, config, &["word"])
-            .await?;
-        let parsed: GroqTranscriptionResponse = serde_json::from_str(&body)?;
-        Ok(parsed)
     }
 
     /// POST `audio`, in `format`, as a `verbose_json` request with the given
@@ -235,129 +197,18 @@ impl TranscriptionBackend for GroqBackend {
         Ok(text)
     }
 
-    async fn transcribe_stream(
-        &self,
-        mut audio_rx: mpsc::Receiver<AudioChunk>,
-        text_tx: mpsc::Sender<String>,
-        config: &TranscriptionConfig,
-    ) -> anyhow::Result<()> {
-        let mut timestamp_dedup = TimestampDedup::new();
-        let mut text_dedup = TextDedup::new();
-        let mut buffer: Vec<i16> = Vec::new();
-        let mut silence_count: usize = 0;
-
-        while let Some(chunk) = audio_rx.recv().await {
-            // Check if this chunk is silent.
-            if is_silent(&chunk, SILENCE_THRESHOLD) {
-                silence_count += chunk.len();
-            } else {
-                silence_count = 0;
-            }
-
-            buffer.extend_from_slice(&chunk);
-
-            // Check if we should send this chunk:
-            // - We have at least MIN_CHUNK_SAMPLES and hit a silence boundary.
-            let has_enough = buffer.len() >= MIN_CHUNK_SAMPLES;
-            let at_silence = silence_count >= MIN_SILENCE_SAMPLES;
-
-            if has_enough && at_silence {
-                let chunk_duration = buffer.len() as f64 / SAMPLE_RATE as f64;
-                info!(
-                    "groq stream: sending chunk of {:.1}s ({} samples)",
-                    chunk_duration,
-                    buffer.len()
-                );
-
-                let wav_data = encode_wav(&buffer)?;
-                if wav_data.len() <= MAX_FILE_SIZE {
-                    match self.send_chunk(&wav_data, config).await {
-                        Ok(resp) => {
-                            let text = if !resp.words.is_empty() {
-                                let words: Vec<AsrWord> =
-                                    resp.words.iter().map(Into::into).collect();
-                                let accepted = timestamp_dedup.filter_words(&words);
-                                accepted
-                                    .iter()
-                                    .map(|w| w.text.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            } else {
-                                text_dedup.filter_text(&resp.text)
-                            };
-
-                            if !text.is_empty() {
-                                text_tx.send(text).await.ok();
-                            }
-                        }
-                        Err(e) => {
-                            error!("groq stream: chunk transcription failed: {e}");
-                        }
-                    }
-
-                    timestamp_dedup.advance_offset(chunk_duration);
-                } else {
-                    warn!(
-                        "groq stream: chunk too large ({} bytes), skipping",
-                        wav_data.len()
-                    );
-                }
-
-                buffer.clear();
-                silence_count = 0;
-            }
-        }
-
-        // Send any remaining audio.
-        if !buffer.is_empty() {
-            let chunk_duration = buffer.len() as f64 / SAMPLE_RATE as f64;
-            info!(
-                "groq stream: sending final chunk of {:.1}s ({} samples)",
-                chunk_duration,
-                buffer.len()
-            );
-
-            let wav_data = encode_wav(&buffer)?;
-            if wav_data.len() <= MAX_FILE_SIZE {
-                match self.send_chunk(&wav_data, config).await {
-                    Ok(resp) => {
-                        let text = if !resp.words.is_empty() {
-                            let words: Vec<AsrWord> = resp.words.iter().map(Into::into).collect();
-                            let accepted = timestamp_dedup.filter_words(&words);
-                            accepted
-                                .iter()
-                                .map(|w| w.text.as_str())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        } else {
-                            text_dedup.filter_text(&resp.text)
-                        };
-
-                        if !text.is_empty() {
-                            text_tx.send(text).await.ok();
-                        }
-                    }
-                    Err(e) => {
-                        error!("groq stream: final chunk transcription failed: {e}");
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
+    // Uses the default transcribe_stream (collect + transcribe) since this
+    // backend does not support streaming.
     fn supports_streaming(&self) -> bool {
         false
     }
 
-    // Whisper's `prompt` multipart field, set by both request builders
-    // (`form.text("prompt", ...)` in `transcribe` and in the chunked path).
+    // Whisper's `prompt` multipart field, set by `build_form` for every
+    // request.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
     }
 
-    // One chunk's words, space-joined, per send.
     fn stream_text(&self) -> StreamText {
         StreamText::Phrases
     }
@@ -401,6 +252,7 @@ pub fn parse_response(body: &str) -> anyhow::Result<GroqTranscriptionResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::wav::encode_wav;
     use crate::transcription::retry::{retry_transient, RateLimitExhausted, RATE_LIMIT_BUDGET};
     use crate::transcription::test_server::{serve_once, serve_responses};
     use crate::transcription::RetryableHttpError;
