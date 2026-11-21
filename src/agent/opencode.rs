@@ -503,13 +503,19 @@ mod tests {
 
     #[test]
     fn ask_puts_the_rules_in_the_child_environment() {
-        let launch = OpenCode
-            .launch(&agent(Permissions::Ask), &resumed("ses_1"), &request("x"))
-            .unwrap();
-        let (name, value) = &launch.env[0];
-        assert_eq!(name, CONFIG_CONTENT_VAR);
-        assert!(value.contains(r#""action":"shell""#), "{value}");
-        assert!(!launch.args.contains(&"--auto".to_string()));
+        let launched = OpenCode.launch(&agent(Permissions::Ask), &resumed("ses_1"), &request("x"));
+        // `launch` reads the daemon's environment, here the test process's.
+        match ask_config(std::env::var(CONFIG_CONTENT_VAR).ok().as_deref()) {
+            Ok(config) => {
+                let launch = launched.unwrap();
+                assert_eq!(launch.env, [(CONFIG_CONTENT_VAR.to_string(), config)]);
+                assert!(!launch.args.contains(&"--auto".to_string()));
+            }
+            Err(e) => {
+                let err = launched.unwrap_err();
+                assert!(err.contains(&e), "{err}");
+            }
+        }
     }
 
     #[test]
