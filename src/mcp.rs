@@ -203,7 +203,7 @@ pub struct RecordingInfo {
     pub speakers: Vec<SpeakerInfo>,
     /// Who the user said the recording is with.
     pub participants: Vec<String>,
-    /// The summary, in Markdown.
+    /// The summary, in Markdown (none when too short to summarize).
     pub summary: Option<String>,
     /// The summary was made before the transcript or the speaker names
     /// last changed.
@@ -466,6 +466,8 @@ pub fn recording(root: &Path, params: &RecordingParams) -> Result<RecordingInfo,
         })
         .collect();
     let header_duration = meta.ended_at.map(|_| render::duration_ms(&meta) / 1000);
+    // "Too short to summarize." is no summary: no time, never stale.
+    let summarized = is_summary(meta.summary.as_deref());
     Ok(RecordingInfo {
         id: meta.id.clone(),
         title: render::title(&meta),
@@ -482,9 +484,9 @@ pub fn recording(root: &Path, params: &RecordingParams) -> Result<RecordingInfo,
         system_language: meta.system_language.clone(),
         speakers,
         participants: meta.participants.clone(),
-        summary: meta.summary.clone(),
-        summary_stale: meta.summary_stale,
-        summarized_at: meta.summarized_at.map(rfc3339),
+        summary: meta.summary.clone().filter(|_| summarized),
+        summary_stale: summarized && meta.summary_stale,
+        summarized_at: meta.summarized_at.filter(|_| summarized).map(rfc3339),
         transcript_lines: lines(&meta).len(),
         backend: meta.backend.clone(),
         model: meta.model.clone(),
@@ -730,7 +732,12 @@ pub fn search(root: &Path, params: &SearchParams) -> Result<SearchOutput, String
         if find_ci(&title, &needle).is_some() {
             found.push(hit("title", title.clone()));
         }
-        if let Some(summary) = header.summary.as_deref().map(flat) {
+        if let Some(summary) = header
+            .summary
+            .as_deref()
+            .filter(|&s| is_summary(Some(s)))
+            .map(flat)
+        {
             if let Some(range) = find_ci(&summary, &needle) {
                 found.push(hit("summary", snippet(&summary, range)));
             }
@@ -1356,17 +1363,41 @@ mod tests {
         assert_eq!(snippet("ab", 0..1), "ab");
     }
 
-    /// The list reads headers only: a recording whose transcript text
-    /// cannot even be read as text is still listed, and has_summary is
-    /// false for "Too short to summarize.".
+    /// "Too short to summarize." is no summary: search finds no summary
+    /// words in it, get_recording gives none (no time, never stale) and
+    /// has_summary is false. The list reads headers only: a recording whose
+    /// transcript text cannot even be read as text is still listed.
     #[test]
     fn list_reads_headers_and_too_short_is_no_summary() {
         let tmp = fixture();
         let dir = tmp.path().join("2026-10-17_0900_standup");
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.summary = Some(TOO_SHORT.into());
+        meta.summarized_at = Some(meta.started_at);
+        meta.summary_stale = true;
+        store::write_meta(&dir, &meta).unwrap();
+        for query in ["short", "summarize"] {
+            let out = find(tmp.path(), query, |_| {}).unwrap();
+            assert!(
+                !out.hits.iter().any(|h| h.field == "summary"),
+                "{query}: {:?}",
+                out.hits
+            );
+        }
+        let info = recording(
+            tmp.path(),
+            &RecordingParams {
+                id: "2026-10-17".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(info.summary, None);
+        assert_eq!(info.summarized_at, None);
+        assert!(!info.summary_stale);
+
         let mut json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("recording.json")).unwrap()).unwrap();
         json["segments"][0]["text"] = json!(12345);
-        json["summary"] = json!(TOO_SHORT);
         std::fs::write(dir.join("recording.json"), json.to_string()).unwrap();
         assert!(
             store::read_meta(&dir).is_err(),
