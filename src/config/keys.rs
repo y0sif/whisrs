@@ -73,17 +73,17 @@ pub fn key_summary_from(config: &Config, env: impl Fn(&str) -> Option<String>) -
                 .openai_compatible_realtime
                 .as_ref()
                 .and_then(|r| r.api_key.as_deref())
-                .filter(|key| !key.is_empty())
+                .filter(|key| !key.trim().is_empty())
             {
                 Some(key) => KeySummary::File {
-                    masked: mask_api_key(key),
+                    masked: mask_api_key(key.trim()),
                 },
                 None => KeySummary::Optional("bearer token"),
             };
         }
         "asr-sidecar" | "asr" | "vibevoice" => {
-            // Unlike the other backends, the daemon trims both sides here and
-            // treats a blank value as absent.
+            // The daemon trims both the env var (no other backend does) and
+            // the file key here, and treats a blank value as absent.
             let var = "WHISRS_ASR_SIDECAR_API_KEY";
             if let Some(key) = env(var).filter(|key| !key.trim().is_empty()) {
                 return from_env(var, key.trim());
@@ -94,7 +94,7 @@ pub fn key_summary_from(config: &Config, env: impl Fn(&str) -> Option<String>) -
                 .filter(|key| !key.trim().is_empty())
             {
                 Some(key) => KeySummary::File {
-                    masked: mask_api_key(key),
+                    masked: mask_api_key(key.trim()),
                 },
                 // OpenRouter refuses a request without one.
                 None if sidecar.is_some_and(|s| crate::config::catalog::is_openrouter(&s.url)) => {
@@ -411,10 +411,11 @@ api_key = "tts-SECRET-gggg"
         assert_eq!(key_summary(own, &[]), KeySummary::Optional("API key"));
     }
 
-    /// The daemon's blank-env rules differ by backend: groq only skips an
-    /// empty string, so whitespace counts as set, while the sidecar trims.
+    /// The daemon's blank and padding rules differ by backend: groq only skips
+    /// an empty env var, so whitespace counts as set; the sidecar and
+    /// openai-compatible-realtime trim.
     #[test]
-    fn key_summary_follows_each_backends_blank_env_rule() {
+    fn key_summary_follows_each_backends_blank_and_padding_rules() {
         let groq = "[general]\nbackend = \"groq\"\n[groq]\napi_key = \"file-key-1234\"\n";
         let empty = key_summary(groq, &[("WHISRS_GROQ_API_KEY", "")]);
         assert_eq!(empty, file_key("****1234"));
@@ -436,5 +437,18 @@ api_key = "tts-SECRET-gggg"
             &[("WHISRS_ASR_SIDECAR_API_KEY", " env-key-9876\n")],
         );
         assert_eq!(padded, env_key("WHISRS_ASR_SIDECAR_API_KEY", "****9876"));
+        let padded_file = "[general]\nbackend = \"asr-sidecar\"\n\
+                           [asr-sidecar]\napi_key = \"file-key-1234\\n\"\n";
+        assert_eq!(key_summary(padded_file, &[]), file_key("****1234"));
+
+        let realtime = "[general]\nbackend = \"openai-compatible-realtime\"\n\
+                        [openai-compatible-realtime]\n";
+        let padded = format!("{realtime}api_key = \"rt-key-5555\\n\"\n");
+        assert_eq!(key_summary(&padded, &[]), file_key("****5555"));
+        let blank = format!("{realtime}api_key = \"   \"\n");
+        assert_eq!(
+            key_summary(&blank, &[]),
+            KeySummary::Optional("bearer token")
+        );
     }
 }
