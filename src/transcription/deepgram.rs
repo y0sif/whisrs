@@ -239,6 +239,28 @@ pub const DIARIZE_MODEL: &str = "latest";
 /// What `recording.json` records as `diarization` for Deepgram.
 pub const DIARIZATION_LABEL: &str = "deepgram:latest";
 
+/// The `[deepgram]` formatting flags one request carries. [`Default`] is
+/// what the config keys default to: `smart_format` on, the other two off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeepgramFormat {
+    /// `smart_format`: punctuation, capitals and formatted numbers.
+    pub smart_format: bool,
+    /// `numerals`: numbers as digits, ordinals and small ones too.
+    pub numerals: bool,
+    /// `paragraphs`: dictation typed broken into paragraphs.
+    pub paragraphs: bool,
+}
+
+impl Default for DeepgramFormat {
+    fn default() -> Self {
+        Self {
+            smart_format: true,
+            numerals: false,
+            paragraphs: false,
+        }
+    }
+}
+
 /// What to log when the configured model cannot take the vocabulary at all, or
 /// `None` when there is nothing to report.
 ///
@@ -258,13 +280,22 @@ fn unsupported_model_keyterm_notice(model: &str, keyterms: &[String]) -> Option<
 /// Build common query parameters for Deepgram requests.
 fn build_query_params<'a>(
     config: &'a TranscriptionConfig,
+    format: &DeepgramFormat,
     extra: &[(&'a str, &'a str)],
 ) -> Vec<(&'a str, &'a str)> {
     let mut params = vec![
         ("model", config.model.as_str()),
         ("language", map_language(&config.language)),
-        ("smart_format", "true"),
+        (
+            "smart_format",
+            if format.smart_format { "true" } else { "false" },
+        ),
     ];
+    // Off is left out: Deepgram's own default. `paragraphs` goes as an extra
+    // of the dictation request only.
+    if format.numerals {
+        params.push(("numerals", "true"));
+    }
     // Keyterm prompting: one repeated `keyterm` per term. Deepgram rejects
     // weights/intensifiers and comma- or semicolon-separated lists, and caps the
     // set at 500 tokens per request (see `KEYTERM_MAX_WORDS`).
@@ -316,6 +347,32 @@ struct DeepgramChannel {
 #[derive(Debug, Deserialize)]
 struct DeepgramAlternative {
     transcript: String,
+    /// The same words broken into paragraphs, with a leading line break.
+    /// Deepgram sends it whenever `smart_format` or `paragraphs` is on.
+    #[serde(default)]
+    paragraphs: Option<DeepgramParagraphs>,
+}
+
+impl DeepgramAlternative {
+    /// The transcript to type: the paragraph-broken one when `paragraphs` is
+    /// on and it came back with text, the flat one otherwise. Smart formatting alone
+    /// brings the paragraphs back too, so the flag decides, not the response.
+    fn text(&self, paragraphs: bool) -> &str {
+        if !paragraphs {
+            return &self.transcript;
+        }
+        self.paragraphs
+            .as_ref()
+            .map(|p| p.transcript.as_str())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(&self.transcript)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeepgramParagraphs {
+    #[serde(default)]
+    transcript: String,
 }
 
 /// Error response from the Deepgram API.
@@ -354,15 +411,18 @@ struct StreamingChannel {
 pub struct DeepgramRestBackend {
     client: reqwest::Client,
     api_key: String,
+    /// `[deepgram]` formatting flags, resolved once by the factory.
+    format: DeepgramFormat,
     /// [`DEEPGRAM_REST_URL`]; tests point it at a local server.
     url: String,
 }
 
 impl DeepgramRestBackend {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, format: DeepgramFormat) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            format,
             url: rest_url(),
         }
     }
@@ -373,7 +433,7 @@ impl DeepgramRestBackend {
     pub(crate) fn with_url(api_key: String, url: String) -> Self {
         Self {
             url,
-            ..Self::new(api_key)
+            ..Self::new(api_key, DeepgramFormat::default())
         }
     }
 
@@ -387,7 +447,7 @@ impl DeepgramRestBackend {
         extra: &[(&str, &str)],
     ) -> anyhow::Result<String> {
         let api_key = resolve_api_key(&self.api_key)?;
-        let params = build_query_params(config, extra);
+        let params = build_query_params(config, &self.format, extra);
 
         let response = self
             .client
@@ -440,6 +500,9 @@ fn rest_url() -> String {
 /// Extra query params for a recording request: `utterances=true` makes Deepgram
 /// group words into timed utterances at pauses.
 const SEGMENT_QUERY_EXTRA: &[(&str, &str)] = &[("utterances", "true")];
+
+/// Extra query params for a dictation with `[deepgram] paragraphs` on.
+const PARAGRAPH_QUERY_EXTRA: &[(&str, &str)] = &[("paragraphs", "true")];
 
 /// [`SEGMENT_QUERY_EXTRA`] for a track whose voices Deepgram tells apart:
 /// `diarize_model` both turns diarization on and picks the model, and every
@@ -596,7 +659,12 @@ impl TranscriptionBackend for DeepgramRestBackend {
             config.language
         );
 
-        let body = self.post(audio, UploadFormat::WAV, config, &[]).await?;
+        let extra = if self.format.paragraphs {
+            PARAGRAPH_QUERY_EXTRA
+        } else {
+            &[]
+        };
+        let body = self.post(audio, UploadFormat::WAV, config, extra).await?;
 
         let parsed: DeepgramResponse = serde_json::from_str(&body)?;
         let text = parsed
@@ -604,7 +672,7 @@ impl TranscriptionBackend for DeepgramRestBackend {
             .channels
             .first()
             .and_then(|ch| ch.alternatives.first())
-            .map(|alt| alt.transcript.trim().to_string())
+            .map(|alt| alt.text(self.format.paragraphs).trim().to_string())
             .unwrap_or_default();
 
         if text.is_empty() {
@@ -670,11 +738,14 @@ impl TranscriptionBackend for DeepgramRestBackend {
 /// results to avoid duplicates.
 pub struct DeepgramStreamingBackend {
     api_key: String,
+    /// `[deepgram]` formatting flags. The socket gets no `paragraphs`: the
+    /// live endpoint returns none, and the config warns about it at load.
+    format: DeepgramFormat,
 }
 
 impl DeepgramStreamingBackend {
-    pub fn new(api_key: String) -> Self {
-        Self { api_key }
+    pub fn new(api_key: String, format: DeepgramFormat) -> Self {
+        Self { api_key, format }
     }
 }
 
@@ -729,6 +800,7 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
 
         let params = build_query_params(
             config,
+            &self.format,
             &[
                 ("encoding", "linear16"),
                 ("sample_rate", "16000"),
@@ -869,7 +941,7 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
         audio: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<Transcript> {
-        DeepgramRestBackend::new(self.api_key.clone())
+        DeepgramRestBackend::new(self.api_key.clone(), self.format)
             .transcribe_segments(audio, config)
             .await
     }
@@ -991,32 +1063,93 @@ mod tests {
 
     #[tokio::test]
     async fn rest_rejects_empty_audio() {
-        let backend = DeepgramRestBackend::new("test-key".to_string());
+        let backend = DeepgramRestBackend::new("test-key".to_string(), DeepgramFormat::default());
         let config = query_config("nova-3", &[]);
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
     }
 
-    /// Every request carries the model, smart formatting and the language,
-    /// `auto` going as Deepgram's `multi`.
+    /// Every request carries the model, the language (`auto` going as
+    /// Deepgram's `multi`) and `smart_format`; `numerals` only when on, and
+    /// never `paragraphs`, which only the dictation request adds.
     #[test]
-    fn build_query_params_carries_model_language_and_smart_format() {
-        for (language, want_language) in
-            [("en", "en"), ("fr", "fr"), ("ja", "ja"), ("auto", "multi")]
-        {
+    fn build_query_params_carries_model_language_and_formatting() {
+        let default = DeepgramFormat::default();
+        let all_flipped = DeepgramFormat {
+            smart_format: false,
+            numerals: true,
+            paragraphs: true,
+        };
+        for (language, format, want_language, want_smart_format, want_numerals) in [
+            ("en", default, "en", "true", false),
+            ("fr", default, "fr", "true", false),
+            ("ja", default, "ja", "true", false),
+            ("auto", default, "multi", "true", false),
+            ("en", all_flipped, "en", "false", true),
+        ] {
+            let row = format!("{language}, {format:?}");
             let mut config = query_config("nova-3", &[]);
             config.language = language.to_string();
-            let params = build_query_params(&config, &[]);
+            let params = build_query_params(&config, &format, &[]);
             for want in [
                 ("model", "nova-3"),
-                ("smart_format", "true"),
+                ("smart_format", want_smart_format),
                 ("language", want_language),
             ] {
                 assert!(
                     params.contains(&want),
-                    "{language}: {want:?} missing from {params:?}"
+                    "{row}: {want:?} missing from {params:?}"
                 );
             }
+            let numerals = params.iter().find(|(k, _)| *k == "numerals");
+            assert_eq!(
+                numerals.map(|(_, v)| *v),
+                want_numerals.then_some("true"),
+                "{row}: {params:?}"
+            );
+            assert!(
+                !params.iter().any(|(k, _)| *k == "paragraphs"),
+                "{row}: paragraphs sent: {params:?}"
+            );
+        }
+    }
+
+    /// Dictation asks for paragraphs and types `paragraphs.transcript`
+    /// (trimmed of its leading line break) only with `paragraphs` on. Smart
+    /// formatting brings the paragraphs back anyway, and without the flag
+    /// the flat transcript is typed.
+    #[tokio::test]
+    async fn dictation_types_the_paragraphs_only_when_asked() {
+        let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
+        let body = r#"{"results": {"channels": [{"alternatives": [{
+            "transcript": "one two three four",
+            "paragraphs": {"transcript": "\none two\n\nthree four"}
+        }]}]}}"#;
+        for (paragraphs, want_text) in [
+            (false, "one two three four"),
+            (true, "one two\n\nthree four"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let backend = DeepgramRestBackend {
+                format: DeepgramFormat {
+                    paragraphs,
+                    ..DeepgramFormat::default()
+                },
+                ..local_backend(&listener)
+            };
+            let server = tokio::spawn(serve_once(listener, body));
+            let text = backend
+                .transcribe(&wav, &query_config("nova-3", &[]))
+                .await
+                .unwrap_or_else(|e| panic!("paragraphs = {paragraphs}: {e}"));
+            assert_eq!(text, want_text, "paragraphs = {paragraphs}");
+            let request = server.await.unwrap();
+            let line = request.head.lines().next().unwrap();
+            assert_eq!(
+                line.contains("paragraphs=true"),
+                paragraphs,
+                "paragraphs = {paragraphs}: {line}"
+            );
         }
     }
 
@@ -1048,7 +1181,7 @@ mod tests {
         ];
         for (name, model, terms, want) in cases {
             let config = query_config(model, terms);
-            let params = build_query_params(&config, &[]);
+            let params = build_query_params(&config, &DeepgramFormat::default(), &[]);
             assert_eq!(keyterm_values(&params), want, "{name}");
         }
     }
@@ -1062,7 +1195,7 @@ mod tests {
         terms.extend((0..1000).map(|i| format!("term{i:04}")));
 
         let config = owned_query_config("nova-3", &terms);
-        let params = build_query_params(&config, &[]);
+        let params = build_query_params(&config, &DeepgramFormat::default(), &[]);
         let sent = keyterm_values(&params);
         let advertised = effective_keyterms(&terms);
 
@@ -1125,7 +1258,7 @@ mod tests {
 
         // And the wire carries exactly the effective terms.
         let config = owned_query_config("nova-3", &terms);
-        let params = build_query_params(&config, &[]);
+        let params = build_query_params(&config, &DeepgramFormat::default(), &[]);
         let sent = keyterm_values(&params);
         assert_eq!(sent.len(), effective.len());
     }
@@ -1149,7 +1282,7 @@ mod tests {
         assert_eq!(effective_keyterms(&last), vec!["whisrs", "Hyprland"]);
 
         let config = owned_query_config("nova-3", &first);
-        let params = build_query_params(&config, &[]);
+        let params = build_query_params(&config, &DeepgramFormat::default(), &[]);
         assert_eq!(keyterm_values(&params), vec!["whisrs", "Hyprland"]);
     }
 
@@ -1229,7 +1362,7 @@ mod tests {
         assert_eq!(effective_keyterms(&terms).len(), KEYTERM_MAX_TERMS);
 
         let config = owned_query_config("nova-3", &terms);
-        let params = build_query_params(&config, &[]);
+        let params = build_query_params(&config, &DeepgramFormat::default(), &[]);
         let sent = keyterm_values(&params);
         assert_eq!(sent.len(), KEYTERM_MAX_TERMS);
     }
@@ -1239,7 +1372,7 @@ mod tests {
         // The streaming URI is assembled from these params by hand, so the
         // encoding has to survive the join, not just `percent_encode`.
         let config = query_config("nova-3", &["GNOME Shell"]);
-        let params = build_query_params(&config, &[]);
+        let params = build_query_params(&config, &DeepgramFormat::default(), &[]);
         let query = build_query_string(&params);
         assert!(
             query.contains("keyterm=GNOME%20Shell"),
@@ -1308,12 +1441,15 @@ mod tests {
     #[test]
     fn segment_query_asks_for_utterances_and_keeps_keyterms() {
         let config = query_config("nova-3", &["whisrs"]);
-        let params = build_query_params(&config, SEGMENT_QUERY_EXTRA);
+        let params = build_query_params(&config, &DeepgramFormat::default(), SEGMENT_QUERY_EXTRA);
         assert!(params.contains(&("utterances", "true")));
         assert!(params.contains(&("smart_format", "true")));
         assert_eq!(keyterm_values(&params), ["whisrs"]);
         // Dictation's params stay without it.
-        assert!(!build_query_params(&config, &[]).contains(&("utterances", "true")));
+        assert!(
+            !build_query_params(&config, &DeepgramFormat::default(), &[])
+                .contains(&("utterances", "true"))
+        );
     }
 
     /// A backend that posts to the local server on `listener`.
@@ -1348,7 +1484,11 @@ mod tests {
                 .collect()
         };
         let config = diarized("nova-3");
-        let params = build_query_params(&config, segment_query_extra(&config));
+        let params = build_query_params(
+            &config,
+            &DeepgramFormat::default(),
+            segment_query_extra(&config),
+        );
         assert_eq!(
             diarize_params(&params),
             [("diarize_model".to_string(), "latest".to_string())]
@@ -1356,14 +1496,26 @@ mod tests {
         assert!(params.contains(&("utterances", "true")));
 
         let plain = query_config("nova-3", &[]);
-        let params = build_query_params(&plain, segment_query_extra(&plain));
+        let params = build_query_params(
+            &plain,
+            &DeepgramFormat::default(),
+            segment_query_extra(&plain),
+        );
         assert!(diarize_params(&params).is_empty());
         let whisper = diarized("whisper-large");
-        assert!(
-            diarize_params(&build_query_params(&whisper, segment_query_extra(&whisper))).is_empty()
-        );
+        assert!(diarize_params(&build_query_params(
+            &whisper,
+            &DeepgramFormat::default(),
+            segment_query_extra(&whisper)
+        ))
+        .is_empty());
         // Dictation REST and the WebSocket add their own extras to these.
-        assert!(diarize_params(&build_query_params(&config, &[])).is_empty());
+        assert!(diarize_params(&build_query_params(
+            &config,
+            &DeepgramFormat::default(),
+            &[]
+        ))
+        .is_empty());
         assert!(supports_diarization("nova-2-meeting"));
         assert!(supports_diarization("base"));
         assert!(!supports_diarization("whisper-medium"));

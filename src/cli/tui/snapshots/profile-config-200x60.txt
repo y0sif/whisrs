@@ -10,25 +10,26 @@
 
 
 
-
-
                                                   ╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
                                                   │ whisrs ▁▃▅▃▁                                                       config · profile offline · ●  │
                                                   │                                                                                                  │
                                                   │   General               ▌ backend           ◂ local-whisper ▸                           profile  │
                                                   │   Backend & keys          deepgram api_key  set ****9f2c                              base only  │
                                                   │   Audio                   deepgram model    nova-3                                         base  │
-                                                  │   Vocabulary              groq api_key      WHISRS_GROQ_API_KEY (this shell)          base only  │
-                                                  │   Replacements            groq model        whisper-large-v3-turbo                         base  │
-                                                  │   Typing                  openai api_key    not set                                   base only  │
-                                                  │   Hotkeys                 openai model      gpt-4o-mini-transcribe                         base  │
-                                                  │   Overlay                 openai languages  none                                           base  │
-                                                  │   Read aloud (TTS)        whisper model     /m/ggml-base.bin                            profile  │
-                                                  │   Agents                  segmentation      silence                                        base  │
-                                                  │   LLM                     phrase silence    400 ms                                         base  │
-                                                  │   LLM commands            flash_attn        off                                            base  │
-                                                  │   Recording               sidecar url       http://127.0.0.1:8765/transcribe               base  │
-                                                  │   Hooks                   sidecar model     microsoft/VibeVoice-ASR-HF                     base  │
+                                                  │   Vocabulary              smart format      on                                             base  │
+                                                  │   Replacements            numerals          off                                            base  │
+                                                  │   Typing                  paragraphs        off                                            base  │
+                                                  │   Hotkeys                 groq api_key      WHISRS_GROQ_API_KEY (this shell)          base only  │
+                                                  │   Overlay                 groq model        whisper-large-v3-turbo                         base  │
+                                                  │   Read aloud (TTS)        openai api_key    not set                                   base only  │
+                                                  │   Agents                  openai model      gpt-4o-mini-transcribe                         base  │
+                                                  │   LLM                     openai languages  none                                           base  │
+                                                  │   LLM commands            whisper model     /m/ggml-base.bin                            profile  │
+                                                  │   Recording               segmentation      silence                                        base  │
+                                                  │   Hooks                   phrase silence    400 ms                                         base  │
+                                                  │                           flash_attn        off                                            base  │
+                                                  │                           sidecar url       http://127.0.0.1:8765/transcribe               base  │
+                                                  │                           sidecar model     microsoft/VibeVoice-ASR-HF                     base  │
                                                   │                           sidecar api_key   not set, optional                         base only  │
                                                   │                           realtime url      empty                                          base  │
                                                   │                           realtime model    Whisper-Tiny                                   base  │
@@ -44,7 +45,6 @@
                                                   │   ! unknown key [general] silense_timeout_ms is ignored                                          │
                                                   ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
                                                     j/k move · tab pane · h/l change · enter pick · x base · w save · e $EDITOR · / filter · ? help
-
 
 
 

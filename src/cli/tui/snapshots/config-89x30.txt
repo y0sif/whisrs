@@ -6,6 +6,9 @@
    │   backend           deepgram-streaming                                          │
    │ ▌ deepgram api_key  set ****9f2c                                                │
    │   deepgram model    nova-3                                                      │
+   │   smart format      on                                                          │
+   │   numerals          off                                                         │
+   │   paragraphs        off                                                         │
    │   groq api_key      WHISRS_GROQ_API_KEY (this shell)                            │
    │   groq model        whisper-large-v3-turbo                                      │
    │   openai api_key    not set                                                     │
@@ -19,9 +22,6 @@
    │   sidecar model     microsoft/VibeVoice-ASR-HF                                  │
    │   sidecar api_key   not set, optional                                           │
    │   realtime url      empty                                                       │
-   │   realtime model    Whisper-Tiny                                                │
-   │   realtime profile  lemonade                                                    │
-   │   turn detection    server-vad                                                  │
    │                                                                                 │
    │   API key for the deepgram backends. WHISRS_DEEPGRAM_API_KEY wins over it.      │
    │                                                                                 │

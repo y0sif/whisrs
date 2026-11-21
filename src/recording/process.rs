@@ -1102,6 +1102,18 @@ fn cache_fingerprint(name: &str, config: &Config, tcfg: &TranscriptionConfig) ->
     if tcfg.diarize {
         key["diarize_model"] = serde_json::json!(crate::transcription::deepgram::DIARIZE_MODEL);
     }
+    // `[deepgram] smart_format` and `numerals` change Deepgram's words, so
+    // they key its chunks when either is off its default, leaving the
+    // default's chunks matching. `paragraphs` is never sent with a recording.
+    if canonical_backend_name(name) == "deepgram" {
+        let format = config.deepgram_format();
+        if !format.smart_format || format.numerals {
+            key["deepgram_format"] = serde_json::json!({
+                "smart_format": format.smart_format,
+                "numerals": format.numerals,
+            });
+        }
+    }
     // Local whisper and the phrase fallback cut a chunk into phrases by the
     // detector, so its text depends on it. Absent for `rms`, which decides as
     // 0.1.31 did, so a chunk cached before still matches.
@@ -3764,6 +3776,21 @@ mod tests {
             fingerprint_of(sidecar),
             fingerprint_of(&sidecar.replace("\"asr-sidecar\"\n[", "\"vibevoice\"\n["))
         );
+
+        // Deepgram's smart_format and numerals change its words; paragraphs,
+        // which a recording never sends, does not.
+        let deepgram = "[general]\nbackend = \"deepgram\"\n[deepgram]\nmodel = \"nova-3\"\n";
+        for (flag, changes) in [
+            ("smart_format = false", true),
+            ("numerals = true", true),
+            ("paragraphs = true", false),
+        ] {
+            assert_eq!(
+                fingerprint_of(deepgram) != fingerprint_of(&format!("{deepgram}{flag}\n")),
+                changes,
+                "{flag}"
+            );
+        }
     }
 
     /// Only the ASR sidecar's chunks changed with its timings: every other

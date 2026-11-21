@@ -935,6 +935,44 @@ pub struct DeepgramConfig {
     pub api_key: String,
     #[serde(default = "default_deepgram_model")]
     pub model: String,
+    /// Deepgram `smart_format`: punctuation, capitals and formatted numbers.
+    /// Default true: off, the text has no punctuation or capitals, except in
+    /// dictation with `paragraphs` on.
+    #[serde(default = "default_true")]
+    pub smart_format: bool,
+    /// Deepgram `numerals`: numbers as digits, ordinals and small ones too.
+    #[serde(default)]
+    pub numerals: bool,
+    /// Deepgram `paragraphs`: dictation on `backend = "deepgram"` is typed
+    /// broken into paragraphs. Recordings and `deepgram-streaming` ignore it.
+    #[serde(default)]
+    pub paragraphs: bool,
+}
+
+impl DeepgramConfig {
+    /// The formatting flags this section asks for, as the request builder
+    /// takes them.
+    pub fn format(&self) -> deepgram::DeepgramFormat {
+        deepgram::DeepgramFormat {
+            smart_format: self.smart_format,
+            numerals: self.numerals,
+            paragraphs: self.paragraphs,
+        }
+    }
+}
+
+impl Default for DeepgramConfig {
+    /// The serde defaults: written out, since a derive would turn
+    /// `smart_format` off.
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            model: default_deepgram_model(),
+            smart_format: true,
+            numerals: false,
+            paragraphs: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2342,6 +2380,7 @@ impl Config {
         }
 
         warnings.extend(self.deepgram_keyterm_warnings(backend));
+        warnings.extend(self.deepgram_paragraphs_warning(backend));
         warnings.extend(self.inert_prompt_warnings(backend));
         warnings.extend(self.openrouter_prompt_warnings());
         warnings.extend(self.openai_languages_warnings(backend));
@@ -3011,6 +3050,15 @@ impl Config {
             .unwrap_or_else(default_deepgram_model)
     }
 
+    /// The `[deepgram]` formatting flags this config sends. Without the
+    /// section, the defaults an empty one gets.
+    pub fn deepgram_format(&self) -> deepgram::DeepgramFormat {
+        self.deepgram
+            .as_ref()
+            .map(DeepgramConfig::format)
+            .unwrap_or_default()
+    }
+
     /// The OpenAI realtime model this config will actually transcribe with.
     ///
     /// Not [`default_openai_model`], on purpose. `[openai] model` is shared
@@ -3130,6 +3178,19 @@ impl Config {
             });
         }
         warnings
+    }
+
+    /// The warning for `[deepgram] paragraphs` with
+    /// `backend = "deepgram-streaming"`, whose live socket returns no
+    /// paragraphs. A section left behind on another backend says nothing.
+    fn deepgram_paragraphs_warning(&self, backend: &str) -> Option<ConfigWarning> {
+        let paragraphs = self.deepgram.as_ref().is_some_and(|d| d.paragraphs);
+        (backend == "deepgram-streaming" && paragraphs).then(|| ConfigWarning {
+            message: "[deepgram] paragraphs does nothing with backend = \"deepgram-streaming\", \
+                      whose live socket returns no paragraphs. It applies with \
+                      backend = \"deepgram\"."
+                .to_string(),
+        })
     }
 
     /// Resolve [`DeepgramHintChannel`] for this config.
@@ -4048,6 +4109,7 @@ mod tests {
             config.deepgram = Some(DeepgramConfig {
                 api_key: "test-key".to_string(),
                 model: default_deepgram_model(),
+                ..Default::default()
             });
             config.openai = Some(OpenAiConfig {
                 api_key: "test-key".to_string(),
@@ -4267,8 +4329,41 @@ mod tests {
         config.deepgram = Some(DeepgramConfig {
             api_key: "test-key".to_string(),
             model: model.to_string(),
+            ..Default::default()
         });
         config
+    }
+
+    /// `[deepgram] paragraphs` warns with `deepgram-streaming`, whose live
+    /// socket returns none, and nowhere else: the REST backend sends it, and
+    /// a section left behind on another backend is not that backend's.
+    #[test]
+    fn config_validate_warns_paragraphs_only_with_the_streaming_backend() {
+        for (backend, warns) in [
+            ("deepgram-streaming", true),
+            ("deepgram", false),
+            ("groq", false),
+        ] {
+            let mut config = keyed_groq_config();
+            config.general.backend = backend.to_string();
+            config.deepgram = Some(DeepgramConfig {
+                api_key: "test-key".to_string(),
+                paragraphs: true,
+                ..Default::default()
+            });
+            let warnings = config
+                .validate()
+                .unwrap_or_else(|e| panic!("{backend}: {e}"));
+            let warning = warnings.iter().find(|w| w.message.contains("paragraphs"));
+            assert_eq!(warning.is_some(), warns, "{backend}: {warnings:?}");
+            if let Some(warning) = warning {
+                assert!(
+                    warning.message.contains("deepgram-streaming"),
+                    "{backend}: the warning must name the backend: {}",
+                    warning.message
+                );
+            }
+        }
     }
 
     /// A pre-Nova-3 deepgram model takes no keyterm, so a vocabulary on it
@@ -4435,15 +4530,19 @@ mod tests {
     }
 
     #[test]
-    fn deepgram_keyterm_warnings_without_a_deepgram_section_use_the_default_model() {
-        // `[deepgram]` is optional; the section's serde default (nova-3)
-        // supports keyterm, so an absent section must not produce the
-        // "vocabulary is ignored" warning. Goes through the warning builder
-        // rather than `validate` because `validate` rejects a deepgram backend
-        // with no section and no `WHISRS_DEEPGRAM_API_KEY` before it gets here.
+    fn a_missing_deepgram_section_answers_like_an_empty_one() {
+        // `[deepgram]` is optional, and without it the model and the
+        // formatting are an empty section's serde defaults. The default model
+        // (nova-3) supports keyterm, so an absent section must not produce
+        // the "vocabulary is ignored" warning. Goes through the warning
+        // builder rather than `validate` because `validate` rejects a deepgram
+        // backend with no section and no `WHISRS_DEEPGRAM_API_KEY` before it
+        // gets here.
         let mut config = deepgram_config_with_vocabulary("nova-3", &["whisrs".to_string()]);
         config.deepgram = None;
+        let empty: Config = toml::from_str("[deepgram]\n").expect("an empty section parses");
         assert_eq!(config.deepgram_model(), default_deepgram_model());
+        assert_eq!(config.deepgram_format(), empty.deepgram_format());
         let warnings = config.deepgram_keyterm_warnings("deepgram");
         assert!(
             warnings.is_empty(),
@@ -4609,6 +4708,7 @@ mod tests {
             deepgram: Some(DeepgramConfig {
                 api_key: "test-key".to_string(),
                 model: default_deepgram_model(),
+                ..Default::default()
             }),
             groq: Some(GroqConfig {
                 api_key: "test-key".to_string(),
@@ -6763,12 +6863,15 @@ mod tests {
             SendsPromptCase {
                 name: "deepgram",
                 model: "nova-3",
-                backend: Box::new(DeepgramRestBackend::new(String::new())),
+                backend: Box::new(DeepgramRestBackend::new(String::new(), Default::default())),
             },
             SendsPromptCase {
                 name: "deepgram-streaming",
                 model: "nova-3",
-                backend: Box::new(DeepgramStreamingBackend::new(String::new())),
+                backend: Box::new(DeepgramStreamingBackend::new(
+                    String::new(),
+                    Default::default(),
+                )),
             },
             SendsPromptCase {
                 name: "groq",

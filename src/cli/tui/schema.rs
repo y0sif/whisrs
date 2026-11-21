@@ -530,6 +530,27 @@ const BACKEND: &[Field] = &[
          none of it.",
     ),
     field(
+        "deepgram.smart_format",
+        "smart format",
+        Kind::Bool,
+        "Punctuation, capitals and formatted numbers (\"200\", \"$900\"). Off, the text is \
+         lowercase with no punctuation, except in dictation with paragraphs on.",
+    ),
+    field(
+        "deepgram.numerals",
+        "numerals",
+        Kind::Bool,
+        "Numbers as digits, ordinals and small ones too (\"1st\", \"3\").",
+    ),
+    field(
+        "deepgram.paragraphs",
+        "paragraphs",
+        Kind::Bool,
+        "Type dictation broken into paragraphs, with backend = \"deepgram\" only: recordings \
+         and deepgram-streaming ignore it. A break is typed as a line break, or as a space in \
+         a terminal whisrs recognizes.",
+    ),
+    field(
         "groq.api_key",
         "groq api_key",
         Kind::Secret,
@@ -1477,6 +1498,7 @@ mod tests {
             deepgram: Some(DeepgramConfig {
                 api_key: "k".into(),
                 model: "m".into(),
+                ..Default::default()
             }),
             groq: Some(GroqConfig {
                 api_key: "k".into(),
