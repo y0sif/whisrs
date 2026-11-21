@@ -49,14 +49,18 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # ggml defaults to -march=native, so an unpinned build inherits the runner's
-      # ISA (v0.1.26 shipped AVX-512, #150). OFF gives an x86-64-v3 floor
-      # (AVX2/BMI2/FMA/F16C, no AVX-512).
-      # Set only on x86_64: whisper-rs-sys forwards every GGML_* var to cmake, and
-      # an empty value would read as OFF on the ARM rows too.
-      - name: Pin x86_64 CPU baseline
-        if: matrix.arch == 'x86_64'
-        run: echo "GGML_NATIVE=OFF" >> "$GITHUB_ENV"
+      # ggml defaults to -march=native (-mcpu=native on ARM), so an unpinned
+      # build inherits the runner's ISA and SIGILLs on CPUs without it.
+      # GGML_NATIVE=OFF turns that off. On x86_64, OFF alone gives an
+      # x86-64-v3 floor (AVX2/BMI2/FMA/F16C, no AVX-512). On ARM, OFF alone adds
+      # no -march, so GGML_CPU_ARM_ARCH sets the floor: ARMv8.2 with dotprod
+      # and fp16 (Pi 5, Apple M1, Neoverse N1 and newer, not the Pi 4).
+      - name: Pin CPU baseline
+        run: |
+          echo "GGML_NATIVE=OFF" >> "$GITHUB_ENV"
+          if [ "${{ matrix.arch }}" = aarch64 ]; then
+            echo "GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16" >> "$GITHUB_ENV"
+          fi
 
       # whisper-rs-sys never reruns on GGML_* changes, so key the cache on them
       # or a restored target/ keeps the old ggml build.
@@ -67,9 +71,8 @@ jobs:
       - name: Build
         run: cargo build --release ${{ matrix.features }}
 
-      - name: Check for AVX-512 instructions
-        if: matrix.arch == 'x86_64'
-        run: scripts/check-no-avx512.sh
+      - name: Check CPU baseline
+        run: scripts/check-cpu-baseline.sh
 
       - name: Package
         run: |

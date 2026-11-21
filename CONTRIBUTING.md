@@ -94,11 +94,11 @@ for feature in vulkan cuda hipblas; do
   cargo metadata --locked --format-version 1 --features "$feature" > /dev/null
 done
 
-# Release builds, full and minimal, with no AVX-512 in the binaries
+# Release builds, full and minimal, with no instructions above the release CPU baseline
 GGML_NATIVE=OFF cargo build --release
-scripts/check-no-avx512.sh
+scripts/check-cpu-baseline.sh
 GGML_NATIVE=OFF cargo build --release --no-default-features --features tray,overlay,hooks,recording,mcp
-scripts/check-no-avx512.sh
+scripts/check-cpu-baseline.sh
 ```
 
 `cargo fmt` fixes what the first check reports.
