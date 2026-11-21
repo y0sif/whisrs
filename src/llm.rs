@@ -510,11 +510,17 @@ async fn chat_with_key(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        if status.as_u16() == 401 {
-            anyhow::bail!("LLM API: invalid API key; check [llm] api_key in config.toml");
+        let message = if status.as_u16() == 401 {
+            "LLM API: invalid API key; check [llm] api_key in config.toml".to_string()
+        } else {
+            let detail: String = body.trim().chars().take(ERROR_BODY_CHARS).collect();
+            format!("LLM API error ({status}): {detail}")
+        };
+        return Err(crate::transcription::HttpStatusError {
+            status: status.as_u16(),
+            message,
         }
-        let detail: String = body.trim().chars().take(ERROR_BODY_CHARS).collect();
-        anyhow::bail!("LLM API error ({status}): {detail}");
+        .into());
     }
 
     let chat_response: ChatResponse = response
@@ -605,12 +611,15 @@ mod tests {
         let err = format!("{:#}", send().await.unwrap_err());
         assert!(err.starts_with("failed to parse LLM response"), "{err}");
         assert!(!err.contains("s3cret"), "{err}");
-        let err = format!("{:#}", send().await.unwrap_err());
+        let err = send().await.unwrap_err();
+        assert_eq!(crate::transcription::http_status(&err), Some(500));
+        let err = format!("{err:#}");
         assert!(err.starts_with("LLM API error (500"), "{err}");
         assert_eq!(err.matches('x').count(), 300, "{err}");
-        let err = format!("{:#}", send().await.unwrap_err());
+        let err = send().await.unwrap_err();
+        assert_eq!(crate::transcription::http_status(&err), Some(401));
         assert_eq!(
-            err,
+            format!("{err:#}"),
             "LLM API: invalid API key; check [llm] api_key in config.toml"
         );
         server.await.unwrap();

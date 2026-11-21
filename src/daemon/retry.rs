@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(
             message,
             format!(
-                "transcription failed: Cannot reach API — check your internet connection. The \
+                "transcription failed: Cannot reach API. Check your internet connection. The \
                  audio is kept at {}",
                 path.display()
             )

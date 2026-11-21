@@ -42,7 +42,7 @@ use whisrs::llm;
 use whisrs::replacements::Replacer;
 use whisrs::state::Action;
 use whisrs::transcription::{
-    needs_space_between, transcription_prompt, StreamText, TranscriptionBackend,
+    http_status, needs_space_between, transcription_prompt, StreamText, TranscriptionBackend,
     TranscriptionConfig,
 };
 use whisrs::window::WindowTracker;
@@ -360,7 +360,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             let friendly = format_api_error(&e);
-            error!("streaming transcription error: {friendly}");
+            error!("streaming transcription error: {e:#}");
             stream_error = Some(friendly);
         }
         Err(e) => {
@@ -1487,11 +1487,12 @@ pub(crate) fn format_api_error(err: &anyhow::Error) -> String {
         return "Realtime transcription timed out waiting for the server to finish after stop"
             .to_string();
     }
-    if msg.contains("invalid API key") || msg.contains("401") {
-        return "Invalid API key — check your config at ~/.config/whisrs/config.toml".to_string();
+    let status = http_status(err);
+    if status == Some(401) || msg.contains("invalid API key") {
+        return "Invalid API key. Check your config at ~/.config/whisrs/config.toml".to_string();
     }
-    if msg.contains("rate limit") || msg.contains("429") {
-        return "Rate limited — wait a moment and try again".to_string();
+    if status == Some(429) || msg.contains("rate limit") {
+        return "Rate limited. Wait a moment and try again".to_string();
     }
     if msg.contains("error sending request")
         || msg.contains("dns error")
@@ -1499,7 +1500,7 @@ pub(crate) fn format_api_error(err: &anyhow::Error) -> String {
         || msg.contains("timed out")
         || msg.contains("ConnectError")
     {
-        return "Cannot reach API — check your internet connection".to_string();
+        return "Cannot reach API. Check your internet connection".to_string();
     }
     msg
 }
@@ -1664,14 +1665,63 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn format_api_error_preserves_realtime_flush_timeout_context() {
-        let err = anyhow::anyhow!(
-            "timed out waiting for final transcription completion from ws://example after commit"
-        );
-        assert_eq!(
-            format_api_error(&err),
-            "Realtime transcription timed out waiting for the server to finish after stop"
-        );
+    fn format_api_error_names_the_failure() {
+        use tokio_tungstenite::tungstenite;
+        use whisrs::transcription::{HttpStatusError, RetryableHttpError};
+        let invalid_key = "Invalid API key. Check your config at ~/.config/whisrs/config.toml";
+        let unreachable = "Cannot reach API. Check your internet connection";
+        let server_error = "ASR sidecar error (500): Traceback, line 401 in decode (request 429f)";
+        let refused_handshake = tungstenite::http::Response::builder()
+            .status(401)
+            .body(None)
+            .expect("refused handshake: response");
+        let cases: [(&str, anyhow::Error, &str); 6] = [
+            (
+                "flush timeout",
+                anyhow::anyhow!(
+                    "timed out waiting for final transcription completion from ws://example \
+                     after commit"
+                ),
+                "Realtime transcription timed out waiting for the server to finish after stop",
+            ),
+            (
+                "connect error to a port holding 401",
+                anyhow::anyhow!("error sending request for url (http://127.0.0.1:4010/transcribe)"),
+                unreachable,
+            ),
+            (
+                "401 and 429 only in the text",
+                anyhow::anyhow!(server_error),
+                server_error,
+            ),
+            (
+                "HTTP 401",
+                HttpStatusError {
+                    status: 401,
+                    message: "Unauthorized".into(),
+                }
+                .into(),
+                invalid_key,
+            ),
+            (
+                "HTTP 429",
+                RetryableHttpError {
+                    status: 429,
+                    retry_after: None,
+                    message: "Too Many Requests".into(),
+                }
+                .into(),
+                "Rate limited. Wait a moment and try again",
+            ),
+            (
+                "websocket handshake refused with 401",
+                tungstenite::Error::Http(refused_handshake).into(),
+                invalid_key,
+            ),
+        ];
+        for (name, err, want) in cases {
+            assert_eq!(format_api_error(&err), want, "{name}");
+        }
     }
 
     /// The text channel sender, the cancel flag, the sink log, and the join

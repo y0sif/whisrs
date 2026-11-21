@@ -152,9 +152,19 @@ pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504 | 520..=524)
 }
 
+/// A request answered with an error status no retry layer acts on, such as
+/// a 401, or an LLM request answered with any error status. It reads as
+/// `message` alone.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct HttpStatusError {
+    pub status: u16,
+    pub message: String,
+}
+
 /// An error for a failed request: a [`RetryableHttpError`] for a transient
-/// status ([`is_retryable_status`]), a plain error otherwise. `message` is
-/// what the user sees either way.
+/// status ([`is_retryable_status`]), an [`HttpStatusError`] otherwise.
+/// `message` is what the user sees either way.
 pub(crate) fn http_error(
     status: u16,
     retry_after: Option<std::time::Duration>,
@@ -168,8 +178,28 @@ pub(crate) fn http_error(
         }
         .into()
     } else {
-        anyhow::anyhow!(message)
+        HttpStatusError { status, message }.into()
     }
+}
+
+/// The HTTP status a failed request was answered with: from a
+/// [`RetryableHttpError`], an [`HttpStatusError`] or a refused websocket
+/// handshake anywhere in `err`'s chain. `None` when no server answered, and
+/// for a status that appears only in an error's text.
+pub fn http_status(err: &anyhow::Error) -> Option<u16> {
+    use tokio_tungstenite::tungstenite;
+    err.chain().find_map(|cause| {
+        if let Some(e) = cause.downcast_ref::<RetryableHttpError>() {
+            return Some(e.status);
+        }
+        if let Some(e) = cause.downcast_ref::<HttpStatusError>() {
+            return Some(e.status);
+        }
+        match cause.downcast_ref::<tungstenite::Error>() {
+            Some(tungstenite::Error::Http(response)) => Some(response.status().as_u16()),
+            _ => None,
+        }
+    })
 }
 
 /// The wait a response asks for: `retry-after-ms` (OpenAI), else
@@ -566,12 +596,13 @@ mod tests {
     }
 
     #[test]
-    fn transient_statuses_are_retryable() {
+    fn http_error_keeps_the_status_and_marks_transient_ones() {
         let err = http_error(429, None, "rate limited".into());
         assert!(err.downcast_ref::<RetryableHttpError>().is_some());
         assert_eq!(err.to_string(), "rate limited");
         for status in [429, 500, 502, 503, 504, 520, 521, 522, 523, 524] {
             let err = http_error(status, None, "x".into());
+            assert_eq!(http_status(&err), Some(status), "{status}");
             let retryable = err.downcast_ref::<RetryableHttpError>();
             assert!(retryable.is_some(), "{status}");
             assert_eq!(
@@ -581,12 +612,12 @@ mod tests {
             );
         }
         for status in [400, 401, 403, 404, 413, 422, 501, 505, 525, 526] {
+            let err = http_error(status, None, "x".into());
             assert!(
-                http_error(status, None, "x".into())
-                    .downcast_ref::<RetryableHttpError>()
-                    .is_none(),
+                err.downcast_ref::<RetryableHttpError>().is_none(),
                 "{status}"
             );
+            assert_eq!(http_status(&err), Some(status), "{status}");
         }
     }
     use super::*;
