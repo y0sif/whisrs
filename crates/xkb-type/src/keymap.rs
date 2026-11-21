@@ -519,6 +519,20 @@ pub(crate) fn build_reverse_map(keymap: &xkbcommon::xkb::Keymap) -> HashMap<char
         }
     }
 
+    // A line break is Enter, as on wayland-vk. The keysym loop finds `\n`
+    // on Linefeed, a separate key that GUI toolkits ignore.
+    map.insert(
+        '\n',
+        KeyMapping {
+            main: KeyTap {
+                keycode: evdev::Key::KEY_ENTER.code(),
+                shift: false,
+                altgr: false,
+            },
+            follow: None,
+        },
+    );
+
     // Pass 1: dead_X + Space for literal punctuation
     for (ch, dead_sym) in [
         ('\'', KEY_dead_acute),
@@ -627,11 +641,10 @@ mod tests {
 
     #[test]
     fn build_us_keymap() {
-        let km = XkbKeymap::from_layout(&us_layout());
-        if let Ok(km) = km {
-            assert!(!km.is_empty(), "keymap should not be empty");
-            assert!(km.lookup('a').is_some(), "'a' should be in the keymap");
-        }
+        let km = XkbKeymap::from_layout(&us_layout()).unwrap();
+        assert!(!km.is_empty(), "keymap should not be empty");
+        assert!(km.lookup('a').is_some(), "'a' should be in the keymap");
+        assert_key_full(&km, '\n', evdev::Key::KEY_ENTER.code(), false, false, "US");
     }
 
     #[test]
