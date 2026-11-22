@@ -1,6 +1,6 @@
 [package]
 name = "audio-silence-gate"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.87"
 description = "Speech detection for audio capture: the earshot VAD with level floors and hangover, an RMS gate, auto-stop and a level meter"

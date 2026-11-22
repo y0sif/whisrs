@@ -11,7 +11,7 @@ members = [
 
 [package]
 name = "whisrs"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Voice for the Linux desktop: dictation, read-aloud, meeting transcription, voice-driven LLM commands and coding agents, with Groq, Deepgram, OpenAI or offline whisper.cpp."
 license = "MIT"
@@ -86,7 +86,7 @@ asr-dedup = { path = "crates/asr-dedup", version = "0.1" }
 audio-silence-gate = { path = "crates/audio-silence-gate", version = "0.2" }
 filler-remove = { path = "crates/filler-remove", version = "0.1" }
 prompt-echo = { path = "crates/prompt-echo", version = "0.1" }
-xkb-type = { path = "crates/xkb-type", version = "0.2.0", features = ["arboard", "wayland-vk", "xtest"] }
+xkb-type = { path = "crates/xkb-type", version = "0.2.1", features = ["arboard", "wayland-vk", "xtest"] }
 async-trait = "0.1"
 base64 = "0.22"
 # Shares one upload buffer between the retries of a diarization sidecar

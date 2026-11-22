@@ -41,7 +41,7 @@ What changed in each release: [GitHub Releases](https://github.com/y0sif/whisrs/
 curl -sSf https://y0sif.github.io/whisrs/install.sh | bash
 ```
 
-The script installs the latest release for x86_64 or aarch64 in `/usr/local/bin`, with its runtime libraries, then runs `whisrs setup`. Run it again to upgrade. Put `WHISRS_VERSION=v0.2.1` before `bash` to pin a release, or `WHISRS_MINIMAL=1` for the build without whisper.cpp (cloud backends only).
+The script installs the latest release for x86_64 or aarch64 in `/usr/local/bin`, with its runtime libraries, then runs `whisrs setup`. Run it again to upgrade. Put `WHISRS_VERSION=v0.2.2` before `bash` to pin a release, or `WHISRS_MINIMAL=1` for the build without whisper.cpp (cloud backends only).
 
 <details>
 <summary>Arch Linux (AUR)</summary>
