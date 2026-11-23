@@ -219,7 +219,7 @@ pub const INPUT_BACKENDS: &[Entry] = &[
     ("auto", "Wayland virtual keyboard, else uinput"),
     ("uinput", "a virtual keyboard device (/dev/uinput)"),
     ("wayland-vk", "the Wayland virtual keyboard only"),
-    ("xtest", "the X server's XTEST (X11)"),
+    ("xtest", "the X server's XTEST (X11, fastest)"),
 ];
 
 /// `[overlay] theme`.

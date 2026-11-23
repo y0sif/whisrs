@@ -118,6 +118,14 @@ On GNOME and KDE whisrs cannot focus the window you started in again ([Terminal 
 
 Some terminal UIs drop characters when whisrs types fast: raise `[input] key_delay_ms` as [Typing](configuration.md#typing) describes, then run `whisrs restart`.
 
+## Typing is slow on X11
+
+If a long dictation appears one character at a time instead of all at once: on X11, `auto`
+types through uinput, which waits at least 1 ms after every key event, so the text takes
+seconds to type out. XTEST types the whole block almost at once. Set `[input] backend =
+"xtest"` and `key_delay_ms = 0` as [Typing](configuration.md#typing) shows, then run
+`whisrs restart`. `paste = true` is also instant, but it borrows the clipboard.
+
 ## Daemon not running
 
 Start the daemon by hand (`whisrsd`) or through your service manager. `whisrs setup` installs the user service; to install it yourself under systemd, point `ExecStart` at the installed `whisrsd`, since systemd ignores your shell's `PATH` and the shipped unit names a bare `whisrsd`:

@@ -144,7 +144,7 @@ whisrs runs on every Wayland compositor and on X11. Typing, hotkeys, read-aloud,
 | GNOME (Wayland) | No | Recording pill through the bundled [Shell extension](docs/configuration.md#gnome-overlay); no agent overlay |
 | Other Wayland compositors | No | Where the compositor has layer-shell |
 
-whisrs types through the Wayland virtual keyboard where the compositor offers it and through uinput everywhere else; on X11, XTEST is an option ([Typing](docs/configuration.md#typing)). Window tracking returns focus to the window you started in before typing, and tells a terminal from other windows ([terminal detection](docs/configuration.md#terminal-detection)); without it, text goes to the window focused when it is typed. Audio comes from the default input (your PipeWire or PulseAudio default source, through ALSA) or the one `[audio] device` names.
+whisrs types through the Wayland virtual keyboard where the compositor offers it and through uinput everywhere else; on X11, XTEST is an option and types fastest ([Typing](docs/configuration.md#typing)). Window tracking returns focus to the window you started in before typing, and tells a terminal from other windows ([terminal detection](docs/configuration.md#terminal-detection)); without it, text goes to the window focused when it is typed. Audio comes from the default input (your PipeWire or PulseAudio default source, through ALSA) or the one `[audio] device` names.
 
 ## How whisrs Compares
 
