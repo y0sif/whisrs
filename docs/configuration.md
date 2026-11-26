@@ -80,6 +80,14 @@ virtual keyboard when the compositor has it, else uinput (`/dev/uinput`).
   access needed, and `key_delay_ms = 0` drops no keys. It refuses to start on Xwayland, when
   an XKB option moves Ctrl or Shift, and when the X server's keyboard layout differs from
   the one whisrs detected (run `setxkbmap` with your layout).
+- On X11, `xtest` is the fast choice. uinput waits at least 1 ms after every key event, so
+  a long dictation takes seconds to type; XTEST at `key_delay_ms = 0` types it almost at once:
+
+  ```toml
+  [input]
+  backend = "xtest"
+  key_delay_ms = 0
+  ```
 - `key_delay_ms` (default 2) is the pause between keys. Raise it to 4 to 10 when a terminal UI
   drops characters (some Ink-based ones, such as Claude Code, do); uinput treats 0 as 1.
 - `paste = true` pastes with Ctrl+V (Ctrl+Shift+V in a terminal) instead of typing, which
