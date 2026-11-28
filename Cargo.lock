@@ -4877,7 +4877,7 @@ checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
 
 [[package]]
 name = "xkb-type"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arboard",

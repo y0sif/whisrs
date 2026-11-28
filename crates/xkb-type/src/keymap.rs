@@ -278,6 +278,37 @@ pub struct XkbKeymap {
 }
 
 impl XkbKeymap {
+    /// Compile the compositor's complete rules and restrict lookup to its selected group.
+    pub(crate) fn for_group(
+        layouts: &str,
+        variants: &str,
+        model: &str,
+        options: &str,
+        group: u32,
+    ) -> anyhow::Result<Self> {
+        let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkbcommon::xkb::Keymap::new_from_names(
+            &context,
+            "evdev",
+            model,
+            layouts,
+            variants,
+            Some(options.to_owned()),
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .ok_or_else(|| anyhow::anyhow!("cannot compile compositor keymap"))?;
+        anyhow::ensure!(
+            group < keymap.num_layouts(),
+            "invalid compositor layout group"
+        );
+        Ok(Self {
+            map: build_group_reverse_map(&keymap, group),
+            level3_keycode: find_level3_keycode(&keymap).unwrap_or(evdev::Key::KEY_RIGHTALT.code()),
+            #[cfg(feature = "xtest")]
+            group1: Group1Keysyms::from_keymap(&keymap),
+        })
+    }
+
     pub fn from_layout(detected: &KeyboardLayout) -> anyhow::Result<Self> {
         let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
         let keymap = xkbcommon::xkb::Keymap::new_from_names(
@@ -519,6 +550,92 @@ pub(crate) fn build_reverse_map(keymap: &xkbcommon::xkb::Keymap) -> HashMap<char
         }
     }
 
+    complete_reverse_map(&mut map, &dead_keys);
+
+    map
+}
+
+#[allow(non_upper_case_globals)]
+fn build_group_reverse_map(
+    keymap: &xkbcommon::xkb::Keymap,
+    group: u32,
+) -> HashMap<char, KeyMapping> {
+    let mut map: HashMap<char, KeyMapping> = HashMap::new();
+    let mut dead_keys: HashMap<u32, KeyTap> = HashMap::new();
+    let min = keymap.min_keycode().raw();
+    let max = keymap.max_keycode().raw();
+    let level3 = find_level3_keycode(keymap).unwrap_or(evdev::Key::KEY_RIGHTALT.code());
+    for raw_keycode in min..=max {
+        let evdev_keycode = raw_keycode.saturating_sub(8);
+        // Match the uinput device's registered key range.
+        if !(1..=247).contains(&evdev_keycode) {
+            continue;
+        }
+        let evdev_keycode = evdev_keycode as u16;
+        let keycode = xkbcommon::xkb::Keycode::new(raw_keycode);
+        for (shift, altgr) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut state = xkbcommon::xkb::State::new(keymap);
+            state.update_mask(0, 0, 0, 0, 0, group);
+            if shift {
+                state.update_key(
+                    xkbcommon::xkb::Keycode::new(u32::from(evdev::Key::KEY_LEFTSHIFT.code()) + 8),
+                    xkbcommon::xkb::KeyDirection::Down,
+                );
+            }
+            if altgr {
+                state.update_key(
+                    xkbcommon::xkb::Keycode::new(u32::from(level3) + 8),
+                    xkbcommon::xkb::KeyDirection::Down,
+                );
+            }
+            let syms = state.key_get_syms(keycode);
+            // A key yielding multiple symbols cannot type one character alone.
+            if syms.len() != 1 {
+                continue;
+            }
+            for &sym in syms {
+                let raw = sym.raw();
+                if matches!(
+                    raw,
+                    KEY_dead_grave
+                        | KEY_dead_acute
+                        | KEY_dead_circumflex
+                        | KEY_dead_tilde
+                        | KEY_dead_diaeresis
+                        | KEY_dead_cedilla
+                ) {
+                    dead_keys.entry(raw).or_insert(KeyTap {
+                        keycode: evdev_keycode,
+                        shift,
+                        altgr,
+                    });
+                    continue;
+                }
+                let unicode = xkbcommon::xkb::keysym_to_utf32(sym);
+                if unicode == 0 {
+                    continue;
+                }
+                if let Some(ch) = char::from_u32(unicode) {
+                    map.entry(ch).or_insert(KeyMapping {
+                        main: KeyTap {
+                            keycode: evdev_keycode,
+                            shift,
+                            altgr,
+                        },
+                        follow: None,
+                    });
+                }
+            }
+        }
+    }
+
+    complete_reverse_map(&mut map, &dead_keys);
+
+    map
+}
+
+// Share dead-key composition and newline handling with the legacy keymap.
+fn complete_reverse_map(map: &mut HashMap<char, KeyMapping>, dead_keys: &HashMap<u32, KeyTap>) {
     // A line break is Enter, as on wayland-vk. The keysym loop finds `\n`
     // on Linefeed, a separate key that GUI toolkits ignore.
     map.insert(
@@ -581,8 +698,6 @@ pub(crate) fn build_reverse_map(keymap: &xkbcommon::xkb::Keymap) -> HashMap<char
             },
         );
     }
-
-    map
 }
 
 #[cfg(test)]
