@@ -5,6 +5,7 @@ import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {KeyboardControl} from './keyboard.js';
 
 const DBUS_INTERFACE = 'org.whisrs.Overlay';
 const DBUS_PATH = '/org/whisrs/Overlay';
@@ -39,6 +40,7 @@ const KNOWN_POSITIONS = [
 
 export default class WhisrsOverlayExtension extends Extension {
     enable() {
+        this._keyboardControl = new KeyboardControl();
         this._theme = 'carbon';
         this._placement = 'bottom-center';
 
@@ -116,6 +118,8 @@ export default class WhisrsOverlayExtension extends Extension {
     }
 
     disable() {
+        this._keyboardControl?.destroy();
+        this._keyboardControl = null;
         this._stopAnimation();
 
         for (const id of [

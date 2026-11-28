@@ -1,6 +1,6 @@
 [package]
 name = "xkb-type"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.74"
 description = "Virtual keyboard typing via evdev/uinput or X11 XTEST with XKB layout-aware key mapping"

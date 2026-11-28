@@ -3,7 +3,9 @@
 //! Creates a virtual keyboard device via `/dev/uinput` (or, with the `xtest`
 //! feature, an X server connection) and injects key events using the reverse
 //! XKB keymap to produce the correct characters regardless of the user's
-//! keyboard layout.
+//! keyboard layout. Auto-detected uinput keyboards first try transactional
+//! GNOME source control (see `layout_control`); explicit keymaps and XTEST
+//! retain the legacy path.
 
 use std::ops::{ControlFlow, Range};
 use std::thread;
@@ -143,6 +145,7 @@ pub struct Keyboard {
     keymap: XkbKeymap,
     clipboard: Box<dyn ClipboardBackend>,
     key_delay: Duration,
+    managed_layouts: bool,
 }
 
 impl Keyboard {
@@ -164,7 +167,9 @@ impl Keyboard {
     pub fn new(key_delay: Duration) -> anyhow::Result<Self> {
         let layout = KeyboardLayout::detect();
         let keymap = XkbKeymap::from_layout(&layout)?;
-        Self::with_components(keymap, default_clipboard(), key_delay)
+        let mut keyboard = Self::with_components(keymap, default_clipboard(), key_delay)?;
+        keyboard.managed_layouts = true;
+        Ok(keyboard)
     }
 
     /// Like [`Keyboard::new`], but uses a longer post-creation settle
@@ -179,7 +184,14 @@ impl Keyboard {
     pub fn new_prewarm(key_delay: Duration) -> anyhow::Result<Self> {
         let layout = KeyboardLayout::detect();
         let keymap = XkbKeymap::from_layout(&layout)?;
-        Self::with_components_settle(keymap, default_clipboard(), key_delay, INITIAL_WARMUP_DELAY)
+        let mut keyboard = Self::with_components_settle(
+            keymap,
+            default_clipboard(),
+            key_delay,
+            INITIAL_WARMUP_DELAY,
+        )?;
+        keyboard.managed_layouts = true;
+        Ok(keyboard)
     }
 
     /// Create a virtual keyboard for a specific XKB layout (and optional
@@ -258,6 +270,7 @@ impl Keyboard {
             keymap,
             clipboard,
             key_delay,
+            managed_layouts: false,
         })
     }
 
@@ -281,6 +294,7 @@ impl Keyboard {
             keymap,
             clipboard: default_clipboard(),
             key_delay,
+            managed_layouts: false,
         })
     }
 
@@ -319,6 +333,25 @@ impl Keyboard {
         text: &str,
         gate: &mut dyn FnMut(usize) -> ControlFlow<()>,
     ) -> anyhow::Result<Typed> {
+        if self.managed_layouts {
+            if let Some(mut session) = crate::layout_control::prepare()? {
+                return session.type_text(text, gate, |map, fragment| {
+                    self.release_all_modifiers()?;
+                    for (_, step) in plan_steps(fragment, |ch| map.lookup(ch).copied()) {
+                        match step {
+                            Step::Key(mapping) => {
+                                self.tap_key_using(&mapping.main, map.level3_keycode())?;
+                                if let Some(follow) = mapping.follow {
+                                    self.tap_key_using(&follow, map.level3_keycode())?;
+                                }
+                            }
+                            Step::Paste(range) => self.paste_text(&fragment[range])?,
+                        }
+                    }
+                    self.sink.sync()
+                });
+            }
+        }
         self.release_all_modifiers()?;
 
         let keymap = &self.keymap;
@@ -399,7 +432,23 @@ impl Keyboard {
     /// `KEY_RIGHTALT`; using the XKB keycode keeps third-level characters
     /// like `é` working with uinput.
     fn tap_key(&mut self, tap: &KeyTap) -> anyhow::Result<()> {
-        let level3_key = Key::new(self.keymap.level3_keycode());
+        self.tap_key_using(tap, self.keymap.level3_keycode())
+    }
+
+    fn tap_key_using(&mut self, tap: &KeyTap, level3: u16) -> anyhow::Result<()> {
+        let result = self.tap_key_inner(tap, level3);
+        if result.is_err() {
+            // Best effort even if a press or flush failed mid-character.
+            let _ = self.sink.key(tap.keycode, false);
+            let _ = self.sink.key(level3, false);
+            let _ = self.sink.key(Key::KEY_LEFTSHIFT.code(), false);
+            let _ = self.sink.flush();
+        }
+        result
+    }
+
+    fn tap_key_inner(&mut self, tap: &KeyTap, level3: u16) -> anyhow::Result<()> {
+        let level3_key = Key::new(level3);
 
         if tap.shift {
             self.set_modifier(Key::KEY_LEFTSHIFT, true)?;

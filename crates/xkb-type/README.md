@@ -16,7 +16,8 @@ All three implement the `KeyInjector` trait, so a caller can pick one at runtime
 | Wayland virtual keyboard | `wayland_vk::WaylandVkKeyboard::new` | A compositor that offers `zwp_virtual_keyboard_v1` | `wayland-vk` |
 | X11 XTEST | `Keyboard::new_xtest` | An X11 session (not Xwayland) | `xtest` |
 
-- **uinput** reads the active XKB layout with `xkbcommon`, maps every character to the physical key and modifiers that produce it (AltGr and dead keys included), and types through a virtual keyboard device. Characters the layout lacks (emoji, rare symbols) are pasted through the clipboard (Ctrl+V), and the clipboard is restored afterwards.
+- **uinput** on GNOME Wayland first probes the whisrs Shell extension for acknowledged layout control. With the updated extension on GNOME 50, it reads the active and available XKB sources, compiles their complete keymaps (including variants, model and options), checks switching and restoration before typing, and selects the appropriate source as scripts change. Character lookup is restricted to the selected XKB group; punctuation and modifiers come from that keymap. The original source is restored after completion, a gate stop, or an error. An error after typing starts stops the operation without replaying the text; the error identifies the byte offset and whether the current character may have been partly sent. If capability checks fail before typing, and any temporary switch has been restored, it uses the existing detection path. Explicit `with_layout` / `with_components` keyboards and XTEST retain their existing behavior.
+- **uinput fallback** reads the active XKB layout with `xkbcommon`, maps every character to the physical key and modifiers that produce it (AltGr and dead keys included), and types through a virtual keyboard device. Characters the layout lacks (emoji, rare symbols) are pasted through the clipboard (Ctrl+V), and the clipboard is restored afterwards.
 - **Wayland virtual keyboard** uploads its own keymap to the compositor, so each character types correctly whatever layout is active, mixed scripts included. It needs no `/dev/uinput`. `new` fails when the compositor lacks the protocol, so a caller can fall back to uinput.
 - **XTEST** sends keys through the X server, which processes them in order, so a key delay of zero drops nothing. It needs no `/dev/uinput`, and refuses to start on Xwayland or when the server's keyboard layout differs from the detected one.
 
@@ -101,6 +102,9 @@ The backend features, `wayland-vk` and `xtest`, are in the [Backends](#backends)
 - `libxkbcommon` (installed on most Linux desktops)
 - The backend's own needs, from the table above
 - `wl-clipboard` for the Wayland clipboard
+- For automatic source switching on GNOME Wayland: GNOME 50, `gdbus` (GLib tools), and the updated [whisrs Shell extension](../../contrib/gnome-shell-extension/README.md). Older extensions, unsupported Shell APIs, IBus sources, and externally supplied or locked keymaps use the existing input path. This does not enable switching on other compositors.
+
+The Shell bridge uses its source manager and waits for Mutter to apply each switch; it never writes `gsettings current` or enables `Shell.Eval`. uinput has no acknowledgement that an application consumed a key, so layout boundaries include a short drain delay. As with ordinary typing, keep the destination focused. Characters absent from every configured XKB source still use the clipboard; an IME is not driven through raw XKB key events.
 
 ## Installation
 

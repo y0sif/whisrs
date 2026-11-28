@@ -62,6 +62,7 @@
 pub mod clipboard;
 pub mod keyboard;
 pub mod keymap;
+mod layout_control;
 #[cfg(feature = "wayland-vk")]
 pub mod wayland_vk;
 #[cfg(feature = "xtest")]
